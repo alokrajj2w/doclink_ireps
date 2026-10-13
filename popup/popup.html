@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DocLink</title>
+  <link rel="stylesheet" href="popup.css">
+  <link rel="stylesheet" href="../tender/tender.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <img class="brand-logo" src="../assets/logo.png" alt="Joules to Watts">
+      <h1>DocLink</h1>
+    </div>
+    <div class="connection" id="connection" data-state="checking" title="IREPS session status">
+      <span class="connection-label">IREPS</span>
+      <span class="connection-status"><span class="dot"></span><span id="connection-text">Checking…</span></span>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <!-- ===================== Not-on-IREPS gate =====================
+         Shown instead of every other view (they keep their state) while the
+         active tab is not the IREPS portal config.json targets. -->
+    <section id="view-gate" class="view" hidden>
+      <article class="card card-attention">
+        <h2 id="gate-title">Go to IREPS and log in</h2>
+        <p class="card-text" id="gate-text">DocLink works only on the IREPS portal. This tab is not an IREPS page.</p>
+        <ol class="instructions" id="gate-steps">
+          <li>Open IREPS in this Chrome window</li>
+          <li>Log in using your normal security key</li>
+          <li>Keep the IREPS tab active - DocLink appears here automatically</li>
+        </ol>
+        <button id="btn-gate-open-ireps" class="btn btn-primary" type="button">Open IREPS</button>
+        <p class="gate-portal" id="gate-portal"></p>
+      </article>
+    </section>
+
+    <!-- ===================== Main view ===================== -->
+    <section id="view-main" class="view">
+      <article class="card" id="card-download">
+        <h2>Download IREPS Bill Status</h2>
+
+        <details class="options" id="options">
+          <summary>Search options <span class="options-summary" id="options-summary">Last 90 Days, All Zones</span></summary>
+          <div class="options-body">
+            <fieldset class="field">
+              <legend class="field-label">Range</legend>
+              <label class="radio"><input type="radio" name="opt-range" value="last90Days" checked> Last 90 Days</label>
+              <label class="radio"><input type="radio" name="opt-range" value="dateRange"> Select Date</label>
+              <div class="date-row" id="date-row">
+                <label class="field"><span class="field-label">From</span><input type="date" id="opt-date-from"></label>
+                <label class="field"><span class="field-label">To</span><input type="date" id="opt-date-to"></label>
+              </div>
+              <p class="field-hint">Date range must be within 180 days.</p>
+            </fieldset>
+            <label class="field">
+              <span class="field-label">Railway Zone</span>
+              <select id="opt-zone"><option value="-1">All</option></select>
+            </label>
+          </div>
+        </details>
+
+        <button id="btn-download" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Download Bill Status</span>
+        </button>
+
+        <div id="progress" class="progress" hidden>
+          <ol class="steps" id="steps">
+            <li data-stage="CHECKING_SESSION">Checking IREPS session</li>
+            <li data-stage="FETCHING">Retrieving Bill Status</li>
+            <li data-stage="PROCESSING">Processing bills</li>
+            <li data-stage="GENERATING_FILE">Generating Excel</li>
+            <li data-stage="DOWNLOADING">Downloading</li>
+          </ol>
+          <p class="progress-message" id="progress-message"></p>
+        </div>
+
+        <div id="result-error" class="result result-error" hidden>
+          <div class="result-title" id="error-title"></div>
+          <p id="error-message" class="result-text"></p>
+          <div class="result-actions">
+            <button id="btn-error-preview" class="btn btn-link" type="button" hidden>Open printable preview</button>
+            <button id="btn-error-retry" class="btn btn-link" type="button">Try again</button>
+          </div>
+        </div>
+      </article>
+
+      <!-- CRN / R-NOTE: same layout as Bill Status; the body comes from #tpl-doc-card (popup-documents.js) -->
+      <article class="card doc-card" id="card-crn" data-criteria="CRN">
+        <h2>Download IREPS CRN</h2>
+      </article>
+
+      <article class="card doc-card" id="card-rnote" data-criteria="RNOTE">
+        <h2>Download IREPS R-NOTE</h2>
+      </article>
+
+      <article class="card" id="card-ma">
+        <h2>Download IREPS MA Copies</h2>
+        <button id="btn-ma-open" class="btn btn-primary" type="button">Download MA</button>
+      </article>
+
+      <article class="card" id="card-po-ic">
+        <h2>Download IREPS PO / Inspection Certificate</h2>
+        <button id="btn-po-ic-open" class="btn btn-primary" type="button">Download PO / IC</button>
+      </article>
+
+      <article class="card" id="card-tender">
+        <h2>Download Tender Documents</h2>
+        <button id="btn-tender-open" class="btn btn-primary" type="button">Download Tender Documents</button>
+      </article>
+
+      <article class="card card-muted" id="card-upload">
+        <div class="card-heading">
+          <h2>Upload Document</h2>
+          <span class="badge">Coming Soon</span>
+        </div>
+        <p class="card-text">Upload documents to the configured IREPS workflow.</p>
+        <button id="btn-upload" class="btn btn-secondary" type="button">Upload Document</button>
+      </article>
+
+      <!-- Last completed download (Bill Status, CRN, R-NOTE): pinned to the bottom of the main view -->
+      <article id="main-result" class="result result-success result-panel" hidden>
+        <div class="result-title" id="main-result-title"></div>
+        <p id="main-result-summary" class="result-text"></p>
+        <p id="main-result-filter" class="result-text result-muted"></p>
+        <p id="main-result-filename" class="result-filename"></p>
+        <div class="result-actions">
+          <button id="btn-main-show-file" class="btn btn-link" type="button">Show in folder</button>
+          <button id="btn-main-preview" class="btn btn-link" type="button" hidden>Open printable preview</button>
+          <button id="btn-main-dismiss" class="btn btn-link" type="button">Dismiss</button>
+        </div>
+      </article>
+    </section>
+
+    <!-- ===================== Login required view ===================== -->
+    <section id="view-login" class="view" hidden>
+      <article class="card card-attention">
+        <h2 id="login-title">IREPS login required</h2>
+        <p class="card-text" id="login-text">Please log in to IREPS in this Chrome browser, then return to DocLink and try again.</p>
+        <ol class="instructions">
+          <li>Open IREPS in this Chrome browser</li>
+          <li>Log in using your normal security key</li>
+          <li>Return to DocLink</li>
+          <li>Click Download again</li>
+        </ol>
+        <button id="btn-open-ireps" class="btn btn-primary" type="button">Open IREPS</button>
+        <button id="btn-login-back" class="btn btn-link" type="button">Back</button>
+      </article>
+    </section>
+
+    <!-- ===================== MA copies view ===================== -->
+    <section id="view-ma" class="view" hidden>
+      <article class="card">
+        <div class="card-heading">
+          <h2>IREPS Modification Advice (MA)</h2>
+          <button id="btn-ma-back" class="btn btn-link" type="button">Back</button>
+        </div>
+        <p class="card-text">Finds the Modification Advices of a date and downloads their MA PDF copies from IREPS.</p>
+
+        <form id="ma-form" class="form" novalidate>
+          <fieldset class="field">
+            <legend class="field-label">MA Date</legend>
+            <label class="radio"><input type="radio" name="ma-date-mode" value="date" checked> Single date</label>
+            <div class="date-row" id="ma-date-row">
+              <label class="field"><span class="field-label">Date</span><input type="date" id="ma-date"></label>
+            </div>
+            <label class="radio"><input type="radio" name="ma-date-mode" value="dateRange"> Date range</label>
+            <div class="date-row" id="ma-range-row" hidden>
+              <label class="field"><span class="field-label">From</span><input type="date" id="ma-date-from"></label>
+              <label class="field"><span class="field-label">To</span><input type="date" id="ma-date-to"></label>
+            </div>
+            <label class="radio"><input type="radio" name="ma-date-mode" value="all"> All (Last 180 Days)</label>
+          </fieldset>
+
+          <details class="options" id="ma-options">
+            <summary>More filters <span class="options-summary" id="ma-options-summary">All Railways</span></summary>
+            <div class="options-body">
+              <label class="field">
+                <span class="field-label">Railway</span>
+                <select id="ma-rly"><option value="-1">All</option></select>
+              </label>
+              <label class="field">
+                <span class="field-label">PO Number (optional)</span>
+                <input id="ma-po" type="text" autocomplete="off" placeholder="Search one PO only">
+              </label>
+            </div>
+          </details>
+
+          <button id="btn-ma-search" class="btn btn-primary" type="submit">
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label">Search MAs</span>
+          </button>
+        </form>
+
+        <div id="ma-progress" class="progress" hidden>
+          <p class="progress-message" id="ma-progress-message"></p>
+        </div>
+
+        <div id="ma-error" class="result result-error" hidden>
+          <div class="result-title" id="ma-error-title"></div>
+          <p id="ma-error-message" class="result-text"></p>
+          <div class="result-actions">
+            <button id="btn-ma-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button>
+          </div>
+        </div>
+
+        <section id="ma-results" class="doc-results" hidden>
+          <div class="doc-results-head">
+            <div>
+              <div class="result-title" id="ma-results-title">MA Results</div>
+              <p class="result-text result-muted" id="ma-results-filter"></p>
+            </div>
+            <button id="btn-ma-new-search" class="btn btn-link" type="button">New search</button>
+          </div>
+
+          <div class="doc-toolbar">
+            <label class="doc-select-all"><input type="checkbox" id="ma-select-all"> <span id="ma-select-all-label">Select all</span></label>
+            <input id="ma-filter" type="search" placeholder="Filter by MA, PO, unit…" autocomplete="off">
+          </div>
+
+          <ul id="ma-list" class="doc-list"></ul>
+
+          <div class="btn-row">
+            <button id="btn-ma-download-selected" class="btn btn-primary" type="button" disabled>Download Selected</button>
+            <button id="btn-ma-download-all" class="btn btn-secondary" type="button">Download All</button>
+          </div>
+
+          <div id="ma-download-summary" class="result result-success" hidden>
+            <div class="result-title" id="ma-download-title"></div>
+            <p id="ma-download-text" class="result-text"></p>
+            <p class="result-filename" id="ma-download-folder">Downloads/DocLink/IREPS/MA/</p>
+            <div class="result-actions">
+              <button id="btn-ma-show-folder" class="btn btn-link" type="button" hidden>Show in folder</button>
+              <button id="btn-ma-retry-failed" class="btn btn-link" type="button" hidden>Retry failed downloads</button>
+            </div>
+          </div>
+        </section>
+      </article>
+    </section>
+
+    <!-- ===================== PO / Inspection Certificate view ===================== -->
+    <section id="view-po-ic" class="view" hidden>
+      <article class="card">
+        <div class="card-heading">
+          <h2>IREPS Document Download</h2>
+          <button id="btn-po-ic-back" class="btn btn-link" type="button">Back</button>
+        </div>
+        <p class="card-text">Enter a PO Number once, then download the Purchase Order and/or its issued Inspection Certificates.</p>
+
+        <label class="field">
+          <span class="field-label">PO Number</span>
+          <input id="po-ic-number" type="text" autocomplete="off" placeholder="e.g. 27253922100240">
+        </label>
+
+        <section class="doc-results">
+          <h3 class="section-heading">Purchase Order</h3>
+          <button id="btn-po-download" class="btn btn-primary" type="button">
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label">Download PO</span>
+          </button>
+          <div id="po-progress" class="progress" hidden>
+            <p class="progress-message" id="po-progress-message"></p>
+          </div>
+          <div id="po-error" class="result result-error" hidden>
+            <div class="result-title" id="po-error-title"></div>
+            <p id="po-error-message" class="result-text"></p>
+            <div class="result-actions">
+              <button id="btn-po-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button>
+            </div>
+          </div>
+          <div id="po-result" class="result result-success" hidden>
+            <div class="result-title" id="po-result-title"></div>
+            <p id="po-result-filename" class="result-filename"></p>
+            <div class="result-actions">
+              <button id="btn-po-show-file" class="btn btn-link" type="button">Show in folder</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="doc-results">
+          <h3 class="section-heading">Inspection Certificate</h3>
+          <button id="btn-ic-download" class="btn btn-primary" type="button">
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label">Download Inspection Certificate</span>
+          </button>
+          <div id="ic-progress" class="progress" hidden>
+            <p class="progress-message" id="ic-progress-message"></p>
+          </div>
+          <div id="ic-error" class="result result-error" hidden>
+            <div class="result-title" id="ic-error-title"></div>
+            <p id="ic-error-message" class="result-text"></p>
+            <div class="result-actions">
+              <button id="btn-ic-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button>
+            </div>
+          </div>
+          <div id="ic-result" class="result result-success" hidden>
+            <div class="result-title" id="ic-result-title"></div>
+            <p id="ic-result-text" class="result-text"></p>
+            <p class="result-filename" id="ic-result-folder"></p>
+            <div class="result-actions">
+              <button id="btn-ic-show-folder" class="btn btn-link" type="button" hidden>Show in folder</button>
+              <button id="btn-ic-retry" class="btn btn-link" type="button" hidden>Retry failed downloads</button>
+            </div>
+          </div>
+        </section>
+      </article>
+    </section>
+
+    <!-- ===================== Tender documents view ===================== -->
+    <section id="view-tender" class="view" hidden>
+      <article class="card">
+        <div class="card-heading">
+          <h2>DocLink — Tender Documents</h2>
+          <button id="btn-tender-back" class="btn btn-link" type="button">Back</button>
+        </div>
+
+        <!-- Active IREPS account (read live from the IREPS home page; never hardcoded) -->
+        <div id="tender-account" class="tender-account" aria-live="polite">
+          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Connection</span><span id="acc-connection">Checking…</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Company</span><span id="acc-company">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Operating Unit</span><span id="acc-unit">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Account ID</span><span id="acc-id">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Account Status</span><span id="acc-status">Checking…</span></div>
+          <p id="acc-warning" class="result-text tender-bad" hidden></p>
+          <button id="btn-account-refresh" class="btn btn-link" type="button">Refresh account</button>
+        </div>
+
+        <p class="card-text">DocLink reads your IREPS My Messages, takes each tender number from the NIT message itself, downloads the NIT and its supporting documents, then collects corrigenda, negotiation, counter offer, LOA, correspondence and My Offer for the selected dates. Financial and Commercial Tabulations are not downloaded.</p>
+        <div class="tender-dates">
+          <label class="field"><span class="field-label">From</span><input id="auto-from" type="date"></label>
+          <label class="field"><span class="field-label">To</span><input id="auto-to" type="date"></label>
+        </div>
+        <button id="btn-auto-run" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Scan My Messages &amp; Download</span>
+        </button>
+        <button id="btn-auto-retry" class="btn btn-link" type="button" hidden>Retry failed</button>
+        <button id="btn-copy-diag" class="btn btn-link" type="button">Copy diagnostics</button>
+        <div id="tender-progress" class="progress" hidden>
+          <p class="progress-message" id="tender-progress-message"></p>
+        </div>
+        <div id="tender-error" class="result result-error" hidden>
+          <p id="tender-error-message" class="result-text"></p>
+        </div>
+        <div id="auto-discovered" class="result" hidden>
+          <div class="result-title">Tenders found in My Messages</div>
+          <ul id="auto-discovered-rows" class="tender-rows"></ul>
+          <div id="auto-review" hidden>
+            <div class="result-title">Needs review (no download was started)</div>
+            <ul id="auto-review-rows" class="tender-rows"></ul>
+          </div>
+        </div>
+        <div id="tender-result" class="result result-success" hidden>
+          <div class="result-title">Download result</div>
+          <p id="tender-result-tender" class="result-text"></p>
+          <ul id="tender-result-rows" class="tender-rows"></ul>
+          <p id="tender-result-totals" class="result-text"></p>
+          <p id="tender-result-folder" class="result-filename"></p>
+          <div class="result-actions">
+            <button id="btn-tender-show" class="btn btn-link" type="button" hidden>Show in folder</button>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- ===================== Upload view (Phase 2 placeholder) ===================== -->
+    <section id="view-upload" class="view" hidden>
+      <article class="card">
+        <div class="card-heading">
+          <h2>Upload Document</h2>
+          <span class="badge">Phase 2</span>
+        </div>
+
+        <form id="upload-form" class="form" novalidate>
+          <label class="field">
+            <span class="field-label">Source:</span>
+            <select id="upload-source"></select>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Select Document:</span>
+            <input id="upload-file" type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png">
+          </label>
+
+          <label class="field">
+            <span class="field-label">Document Type:</span>
+            <select id="upload-type"></select>
+          </label>
+
+          <button id="btn-upload-submit" class="btn btn-primary" type="submit">Upload</button>
+          <p id="upload-message" class="form-message" hidden></p>
+        </form>
+        <button id="btn-upload-back" class="btn btn-link" type="button">Back</button>
+      </article>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <div class="meta">
+      <span class="meta-label">Last download:</span>
+      <span id="meta-last-download" class="meta-value">-</span>
+    </div>
+    <div class="meta">
+      <span class="meta-label">Status:</span>
+      <span id="meta-status" class="meta-value">-</span>
+    </div>
+  </footer>
+
+  <!-- Body of the CRN / R-NOTE cards (IREPS PO Search controls). One copy per
+       card; the {label} words and radio group names are filled in per card. -->
+  <template id="tpl-doc-card">
+    <details class="options" data-role="options">
+      <summary>Search options <span class="options-summary" data-role="summary">Last 180 Days, All Railways</span></summary>
+      <div class="options-body">
+        <fieldset class="field">
+          <legend class="field-label">Range</legend>
+          <label class="radio"><input type="radio" data-role="range" value="last180Days" checked> Last 180 Days</label>
+          <label class="radio"><input type="radio" data-role="range" value="dateRange"> Select Date</label>
+          <div class="date-row" data-role="date-row" hidden>
+            <label class="field"><span class="field-label">From</span><input type="date" data-role="date-from"></label>
+            <label class="field"><span class="field-label">To</span><input type="date" data-role="date-to"></label>
+          </div>
+          <label class="radio"><input type="radio" data-role="range" value="poNumber"> PO No.</label>
+          <div class="po-row" data-role="po-row" hidden>
+            <input type="text" data-role="po" autocomplete="off" maxlength="30" placeholder="PO number" aria-label="PO number">
+          </div>
+          <p class="field-hint">Date range must be within 180 days.</p>
+        </fieldset>
+        <label class="field">
+          <span class="field-label">Railway</span>
+          <select data-role="rly"><option value="-1">All</option></select>
+        </label>
+        <label class="field">
+          <span class="field-label">File format</span>
+          <select data-role="format"></select>
+        </label>
+      </div>
+    </details>
+
+    <button class="btn btn-primary" type="button" data-role="download">
+      <span class="btn-spinner" aria-hidden="true"></span>
+      <span class="btn-label" data-role="label">Download</span>
+    </button>
+
+    <div class="progress" data-role="progress" hidden>
+      <ol class="steps">
+        <li data-stage="CHECKING_SESSION">Checking IREPS session</li>
+        <li data-stage="SEARCHING" data-role="step-search">Searching</li>
+        <li data-stage="PARSING" data-role="step-parse">Reading records</li>
+        <li data-stage="GENERATING_FILE">Building the export file</li>
+        <li data-stage="DOWNLOADING">Downloading</li>
+      </ol>
+      <p class="progress-message" data-role="progress-message"></p>
+    </div>
+
+    <div class="result result-error" data-role="error" hidden>
+      <div class="result-title" data-role="error-title"></div>
+      <p class="result-text" data-role="error-message"></p>
+      <div class="result-actions">
+        <button class="btn btn-link" type="button" data-role="open-ireps" hidden>Open IREPS</button>
+        <button class="btn btn-link" type="button" data-role="retry">Try again</button>
+      </div>
+    </div>
+  </template>
+
+  <script type="module" src="popup.js"></script>
+  <script type="module" src="../tender/tender-ui.js"></script>
+</body>
+</html>

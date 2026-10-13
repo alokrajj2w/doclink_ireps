@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<!--
+  TEST FIXTURE - not a real login page. Used by the DocLink tests and the
+  local mock server (localhost only) to stand in for "the portal sent back
+  its login page", i.e. the session has expired.
+
+  It carries only the markers DocLink's session detection looks for
+  (services/session-service.js): the words "login", "user id" and
+  "security key", and a password input. The password input is disabled,
+  unnamed and outside any form, so nothing typed here is ever submitted.
+  The "Login with security key (simulated)" button posts to the mock's own
+  /login, which issues a random JSESSIONID cookie; no credentials are involved.
+-->
+<html>
+<head>
+<title>Login - DocLink test fixture</title>
+<style>
+body{margin:0;font-family:system-ui,sans-serif;font-size:13px;background:#fff;color:#222}
+.notice{background:#fff3cd;border-bottom:1px solid #e0c96b;padding:8px 16px;font-weight:600}
+.box{max-width:420px;margin:32px auto;border:1px dashed #999;padding:16px}
+.box td{padding:4px}
+</style>
+</head>
+<body>
+<div class="notice">DocLink test fixture &mdash; local mock, not a real login page. Do not enter credentials.</div>
+<div class="box">
+  <h3>Login</h3>
+  <p>Session expired. The real portal signs users in with a security key.</p>
+  <table>
+    <tr><td>User Id</td><td><input type="text" disabled aria-label="placeholder (disabled)"></td></tr>
+    <tr><td>Password</td><td><input type="password" disabled aria-label="placeholder (disabled)"></td></tr>
+  </table>
+  <form method="post" action="/login"><button type="submit">Login with security key (simulated)</button></form>
+  <p><a href="/mock/">Mock control panel</a></p>
+</div>
+</body>
+</html>
