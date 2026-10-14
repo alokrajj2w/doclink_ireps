@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DocLink",
-  "version": "1.1.0",
-  "description": "Download IREPS Bill Status reports and CRN (Consignment Receipt Note) PDFs; upload business documents.",
+  "version": "1.2.0",
+  "description": "Download IREPS Bill Status, CRN and R-NOTE reports to this computer or to the Recon Engine (S3); upload business documents.",
   "minimum_chrome_version": "116",
   "icons": {
     "16": "assets/icon16.png",
@@ -19,7 +19,8 @@
   ],
   "host_permissions": [
     "http://localhost:8765/*",
-    "https://www.ireps.gov.in/*"
+    "https://www.ireps.gov.in/*",
+    "http://localhost:8000/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",

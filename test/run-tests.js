@@ -36,6 +36,7 @@ import { runRnoteTests } from "./rnote-tests.js";
 import { runMaTests } from "./ma-tests.js";
 import { runPoTests } from "./po-tests.js";
 import { runIcTests } from "./ic-tests.js";
+import { runReconTests } from "./recon-tests.js";
 import { compileMatchPatterns, compileMatchPattern, classifyTabUrl, TAB_SCOPE } from "../utils/url-scope.js";
 
 const results = [];
@@ -914,6 +915,7 @@ await runRnoteTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 await runMaTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 await runPoTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 await runIcTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
+await runReconTests({ test, assert, eq });
 
 /* ---------------------------------------------------------------- report */
 

@@ -9,8 +9,9 @@
 
 import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError } from "../utils/messages.js";
 import { UPLOAD_SOURCES, DOCUMENT_TYPES } from "../services/upload-service.js";
+import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
 import { formatFriendlyDateTime } from "../utils/filename.js";
-import { initDocuments, handleDocumentMessage, restoreDocuments } from "./popup-documents.js";
+import { initDocuments, handleDocumentMessage, restoreDocuments, refreshDocumentsDestination } from "./popup-documents.js";
 import { initMa, handleMaMessage, restoreMa } from "./popup-ma.js";
 import { initPoIc, handlePoIcMessage, restorePoIc } from "./popup-po-ic.js";
 import { initGate, currentPanelTabId } from "./popup-gate.js";
@@ -33,6 +34,8 @@ const el = {
   optDateFrom: $("opt-date-from"),
   optDateTo: $("opt-date-to"),
   optZone: $("opt-zone"),
+  optDestination: Array.from(document.querySelectorAll('input[name="save-destination"]')),
+  stepSave: $("step-save"),
   btnDownload: $("btn-download"),
   btnLabel: document.querySelector("#btn-download .btn-label"),
   progress: $("progress"),
@@ -51,6 +54,7 @@ const el = {
   errorMessage: $("error-message"),
   btnErrorPreview: $("btn-error-preview"),
   btnErrorRetry: $("btn-error-retry"),
+  btnErrorOpenRecon: $("btn-error-open-recon"),
   btnUpload: $("btn-upload"),
   loginTitle: $("login-title"),
   loginText: $("login-text"),
@@ -179,7 +183,7 @@ function setConnectionForError(described) {
 function setButtonBusy(busy, label) {
   el.btnDownload.disabled = busy;
   el.btnDownload.classList.toggle("is-busy", busy);
-  el.btnLabel.textContent = label || "Download Bill Status";
+  el.btnLabel.textContent = label || (selectedDestination() === SAVE_DESTINATION.RECON ? "Save Bill Status to Recon" : "Download Bill Status");
 }
 
 /* ------------------------------------------------ shared bottom result panel */
@@ -212,6 +216,7 @@ function resetResults() {
   el.resultError.hidden = true;
   el.resultError.classList.remove("is-notice");
   el.btnErrorPreview.hidden = true;
+  el.btnErrorOpenRecon.hidden = true;
 }
 
 function renderProgress(stageId, message) {
@@ -238,14 +243,16 @@ function renderComplete(summary) {
   setButtonBusy(false);
   setConnection("connected", "Connected");
   const n = summary.recordCount ?? 0;
+  const toRecon = summary.destination === SAVE_DESTINATION.RECON;
   const extras = [];
   if (summary.skippedCount) extras.push(`${summary.skippedCount} incomplete record${summary.skippedCount === 1 ? "" : "s"} skipped`);
-  if (summary.reconSent) extras.push("sent to Recon Engine");
+  if (toRecon && summary.deduplicated) extras.push("identical file already stored");
+  const loaded = toRecon ? describeIngestStats(summary.ingestStats) : "";
   showResult({
-    title: "✓ Bill Status downloaded successfully",
-    summary: `Records found: ${n}${extras.length ? ` (${extras.join(", ")})` : ""}`,
+    title: toRecon ? "✓ Bill Status saved to the Recon Engine (S3)" : "✓ Bill Status downloaded successfully",
+    summary: `Records found: ${n}${extras.length ? ` (${extras.join(", ")})` : ""}${loaded ? `\n${loaded}` : ""}`,
     filter: summary.filter ? `Search: ${summary.filter}` : "",
-    filename: summary.filename || "",
+    filename: (toRecon ? summary.storedPath : summary.filename) || summary.filename || "",
     downloadId: summary.downloadId ?? null,
     preview: true
   });
@@ -269,6 +276,7 @@ function renderError(error) {
   el.errorTitle.textContent = described.title;
   el.errorMessage.textContent = described.message;
   el.btnErrorPreview.hidden = !described.previewAvailable;
+  el.btnErrorOpenRecon.hidden = !described.reconSignIn;
   el.resultError.classList.toggle("is-notice", described.notice === true || described.previewAvailable === true);
   el.resultError.hidden = false;
 }
@@ -296,12 +304,42 @@ function toIrepsDate(isoDate) {
   return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
 }
 
+function selectedDestination() {
+  const checked = el.optDestination.find((r) => r.checked);
+  return checked ? checked.value : SAVE_DESTINATION.LOCAL;
+}
+
+/** Button and progress-step labels follow the Save to choice (only while idle), on every card. */
+function updateDestination() {
+  const toRecon = selectedDestination() === SAVE_DESTINATION.RECON;
+  el.stepSave.textContent = toRecon ? "Uploading to Recon (S3)" : "Downloading";
+  if (!el.btnDownload.disabled) setButtonBusy(false);
+  refreshDocumentsDestination();
+}
+
+/** The Save to switch is one panel-wide preference, remembered across panel openings. */
+async function restoreDestination() {
+  try {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.SAVE_DESTINATION);
+    const value = stored[STORAGE_KEYS.SAVE_DESTINATION];
+    for (const radio of el.optDestination) radio.checked = radio.value === (value === SAVE_DESTINATION.RECON ? SAVE_DESTINATION.RECON : SAVE_DESTINATION.LOCAL);
+  } catch {
+    /* keep the default (Local) */
+  }
+  updateDestination();
+}
+
+function onDestinationChange() {
+  updateDestination();
+  chrome.storage.local.set({ [STORAGE_KEYS.SAVE_DESTINATION]: selectedDestination() }).catch(() => {});
+}
+
 function selectedRange() {
   const checked = el.optRange.find((r) => r.checked);
   return checked ? checked.value : "last90Days";
 }
 
-/** Options sent to the service worker. Mirrors the IREPS form semantics. */
+/** Search options mirroring the IREPS form semantics. */
 function collectOptions() {
   const zone = el.optZone.value || ALL_ZONES;
   if (selectedRange() === "dateRange") {
@@ -367,8 +405,9 @@ async function startDownload() {
   }
   resetResults();
   el.options.open = false;
+  updateDestination();
   renderProgress("CHECKING_SESSION", STAGES.CHECKING_SESSION.label);
-  const response = await send(MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS, { options });
+  const response = await send(MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS, { options: { ...options, destination: selectedDestination() } });
   if (!response) {
     renderError(describeError("UNKNOWN"));
   } else if (response.started === false) {
@@ -432,6 +471,8 @@ el.btnMainShowFile.addEventListener("click", () => {
   if (resultDownloadId !== null) chrome.downloads.show(resultDownloadId);
 });
 el.btnMainDismiss.addEventListener("click", hideResult);
+el.btnErrorOpenRecon.addEventListener("click", () => send(MESSAGE_TYPES.OPEN_RECON));
+for (const radio of el.optDestination) radio.addEventListener("change", onDestinationChange);
 
 for (const radio of el.optRange) radio.addEventListener("change", updateOptionsSummary);
 el.optZone.addEventListener("change", updateOptionsSummary);
@@ -496,7 +537,8 @@ async function onIrepsTabActive() {
   populateUploadForm();
   updateOptionsSummary();
   refreshMeta();
-  initDocuments({ send, showView, setConnection, setConnectionForError, showLogin, showResult, hideResult });
+  initDocuments({ send, showView, setConnection, setConnectionForError, showLogin, showResult, hideResult, getDestination: selectedDestination });
+  await restoreDestination();
   initMa({ send, showView, setConnection, setConnectionForError, showLogin });
   initPoIc({ send, showView, setConnection, setConnectionForError });
   // Nothing talks to IREPS until the active tab is the configured portal.

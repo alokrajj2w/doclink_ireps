@@ -1,7 +1,12 @@
 # DocLink — IREPS Document Automation (Chrome Extension, Manifest V3)
 
 DocLink is a Chrome extension for users of the Indian Railways IREPS portal.
-Version 1.1.0 implements two independent downloads:
+Version 1.2.0 implements the downloads below. One **Save to: Local |
+Recon (S3)** switch at the top right of the panel applies to Bill Status, CRN
+and R-NOTE - the export is either
+saved under `Downloads/DocLink/IREPS/` or uploaded to the Recon Engine, which
+stores it in S3 in one directory per document type and loads it into
+reconciliation (new in 1.2.0, see section 15).
 
 * **Download IREPS Bill Status** (since 1.0.0): retrieves the Bill Status page
   from the user's already-authenticated IREPS browser session, extracts the
@@ -85,7 +90,7 @@ corrected, reconciled or inferred.
 | Flow | `services/bill-status-service.js` | `fetchBillStatus(options)`: page → session check → token → Show Results → parse → validate |
 | Session | `services/session-service.js` | Content-based login / session-expired / Bill Status page detection |
 | Parsing | `services/bill-parser.js` | Label-driven extraction of every `table#table_id` block (plus legacy table fallback) → structured bills + printable HTML |
-| Recon | `services/recon-service.js` | Optional sender (disabled by default); never affects the download |
+| Recon | `services/recon-service.js` | "Save to: Recon (S3)": POSTs the export file to the Recon Engine's `/api/documents` with the user's Recon sign-in cookie; maps its answers to `RECON_*` errors (section 15) |
 | Bill Status export | `services/bill-status-export.js` | Bill Status columns (`BILL_FIELDS` order) handed to the shared table exporter → .xlsx |
 | PDF | `services/pdf-service.js` | Dependency-free PDF writer (Helvetica, wrapping, page breaks, headers/footers); used by the preview's "Download PDF" |
 | Download | `services/download-service.js` | `chrome.downloads` with `uniquify` conflict handling |
@@ -186,6 +191,8 @@ doclink-extension/
 | `tabs` | Open IREPS / the preview page in a new tab |
 | `offscreen` | Create an invisible offscreen document so the parser can use `DOMParser`; MV3 service workers have no DOM |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both declared permanently) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
+
+| host `http://localhost:8000/*` (the Recon Engine; replace/add the deployed Recon URL) | Only for **Save to: Recon (S3)**: lets the service worker POST the export to the Recon Engine with the user's Recon sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
 
 Not requested: `cookies`, `<all_urls>`, `history`, `bookmarks`, `webRequest`,
 `debugger`. The extension never reads cookie values.
@@ -560,7 +567,8 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
   portal; there is no lighter IREPS endpoint); the result is cached for 20 s.
 * Recovery Details is stored as the complete text ("GST TDS DEDUCTION: …\n…");
   structured deduction categories are not extracted yet.
-* Recon Engine sending is a disabled stub (`services/recon-service.js`).
+* Save to Recon (S3) needs the user to be signed in to the Recon Engine in
+  the same Chrome profile (DocLink never handles Recon credentials).
 
 ## 14. Future upload implementation (Phase 2)
 
@@ -569,8 +577,9 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
 (SharePoint / OneDrive / Local), Select Document and Document Type and posts
 `UPLOAD_DOCUMENT` to the service worker. Implementing SharePoint / OneDrive
 access and the IREPS upload workflow touches only that module (plus any new
-permissions it requires). Scheduled downloads and automatic login are explicitly out of scope; Recon
-Engine sending is available as an optional, disabled-by-default step.
+permissions it requires). Scheduled downloads and automatic login are explicitly out of scope. Saving
+IREPS exports to the Recon Engine (S3) is a download destination, not part of
+this upload view (section 15).
 
 ---
 
@@ -814,8 +823,10 @@ download.
 
 The PO Search flows follow the same rules as Bill Status: no cookie,
 JSESSIONID or token is read, stored, logged or sent anywhere. The Struts
-token exists only in local variables inside `searchIrepsDocuments()`. The
-Recon Engine sender is not called for CRN or R-NOTE data.
+token exists only in local variables inside `searchIrepsDocuments()`. With
+Save to: Recon (S3), only the export file itself (the same .xlsx a local
+download would save) is sent to the Recon Engine - never IREPS HTML, cookies
+or tokens.
 
 ---
 
@@ -902,3 +913,57 @@ and grouped in a folder per MA date.
 | `IREPS_MA_DOWNLOAD_FAILED` | network error, HTTP ≠ 2xx, or Chrome could not save the file |
 | `IREPS_MA_INVALID_PDF` | IREPS returned something that is not a PDF (and not a login page) |
 | `IREPS_SESSION_EXPIRED` | login / expired page at any step, including a PDF request |
+
+---
+
+## 15. Save to: this computer or the Recon Engine (S3)
+
+One **Save to** switch at the top right of the main panel applies to the
+Bill Status, CRN and R-NOTE downloads (remembered in `chrome.storage.local`):
+
+| Choice | What happens to the export file |
+|---|---|
+| **Local** (default) | `chrome.downloads` into `Downloads/DocLink/IREPS/` (Bill Status), `.../CRN/`, `.../RNOTE/` - unchanged behaviour |
+| **Recon (S3)** | `POST {reconBaseUrl}/api/documents` (multipart `customer_id`, `doc_type`, `file`) on the Recon Engine (`recon-engine` repo, `backend/app/routes.py`) |
+
+The Recon Engine stores the file in its managed storage - S3 when it runs
+with `STORAGE_BACKEND=s3` - one directory per document type, content-addressed
+(identical bytes are stored once):
+
+```
+s3://<S3_BRONZE_BUCKET>/<S3_PREFIX>bronze/<customer>/bill_status/<sha256>.xlsx
+s3://<S3_BRONZE_BUCKET>/<S3_PREFIX>bronze/<customer>/rnote/<sha256>.xlsx
+s3://<S3_BRONZE_BUCKET>/<S3_PREFIX>bronze/<customer>/crn/<sha256>.xlsx
+```
+
+and then parses it into its reconciliation data (bills / lineage), exactly
+like a manual upload. The result panel shows the stored `s3://` path and the
+load counts ("Loaded into Recon: 12 new, 3 updated, 40 unchanged"). A Recon
+upload is always Excel (the Recon parsers read .xlsx only), so the CRN /
+R-NOTE format choice is locked while Recon (S3) is selected.
+
+**Sign-in.** DocLink never asks for or stores Recon credentials. Sign in to
+the Recon Engine in the same Chrome profile; the upload carries that sign-in
+cookie. Without it the card shows *Recon Engine sign-in required* with an
+**Open Recon Engine** button (`reconAppUrl`).
+
+**Settings** (`config.json`; reload DocLink after editing):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `reconBaseUrl` | `http://localhost:8000` | Recon Engine API origin. Its origin must also be in `manifest.json` `host_permissions` - add the deployed Recon URL there |
+| `reconCustomerId` | `default` | Recon customer key the files are filed under |
+| `reconAppUrl` | `reconBaseUrl` | Page opened by **Open Recon Engine** (e.g. the Vite dev UI on `:5173`) |
+
+**Errors** (`utils/messages.js`):
+
+| Code | Meaning |
+|---|---|
+| `RECON_NOT_CONFIGURED` | `reconBaseUrl` empty/invalid, or its origin missing from `host_permissions`; nothing sent |
+| `RECON_AUTH_REQUIRED` | HTTP 401 - not signed in to the Recon Engine; nothing saved |
+| `RECON_UNAVAILABLE` | network error or no answer within 2 minutes |
+| `RECON_REJECTED` | any other non-2xx (e.g. unknown customer); the Recon Engine's reason is shown |
+| `RECON_NOT_INGESTED` | HTTP 422 - the file **is stored** in S3 but could not be loaded; the parse error is shown |
+
+Tests: `test/recon-tests.js` (fake fetch; part of `test/run-tests.html`).
+
