@@ -587,6 +587,56 @@ body {
   white-space: pre-line;
 }
 
+/* ------------------------------------------------- Save to: local | Recon */
+
+.save-to {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  font-size: 12px;
+}
+.save-to-label {
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.segmented {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+}
+.segmented label {
+  position: relative;
+  padding: 5px 12px;
+  text-align: center;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.segmented label + label {
+  border-left: 1px solid var(--border);
+}
+.segmented input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.segmented label:has(input:checked) {
+  background: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+.segmented label:has(input:focus-visible) {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+.field .field-hint {
+  margin-left: 0;
+}
+
 /* --------------------------------------------------------------------- CRN */
 
 .card-heading .btn-link {

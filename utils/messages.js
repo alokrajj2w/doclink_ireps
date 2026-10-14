@@ -12,6 +12,8 @@ export const MESSAGE_TYPES = Object.freeze({
   GET_TAB_SCOPE: "GET_TAB_SCOPE",
   OPEN_PREVIEW: "OPEN_PREVIEW",
   UPLOAD_DOCUMENT: "UPLOAD_DOCUMENT",
+  // opens the Recon Engine (config.json reconAppUrl) so the user can sign in for "Save to: Recon Engine (S3)"
+  OPEN_RECON: "OPEN_RECON",
 
   // popup -> service worker: PO Search document workflows (CRN, R-NOTE), separate from Bill Status
   SEARCH_PO_LOAD_FORM: "SEARCH_PO_LOAD_FORM",
@@ -315,6 +317,35 @@ export const ERROR_CATALOG = Object.freeze({
     message: "However, Chrome could not save the file. Check your download settings and retry.",
     connection: "connected"
   },
+
+  /* ------------------------------------- Save to: Recon Engine (S3) */
+  RECON_NOT_CONFIGURED: {
+    title: "Recon Engine not configured",
+    message: "DocLink cannot save to the Recon Engine: {detail}. Set reconBaseUrl in config.json (and add it to host_permissions in manifest.json), then reload DocLink.",
+    connection: "connected"
+  },
+  RECON_AUTH_REQUIRED: {
+    title: "Recon Engine sign-in required",
+    message: "Sign in to the Recon Engine in this Chrome window, then try again. Nothing was saved.",
+    reconSignIn: true,
+    connection: "connected"
+  },
+  RECON_UNAVAILABLE: {
+    title: "Recon Engine unavailable",
+    message: "The IREPS records were retrieved, but DocLink could not reach the Recon Engine ({detail}). Try again, or save locally.",
+    connection: "connected"
+  },
+  RECON_REJECTED: {
+    title: "Recon Engine refused the file",
+    message: "The Recon Engine did not accept the upload: {detail}. Nothing was saved.",
+    connection: "connected"
+  },
+  RECON_NOT_INGESTED: {
+    title: "Saved to S3, not loaded",
+    message: "The file was stored by the Recon Engine, but it could not be loaded into reconciliation: {detail}",
+    notice: true,
+    connection: "connected"
+  },
   DOCUMENT_BUSY: {
     title: "Download Already Running",
     message: "Please wait for the current CRN / R-NOTE download to finish."
@@ -432,6 +463,7 @@ export function describeError(code, details = {}) {
     loginRequired: entry.loginRequired === true,
     previewAvailable: entry.previewAvailable === true,
     notice: entry.notice === true,
+    reconSignIn: entry.reconSignIn === true,
     connection: entry.connection || null
   };
 }
@@ -443,7 +475,9 @@ export const STORAGE_KEYS = Object.freeze({
   LAST_RNOTE_DOWNLOAD: "doclink.lastRnoteDownload",
   LAST_MA_DOWNLOAD: "doclink.lastMaDownload",
   LAST_PO_DOWNLOAD: "doclink.lastPoDownload",
-  LAST_IC_DOWNLOAD: "doclink.lastIcDownload"
+  LAST_IC_DOWNLOAD: "doclink.lastIcDownload",
+  // the panel-wide Save to switch: "local" | "recon"
+  SAVE_DESTINATION: "doclink.saveDestination"
 });
 
 /** chrome.storage.session keys (memory only, cleared when Chrome closes). */

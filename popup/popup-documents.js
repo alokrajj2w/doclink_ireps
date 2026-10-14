@@ -18,12 +18,16 @@
  * one card is busy the other card's Download is refused with a clear message.
  *
  * The downloaded file is whatever format the user picked (Excel .xlsx by
- * default, CSV optional) - nothing here assumes a PDF.
+ * default, CSV optional) - nothing here assumes a PDF. The panel-wide
+ * "Save to" switch (popup.js) picks the destination: Local (Downloads) or the
+ * Recon Engine (S3); a Recon upload is always Excel, so the format choice is
+ * locked while it is picked.
  */
 
 import { MESSAGE_TYPES, DOCUMENT_STAGES, documentStageLabel, describeError } from "../utils/messages.js";
 import { EXPORT_FORMATS } from "../services/search-po/search-po-export.js";
 import { SEARCH_PO_DOCUMENT_TYPES, SEARCH_PO_CRITERIA } from "../services/search-po/search-po-api.js";
+import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
 
 const ALL_RAILWAYS = "-1";
 /** The document types that have a card here (PO and MA have their own views). */
@@ -80,6 +84,8 @@ class DocumentCard {
       po: q("po"),
       rly: q("rly"),
       format: q("format"),
+      formatHint: q("format-hint"),
+      stepSave: q("step-save"),
       btnDownload: q("download"),
       btnLabel: q("label"),
       progress: q("progress"),
@@ -89,6 +95,7 @@ class DocumentCard {
       errorTitle: q("error-title"),
       errorMessage: q("error-message"),
       btnOpenIreps: q("open-ireps"),
+      btnOpenRecon: q("open-recon"),
       btnRetry: q("retry")
     };
     const el = this.el;
@@ -114,6 +121,7 @@ class DocumentCard {
     el.btnDownload.addEventListener("click", () => this.start());
     el.btnRetry.addEventListener("click", () => this.start());
     el.btnOpenIreps.addEventListener("click", () => ctx.send(MESSAGE_TYPES.OPEN_IREPS));
+    el.btnOpenRecon.addEventListener("click", () => ctx.send(MESSAGE_TYPES.OPEN_RECON));
     this.setBusy(false);
     this.updateSummary();
   }
@@ -121,6 +129,22 @@ class DocumentCard {
   selectedRange() {
     const checked = this.el.ranges.find((r) => r.checked);
     return checked ? checked.value : "last180Days";
+  }
+
+  selectedDestination() {
+    return (ctx && ctx.getDestination && ctx.getDestination()) || SAVE_DESTINATION.LOCAL;
+  }
+
+  /** Recon uploads are always Excel: lock the format; relabel the button and the last step (only while idle). */
+  updateDestination() {
+    const el = this.el;
+    const toRecon = this.selectedDestination() === SAVE_DESTINATION.RECON;
+    if (toRecon) el.format.value = EXPORT_FORMATS[0].value;
+    el.format.disabled = toRecon;
+    el.formatHint.hidden = !toRecon;
+    el.stepSave.textContent = toRecon ? "Uploading to Recon (S3)" : "Downloading";
+    if (!el.btnDownload.disabled) this.setBusy(false);
+    this.updateSummary();
   }
 
   collectOptions() {
@@ -166,13 +190,14 @@ class DocumentCard {
   setBusy(busy, text) {
     this.el.btnDownload.disabled = busy;
     this.el.btnDownload.classList.toggle("is-busy", busy);
-    this.el.btnLabel.textContent = text || `Download ${this.label}`;
+    this.el.btnLabel.textContent = text || (this.selectedDestination() === SAVE_DESTINATION.RECON ? `Save ${this.label} to Recon` : `Download ${this.label}`);
   }
 
   clearError() {
     this.el.error.hidden = true;
     this.el.error.classList.remove("is-notice");
     this.el.btnOpenIreps.hidden = true;
+    this.el.btnOpenRecon.hidden = true;
   }
 
   renderProgress(stageId, message) {
@@ -202,12 +227,15 @@ class DocumentCard {
     if (summary.form && summary.form.railways) shareRailways(summary.form.railways);
     const n = summary.recordCount ?? 0;
     const pages = summary.pagesFetched > 1 ? ` across ${summary.pagesFetched} result pages` : "";
+    const toRecon = summary.destination === SAVE_DESTINATION.RECON;
+    const stored = toRecon && summary.deduplicated ? ", identical file already stored" : "";
+    const loaded = toRecon ? describeIngestStats(summary.ingestStats) : "";
     ctx.showView("main");
     ctx.showResult({
-      title: `✓ ${this.label} export downloaded successfully`,
-      summary: `${this.label} records exported: ${n}${pages} (${formatLabel(summary.format)})`,
+      title: toRecon ? `✓ ${this.label} export saved to the Recon Engine (S3)` : `✓ ${this.label} export downloaded successfully`,
+      summary: `${this.label} records exported: ${n}${pages} (${formatLabel(summary.format)}${stored})${loaded ? `\n${loaded}` : ""}`,
       filter: summary.filter ? `Search: ${summary.filter}` : "",
-      filename: summary.filename || "",
+      filename: (toRecon ? summary.storedPath : summary.filename) || summary.filename || "",
       downloadId: summary.downloadId ?? null
     });
   }
@@ -226,6 +254,7 @@ class DocumentCard {
     el.errorTitle.textContent = described.title;
     el.errorMessage.textContent = described.message;
     el.btnOpenIreps.hidden = described.connection !== "login";
+    el.btnOpenRecon.hidden = !described.reconSignIn;
     el.error.classList.toggle("is-notice", described.notice === true);
     el.error.hidden = false;
     el.error.scrollIntoView({ block: "nearest" });
@@ -245,8 +274,9 @@ class DocumentCard {
     }
     ctx.hideResult();
     this.el.options.open = false;
+    this.updateDestination();
     this.renderProgress("CHECKING_SESSION", documentStageLabel(DOCUMENT_STAGES.CHECKING_SESSION, this.label));
-    const response = await ctx.send(MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS, { criteria: this.criteria, options });
+    const response = await ctx.send(MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS, { criteria: this.criteria, options: { ...options, destination: this.selectedDestination() } });
     if (!response) this.renderError(describeError("UNKNOWN"));
     else if (response.started === false) this.renderError(response.error || describeError("DOCUMENT_BUSY"));
   }
@@ -309,6 +339,11 @@ export function handleDocumentMessage(message) {
     default:
       return false;
   }
+}
+
+/** The panel-wide Save to switch changed (or was restored): relabel every card. */
+export function refreshDocumentsDestination() {
+  for (const card of cards.values()) card.updateDestination();
 }
 
 /**

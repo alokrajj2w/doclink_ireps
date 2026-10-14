@@ -5,8 +5,13 @@
  *
  *   popup click -> POST viewBills.do (empty) -> session validation ->
  *   Struts token -> POST viewBills.do (Show Results) -> parser (offscreen
- *   document) -> validation -> Excel (.xlsx) export -> local download ->
- *   optional Recon Engine -> popup status
+ *   document) -> validation -> Excel (.xlsx) export -> save -> popup status
+ *
+ * "Save" is the user's choice per download (options.destination): the local
+ * Downloads folder (chrome.downloads), or the Recon Engine, which stores the
+ * file in S3 under a directory per document type and loads it into
+ * reconciliation (services/recon-service.js). The same choice applies to the
+ * CRN and R-NOTE exports below.
  *
  * All real work is delegated to the service modules; this file only wires
  * the steps together, tracks job state and relays progress to the popup.
@@ -43,7 +48,7 @@ import { checkIrepsSession } from "../services/session-service.js";
 import { extractBillStatusForm, publicFormInfo } from "../services/ireps-form.js";
 import { fetchBillStatus } from "../services/bill-status-service.js";
 import { buildBillStatusExport } from "../services/bill-status-export.js";
-import { sendBillStatusToRecon } from "../services/recon-service.js";
+import { uploadToRecon, loadReconConfig, ReconError, RECON_CONFIG, RECON_DOC_TYPE, SAVE_DESTINATION } from "../services/recon-service.js";
 import { uploadDocument } from "../services/upload-service.js";
 import { searchIrepsDocuments, validateSearchPoSession, SEARCH_PO_FLOW_STAGES } from "../services/search-po/search-po-service.js";
 import { loadSearchPoPage, SEARCH_PO_ERROR, SEARCH_PO_CRITERIA, SEARCH_PO_DOCUMENT_TYPES } from "../services/search-po/search-po-api.js";
@@ -55,7 +60,7 @@ import { searchMa, downloadMaPdfs, MA_ERROR, MA_FLOW_STAGES } from "../services/
 import { downloadBytes } from "../services/download-service.js";
 import { downloadPo, PO_ERROR, PO_FLOW_STAGES } from "../services/po/po-service.js";
 import { downloadInspectionCertificates, IC_ERROR, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
-import { buildDocumentExportDownloadPath, buildBillStatusExportDownloadPath } from "../utils/filename.js";
+import { buildDocumentExportDownloadPath, buildDocumentExportFilename, buildBillStatusExportDownloadPath, buildBillStatusExportFilename } from "../utils/filename.js";
 import { MESSAGE_TYPES, TARGETS, STAGES, DOCUMENT_STAGES, MA_STAGES, PO_STAGES, IC_STAGES, documentStageLabel, describeError, STORAGE_KEYS, SESSION_KEYS } from "../utils/messages.js";
 import { logger, installLogCollector, installConsoleHelpers } from "../utils/logger.js";
 import { classifyTabUrl } from "../utils/url-scope.js";
@@ -283,16 +288,50 @@ const STAGE_FOR_PROGRESS = {
 };
 
 /**
- * @param {{ mode?: string, zone?: string, dateFrom?: string, dateTo?: string }} options
+ * Save an export file where the user chose: the Downloads folder, or the
+ * Recon Engine (S3). Failures surface as WorkflowError with the code the
+ * caller passes for a local failure, or the Recon error's own code.
+ *
+ * @param {import("../services/search-po/search-po-export.js").ExportFile} file
+ * @param {{ destination: string, docType: string, localPath: string, filename: string, localErrorCode: string }} target
+ * @returns {Promise<{ destination: string, downloadId: number|null, filename: string, storedPath: string|null, deduplicated: boolean, ingestStats: object|null }>}
+ */
+async function saveExportFile(file, target) {
+  if (target.destination === SAVE_DESTINATION.RECON) {
+    try {
+      const stored = await uploadToRecon({ docType: target.docType, bytes: file.bytes, filename: target.filename, mimeType: file.mimeType });
+      return { destination: SAVE_DESTINATION.RECON, downloadId: null, filename: target.filename, storedPath: stored.storedPath, deduplicated: stored.deduplicated, ingestStats: stored.stats };
+    } catch (error) {
+      if (error instanceof ReconError) throw new WorkflowError(error.code, { status: error.status, detail: error.detail });
+      throw error;
+    }
+  }
+  try {
+    const download = await downloadBytes(file.bytes, { path: target.localPath, mimeType: file.mimeType });
+    return { destination: SAVE_DESTINATION.LOCAL, downloadId: download.downloadId, filename: download.filename, storedPath: null, deduplicated: false, ingestStats: null };
+  } catch (error) {
+    logger.error("Download failed", error);
+    throw new WorkflowError(target.localErrorCode);
+  }
+}
+
+/** A user-chosen destination, defaulting to the Downloads folder. */
+function sanitiseDestination(value) {
+  return value === SAVE_DESTINATION.RECON ? SAVE_DESTINATION.RECON : SAVE_DESTINATION.LOCAL;
+}
+
+/**
+ * @param {{ mode?: string, zone?: string, dateFrom?: string, dateTo?: string, destination?: string }} options
  */
 async function runDownloadWorkflow(options) {
   const startedAt = new Date();
+  const { destination, ...searchOptions } = options;
 
   // Steps 1-4: session, token, search, parse (services/bill-status-service.js).
   await progress(STAGES.CHECKING_SESSION);
   let fetched;
   try {
-    fetched = await fetchBillStatus(options, {
+    fetched = await fetchBillStatus(searchOptions, {
       initialPage: takeCachedPage(),
       parseHtml: (html, parseOptions) => parseInOffscreen(html, parseOptions),
       onProgress: (stage) => {
@@ -329,43 +368,39 @@ async function runDownloadWorkflow(options) {
     throw new WorkflowError("EXPORT_ERROR");
   }
 
-  // Step 6: local download.
-  await progress(STAGES.DOWNLOADING);
-  let download;
-  try {
-    download = await downloadBytes(file.bytes, { path: buildBillStatusExportDownloadPath(startedAt), mimeType: file.mimeType });
-  } catch (error) {
-    logger.error("Download failed", error);
-    throw new WorkflowError("DOWNLOAD_ERROR");
-  }
-
-  // Step 7 (optional): Recon Engine. Never affects the download outcome.
-  let recon = { sent: false, skipped: true };
-  try {
-    recon = await sendBillStatusToRecon(fetched);
-  } catch (error) {
-    logger.warn("Recon Engine send failed", error);
-  }
+  // Step 6: save - Downloads folder or the Recon Engine (S3).
+  const toRecon = destination === SAVE_DESTINATION.RECON;
+  await progress(STAGES.DOWNLOADING, toRecon ? "Uploading to the Recon Engine (S3)..." : undefined);
+  const saved = await saveExportFile(file, {
+    destination,
+    docType: RECON_DOC_TYPE.BILL_STATUS,
+    localPath: buildBillStatusExportDownloadPath(startedAt),
+    filename: buildBillStatusExportFilename(startedAt),
+    localErrorCode: "DOWNLOAD_ERROR"
+  });
 
   const summary = {
-    downloadId: download.downloadId,
-    filename: download.filename,
+    destination: saved.destination,
+    downloadId: saved.downloadId,
+    filename: saved.filename,
+    storedPath: saved.storedPath,
+    deduplicated: saved.deduplicated,
+    ingestStats: saved.ingestStats,
     recordCount: result.recordCount,
     skippedCount: result.skippedCount || 0,
     warningCount: (result.warnings || []).length,
     request: fetched.request,
     filter: fetched.filter,
     fetchedAt: fetched.fetchedAt,
-    reconSent: recon.sent === true,
     downloadedAt: new Date().toISOString()
   };
   await chrome.storage.local.set({
     [STORAGE_KEYS.LAST_DOWNLOAD]: {
       lastDownloadAt: summary.downloadedAt,
-      lastDownloadFilename: summary.filename,
+      lastDownloadFilename: summary.storedPath || summary.filename,
       lastRecordCount: summary.recordCount,
       lastFilter: summary.filter,
-      lastStatus: "Downloaded successfully"
+      lastStatus: toRecon ? "Saved to Recon Engine (S3)" : "Downloaded successfully"
     }
   });
   return summary;
@@ -390,6 +425,7 @@ function sanitiseOptions(raw) {
   if (typeof options.zone === "string") out.zone = options.zone;
   if (typeof options.dateFrom === "string") out.dateFrom = options.dateFrom;
   if (typeof options.dateTo === "string") out.dateTo = options.dateTo;
+  out.destination = sanitiseDestination(options.destination);
   return out;
 }
 
@@ -398,14 +434,14 @@ async function startDownloadJob(rawOptions) {
   jobRunning = true;
   const options = sanitiseOptions(rawOptions);
   lastLoggedStep = "";
-  logger.info("Bill Status started", { mode: options.mode || "last90Days", zone: options.zone || "-1" });
+  logger.info("Bill Status started", { mode: options.mode || "last90Days", zone: options.zone || "-1", destination: options.destination });
 
   (async () => {
     try {
       const summary = await runDownloadWorkflow(options);
       await setJobState({ status: "complete", stage: STAGES.COMPLETE.id, message: STAGES.COMPLETE.label, result: summary, error: undefined });
       broadcast(MESSAGE_TYPES.IREPS_DOWNLOAD_COMPLETE, summary);
-      logger.info(`Bill Status complete: ${summary.recordCount} bills saved as ${summary.filename}`, summary);
+      logger.info(`Bill Status complete: ${summary.recordCount} bills saved as ${summary.storedPath || summary.filename}`, summary);
     } catch (error) {
       const code = error instanceof WorkflowError ? error.code : "UNKNOWN";
       const described = describeError(code, error instanceof WorkflowError ? error.details : {});
@@ -431,6 +467,10 @@ async function startDownloadJob(rawOptions) {
 const EXPORT_BUILDERS = {
   [SEARCH_PO_CRITERIA.CRN]: buildCrnExport,
   [SEARCH_PO_CRITERIA.RNOTE]: buildRnoteExport
+};
+const RECON_DOC_TYPES = {
+  [SEARCH_PO_CRITERIA.CRN]: RECON_DOC_TYPE.CRN,
+  [SEARCH_PO_CRITERIA.RNOTE]: RECON_DOC_TYPE.RNOTE
 };
 const LAST_DOWNLOAD_KEYS = {
   [SEARCH_PO_CRITERIA.CRN]: STORAGE_KEYS.LAST_CRN_DOWNLOAD,
@@ -491,7 +531,10 @@ function sanitiseDocumentOptions(raw) {
   }
   if (options.pageNo !== undefined && Number.isFinite(Number(options.pageNo))) out.pageNo = Number(options.pageNo);
   if (options.recordsPerPage !== undefined && Number.isFinite(Number(options.recordsPerPage))) out.recordsPerPage = Number(options.recordsPerPage);
-  out.format = Object.values(EXPORT_FORMAT).includes(options.format) ? options.format : EXPORT_FORMAT.XLSX;
+  out.destination = sanitiseDestination(options.destination);
+  // The Recon Engine reads Excel only, so an upload is always .xlsx.
+  out.format = out.destination === SAVE_DESTINATION.RECON ? EXPORT_FORMAT.XLSX
+    : Object.values(EXPORT_FORMAT).includes(options.format) ? options.format : EXPORT_FORMAT.XLSX;
   return out;
 }
 
@@ -525,11 +568,11 @@ async function loadSearchPoFormInfo({ useCache = true } = {}) {
  * (DocLink's version of the portal's "Export to Excel" - every row, not only
  * the visible page).
  * @param {string} criteria   "CRN" | "RNOTE"
- * @param {{ format: string, mode?: string, railway?: string, poNo?: string, dateFrom?: string, dateTo?: string, recordsPerPage?: number }} options
+ * @param {{ format: string, destination: string, mode?: string, railway?: string, poNo?: string, dateFrom?: string, dateTo?: string, recordsPerPage?: number }} options
  */
 async function runDocumentDownloadWorkflow(criteria, options) {
   const startedAt = new Date();
-  const { format, ...searchOptions } = options;
+  const { format, destination, ...searchOptions } = options;
   const label = typeLabel(criteria);
 
   // Steps 1-5: page, session, token, search, parse, further result pages (shared layer).
@@ -565,21 +608,26 @@ async function runDocumentDownloadWorkflow(criteria, options) {
     throw new WorkflowError("DOCUMENT_EXPORT_ERROR");
   }
 
-  // Step 7: local download.
-  await documentProgress(criteria, DOCUMENT_STAGES.DOWNLOADING);
-  let download;
-  try {
-    download = await downloadBytes(file.bytes, { path: buildDocumentExportDownloadPath(criteria, startedAt, file.extension), mimeType: file.mimeType });
-  } catch (error) {
-    logger.error(`${criteria} download failed`, error);
-    throw new WorkflowError("DOCUMENT_DOWNLOAD_ERROR");
-  }
+  // Step 7: save - Downloads folder or the Recon Engine (S3).
+  const toRecon = destination === SAVE_DESTINATION.RECON;
+  await documentProgress(criteria, DOCUMENT_STAGES.DOWNLOADING, toRecon ? "Uploading to the Recon Engine (S3)..." : undefined);
+  const saved = await saveExportFile(file, {
+    destination,
+    docType: RECON_DOC_TYPES[criteria],
+    localPath: buildDocumentExportDownloadPath(criteria, startedAt, file.extension),
+    filename: buildDocumentExportFilename(criteria, startedAt, file.extension),
+    localErrorCode: "DOCUMENT_DOWNLOAD_ERROR"
+  });
 
   const summary = {
     criteria,
     typeLabel: label,
-    downloadId: download.downloadId,
-    filename: download.filename,
+    destination: saved.destination,
+    downloadId: saved.downloadId,
+    filename: saved.filename,
+    storedPath: saved.storedPath,
+    deduplicated: saved.deduplicated,
+    ingestStats: saved.ingestStats,
     format: file.format,
     recordCount: result.recordCount,
     columnCount: file.columnCount,
@@ -596,10 +644,10 @@ async function runDocumentDownloadWorkflow(criteria, options) {
     await chrome.storage.local.set({
       [key]: {
         lastDownloadAt: summary.downloadedAt,
-        lastDownloadFilename: summary.filename,
+        lastDownloadFilename: summary.storedPath || summary.filename,
         lastRecordCount: summary.recordCount,
         lastFilter: summary.filter,
-        lastStatus: "Downloaded successfully"
+        lastStatus: toRecon ? "Saved to Recon Engine (S3)" : "Downloaded successfully"
       }
     });
   }
@@ -612,7 +660,7 @@ async function startDocumentDownloadJob(rawCriteria, rawOptions) {
   if (documentJobRunning) return { started: false, error: describeError("DOCUMENT_BUSY") };
   documentJobRunning = criteria;
   const options = sanitiseDocumentOptions(rawOptions);
-  logger.info(`${criteria} download started`, { mode: options.mode || "(inferred)", railway: options.railway || "-1", format: options.format });
+  logger.info(`${criteria} download started`, { mode: options.mode || "(inferred)", railway: options.railway || "-1", format: options.format, destination: options.destination });
 
   (async () => {
     try {
@@ -620,7 +668,7 @@ async function startDocumentDownloadJob(rawCriteria, rawOptions) {
       const doneLabel = documentStageLabel(DOCUMENT_STAGES.COMPLETE, typeLabel(criteria));
       await setDocumentJob(criteria, { status: "complete", stage: DOCUMENT_STAGES.COMPLETE.id, message: doneLabel, result: summary, error: undefined });
       broadcast(MESSAGE_TYPES.DOCUMENT_DOWNLOAD_COMPLETE, summary);
-      logger.info(`${typeLabel(criteria)} complete: ${summary.recordCount} records saved as ${summary.filename}`, { records: summary.recordCount, pages: summary.pagesFetched, format: summary.format, downloadId: summary.downloadId });
+      logger.info(`${typeLabel(criteria)} complete: ${summary.recordCount} records saved as ${summary.storedPath || summary.filename}`, { records: summary.recordCount, pages: summary.pagesFetched, format: summary.format, destination: summary.destination, downloadId: summary.downloadId });
     } catch (error) {
       const code = error instanceof WorkflowError ? error.code : "UNKNOWN";
       const described = { ...describeError(code, error instanceof WorkflowError ? error.details : {}), criteria };
@@ -1081,6 +1129,13 @@ const handlers = {
     return { ok: true };
   },
   [MESSAGE_TYPES.UPLOAD_DOCUMENT]: (message) => uploadDocument(message.request || {}),
+  // Sign-in for "Save to: Recon Engine (S3)": the Recon Engine opens in a new tab, IREPS stays put.
+  [MESSAGE_TYPES.OPEN_RECON]: async () => {
+    await loadReconConfig();
+    if (!RECON_CONFIG.appUrl) return { ok: false, error: describeError("RECON_NOT_CONFIGURED", { detail: "reconBaseUrl is not set in config.json" }) };
+    await chrome.tabs.create({ url: RECON_CONFIG.appUrl });
+    return { ok: true };
+  },
 
   // PO Search document workflows (CRN, R-NOTE)
   [MESSAGE_TYPES.SEARCH_PO_LOAD_FORM]: (message) => loadSearchPoFormInfo({ useCache: !message.force }),

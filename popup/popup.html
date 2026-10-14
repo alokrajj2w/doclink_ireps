@@ -39,6 +39,14 @@
 
     <!-- ===================== Main view ===================== -->
     <section id="view-main" class="view">
+      <!-- One Save to switch for Bill Status, CRN and R-NOTE -->
+      <div class="save-to" role="radiogroup" aria-label="Save downloads to">
+        <span class="save-to-label">Save to</span>
+        <div class="segmented">
+          <label title="Downloads/DocLink/IREPS/ on this computer"><input type="radio" name="save-destination" value="local" checked> Local</label>
+          <label title="Recon Engine document storage (S3), then loaded into reconciliation"><input type="radio" name="save-destination" value="recon"> Recon (S3)</label>
+        </div>
+      </div>
       <article class="card" id="card-download">
         <h2>Download IREPS Bill Status</h2>
 
@@ -62,6 +70,7 @@
           </div>
         </details>
 
+
         <button id="btn-download" class="btn btn-primary" type="button">
           <span class="btn-spinner" aria-hidden="true"></span>
           <span class="btn-label">Download Bill Status</span>
@@ -73,7 +82,7 @@
             <li data-stage="FETCHING">Retrieving Bill Status</li>
             <li data-stage="PROCESSING">Processing bills</li>
             <li data-stage="GENERATING_FILE">Generating Excel</li>
-            <li data-stage="DOWNLOADING">Downloading</li>
+            <li data-stage="DOWNLOADING" id="step-save">Downloading</li>
           </ol>
           <p class="progress-message" id="progress-message"></p>
         </div>
@@ -83,6 +92,7 @@
           <p id="error-message" class="result-text"></p>
           <div class="result-actions">
             <button id="btn-error-preview" class="btn btn-link" type="button" hidden>Open printable preview</button>
+            <button id="btn-error-open-recon" class="btn btn-link" type="button" hidden>Open Recon Engine</button>
             <button id="btn-error-retry" class="btn btn-link" type="button">Try again</button>
           </div>
         </div>
@@ -436,9 +446,11 @@
         <label class="field">
           <span class="field-label">File format</span>
           <select data-role="format"></select>
+          <span class="field-hint" data-role="format-hint" hidden>Recon Engine uploads are always Excel.</span>
         </label>
       </div>
     </details>
+
 
     <button class="btn btn-primary" type="button" data-role="download">
       <span class="btn-spinner" aria-hidden="true"></span>
@@ -451,7 +463,7 @@
         <li data-stage="SEARCHING" data-role="step-search">Searching</li>
         <li data-stage="PARSING" data-role="step-parse">Reading records</li>
         <li data-stage="GENERATING_FILE">Building the export file</li>
-        <li data-stage="DOWNLOADING">Downloading</li>
+        <li data-stage="DOWNLOADING" data-role="step-save">Downloading</li>
       </ol>
       <p class="progress-message" data-role="progress-message"></p>
     </div>
@@ -461,6 +473,7 @@
       <p class="result-text" data-role="error-message"></p>
       <div class="result-actions">
         <button class="btn btn-link" type="button" data-role="open-ireps" hidden>Open IREPS</button>
+        <button class="btn btn-link" type="button" data-role="open-recon" hidden>Open Recon Engine</button>
         <button class="btn btn-link" type="button" data-role="retry">Try again</button>
       </div>
     </div>
