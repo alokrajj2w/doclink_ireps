@@ -13,6 +13,7 @@ import { formatFriendlyDateTime } from "../utils/filename.js";
 import { initDocuments, handleDocumentMessage, restoreDocuments } from "./popup-documents.js";
 import { initMa, handleMaMessage, restoreMa } from "./popup-ma.js";
 import { initPoIc, handlePoIcMessage, restorePoIc } from "./popup-po-ic.js";
+import { initBatch, handleBatchMessage, restoreBatch } from "./popup-po-ic-batch.js";
 import { initGate, currentPanelTabId } from "./popup-gate.js";
 import { logger, mirrorLogToConsole, installConsoleHelpers } from "../utils/logger.js";
 
@@ -26,6 +27,7 @@ const el = {
   viewUpload: $("view-upload"),
   viewMa: $("view-ma"),
   viewPoIc: $("view-po-ic"),
+  viewPoIcBatch: $("view-po-ic-batch"),
   options: $("options"),
   optionsSummary: $("options-summary"),
   optRange: Array.from(document.querySelectorAll('input[name="opt-range"]')),
@@ -114,6 +116,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (handleDocumentMessage(message)) return false;
   if (handleMaMessage(message)) return false;
   if (handlePoIcMessage(message)) return false;
+  if (handleBatchMessage(message)) return false;
   switch (message.type) {
     case MESSAGE_TYPES.IREPS_PROGRESS:
       renderProgress(message.stage, message.message);
@@ -140,6 +143,7 @@ function showView(name) {
   el.viewUpload.hidden = name !== "upload";
   el.viewMa.hidden = name !== "ma";
   el.viewPoIc.hidden = name !== "po-ic";
+  el.viewPoIcBatch.hidden = name !== "po-ic-batch";
 }
 
 /** Shared "IREPS login required" view (used by Bill Status and CRN). */
@@ -471,7 +475,8 @@ async function onIrepsTabActive() {
     const documentRestored = restored ? false : await restoreDocuments();
     const maRestored = restored || documentRestored ? false : await restoreMa();
     const poIcRestored = restored || documentRestored || maRestored ? false : await restorePoIc();
-    if (!restored && !documentRestored && !maRestored && !poIcRestored) showView("main");
+    const batchRestored = restored || documentRestored || maRestored || poIcRestored ? false : await restoreBatch();
+    if (!restored && !documentRestored && !maRestored && !poIcRestored && !batchRestored) showView("main");
     const state = await send(MESSAGE_TYPES.GET_JOB_STATE);
     if (!state || state.status !== "running") {
       if (restored && state && state.status === "error" && state.error && state.error.loginRequired) {
@@ -499,6 +504,7 @@ async function onIrepsTabActive() {
   initDocuments({ send, showView, setConnection, setConnectionForError, showLogin, showResult, hideResult });
   initMa({ send, showView, setConnection, setConnectionForError, showLogin });
   initPoIc({ send, showView, setConnection, setConnectionForError });
+  initBatch({ send, showView, setConnection, setConnectionForError });
   // Nothing talks to IREPS until the active tab is the configured portal.
   await initGate({ send, setConnection, onActive: onIrepsTabActive });
 })();

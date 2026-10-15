@@ -112,6 +112,11 @@
         <button id="btn-tender-open" class="btn btn-primary" type="button">Download Tender Documents</button>
       </article>
 
+      <article class="card" id="card-pending">
+        <h2>Pending Correspondence Downloads</h2>
+        <button id="btn-pending-open" class="btn btn-primary" type="button">Pending Correspondence</button>
+      </article>
+
       <article class="card card-muted" id="card-upload">
         <div class="card-heading">
           <h2>Upload Document</h2>
@@ -249,6 +254,7 @@
           <button id="btn-po-ic-back" class="btn btn-link" type="button">Back</button>
         </div>
         <p class="card-text">Enter a PO Number once, then download the Purchase Order and/or its issued Inspection Certificates.</p>
+        <button id="btn-po-ic-batch-open" class="btn btn-link" type="button">Download POs by date / ICs from notifications &rarr;</button>
 
         <label class="field">
           <span class="field-label">PO Number</span>
@@ -309,6 +315,60 @@
       </article>
     </section>
 
+    <!-- ============ PO by date + IC from notifications (batch downloads) ============ -->
+    <section id="view-po-ic-batch" class="view" hidden>
+      <article class="card" id="card-pod">
+        <div class="card-heading">
+          <h2>Download POs by PO Date</h2>
+          <button id="btn-pod-back" class="btn btn-link" type="button">Back</button>
+        </div>
+        <p class="card-text">Downloads every Purchase Order dated in the range, across all result pages. For one day, use the same date in both fields.</p>
+        <div class="date-row batch-dates">
+          <label class="field"><span class="field-label">From Date</span><input type="date" id="pod-from"></label>
+          <label class="field"><span class="field-label">To Date</span><input type="date" id="pod-to"></label>
+        </div>
+        <button id="btn-pod-download" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Download All Matching POs</span>
+        </button>
+        <div id="pod-progress" class="progress" hidden><p class="progress-message" id="pod-progress-message"></p><progress id="pod-bar" max="1" value="0"></progress></div>
+        <div id="pod-error" class="result result-error" hidden>
+          <div class="result-title" id="pod-error-title"></div>
+          <p id="pod-error-message" class="result-text"></p>
+          <div class="result-actions"><button id="btn-pod-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button></div>
+        </div>
+        <div id="pod-result" class="result" hidden>
+          <div class="result-title" id="pod-result-title"></div>
+          <p id="pod-result-text" class="result-text"></p>
+          <dl class="batch-counts" id="pod-counts"></dl>
+          <div class="result-actions"><button id="btn-pod-retry" class="btn btn-link" type="button" hidden>Retry failed downloads</button></div>
+        </div>
+        <details id="pod-details" class="batch-details" hidden><summary>Individual results</summary><ul class="doc-list" id="pod-list"></ul></details>
+      </article>
+
+      <article class="card" id="card-icn">
+        <div class="card-heading"><h2>Download ICs from Notifications</h2></div>
+        <p class="card-text">Reads the IC-issued notifications on the IREPS main page, finds each PO's completed inspection call and downloads the IC PDFs.</p>
+        <button id="btn-icn-download" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Download IC from Notifications</span>
+        </button>
+        <div id="icn-progress" class="progress" hidden><p class="progress-message" id="icn-progress-message"></p><progress id="icn-bar" max="1" value="0"></progress></div>
+        <div id="icn-error" class="result result-error" hidden>
+          <div class="result-title" id="icn-error-title"></div>
+          <p id="icn-error-message" class="result-text"></p>
+          <div class="result-actions"><button id="btn-icn-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button></div>
+        </div>
+        <div id="icn-result" class="result" hidden>
+          <div class="result-title" id="icn-result-title"></div>
+          <p id="icn-result-text" class="result-text"></p>
+          <dl class="batch-counts" id="icn-counts"></dl>
+          <div class="result-actions"><button id="btn-icn-retry" class="btn btn-link" type="button" hidden>Retry failed</button></div>
+        </div>
+        <details id="icn-details" class="batch-details" hidden><summary>Notifications and documents</summary><ul class="doc-list" id="icn-list"></ul></details>
+      </article>
+    </section>
+
     <!-- ===================== Tender documents view ===================== -->
     <section id="view-tender" class="view" hidden>
       <article class="card">
@@ -362,6 +422,61 @@
           <div class="result-actions">
             <button id="btn-tender-show" class="btn btn-link" type="button" hidden>Show in folder</button>
           </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- ===================== Pending correspondence view ===================== -->
+    <section id="view-pending" class="view" hidden>
+      <article class="card">
+        <div class="card-heading">
+          <h2>Pending Correspondence Downloads</h2>
+          <button id="btn-pc-back" class="btn btn-link" type="button">Back</button>
+        </div>
+
+        <div class="tender-account" aria-live="polite">
+          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Connection</span><span id="pc-acc-connection">Checking…</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Company</span><span id="pc-acc-company">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Operating Unit</span><span id="pc-acc-unit">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Account ID</span><span id="pc-acc-id">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Account Status</span><span id="pc-acc-status">Checking…</span></div>
+          <p id="pc-acc-warning" class="result-text tender-bad" hidden></p>
+          <button id="btn-pc-account-refresh" class="btn btn-link" type="button">Refresh account</button>
+        </div>
+
+        <p class="card-text">Downloads every letter listed under <b>Pending Replies</b> for every tender in <b>Correspondence - Pending</b>, plus any attachments of those letters. Read-only: DocLink never submits a reply.</p>
+        <button id="btn-pc-run" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Download All Pending Correspondence</span>
+        </button>
+        <button id="btn-pc-retry" class="btn btn-link" type="button" hidden>Retry failed</button>
+        <label class="pc-force"><input id="pc-force" type="checkbox"> Download again even if already saved</label>
+        <button id="btn-pc-diag" class="btn btn-link" type="button">Copy diagnostics</button>
+
+        <div id="pc-progress" class="progress" hidden><p class="progress-message" id="pc-progress-message"></p></div>
+        <div id="pc-error" class="result result-error" hidden><p id="pc-error-message" class="result-text"></p></div>
+        <p id="pc-empty" class="result-text" hidden>No pending correspondence found</p>
+
+        <div id="pc-counts" class="result" hidden>
+          <div class="result-title">Summary</div>
+          <ul class="tender-rows">
+            <li class="tender-row"><span>Pending correspondence records</span><span id="pc-n-records">0</span></li>
+            <li class="tender-row"><span>Letters discovered</span><span id="pc-n-letters">0</span></li>
+            <li class="tender-row"><span>Letters downloaded</span><span id="pc-n-downloaded">0</span></li>
+            <li class="tender-row"><span>Attachments downloaded</span><span id="pc-n-attachments">0</span></li>
+            <li class="tender-row"><span>Unavailable letters</span><span id="pc-n-unavailable">0</span></li>
+            <li class="tender-row"><span>Failed downloads</span><span id="pc-n-failed">0</span></li>
+            <li class="tender-row"><span>Needs review</span><span id="pc-n-review">0</span></li>
+            <li class="tender-row"><span>Records with no pending letters</span><span id="pc-n-noletters">0</span></li>
+          </ul>
+          <p id="pc-folder" class="result-filename"></p>
+        </div>
+
+        <div id="pc-table-wrap" class="pc-table-wrap" hidden>
+          <table class="pc-table">
+            <thead><tr><th>Tender No.</th><th>Letter No.</th><th>Subject</th><th>Reply Deadline</th><th>Status</th></tr></thead>
+            <tbody id="pc-tbody"></tbody>
+          </table>
         </div>
       </article>
     </section>
@@ -468,5 +583,6 @@
 
   <script type="module" src="popup.js"></script>
   <script type="module" src="../tender/tender-ui.js"></script>
+  <script type="module" src="../tender/pending-ui.js"></script>
 </body>
 </html>

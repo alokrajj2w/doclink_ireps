@@ -31,6 +31,7 @@ const ENTRY_POINTS = [
   "popup/popup.js",
   "pages/preview.js",
   "tender/tender-ui.js",
+  "tender/pending-ui.js",
 ];
 
 /** Files copied verbatim (no JS to protect, or needed as-is at runtime). */

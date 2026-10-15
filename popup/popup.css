@@ -783,3 +783,68 @@ body[data-gate="on"] .app-footer {
 .po-row input {
   width: 100%;
 }
+
+/* ------------------------------------------- PO by date / IC from notifications */
+
+.batch-dates {
+  margin-left: 0;
+  margin-bottom: 10px;
+}
+.batch-counts {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 12px;
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+.batch-counts dt {
+  color: var(--text-muted);
+}
+.batch-counts dd {
+  margin: 0;
+  font-weight: 700;
+  text-align: right;
+}
+.batch-counts dd.is-bad {
+  color: var(--danger);
+}
+.progress progress {
+  width: 100%;
+  height: 6px;
+  margin-top: 6px;
+}
+.batch-details {
+  margin-top: 10px;
+}
+.batch-details summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary);
+}
+.batch-details .doc-list {
+  margin-top: 6px;
+}
+.batch-item {
+  grid-template-columns: 1fr auto;
+}
+.batch-item .doc-meta[title] {
+  cursor: help;
+}
+.chip-skipped,
+.chip-duplicate,
+.chip-unparsed,
+.chip-not_found,
+.chip-no_link {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.chip-error,
+.chip-session_expired {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.chip-matched {
+  background: var(--success-soft);
+  color: var(--success);
+}

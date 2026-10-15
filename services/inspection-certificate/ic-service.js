@@ -47,7 +47,7 @@ const DOWNLOAD_CODES = Object.freeze({
 });
 
 /** Validate a vendorInspectionCallList.do response and decide whether the user is authenticated. */
-function validateIcSession(html, response = {}, notRecognisedCode = IC_ERROR.LIST_PAGE_FAILED) {
+export function validateIcSession(html, response = {}, notRecognisedCode = IC_ERROR.LIST_PAGE_FAILED) {
   if (response.status !== undefined && response.ok === false) {
     return { authenticated: false, reason: `IREPS returned HTTP ${response.status}`, code: notRecognisedCode, status: response.status };
   }

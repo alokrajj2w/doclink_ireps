@@ -55,6 +55,10 @@ import { searchMa, downloadMaPdfs, MA_ERROR, MA_FLOW_STAGES } from "../services/
 import { downloadBytes } from "../services/download-service.js";
 import { downloadPo, PO_ERROR, PO_FLOW_STAGES } from "../services/po/po-service.js";
 import { downloadInspectionCertificates, IC_ERROR, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
+import { runPoDateDownload, retryPoDateFailures } from "../services/po/po-date-service.js";
+import { runIcNotificationDownload, retryIcNotificationFailures, publicIcState } from "../services/inspection-certificate/ic-notification-service.js";
+import { isoToIrepsDate } from "../services/batch-utils.js";
+import { IC_DOWNLOAD_SUBFOLDER } from "../utils/filename.js";
 import { buildDocumentExportDownloadPath, buildBillStatusExportDownloadPath } from "../utils/filename.js";
 import { MESSAGE_TYPES, TARGETS, STAGES, DOCUMENT_STAGES, MA_STAGES, PO_STAGES, IC_STAGES, documentStageLabel, describeError, STORAGE_KEYS, SESSION_KEYS } from "../utils/messages.js";
 import { logger, installLogCollector, installConsoleHelpers } from "../utils/logger.js";
@@ -1048,6 +1052,146 @@ async function startIcDownload(rawPoNo) {
   return { started: true };
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* Batch downloads: PO by date, IC from main-page notifications               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Both batch workflows keep one state object each (kind "po-date" /
+ * "ic-notif"); the popup is a pure view of it. The state is broadcast
+ * (throttled) as BATCH_UPDATE, mirrored into chrome.storage.session for a
+ * popup that opens later, and the full state (including what a retry needs)
+ * stays in memory here.
+ */
+const batch = { "po-date": null, "ic-notif": null };
+const batchRunning = { "po-date": false, "ic-notif": false };
+const batchTimers = {};
+
+function publicBatchState(kind) {
+  const state = batch[kind];
+  if (!state) return { kind, phase: "idle", running: batchRunning[kind] };
+  return { ...(kind === "ic-notif" ? publicIcState(state) : state), running: batchRunning[kind] };
+}
+
+function pushBatchState(kind, { immediately = false } = {}) {
+  const send = () => {
+    batchTimers[kind] = null;
+    const snapshot = publicBatchState(kind);
+    broadcast(MESSAGE_TYPES.BATCH_UPDATE, { kind, state: snapshot });
+    chrome.storage.session.set({ [`${SESSION_KEYS.BATCH_STATE}.${kind}`]: snapshot }).catch(() => {});
+  };
+  if (immediately) {
+    if (batchTimers[kind]) clearTimeout(batchTimers[kind]);
+    send();
+  } else if (!batchTimers[kind]) {
+    batchTimers[kind] = setTimeout(send, 250);
+  }
+}
+
+async function restoreBatchState(kind) {
+  if (batch[kind] || batchRunning[kind]) return;
+  try {
+    const stored = await chrome.storage.session.get(`${SESSION_KEYS.BATCH_STATE}.${kind}`);
+    const saved = stored[`${SESSION_KEYS.BATCH_STATE}.${kind}`];
+    // A run that was in flight when the worker stopped cannot continue; show it as stopped.
+    if (saved) {
+      const { running, ...rest } = saved;
+      batch[kind] = rest.phase === "complete" || rest.phase === "error" ? rest : { ...rest, phase: "error", error: describeError("UNKNOWN", { detail: "the download was interrupted" }) };
+    }
+  } catch (error) {
+    logger.debug("Could not restore batch state", error);
+  }
+}
+
+/** The state to hand to the retry functions: re-adds the working indexes of the IC run after a restore. */
+function ensureIcIndexes(state) {
+  if (state.urlIndex) return state;
+  state.urlIndex = new Map(state.items.filter((i) => i.url).map((i) => [i.url, i]));
+  state.pathIndex = new Set(state.items.map((i) => i.path));
+  state.lookupCache = new Map();
+  return state;
+}
+
+function batchErrorState(kind, previous, error) {
+  const described = error instanceof IrepsError ? describeError(error.code, { status: error.status, detail: error.detail }) : describeError("UNKNOWN", { detail: errorDetail(error) });
+  if (!(error instanceof IrepsError)) logger.error(`${kind} batch failed`, error);
+  else logger.warn(`${kind} batch stopped: ${described.title}`, { code: error.code, status: error.status ?? null });
+  if (described.code === "IREPS_SESSION_EXPIRED") lastSessionCheck = null;
+  return { ...(previous || { kind }), kind, phase: "error", error: described, finishedAt: new Date().toISOString() };
+}
+
+/** Save the IC manifest (identifiers and outcomes only - never cookies, tokens or headers). */
+async function saveIcManifest(state) {
+  if (!state.manifest || state.manifest.length === 0) return;
+  try {
+    const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
+    const payload = { generatedAt: new Date().toISOString(), counts: state.counts, records: state.manifest };
+    const saved = await downloadBytes(new TextEncoder().encode(JSON.stringify(payload, null, 2)), {
+      path: `${IC_DOWNLOAD_SUBFOLDER}/IC_notifications_manifest_${stamp}.json`,
+      mimeType: "application/json"
+    });
+    state.manifestFile = saved.filename;
+  } catch (error) {
+    logger.warn("Could not save the IC manifest", error);
+  }
+}
+
+async function runBatch(kind, work) {
+  batchRunning[kind] = true;
+  const update = (state) => {
+    batch[kind] = state;
+    pushBatchState(kind);
+  };
+  try {
+    const finalState = await work(update);
+    batch[kind] = finalState;
+    if (kind === "ic-notif") await saveIcManifest(finalState);
+    if (finalState.sessionExpired) lastSessionCheck = null;
+    await chrome.storage.local.set({ [`doclink.last.${kind}`]: { at: new Date().toISOString(), counts: finalState.counts } }).catch(() => {});
+  } catch (error) {
+    batch[kind] = batchErrorState(kind, batch[kind], error);
+  } finally {
+    batchRunning[kind] = false;
+    pushBatchState(kind, { immediately: true });
+  }
+}
+
+/** Parser bridges to the offscreen document, per workflow. */
+function batchParser(kind) {
+  return kind === "po-date"
+    ? (html, options) => parseSearchPoInOffscreen(html, { ...options, criteria: SEARCH_PO_CRITERIA.PO })
+    : (html, options) => parseIcInOffscreen(html, (options && options.poNo) || null, options);
+}
+
+async function startBatch(message) {
+  const kind = message.kind;
+  if (kind !== "po-date" && kind !== "ic-notif") return { started: false, error: describeError("UNKNOWN", { detail: "unknown download type" }) };
+  if (batchRunning["po-date"] || batchRunning["ic-notif"]) return { started: false, error: describeError("BATCH_BUSY") };
+  if (kind === "po-date") {
+    const dateFrom = isoToIrepsDate(message.dateFrom) || message.dateFrom;
+    const dateTo = isoToIrepsDate(message.dateTo) || message.dateTo;
+    batch[kind] = null;
+    runBatch(kind, (update) => runPoDateDownload({ dateFrom, dateTo }, { parseHtml: batchParser(kind), onUpdate: update }));
+  } else {
+    batch[kind] = null;
+    runBatch(kind, (update) => runIcNotificationDownload({ parseHtml: batchParser(kind), onUpdate: update }));
+  }
+  pushBatchState(kind, { immediately: true });
+  return { started: true };
+}
+
+async function retryBatch(kind) {
+  await restoreBatchState(kind);
+  if (batchRunning["po-date"] || batchRunning["ic-notif"]) return { started: false, error: describeError("BATCH_BUSY") };
+  const state = batch[kind];
+  if (!state || state.phase !== "complete") return { started: false, error: describeError("UNKNOWN", { detail: "nothing to retry" }) };
+  if (kind === "po-date") runBatch(kind, (update) => retryPoDateFailures(state, { parseHtml: batchParser(kind), onUpdate: () => update(state) }).then(() => state));
+  else runBatch(kind, (update) => retryIcNotificationFailures(ensureIcIndexes(state), { parseHtml: batchParser(kind), onUpdate: () => update(state) }));
+  pushBatchState(kind, { immediately: true });
+  return { started: true };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Message router                                                             */
 /* -------------------------------------------------------------------------- */
@@ -1100,7 +1244,15 @@ const handlers = {
   [MESSAGE_TYPES.PO_DOWNLOAD]: (message) => startPoDownload(message.poNo),
   [MESSAGE_TYPES.GET_PO_STATE]: () => ({ ...poState, running: poRunning }),
   [MESSAGE_TYPES.IC_DOWNLOAD]: (message) => startIcDownload(message.poNo),
-  [MESSAGE_TYPES.GET_IC_STATE]: () => ({ ...icState, running: icRunning })
+  [MESSAGE_TYPES.GET_IC_STATE]: () => ({ ...icState, running: icRunning }),
+
+  // Batch downloads: PO by date, IC from notifications
+  [MESSAGE_TYPES.BATCH_START]: (message) => startBatch(message),
+  [MESSAGE_TYPES.BATCH_RETRY]: (message) => retryBatch(message.kind),
+  [MESSAGE_TYPES.BATCH_GET_STATE]: async (message) => {
+    await restoreBatchState(message.kind);
+    return publicBatchState(message.kind);
+  }
 };
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

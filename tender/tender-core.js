@@ -77,6 +77,8 @@ export function isExcludedUrl(url) {
 }
 
 /** Authenticated request. `form` is an object / URLSearchParams (body for POST, query for GET). */
+export const fetchSettings = { timeoutMs: 45000 };
+
 export async function irepsFetch(base, ref, { method = 'GET', form = null, relativeTo } = {}) {
   let url = absUrl(base, ref, relativeTo);
   if (isExcludedUrl(url)) throw new TenderError('EXCLUDED', 'Financial/Commercial Tabulation downloads are excluded from DocLink tender downloads.');
@@ -92,8 +94,21 @@ export async function irepsFetch(base, ref, { method = 'GET', form = null, relat
       init.headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
   }
-  const res = await fetch(url, init);
-  const bytes = new Uint8Array(await res.arrayBuffer());
+  // A portal page that never answers must not stall the whole run: give up after fetchSettings.timeoutMs.
+  const ctl = new AbortController();
+  init.signal = ctl.signal;
+  const timer = setTimeout(() => ctl.abort(), fetchSettings.timeoutMs);
+  let res;
+  let bytes;
+  try {
+    res = await fetch(url, init);
+    bytes = new Uint8Array(await res.arrayBuffer());
+  } catch (e) {
+    if (ctl.signal.aborted) throw new TenderError('TIMEOUT', `IREPS did not respond within ${fetchSettings.timeoutMs / 1000} seconds (${new URL(url).pathname}).`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   const contentType = res.headers.get('content-type') || '';
   let cached = null;
   return {
@@ -355,7 +370,7 @@ function metaRedirect(doc, html) {
   return u || '';
 }
 
-function looksLikeErrorPage(doc) {
+export function looksLikeErrorPage(doc) {
   const title = norm(doc.querySelector('title')?.textContent);
   const text = norm(doc.body?.textContent);
   if (text.length < 40) return 'The IREPS page was empty.';
@@ -578,8 +593,11 @@ const MIME = { '.pdf': 'application/pdf', '.html': 'text/html', '.json': 'applic
  * Saves into Downloads/DocLink/<accountLabel>/Tender_<tenderNo>/<subdir>/<file>.
  * Names are unique within a run (no silent overwrite) and every path is sanitised.
  */
-export function createSaver({ accountLabel, tenderNo }) {
-  const root = `${DOWNLOAD_ROOT}/${safeSegment(accountLabel)}/Tender_${safeSegment(tenderNo)}`;
+export function createSaver({ accountLabel, tenderNo, subPath = null, conflict = 'uniquify' }) {
+  // `subPath` (e.g. ['Correspondence','Pending',<tenderNo>]) replaces the default Tender_<no> folder.
+  const root = subPath
+    ? [DOWNLOAD_ROOT, safeSegment(accountLabel), ...subPath.map((p) => safeSegment(p))].join('/')
+    : `${DOWNLOAD_ROOT}/${safeSegment(accountLabel)}/Tender_${safeSegment(tenderNo)}`;
   const used = new Set();
 
   function uniquePath(subdir, fileName) {
@@ -603,7 +621,7 @@ export function createSaver({ accountLabel, tenderNo }) {
     const rel = uniquePath(subdir, fileName);
     const url = URL.createObjectURL(new Blob([bytes], { type: mime || MIME[ext] || 'application/octet-stream' }));
     try {
-      const id = await chrome.downloads.download({ url, filename: `${root}/${rel}`, conflictAction: 'uniquify', saveAs: false });
+      const id = await chrome.downloads.download({ url, filename: `${root}/${rel}`, conflictAction: conflict, saveAs: false });
       await waitForDownload(id);
       log('Download', `File saved ${rel}`);
       return { relPath: rel, downloadId: id, size: bytes.length };

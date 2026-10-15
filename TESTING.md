@@ -627,3 +627,44 @@ HTTP status). Cookies, session ids and form tokens are always redacted.
 | 12 | R-NOTE: search → result table saved as .xlsx with page columns + document links | C9c / D10 | ☐ |
 | 13 | MA: today's MAs listed, MA copies (not PO PDFs) saved under the date folder | C9d / D11 | ☐ |
 | 14 | MA: session expiry during PDF download → session message, nothing saved as .pdf | C9d `ma-pdf-login` | ☐ |
+
+
+---
+
+## Pending Correspondence tests
+
+```
+JSDOM_ROOT=/path/to/dir-with-node_modules node --test tender/tests/pending-tests.mjs
+```
+(jsdom is only a test-time stand-in for the browser's DOMParser: `npm i jsdom` in any scratch directory.)
+Fixtures in `tender/tests/fixtures/` are the real list and pending-replies pages from `PENDING CORRESPONDANCE DOWNLOAD.har`
+(user name redacted). The suite covers: all pending rows (count not hardcoded), several letters per tender, Lapsed /
+Previous Replies exclusion, empty table, parent with no pending letters, PDF / embedded-PDF / HTML letters, attachments,
+failure + retry without duplicates, session expiry, the read-only guard (`vendorCorresSubmitReply.do` never requested),
+no secrets in the manifest, and the side-panel UI (real `popup.html` in jsdom).
+
+---
+
+## Batch downloads: POs by PO date, ICs from notifications
+
+`test/batch-tests.js` (run by `test/run-tests.js`, so Part A covers it) drives
+both workflows against an in-memory IREPS simulator: `searchPO.do` (showPage,
+search, `postRequest` page links, the portal's 180-day limit), 
+`vendorInspectionCallList.do` (list page, PO + PO Sr. search, `navigate()`
+paging, results table inside the form, one more data cell than headers - the
+live layout), the notification endpoint and the PDF links. All identifiers in
+the simulator are invented.
+
+Covered: single date, date range, 47 records over 3 pages, no records (empty
+table and "No Record Found" message), out-of-range and duplicate rows,
+duplicate PO numbers across units, missing/broken/HTML/login PDF links,
+expired session, retry of failed items only, transient-failure auto retry,
+range split at 180 days; one / several / repeated / unreadable / LOA / empty
+notifications, leading zeros in the PO serial, no matching call, matching row
+without an IC link, several matching rows, REF_ID mismatch, duplicate
+documents, paging, expired session, invalid JSON, non-PDF content, partial
+failure and retry.
+
+`DOCLINK_TESTS 168/168 passed` is the expected line after these were added.
+Not covered by any automatic test: the live portal itself (see README,
+"Batch downloads - what is not verified").

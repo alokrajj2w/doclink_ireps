@@ -89,6 +89,8 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
 
 const LEDGER_BUCKET = { CORRIGENDA: 'corrigenda', NEGOTIATION: 'letters', COUNTER_OFFER: 'letters', LOA: 'letters', CORRESPONDENCE: 'letters' };
 
+const ITEM_CONCURRENCY = 3;
+
 async function downloadItems(run, result, items, build) {
   items = dedupeItems(items);
   const bucket = LEDGER_BUCKET[result.category];
@@ -100,21 +102,40 @@ async function downloadItems(run, result, items, build) {
     items = fresh;
   }
   result.discovered = items.length;
-  for (const item of items) {
-    try {
-      if (item.skip) throw new TenderError(item.skip.code, item.skip.message);
-      const { files, converted } = await resolveAndDownloadIrepsDocument(build(item), run);
+  if (items.length) await assertSameAccount(run.account, { base: run.base }); // steps run in parallel: re-check before this category starts saving
+  // up to ITEM_CONCURRENCY documents of one category download at the same time; results keep the list order
+  const outcomes = new Array(items.length);
+  let next = 0;
+  let fatal = null;
+  const worker = async () => {
+    while (!fatal && next < items.length) {
+      const i = next++;
+      const item = items[i];
+      try {
+        if (item.skip) throw new TenderError(item.skip.code, item.skip.message);
+        const { files, converted } = await resolveAndDownloadIrepsDocument(build(item), run);
+        if (run.ledger && bucket) run.ledger.mark(bucket, ledgerKey(item));
+        outcomes[i] = { ok: true, files, converted };
+      } catch (e) {
+        if (e.code === 'SESSION_EXPIRED' || e.code === 'EXCLUDED') { fatal = fatal || e; return; }
+        outcomes[i] = { ok: false, item, error: e };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(ITEM_CONCURRENCY, items.length) }, worker));
+  if (fatal) throw fatal;
+  for (const o of outcomes) {
+    if (!o) continue;
+    if (o.ok) {
       result.downloaded++;
-      if (run.ledger && bucket) run.ledger.mark(bucket, ledgerKey(item));
-      result.files.push(...files);
-      if (converted) {
+      result.files.push(...o.files);
+      if (o.converted) {
         result.warnings.push('Some documents were printable web pages. A text-only PDF rendering and the complete original .html were saved; the PDF does not keep the page layout.');
       }
-    } catch (e) {
-      if (e.code === 'SESSION_EXPIRED' || e.code === 'EXCLUDED') throw e;
+    } else {
       result.failed++;
-      result.files.push({ fileName: '', id: item.id || '', status: 'FAILED', error: e.message, code: e.code || '' });
-      log(result.category, `failed ${item.id || ''}: ${e.message}`);
+      result.files.push({ fileName: '', id: o.item.id || '', status: 'FAILED', error: o.error.message, code: o.error.code || '' });
+      log(result.category, `failed ${o.item.id || ''}: ${o.error.message}`);
     }
   }
   result.warnings = [...new Set(result.warnings)];
@@ -216,8 +237,13 @@ const inlineScripts = (doc) => [...doc.querySelectorAll('script:not([src])')].ma
 
 // ---------------------------------------------------------------- NIT page (shared)
 
-async function nitPage(run) {
-  if (run.nit) return run.nit;
+function nitPage(run) {
+  // cached as a promise so steps running in parallel share one request
+  if (!run.nitP) run.nitP = loadNitPage(run).catch((e) => { run.nitP = null; throw e; });
+  return run.nitP;
+}
+
+async function loadNitPage(run) {
   const act = allReqs(run.ctx.row.actions).find((r) => /nitPublish\.do/i.test(pathOf(r.url)));
   if (!act) throw new TenderError('NO_NIT', 'The tender row has no View NIT action.');
   noteIds(run, act.url, 'row_action');
@@ -226,9 +252,8 @@ async function nitPage(run) {
   assertSession(res);
   if (res.status !== 200) throw new TenderError('HTTP', `View NIT page returned HTTP ${res.status}.`);
   const doc = parseHtml(res.text());
-  run.nit = { res, doc, actions: elementActions(doc.body || doc) };
   log('Tender', `View NIT page loaded (title "${norm(doc.title)}")`);
-  return run.nit;
+  return { res, doc, actions: elementActions(doc.body || doc) };
 }
 
 // ---------------------------------------------------------------- A. Tender / NIT PDF
@@ -522,8 +547,15 @@ function inboxWindows(defaults, today = new Date()) {
 }
 
 /** All rows for the exact tender in a Post Tenders list, across date windows and result pages. */
-async function inbox(run, status) {
-  if (run.inboxCache.has(status)) return run.inboxCache.get(status);
+function inbox(run, status) {
+  // cached as a promise so parallel steps share one scan of the same list
+  if (!run.inboxCache.has(status)) {
+    run.inboxCache.set(status, scanInboxRows(run, status).catch((e) => { run.inboxCache.delete(status); throw e; }));
+  }
+  return run.inboxCache.get(status);
+}
+
+async function scanInboxRows(run, status) {
   const entry = { status, rows: [], scripts: '', windows: 0, pages: 0 };
   const form = await loadInboxForm(run, status);
   entry.scripts = form.scripts;
@@ -571,7 +603,6 @@ async function inbox(run, status) {
     }
   }
   log('Inbox', `${status}: ${entry.rows.length} matching row(s) over ${entry.windows} date window(s), ${entry.pages} page(s)`);
-  run.inboxCache.set(status, entry);
   return entry;
 }
 
@@ -736,8 +767,13 @@ function pageTenderNo(doc) {
 }
 
 /** nitOid for the correspondence page: inbox rows first, then the correspondence list, then the tender row's oid. */
-async function ensureNitOid(run) {
-  if (run.ids.nitOid) return run.ids.nitOid;
+function ensureNitOid(run) {
+  if (run.ids.nitOid) return Promise.resolve(run.ids.nitOid);
+  if (!run.nitOidP) run.nitOidP = findNitOid(run).finally(() => { run.nitOidP = null; });
+  return run.nitOidP;
+}
+
+async function findNitOid(run) {
   try {
     const res = await irepsFetch(run.base, CORRES_LIST_PATH, { method: 'POST', form: {} });
     assertSession(res);
@@ -841,25 +877,31 @@ export function summarize(categories) {
 
 export const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, companyName: a.companyName, operatingUnit: a.operatingUnit, verified: !!a.verified });
 
-/** Run the given category steps in order; stops (and says why) if the account changes or the session ends. */
+/**
+ * Run the given category steps at the same time: whatever IREPS has ready (NIT, attachments, LOA, counter offer...)
+ * downloads straight away, and a slow or empty list (e.g. Negotiation) never holds the others back.
+ * The run stops (and says why) if the account changes or the session ends.
+ */
 export async function runSteps(run, keys, onProgress = () => {}) {
   const categories = {};
   let aborted = null;
-  for (const [key, msg, fn] of STEPS.filter(([k]) => keys.includes(k))) {
+  const steps = STEPS.filter(([k]) => keys.includes(k));
+  let started = 0;
+  await Promise.all(steps.map(async ([key, msg, fn]) => {
     if (aborted) {
       categories[key] = failedCategory(TYPE[key], `Skipped: ${aborted.message}`);
-      continue;
+      return;
     }
-    onProgress(msg);
+    onProgress(started++ === 0 ? msg : `${msg} (in parallel)`);
     try {
       await assertSameAccount(run.account, { base: run.base });
       categories[key] = await fn(run);
     } catch (e) {
-      if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
+      if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = aborted || { code: e.code, message: e.message };
       else log(TYPE[key], `failed: ${e.message}`);
       categories[key] = failedCategory(TYPE[key], e.message);
     }
-  }
+  }));
   return { categories, aborted };
 }
 

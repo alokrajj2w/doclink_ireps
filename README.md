@@ -407,7 +407,7 @@ Requires Chrome 116 or newer (offscreen documents + `chrome.runtime.getContexts`
 Each JS entry point (`background/service-worker.js`, `background/offscreen.js`,
 `popup/popup.js`, `pages/preview.js`, `tender/tender-ui.js`) is bundled with
 its imports, minified and obfuscated; HTML, CSS, `assets/`, `manifest.json`
-and `config.json` are copied as-is. Tests, `scripts/` and the readable
+and `config.json are copied as-is. Tests, `scripts/` and the readable
 `services/` / `utils/` sources are not included. The source tree is never
 modified.
 
@@ -902,3 +902,64 @@ and grouped in a folder per MA date.
 | `IREPS_MA_DOWNLOAD_FAILED` | network error, HTTP ≠ 2xx, or Chrome could not save the file |
 | `IREPS_MA_INVALID_PDF` | IREPS returned something that is not a PDF (and not a login page) |
 | `IREPS_SESSION_EXPIRED` | login / expired page at any step, including a PDF request |
+
+
+---
+
+## Pending Correspondence Downloads (`tender/tender-pending.js`, `tender/pending-ui.js`)
+
+Main screen -> **Pending Correspondence Downloads** -> **Download All Pending Correspondence**.
+No tender / correspondence / letter ids are typed in; all are read from the live responses.
+
+Request sequence (all in the signed-in browser session, `credentials: include`):
+
+1. `POST /epsn/corres/vendorRelatedCorrespondence.do` (empty body, as the portal menu link). Verified against the HAR.
+2. Parse only the table under the heading **Correspondence - Pending** (found by heading, not position; Lapsed / Replied tables are never read). Rows whose own Status is not `Pending` are listed as *needs review*, not downloaded.
+3. For each row: `POST /epsn/corres/vendorCorrespondencePendingReply.do` with form `nitOid=<from the row>`. Verified against the HAR.
+4. Parse only the table under **Pending Replies** (Lapsed / Previous Replies ignored); every row's `viewPublishedLtr('<nitOid>','<corresId>','<letterId>')` gives the ids.
+5. For each letter: the route is read from the page's own `viewPublishedLtr` script (fallback: `POST /epsn/corres/rly/viewpubIndltr.do`, form `nitOid`, **`letterID`**, `corresId`). The response is handled as a direct PDF, an embedded PDF viewer, or an HTML letter (rendered to a text PDF by the existing `buildPdf` utility; the original page is saved next to it).
+6. Attachments: links in the letter response that point at document files or download/attachment actions are downloaded and recorded separately.
+
+`vendorCorresSubmitReply.do` and anything that looks like a write action is refused in `pcFetch()` (`assertReadOnly`).
+
+Output: `Downloads/DocLink/<verified unit>/Correspondence/Pending/<TenderNo>/Correspondence_<LetterNo>_<dd-mm-yyyy>_<Subject>.pdf`, `Attachment_<LetterNo>_<original name>`, and `Downloads/DocLink/<unit>/Correspondence/Pending/download_manifest.json`.
+Dedupe key: `accountId|nitOid|corresId|letterId` (stored in `chrome.storage.local`, no secrets). **Retry failed** and a repeated run skip letters already saved; tick "Download again" to force.
+Requests are sequential, with bounded retry/backoff on 5xx/429/network errors; a session expiry stops the job and marks the rest `SESSION_EXPIRED`.
+
+Unverified against the live portal: the exact response of `viewpubIndltr.do` (it is not in the supplied HAR) and the markup of its attachment links.
+
+---
+
+## Batch downloads (PO by date, IC from notifications)
+
+Both live in the side panel under **Download PO / IC → "Download POs by date / ICs from notifications"**.
+They are download-only (no inspection call is submitted, approved, withdrawn or revalidated).
+
+### Download POs by PO Date
+`POST /epsn/searchPO.do searchParam=showPage` (token, session check) →
+`POST /epsn/searchPO.do` with `searchCriteria=PO`, `searchRange=2`, `dateFrom`/`dateTo` as `DD/MM/YYYY`,
+`rly=-1`, `recordsPerPage=20` and the token just read → every result page via the portal's own
+`postRequest('/epsn/searchPO.do?…&pageNo=N…')` links. A selection longer than IREPS' 180-day limit is split into
+consecutive windows searched one after another. Rows are re-checked against the selected dates, de-duplicated on
+PO No. + unit + link, and each row's own "Click to View/Download PO" href is fetched, verified as `%PDF`, and saved as
+`Downloads/DocLink/IREPS/PO/<PO date>/PO_<PO>_<date>.pdf` (unit added only when two documents would collide).
+Rows without a link are listed as skipped with the reason.
+
+### Download ICs from Notifications
+`POST /epsn/vndr/activity/ajax.do ajaxMode=getMyActivitesData` → notifications with subject *Inspection* and message
+"IC issued for PONo : … , POSrNo : …" (everything else ignored; identifiers kept verbatim) → for each distinct
+PO + serial: `POST /epsn/tpi/vendorInspectionCallList.do callType=I&status=I` (fresh token), then the search with `poNo`,
+`poSr`, `statusSelected=Completed / IC Issued`, every `navigate(N)` page → rows with the exact PO number, exact serial and an
+IC-issued status → each row's "View/ Download IC PDF" href → `Downloads/DocLink/IREPS/IC/<PO>/IC_<PO>_<SR>_<CALLID>.pdf`.
+`REF_ID` is compared with the row's Call Id and reported, not trusted as the certificate number. A manifest
+(`IC_notifications_manifest_<time>.json`: ids, outcome, reason - never cookies or tokens) is saved beside the ICs.
+Searches run one at a time (the Struts token belongs to the session); downloads run 3 at a time with up to 2 retries for
+network / timeout / HTTP 5xx only. An expired session is never retried.
+
+### What is not verified against the live portal
+* The empty-result page of a **date-range** PO search (handled via "no record found" markers and zero-row tables).
+* That `searchRange=2` filters by *PO date* (rows are re-checked client-side regardless).
+* `recordsPerPage` above 20 for PO searches (20 and the page links are used).
+* The inspection-call date window: the portal's own default is used first; if nothing matches, one wider retry
+  (`dateFrom`/`dateFromIC` = 01/01/2015) is made. Whether IREPS accepts that early a date is unconfirmed.
+* Notifications beyond what `getMyActivitesData` returns (no other notification endpoint is called).

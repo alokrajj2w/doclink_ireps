@@ -24,6 +24,7 @@ import { IREPS_CONFIG, IREPS_ERROR, IrepsError } from "../ireps-api.js";
 import { isIrepsLoginPage } from "../session-service.js";
 import { downloadBytes } from "../download-service.js";
 import { logger } from "../../utils/logger.js";
+import { withRetry } from "../batch-utils.js";
 import { isIrepsOriginUrl } from "./search-po-api.js";
 
 export const DOCUMENT_DOWNLOAD_CONCURRENCY = 3;
@@ -193,6 +194,7 @@ function describeFailure(error, CODES) {
  *
  * @param {DownloadItem[]} items
  * @param {{ concurrency?: number, fetch?: typeof fetch, saveFile?: Function, codes?: object,
+ *          retries?: number, retryDelayMs?: number,
  *          onProgress?: (snapshot: DocumentBatchSnapshot) => void }} [options]
  * @returns {Promise<DocumentBatchSnapshot & { startedAt: string, finishedAt: string }>}
  */
@@ -247,7 +249,9 @@ export async function downloadIrepsDocuments(items, options = {}) {
       state.status = DOCUMENT_DOWNLOAD_STATUS.DOWNLOADING;
       notify();
       try {
-        const done = await downloadIrepsDocument(item, { fetch: options.fetch, saveFile: options.saveFile, codes: CODES });
+        const attempt = () => downloadIrepsDocument(item, { fetch: options.fetch, saveFile: options.saveFile, codes: CODES });
+        // Transient failures only (network / timeout / HTTP 5xx); never an expired session or a non-PDF.
+        const done = options.retries > 0 ? await withRetry(attempt, { attempts: options.retries + 1, delayMs: options.retryDelayMs }) : await attempt();
         state.status = DOCUMENT_DOWNLOAD_STATUS.COMPLETED;
         state.filename = done.filename;
         state.downloadId = done.downloadId;

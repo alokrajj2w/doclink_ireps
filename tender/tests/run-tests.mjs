@@ -165,15 +165,15 @@ test('4. Switching accounts refreshes the context', async () => {
   const b = await acct.getActiveIrepsAccountContext();
   assert.deepEqual([b.irepsAccountId, b.operatingUnit], ['55', 'DELHI']);
 });
-test('4b. Account switch DURING a run stops the remaining categories', async () => {
+test('4b. Account switch DURING a run stops the categories that have not started downloading (steps run in parallel)', async () => {
   mk({ tenders: [T({})] });
   let n = 0;
   const orig = server.handle.bind(server);
   server.handle = async (m, u, b) => { if (u.includes('showHome.do') && ++n === 4) server.s.account = { id: '55', company: 'OTHER LTD-DELHI' }; return orig(m, u, b); };
   const r = await run();
   assert.equal(r.aborted.code, 'ACCOUNT_CHANGED');
-  assert.equal(r.categories.tenderPdf.status, 'DOWNLOADED');
-  assert.ok(Object.values(r.categories).slice(3).every((c) => c.status === 'FAILED'));
+  const failed = Object.values(r.categories).filter((c) => c.status === 'FAILED');
+  assert.ok(failed.length >= 1 && failed.every((c) => /account|Skipped/i.test(c.note || c.error || JSON.stringify(c))));
 });
 
 // =========================== search (5-9) ===================================================
@@ -358,7 +358,8 @@ test('21. Session expiry mid-run is reported and nothing HTML is saved as a docu
   server.handle = async (m, u, b) => { if (u.includes('upload/att/5595304')) server.s.loggedIn = false; return orig(m, u, b); };
   const r = await run();
   assert.equal(r.aborted.code, 'SESSION_EXPIRED');
-  assert.ok(saved.every((s) => s.filename.endsWith('.json') || sniffOk(s.bytes)));
+  // the .html files are the deliberately saved originals of printable pages; no .pdf may be a web page
+  assert.ok(saved.every((s) => !s.filename.endsWith('.pdf') || sniffOk(s.bytes)));
 });
 function sniffOk(b) { return core.sniffKind(b) !== 'html'; }
 test('22. Pagination: letters on later pages are found; loop terminates', async () => {
@@ -729,4 +730,45 @@ test('no password / cookie / token is stored by the extension code', async () =>
   const fs = await import('node:fs');
   const src = ['tender-core.js', 'tender-account.js', 'tender-search.js', 'tender-workflows.js', 'tender-ui.js'].map((f) => fs.readFileSync(new URL('../' + f, import.meta.url), 'utf8')).join('\n');
   assert.ok(!/chrome\.storage|localStorage|sessionStorage|document\.cookie/.test(src));
+});
+
+// =========================== parallel scanning =============================================
+const isNegoList = (b) => { const p = new URLSearchParams(b || ''); return p.get('status') === 'MyNegotiation' && p.has('pageNo'); };
+test('P1. A slow Negotiation list does not hold back NIT, LOA, counter offer or the rest; negotiation downloads when it arrives', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265') });
+  const orig = server.handle.bind(server);
+  server.handle = async (m, u, b) => {
+    if (isNegoList(b)) await new Promise((r) => setTimeout(r, 400));
+    return orig(m, u, b);
+  };
+  const r = await run();
+  const order = saved.map((s) => s.filename);
+  const idx = (re) => order.findIndex((f) => re.test(f));
+  const nego = idx(/\/Negotiation\//), loa = idx(/Advance_Acceptance_LOA/), co = idx(/Counter_Offers/), nit = idx(/NIT_and_Supporting_Documents\/NIT_/);
+  assert.ok(nego >= 0 && loa >= 0 && co >= 0 && nit >= 0, order.join('\n'));
+  assert.ok(nego > loa && nego > co && nego > nit, `negotiation must be saved last:\n${order.join('\n')}`);
+  assert.equal(r.categories.negotiation.status, 'DOWNLOADED');
+  assert.equal(r.categories.loa.status, 'DOWNLOADED');
+  assert.equal(r.categories.counterOffer.status, 'DOWNLOADED');
+});
+
+test('P2. A portal page that never answers times out and only that category fails; the rest download', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265') });
+  const orig = server.handle.bind(server);
+  server.handle = (m, u, b) => (isNegoList(b) ? new Promise(() => {}) : orig(m, u, b)); // never answers
+  const shim = globalThis.fetch;
+  globalThis.fetch = (url, init = {}) => new Promise((resolve, reject) => {
+    init.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    shim(url, init).then(resolve, reject);
+  });
+  core.fetchSettings.timeoutMs = 300;
+  try {
+    const r = await run();
+    assert.equal(r.categories.negotiation.status, 'FAILED');
+    assert.match(r.categories.negotiation.note || r.categories.negotiation.error || JSON.stringify(r.categories.negotiation), /did not respond/);
+    assert.equal(r.categories.loa.status, 'DOWNLOADED');
+    assert.equal(r.categories.counterOffer.status, 'DOWNLOADED');
+    assert.equal(r.categories.tenderPdf.status, 'DOWNLOADED');
+    assert.equal(r.aborted, null);
+  } finally { globalThis.fetch = shim; core.fetchSettings.timeoutMs = 45000; }
 });
