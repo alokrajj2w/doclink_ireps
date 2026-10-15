@@ -2,6 +2,7 @@
 import { runAutomatic } from './tender-auto.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { SESSION_MSG, getLogTail } from './tender-core.js';
+import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
 
 const $ = (id) => document.getElementById(id);
 const main = $('view-main');
@@ -79,8 +80,13 @@ function li(label, value, cls, title, reason) {
   return row;
 }
 
-const catText = (c) => (c.status === 'NOT_AVAILABLE' ? 'none' : c.status === 'FAILED' ? 'failed' : c.status === 'PARTIAL' ? `${c.downloaded} ok, ${c.failed} failed` : `${c.downloaded} downloaded`);
-const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error)].filter(Boolean).join('\n');
+// Save to: ECM / S3 - how many of a category's documents the ECM holds; a document the ECM did not take was saved locally
+const inEcm = (c) => (c.files || []).filter((f) => f.ecm && f.ecm.status !== ECM_OUTCOME.FAILED).length;
+const catText = (c) => {
+  const text = c.status === 'NOT_AVAILABLE' ? 'none' : c.status === 'FAILED' ? 'failed' : c.status === 'PARTIAL' ? `${c.downloaded} ok, ${c.failed} failed` : `${c.downloaded} downloaded`;
+  return inEcm(c) ? `${text} (${inEcm(c)} in ECM)` : text;
+};
+const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : ''))].filter(Boolean).join('\n');
 const LABEL = { tenderPdf: 'NIT', attachments: 'Attachments', myOffer: 'My Offer', corrigenda: 'Corrigenda', negotiation: 'Negotiation', counterOffer: 'Counter offer', loa: 'LOA', correspondence: 'Correspondence' };
 
 const tenderRows = new Map(); // tenderNo -> <li>, updated live as each tender finishes

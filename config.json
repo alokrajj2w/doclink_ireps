@@ -6,5 +6,12 @@
   "//recon": "Save to: Recon (S3). reconBaseUrl = the Recon Engine API (its origin must also be in manifest.json host_permissions); reconCustomerId = the Recon customer the files belong to; reconAppUrl (optional) = the page 'Open Recon Engine' opens for sign-in, defaults to reconBaseUrl.",
   "reconBaseUrl": "http://localhost:8000",
   "reconCustomerId": "default",
-  "reconAppUrl": "http://localhost:5173"
+  "reconAppUrl": "http://localhost:5173",
+  "//okta": "Recon Engine sign-in with Okta (the second login, after IREPS). DocLink opens this Okta app through chrome.identity; register the redirect https://<extension id>.chromiumapp.org/okta in the Okta app (DocLink's sign-in page shows the exact value). The client SECRET never goes here: the Recon backend exchanges the code. enabled=false hides the Okta button.",
+  "okta": {
+    "enabled": true,
+    "issuer": "https://wabtec.oktapreview.com/oauth2/default",
+    "clientId": "0oa2uq0thn3v0mHWG0h8",
+    "redirectPath": "okta"
+  }
 }

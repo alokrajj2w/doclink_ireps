@@ -16,6 +16,7 @@ import { openLedger } from './tender-ledger.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
 } from './tender-workflows.js';
+import { tenderEcmSink } from './tender-ecm.js';
 
 const DAY = 86400000;
 const ddmmyyyy = (d) => fmtDate(d);
@@ -39,6 +40,26 @@ export function dayRange(from, to) {
   return out;
 }
 const parseDmy = (s) => { const [d, m, y] = s.split('/').map(Number); return new Date(y, m - 1, d); };
+
+/**
+ * The tender's closing date (IREPS "Due Date/Time"), searched once per job; '' when IREPS does not
+ * find the tender. Only for ECM uploads (their tender date): the Post Tenders letter lists do not
+ * show it, and a Local run never pays for this search.
+ */
+export async function closingDateFor(job, tenderNo, onProgress = () => {}) {
+  job.closingDates = job.closingDates || new Map();
+  if (!job.closingDates.has(tenderNo)) {
+    let date = '';
+    try {
+      date = (await searchTender(job.base, tenderNo, { preferWindows: [[-90, 0], [0, 90]], onProgress })).closingDate || '';
+    } catch (e) {
+      if (e.code === 'SESSION_EXPIRED') throw e;
+      log('Letters', `Closing date of ${tenderNo} not found (${e.message}); the ECM tender date is left blank`);
+    }
+    job.closingDates.set(tenderNo, date);
+  }
+  return job.closingDates.get(tenderNo);
+}
 
 /** Search for the tender, preferring the date windows implied by its closing date. */
 export async function openTender(job, tenderNo, preferWindows, onProgress) {
@@ -64,7 +85,9 @@ export async function recordManifest(job, run, categories, { range = null, sourc
   const files = prev.files.filter((f) => f.status !== 'FAILED'); // a failed attempt is superseded by the next try
   for (const [category, c] of Object.entries(categories)) {
     for (const f of c.files || []) {
-      if (f.status === 'DOWNLOADED' && files.some((x) => x.relPath === f.relPath)) continue;
+      // the same document again: same local file, or the same ECM document
+      const key = (x) => x.relPath || x.ecm?.uid || null;
+      if (f.status === 'DOWNLOADED' && key(f) && files.some((x) => key(x) === key(f))) continue;
       const { downloadId, ...rest } = f;
       files.push({ category: c.category || category, ...rest });
     }
@@ -190,6 +213,9 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
   const scans = await Promise.all(statuses.map((st) => scanPostTenderList(probe, st))); // independent lists, read together
 
   const byTender = new Map(); // tenderNo -> { categories, folder }
+  // Save to: ECM / S3 (asked once, and only when there is a letter to save), or null
+  let ecm;
+  const ecmSink = async () => (ecm === undefined ? (ecm = await tenderEcmSink(job.account)) : ecm);
   let aborted = null;
   let newLetters = 0;
   let listed = 0;
@@ -207,7 +233,9 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
       try {
         const run = startLetterRun(job, tenderNo);
         await assertSameAccount(job.account, { base: job.base });
-        const items = todays.filter((e) => e.tenderNo === tenderNo).map(({ id, rq, url }) => ({ id, rq, url }));
+        run.ecm = await ecmSink();
+        if (run.ecm) run.ctx.closingDate = await closingDateFor(job, tenderNo, onProgress);
+        const items = todays.filter((e) => e.tenderNo === tenderNo).map(({ id, rq, url, date }) => ({ id, rq, url, date }));
         const r = await downloadLetterItems(run, status, items, scripts);
         rec.categories[LETTER_SPECS[status].key] = r;
         await recordManifest(job, run, { [LETTER_SPECS[status].key]: r }, { range: { from: dates[0], to: dates[dates.length - 1] } });

@@ -587,7 +587,13 @@ body {
   white-space: pre-line;
 }
 
-/* ------------------------------------------------- Save to: local | Recon */
+/* ---------------------------------------------- Save to: local | ECM / S3 */
+
+/* above every view; not while the gate, the login prompt or the upload view is up */
+body[data-gate="on"] .app-main > .save-to,
+.save-to[hidden] {
+  display: none;
+}
 
 .save-to {
   display: flex;
@@ -832,4 +838,92 @@ body[data-gate="on"] .app-footer {
 }
 .po-row input {
   width: 100%;
+}
+
+/* ------------------------------------------- Recon Engine sign-in (login 2) */
+
+.connections {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.connection-recon {
+  font: inherit;
+  font-size: 11px;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+}
+.connection-recon[hidden] {
+  display: none;
+}
+.connection-recon:focus-visible {
+  outline: 2px solid var(--brand-teal);
+  outline-offset: 2px;
+}
+
+/* Like the gate: every other view and the Save to switch step aside without
+   touching their own [hidden] state, so a running job is intact on return. */
+body[data-recon-login="on"] .app-main > .view:not(#view-recon-login),
+body[data-recon-login="on"] .app-main > .save-to {
+  display: none !important;
+}
+body[data-gate="on"] #view-recon-login {
+  display: none !important;
+}
+
+.field input[type="email"],
+.field input[type="password"] {
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.recon-user {
+  margin: 0 0 10px;
+  font-weight: 600;
+  color: var(--success);
+}
+
+.recon-okta .divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.recon-okta .divider::before,
+.recon-okta .divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+.recon-okta .btn {
+  width: 100%;
+}
+
+.form-message-error {
+  margin-top: 10px;
+  color: var(--danger);
+  background: rgba(179, 38, 30, 0.06);
+  border-radius: 8px;
+}
+
+.recon-okta-setup {
+  margin-top: 12px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.recon-okta-setup code {
+  display: block;
+  word-break: break-all;
+  margin: 4px 0;
+  color: var(--text);
 }

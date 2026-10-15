@@ -142,7 +142,7 @@ class DocumentCard {
     if (toRecon) el.format.value = EXPORT_FORMATS[0].value;
     el.format.disabled = toRecon;
     el.formatHint.hidden = !toRecon;
-    el.stepSave.textContent = toRecon ? "Uploading to Recon (S3)" : "Downloading";
+    el.stepSave.textContent = toRecon ? "Uploading to S3" : "Downloading";
     if (!el.btnDownload.disabled) this.setBusy(false);
     this.updateSummary();
   }
@@ -190,7 +190,7 @@ class DocumentCard {
   setBusy(busy, text) {
     this.el.btnDownload.disabled = busy;
     this.el.btnDownload.classList.toggle("is-busy", busy);
-    this.el.btnLabel.textContent = text || (this.selectedDestination() === SAVE_DESTINATION.RECON ? `Save ${this.label} to Recon` : `Download ${this.label}`);
+    this.el.btnLabel.textContent = text || (this.selectedDestination() === SAVE_DESTINATION.RECON ? `Download ${this.label} to S3` : `Download ${this.label}`);
   }
 
   clearError() {

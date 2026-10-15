@@ -37,6 +37,8 @@ import { runMaTests } from "./ma-tests.js";
 import { runPoTests } from "./po-tests.js";
 import { runIcTests } from "./ic-tests.js";
 import { runReconTests } from "./recon-tests.js";
+import { runEcmTests } from "./ecm-tests.js";
+import { runReconAuthTests } from "./recon-auth-tests.js";
 import { compileMatchPatterns, compileMatchPattern, classifyTabUrl, TAB_SCOPE } from "../utils/url-scope.js";
 
 const results = [];
@@ -916,6 +918,8 @@ await runMaTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 await runPoTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 await runIcTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 await runReconTests({ test, assert, eq });
+await runEcmTests({ test, assert, eq });
+await runReconAuthTests({ test, assert, eq });
 
 /* ---------------------------------------------------------------- report */
 
