@@ -27,6 +27,7 @@ import { buildIcDownloadPath } from "../../utils/filename.js";
 import { loadIcListPage, submitIcSearch, buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
 import { extractIcForm, hasIcForm } from "./ic-form.js";
 import { parseIcSearchResults } from "./ic-parser.js";
+import { ECM_KIND } from "../ecm-service.js";
 
 export { IC_ERROR };
 export const IC_DOWNLOAD_STATUS = DOCUMENT_DOWNLOAD_STATUS;
@@ -138,7 +139,8 @@ export function icDownloadItems(records, poNo) {
     url: r.icPdfUrl || null,
     path: buildIcDownloadPath({ poNo: r.poNo || poNo, poSerial: r.poSerial, callId: r.callId }),
     label: `IC ${r.callId || "?"} (PO Sr. ${r.poSerial || "?"})`,
-    meta: { callId: r.callId, poNo: r.poNo || poNo, poSerial: r.poSerial, icDate: r.icDate }
+    meta: { callId: r.callId, icNumber: r.icNumber, poNo: r.poNo || poNo, poSerial: r.poSerial, icDate: r.icDate },
+    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: r.icNumber, customer_po_number: r.poNo || poNo, ic_date: r.icDate } }
   }));
 }
 

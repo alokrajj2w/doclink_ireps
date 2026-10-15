@@ -15,7 +15,8 @@
     "storage",
     "tabs",
     "offscreen",
-    "sidePanel"
+    "sidePanel",
+    "identity"
   ],
   "host_permissions": [
     "http://localhost:8765/*",

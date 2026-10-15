@@ -154,12 +154,17 @@ export async function fetchIrepsDocument(url, deps = {}) {
  * @property {string} path          Downloads-relative target path (…/name.pdf)
  * @property {string} [label]       shown in progress / logs (e.g. "MA 007327")
  * @property {object} [meta]        anything the caller wants echoed back
+ * @property {{ kind: string, fields: object, title?: string }} [ecm]
+ *                                  how the document is filed in the ECM under "ECM / S3"
+ *                                  (services/ecm-service.js)
  */
 
 /**
  * Download one document: fetch, verify, save.
  * @param {DownloadItem} item
- * @param {{ fetch?: typeof fetch, saveFile?: (bytes: Uint8Array, path: string) => Promise<{ downloadId?: number, filename?: string, path?: string }>, codes?: object }} [options]
+ * `saveFile` replaces the local save; it gets the item too (the "ECM / S3" saver reads
+ * item.meta.ecm) and may report where the document went as `ecm`.
+ * @param {{ fetch?: typeof fetch, saveFile?: (bytes: Uint8Array, path: string, item: DownloadItem) => Promise<{ downloadId?: number|null, filename?: string, path?: string, ecm?: object|null }>, codes?: object }} [options]
  */
 export async function downloadIrepsDocument(item, options = {}) {
   const CODES = { ...DEFAULT_CODES, ...(options.codes || {}) };
@@ -167,7 +172,7 @@ export async function downloadIrepsDocument(item, options = {}) {
   const saveFile = options.saveFile || ((data, target) => downloadBytes(data, { path: target, mimeType: "application/pdf" }));
   let saved;
   try {
-    saved = await saveFile(bytes, item.path);
+    saved = await saveFile(bytes, item.path, item);
   } catch (error) {
     logger.error("Document could not be saved", error);
     throw new IrepsError(CODES.DOWNLOAD_FAILED, "Chrome could not save the PDF", { detail: "Chrome could not save the file", cause: error });
@@ -178,6 +183,7 @@ export async function downloadIrepsDocument(item, options = {}) {
     path: item.path,
     filename: (saved && saved.filename) || item.path.split("/").pop(),
     downloadId: saved && saved.downloadId !== undefined ? saved.downloadId : null,
+    ecm: (saved && saved.ecm) || null,
     bytes: bytes.length
   };
 }
@@ -210,6 +216,7 @@ export async function downloadIrepsDocuments(items, options = {}) {
     status: DOCUMENT_DOWNLOAD_STATUS.QUEUED,
     filename: null,
     downloadId: null,
+    ecm: null,
     error: null
   }));
   let sessionExpired = false;
@@ -251,6 +258,7 @@ export async function downloadIrepsDocuments(items, options = {}) {
         state.status = DOCUMENT_DOWNLOAD_STATUS.COMPLETED;
         state.filename = done.filename;
         state.downloadId = done.downloadId;
+        state.ecm = done.ecm;
       } catch (error) {
         state.status = DOCUMENT_DOWNLOAD_STATUS.FAILED;
         state.error = describeFailure(error, CODES);
@@ -276,5 +284,5 @@ export async function downloadIrepsDocuments(items, options = {}) {
  * @property {number} completed
  * @property {number} failed
  * @property {boolean} sessionExpired
- * @property {{ id: string, label: string, meta: object|null, path: string, status: string, filename: string|null, downloadId: number|null, error: { code: string, detail: string|null, status: number|null, skipped?: boolean }|null }[]} items
+ * @property {{ id: string, label: string, meta: object|null, path: string, status: string, filename: string|null, downloadId: number|null, ecm: { status: string, site?: string|null, uid?: string, code?: string, detail?: string|null }|null, error: { code: string, detail: string|null, status: number|null, skipped?: boolean }|null }[]} items
  */

@@ -12,9 +12,10 @@ import { UPLOAD_SOURCES, DOCUMENT_TYPES } from "../services/upload-service.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
 import { formatFriendlyDateTime } from "../utils/filename.js";
 import { initDocuments, handleDocumentMessage, restoreDocuments, refreshDocumentsDestination } from "./popup-documents.js";
-import { initMa, handleMaMessage, restoreMa } from "./popup-ma.js";
-import { initPoIc, handlePoIcMessage, restorePoIc } from "./popup-po-ic.js";
+import { initMa, handleMaMessage, restoreMa, refreshMaDestination } from "./popup-ma.js";
+import { initPoIc, handlePoIcMessage, restorePoIc, refreshPoIcDestination } from "./popup-po-ic.js";
 import { initGate, currentPanelTabId } from "./popup-gate.js";
+import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus } from "./popup-recon-auth.js";
 import { logger, mirrorLogToConsole, installConsoleHelpers } from "../utils/logger.js";
 
 const $ = (id) => document.getElementById(id);
@@ -27,6 +28,7 @@ const el = {
   viewUpload: $("view-upload"),
   viewMa: $("view-ma"),
   viewPoIc: $("view-po-ic"),
+  saveTo: $("save-to"),
   options: $("options"),
   optionsSummary: $("options-summary"),
   optRange: Array.from(document.querySelectorAll('input[name="opt-range"]')),
@@ -92,7 +94,37 @@ let resultDownloadId = null;
 /** Requests that only read state; logged at debug level, everything else is a user action. */
 const QUIET_TYPES = /^(GET_|CHECK_IREPS_SESSION|SEARCH_PO_LOAD_FORM)/;
 
+/** Requests that start a download run; under Save to: ECM / S3 they need the Recon sign-in first. */
+const RUN_TYPES = new Set([
+  MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS,
+  MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS,
+  MESSAGE_TYPES.MA_DOWNLOAD,
+  MESSAGE_TYPES.PO_DOWNLOAD,
+  MESSAGE_TYPES.IC_DOWNLOAD
+]);
+
+function payloadDestination(payload) {
+  return payload.destination || (payload.options && payload.options.destination) || SAVE_DESTINATION.LOCAL;
+}
+
+/** The same request saving locally (the user chose Local on the Recon sign-in page). */
+function toLocal(payload) {
+  const local = { ...payload };
+  if (local.destination) local.destination = SAVE_DESTINATION.LOCAL;
+  if (local.options && local.options.destination) local.options = { ...local.options, destination: SAVE_DESTINATION.LOCAL };
+  return local;
+}
+
 async function send(type, payload = {}) {
+  // Login 2 (Recon Engine) before an ECM / S3 run; login 1 (IREPS) is checked by the run itself.
+  if (RUN_TYPES.has(type) && payloadDestination(payload) === SAVE_DESTINATION.RECON && !(await ensureReconSignedIn())) {
+    payload = toLocal(payload);
+  }
+  // Every "Open Recon Engine" button now opens DocLink's own Recon sign-in page.
+  if (type === MESSAGE_TYPES.OPEN_RECON) {
+    await openReconSignIn();
+    return { ok: true };
+  }
   // "Open IREPS" (every view's button) loads IREPS in this panel's own tab.
   if (type === MESSAGE_TYPES.OPEN_IREPS) {
     const tabId = await currentPanelTabId();
@@ -144,6 +176,7 @@ function showView(name) {
   el.viewUpload.hidden = name !== "upload";
   el.viewMa.hidden = name !== "ma";
   el.viewPoIc.hidden = name !== "po-ic";
+  el.saveTo.hidden = name === "login" || name === "upload";
 }
 
 /** Shared "IREPS login required" view (used by Bill Status and CRN). */
@@ -183,7 +216,7 @@ function setConnectionForError(described) {
 function setButtonBusy(busy, label) {
   el.btnDownload.disabled = busy;
   el.btnDownload.classList.toggle("is-busy", busy);
-  el.btnLabel.textContent = label || (selectedDestination() === SAVE_DESTINATION.RECON ? "Save Bill Status to Recon" : "Download Bill Status");
+  el.btnLabel.textContent = label || (selectedDestination() === SAVE_DESTINATION.RECON ? "Download Bill Status to S3" : "Download Bill Status");
 }
 
 /* ------------------------------------------------ shared bottom result panel */
@@ -309,12 +342,30 @@ function selectedDestination() {
   return checked ? checked.value : SAVE_DESTINATION.LOCAL;
 }
 
-/** Button and progress-step labels follow the Save to choice (only while idle), on every card. */
+/** Buttons of the ECM documents (MA, PO / IC, tenders): under ECM / S3 they read "... to ECM". */
+const ECM_BUTTONS = [
+  ["#btn-ma-open", "Download MA"],
+  ["#btn-po-ic-open", "Download PO / IC"],
+  ["#btn-tender-open", "Download Tender Documents"],
+  ["#btn-auto-run .btn-label", "Scan My Messages & Download"]
+];
+
+/**
+ * Button and progress-step labels follow the Save to choice (only while idle), on every card:
+ * ECM / S3 reads "Download ... to S3" for Bill Status, CRN and R-NOTE and "Download ... to ECM"
+ * for MA, PO / IC and tender documents.
+ */
 function updateDestination() {
   const toRecon = selectedDestination() === SAVE_DESTINATION.RECON;
-  el.stepSave.textContent = toRecon ? "Uploading to Recon (S3)" : "Downloading";
+  el.stepSave.textContent = toRecon ? "Uploading to S3" : "Downloading";
   if (!el.btnDownload.disabled) setButtonBusy(false);
   refreshDocumentsDestination();
+  refreshMaDestination();
+  refreshPoIcDestination();
+  for (const [selector, label] of ECM_BUTTONS) {
+    const button = document.querySelector(selector);
+    if (button) button.textContent = toRecon ? `${label} to ECM` : label;
+  }
 }
 
 /** The Save to switch is one panel-wide preference, remembered across panel openings. */
@@ -330,6 +381,14 @@ async function restoreDestination() {
 }
 
 function onDestinationChange() {
+  updateDestination();
+  chrome.storage.local.set({ [STORAGE_KEYS.SAVE_DESTINATION]: selectedDestination() }).catch(() => {});
+  onReconDestinationChange();
+}
+
+/** Set the Save to switch from code (the Recon sign-in page's "Use Local instead"). */
+function setDestination(value) {
+  for (const radio of el.optDestination) radio.checked = radio.value === value;
   updateDestination();
   chrome.storage.local.set({ [STORAGE_KEYS.SAVE_DESTINATION]: selectedDestination() }).catch(() => {});
 }
@@ -538,9 +597,12 @@ async function onIrepsTabActive() {
   updateOptionsSummary();
   refreshMeta();
   initDocuments({ send, showView, setConnection, setConnectionForError, showLogin, showResult, hideResult, getDestination: selectedDestination });
+  initReconAuth({ getDestination: selectedDestination, setDestination });
   await restoreDestination();
-  initMa({ send, showView, setConnection, setConnectionForError, showLogin });
-  initPoIc({ send, showView, setConnection, setConnectionForError });
+  if (selectedDestination() === SAVE_DESTINATION.RECON) refreshReconStatus();
+  initMa({ send, showView, setConnection, setConnectionForError, showLogin, getDestination: selectedDestination });
+  initPoIc({ send, showView, setConnection, setConnectionForError, getDestination: selectedDestination });
+  updateDestination(); // the MA / PO / IC labels, now that those cards are wired
   // Nothing talks to IREPS until the active tab is the configured portal.
   await initGate({ send, setConnection, onActive: onIrepsTabActive });
 })();

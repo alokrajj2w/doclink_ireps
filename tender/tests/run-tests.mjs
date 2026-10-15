@@ -3,7 +3,7 @@
 import { createRequire } from 'node:module';
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeIreps, PDF } from './fake-ireps.js';
+import { FakeIreps, PDF, corresPage } from './fake-ireps.js';
 
 const req = createRequire((process.env.JSDOM_ROOT || process.cwd()) + '/');
 const { JSDOM } = req('jsdom');
@@ -73,6 +73,11 @@ test('parseWelcomeText: no unit unless the company text states one', () => {
   assert.equal(acct.parseWelcomeText('X Y , TATA-STEEL WORKS (IREPS ID-12)').operatingUnit, null);
   assert.equal(acct.parseWelcomeText('X Y , ACME LTD-PUNE (IREPS ID-77)').operatingUnit, 'PUNE');
   assert.equal(acct.parseWelcomeText('nonsense'), null);
+});
+test('parseWelcomeText: account 60828 is always ROHTAK', () => {
+  assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED (IREPS ID- 60828)').operatingUnit, 'ROHTAK');
+  assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-HOSUR (IREPS ID- 60828)').operatingUnit, 'ROHTAK');
+  assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-HOSUR (IREPS ID- 833)').operatingUnit, 'HOSUR');
 });
 test('isExcludedUrl blocks tabulation endpoints but not My Offer', () => {
   assert.equal(core.isExcludedUrl('/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=1'), true);
@@ -729,4 +734,130 @@ test('no password / cookie / token is stored by the extension code', async () =>
   const fs = await import('node:fs');
   const src = ['tender-core.js', 'tender-account.js', 'tender-search.js', 'tender-workflows.js', 'tender-ui.js'].map((f) => fs.readFileSync(new URL('../' + f, import.meta.url), 'utf8')).join('\n');
   assert.ok(!/chrome\.storage|localStorage|sessionStorage|document\.cookie/.test(src));
+});
+
+// =========================== Save to: ECM / S3 ==============================================
+const tecm = await import('../tender-ecm.js');
+const recon = await import('../../services/recon-service.js');
+const ECM_URL = 'http://localhost:8000/api/ecm/documents';
+const CORRES = { 107200478: { nitOid: '107200478', tenderNo: '29263265', letters: [{ no: '306789', id: '306789', corresId: '225319', subject: 'Withdrawal' }, { no: '306790', id: '306790', corresId: '225320', subject: 'Clarif' }] } };
+
+/** Run fn with the ECM gateway faked: respond(post, n) -> [status, body]. Records every upload. */
+async function withEcm(respond, fn) {
+  recon.applyReconConfig({ reconBaseUrl: 'http://localhost:8000' });
+  chrome.runtime.getManifest = () => ({ host_permissions: ['http://localhost:8000/*'] });
+  const prev = globalThis.fetch;
+  const posts = [];
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url) !== ECM_URL) return prev(url, init);
+    const f = init.body;
+    const post = { kind: f.get('kind'), title: f.get('title'), fields: JSON.parse(f.get('fields')), account: f.get('ireps_account_id'), unit: f.get('operating_unit'), file: f.get('file').name, credentials: init.credentials };
+    posts.push(post);
+    const [status, body] = respond(post, posts.length);
+    return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    return await fn(posts);
+  } finally {
+    globalThis.fetch = prev;
+    delete chrome.runtime.getManifest;
+  }
+}
+
+test('ECM: account 833 is always HOSUR', () => {
+  assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-UNIT 1 (IREPS ID- 833)').operatingUnit, 'HOSUR');
+  assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED (IREPS ID- 833)').operatingUnit, 'HOSUR');
+});
+test('ECM: each tender category maps to its ECM kind, with tender number, date and LOI details; My Offer stays local', () => {
+  const ctx = { tenderNo: '29263265', closingDate: '09/11/2026 15:00' };
+  const doc = (category, action) => tecm.ecmDocumentFor(category, action, ctx);
+  assert.deepEqual(doc('TENDER_PDF', { id: '5569207', meta: { title: 'NIT / Tender document' } }), { kind: 'nit', title: '29263265 - NIT', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00' } });
+  assert.equal(doc('ATTACHMENTS', { id: 'Annexure', meta: { title: 'Annexure - SPEC' } }).title, '29263265 - Attachment - Annexure - SPEC');
+  assert.equal(doc('ATTACHMENTS', { id: 'x', meta: {} }).kind, 'nit');
+  assert.deepEqual([doc('CORRIGENDA', { id: '1204920', meta: { title: '1' } }).kind, doc('NEGOTIATION', { id: '1' }).kind, doc('COUNTER_OFFER', { id: '1' }).kind, doc('CORRESPONDENCE', { id: '1', meta: { title: 'Withdrawal' } }).kind], ['extension', 'nbsp', 'co', 'crp']);
+  assert.deepEqual(doc('LOA', { id: '1461928', meta: { docDate: '04/10/2026' } }), { kind: 'loi', title: '29263265 - LOA 1461928', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00', loi_number: '1461928', loi_date: '04/10/2026' } });
+  assert.equal(doc('MY_OFFER', { id: '1' }), null);
+  assert.equal(tecm.ecmDocumentFor('NIT', {}, { tenderNo: 'T', dueDate: '' }), null);
+  assert.equal(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T', dueDate: new Date(2026, 10, 9).toISOString() }).fields.tender_date, '2026-11-09', 'an automatic-mode due date is its local day');
+});
+test('ECM: Save to Local (the default) never calls the ECM', async () => {
+  mk({ tenders: [FULL()] });
+  await withEcm(() => [201, {}], async (posts) => {
+    await run();
+    assert.equal(posts.length, 0);
+    assert.ok(savedNames().some((n) => n.endsWith('NIT_29263265.pdf')));
+  });
+});
+test('ECM: Save to ECM / S3 files every tender document in the Hosur folder; My Offer and the manifest stay local', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: CORRES });
+  store['doclink.saveDestination'] = 'recon';
+  await withEcm((p, n) => [201, { uid: `u-${n}`, path: `/FT/x/${n}`, title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
+    const r = await run();
+    const c = r.categories;
+    assert.equal(r.summary.failed, 0);
+    const kinds = posts.reduce((m, p) => ({ ...m, [p.kind]: (m[p.kind] || 0) + 1 }), {});
+    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2 });
+    assert.ok(posts.every((p) => p.account === '833' && p.unit === 'HOSUR' && p.fields.tender_number === '29263265' && p.credentials === 'include'));
+    assert.ok(posts.every((p) => !p.fields.tender_date || /^\d{4}-\d{2}-\d{2}$/.test(p.fields.tender_date)), 'tender date, when known, as YYYY-MM-DD');
+    const loi = posts.find((p) => p.kind === 'loi');
+    assert.deepEqual([loi.title, loi.fields.loi_number], ['29263265 - LOA 1461928', '1461928']);
+    assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(loi.fields.loi_date), 'LOI date from the published stamp');
+    assert.equal(new Set(posts.map((p) => p.title)).size, posts.length, 'every title is unique within the tender');
+    // nothing that went to the ECM is in Downloads; My Offer (no ECM kind) and the manifest are
+    const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
+    assert.ok(local.includes('My_Offer/My_Offer_29263265.pdf') && local.includes('download_manifest.json'));
+    assert.ok(!local.some((n) => /^(NIT_and_Supporting_Documents|Negotiation|Counter_Offers|Advance_Acceptance_LOA|Correspondence)\//.test(n)), local.join('\n'));
+    assert.ok(local.includes('Corrigenda/Corrigendum_02_29263265.html'), 'a print-ready letter keeps its original HTML locally');
+    assert.equal(c.tenderPdf.files[0].ecm.status, 'stored');
+    assert.equal(c.tenderPdf.files[0].relPath, null);
+    assert.equal(c.myOffer.files[0].ecm, undefined);
+    const mf = JSON.parse(new TextDecoder().decode(saved.find((s) => s.filename.endsWith('download_manifest.json')).bytes));
+    assert.equal(mf.categories.loa.files[0].ecm.uid, `u-${posts.indexOf(loi) + 1}`, 'the manifest records where each document went');
+  });
+});
+test('ECM: when the ECM refuses or is down, each document is saved locally instead and the reason is kept', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: CORRES });
+  store['doclink.saveDestination'] = 'recon';
+  await withEcm((p, n) => (n === 1 ? [400, { detail: { error: 'INVALID_INPUT', detail: 'nit requires tender_number' } }] : [502, { detail: { error: 'ECM_UPSTREAM_ERROR', detail: 'HTTP 500' } }]), async (posts) => {
+    const r = await run();
+    assert.equal(r.summary.failed, 0, 'nothing is lost');
+    assert.equal(posts.length, 13);
+    const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
+    for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265_1461928.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(local.includes(want), `missing ${want}`);
+    const nit = r.categories.tenderPdf.files[0];
+    assert.deepEqual([nit.ecm.status, nit.ecm.code, nit.ecm.detail], ['failed', 'ECM_REJECTED', 'nit requires tender_number']);
+    assert.equal(r.categories.loa.files[0].ecm.code, 'ECM_UNAVAILABLE');
+  });
+});
+test('ECM: letters by date go to the ECM with the tender date looked up once per tender (a Local run never searches)', async () => {
+  const at = (n) => new Date(NOW() - n * D);
+  const closing = new Date(NOW() - 3 * D);
+  mk({
+    tenders: [T({ no: 'LOA3', nitId: '31', oid: '310', closing }), T({ no: 'NEG1', nitId: '11', oid: '110', closing })],
+    inbox: {
+      MyNegotiation: [{ no: 'NEG1', oid: '5001', letter: '11', date: at(0) }, { no: 'NEG1', oid: '5001', letter: '12', date: at(0) }],
+      MyCounterOffer: [{ no: 'GONE', oid: '5007', letter: '21', date: at(0) }],
+      MyAdvanceAcceptanceLetter: [{ no: 'LOA3', oid: '5003', letter: '31', date: at(0) }],
+    },
+    letterAsPdf: true,
+  });
+  store['doclink.saveDestination'] = 'recon';
+  await withEcm((p, n) => [201, { uid: `u-${n}`, path: '/x', title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
+    const r = await jobs.downloadLettersByDate();
+    assert.equal(r.summary.newLetters, 4);
+    assert.deepEqual(posts.map((p) => p.kind).sort(), ['co', 'loi', 'nbsp', 'nbsp']);
+    const day = `${closing.getFullYear()}-${String(closing.getMonth() + 1).padStart(2, '0')}-${String(closing.getDate()).padStart(2, '0')}`;
+    const loi = posts.find((p) => p.kind === 'loi');
+    assert.deepEqual(loi.fields, { tender_number: 'LOA3', tender_date: day, loi_number: '31', loi_date: dmy(NOW()).split('/').reverse().join('-') });
+    assert.ok(posts.filter((p) => p.kind === 'nbsp').every((p) => p.fields.tender_date === day));
+    assert.equal(posts.find((p) => p.kind === 'co').fields.tender_date, undefined, 'a tender IREPS cannot find: tender date left blank');
+    assert.ok(posts.every((p) => p.account === '833' && p.unit === 'HOSUR'));
+    assert.equal(server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do' && l.body.advancedSearch === 'NEG1').length, 1, 'searched once for two letters');
+    assert.ok(!savedNames().some((n) => /\/(Negotiation|Counter_Offers|Advance_Acceptance_LOA)\//.test(n)), 'nothing that went to the ECM is in Downloads');
+  });
+});
+test('ECM: the correspondence page\'s Closing Date fills the tender date when the run did not search the tender', () => {
+  const doc = new JSDOM(new TextDecoder().decode(corresPage({ nitOid: '1', tenderNo: 'X1', letters: [] }))).window.document;
+  assert.equal(wf.pageClosingDate(doc), '09/09/2026');
+  assert.equal(wf.pageClosingDate(new JSDOM('<table><tr><td>Tender No</td><td>X</td></tr></table>').window.document), '');
 });

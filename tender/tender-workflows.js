@@ -12,6 +12,7 @@ import {
 } from './tender-core.js';
 import { getActiveIrepsAccountContext, assertSameAccount, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
+import { ecmDocumentFor, tenderEcmSink } from './tender-ecm.js';
 
 const INBOX_PATH = '/epsn/vendorInboxLink.do';
 const DEFAULT_AJAX_PATH = '/epsn/supply/tds/ajxdata.do';
@@ -66,7 +67,10 @@ export function dedupeItems(items) {
 /**
  * The single download path used by every category: issue the request exactly as the IREPS page
  * would, validate/resolve the response into a real document, save it, return the file record.
- *   action = { req, opts, subdir, fileName(ext) -> string, id, before?() }
+ *   action = { req, opts, subdir, fileName(ext) -> string, id, category, before?() }
+ * Under "Save to: ECM / S3" (run.ecm) a document whose category has an ECM kind goes to the ECM
+ * folder of the account's unit; when the ECM does not take it, it is saved locally as before.
+ * The file record then carries `ecm` (and no relPath unless a local copy was made).
  */
 export async function resolveAndDownloadIrepsDocument(action, run) {
   if (action.before) await action.before();
@@ -74,10 +78,22 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
     { allowHtml: !!action.allowHtml, allowAnyFile: !!action.allowAnyFile, nameHint: action.nameHint || '' });
   log('Download', `Validating document (${doc.kind}${doc.converted ? ', rendered from HTML' : ''})`);
   const fileName = action.fileName(doc.ext);
-  const saved = await run.saver.save(action.subdir, fileName, doc.bytes);
-  const out = [{ fileName: saved.relPath.split('/').pop(), relPath: saved.relPath, status: 'DOWNLOADED', id: action.id || '', downloadId: saved.downloadId, size: saved.size, converted: !!doc.converted,
+  const ecmDoc = run.ecm ? ecmDocumentFor(action.category, action, run.ctx) : null;
+  let saved;
+  let ecm = null;
+  if (ecmDoc) {
+    const mimeType = /\.pdf$/i.test(fileName) ? 'application/pdf' : doc.contentType || 'application/octet-stream';
+    ({ ecm, local: saved } = await run.ecm.save({ ...ecmDoc, bytes: doc.bytes, filename: fileName, mimeType },
+      () => run.saver.save(action.subdir, fileName, doc.bytes)));
+    log('Download', `ECM ${ecm.status}${ecm.site ? ` (${ecm.site})` : ''}: ${fileName}`);
+  } else {
+    saved = await run.saver.save(action.subdir, fileName, doc.bytes);
+  }
+  const size = saved ? saved.size : doc.bytes.length;
+  const out = [{ fileName: saved ? saved.relPath.split('/').pop() : fileName, relPath: saved ? saved.relPath : null, status: 'DOWNLOADED', id: action.id || '', downloadId: saved ? saved.downloadId : null, size, converted: !!doc.converted,
     title: action.meta?.title || '', docDate: action.meta?.docDate || '', downloadedAt: new Date().toISOString(),
-    validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '', bytes: saved.size } }];
+    validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '', bytes: size },
+    ...(ecm ? { ecm } : {}) }];
   if (doc.kind === 'html') {
     // Keep the complete original page next to the text rendering: nothing from the letter is lost.
     const htmlName = fileName.replace(/\.pdf$/i, '') + '.html';
@@ -103,7 +119,7 @@ async function downloadItems(run, result, items, build) {
   for (const item of items) {
     try {
       if (item.skip) throw new TenderError(item.skip.code, item.skip.message);
-      const { files, converted } = await resolveAndDownloadIrepsDocument(build(item), run);
+      const { files, converted } = await resolveAndDownloadIrepsDocument({ category: result.category, ...build(item) }, run);
       result.downloaded++;
       if (run.ledger && bucket) run.ledger.mark(bucket, ledgerKey(item));
       result.files.push(...files);
@@ -735,6 +751,17 @@ function pageTenderNo(doc) {
   return '';
 }
 
+/** The tender's "Closing Date" as the correspondence page prints it beside the Tender No, or ''. */
+export function pageClosingDate(doc) {
+  for (const c of doc.querySelectorAll('td')) {
+    if (c.children.length === 0 && /^closing\s*date$/i.test(norm(c.textContent))) {
+      const v = norm(c.nextElementSibling?.textContent);
+      if (v) return v;
+    }
+  }
+  return '';
+}
+
 /** nitOid for the correspondence page: inbox rows first, then the correspondence list, then the tender row's oid. */
 async function ensureNitOid(run) {
   if (run.ids.nitOid) return run.ids.nitOid;
@@ -780,6 +807,8 @@ async function correspondence(run) {
     return failedCategory('CORRESPONDENCE', `The correspondence page is for tender ${onPage}, not ${ctx.tenderNo}; nothing was downloaded.`);
   }
   if (!onPage) log('Correspondence', 'Tender No not found on the correspondence page; cannot cross-check');
+  // the ECM's tender date: runs that did not search the tender (letters by date) learn it here
+  if (!ctx.closingDate) ctx.closingDate = pageClosingDate(doc);
 
   const scripts = inlineScripts(doc);
   const items = [];
@@ -845,6 +874,7 @@ export const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, company
 export async function runSteps(run, keys, onProgress = () => {}) {
   const categories = {};
   let aborted = null;
+  if (run.ecm === undefined) run.ecm = await tenderEcmSink(run.account); // Save to: ECM / S3, or null
   for (const [key, msg, fn] of STEPS.filter(([k]) => keys.includes(k))) {
     if (aborted) {
       categories[key] = failedCategory(TYPE[key], `Skipped: ${aborted.message}`);
@@ -866,6 +896,7 @@ export async function runSteps(run, keys, onProgress = () => {}) {
 export function startTenderRun(base, account, found, folderLabel) {
   const tenderContext = {
     tenderNo: found.tenderNo, tenderTitle: found.tenderTitle, railwayUnit: found.railwayUnit, department: found.department, tenderStatus: found.tenderStatus,
+    closingDate: found.closingDate || '',
     nitId: null, nitOid: null, tenderOID: null,
     irepsAccountId: account.irepsAccountId, companyName: account.companyName, operatingUnit: account.operatingUnit,
     tenderPdfUrl: null, nitPageUrl: null, attachments: [], corrigenda: [], discoveredActions: {},

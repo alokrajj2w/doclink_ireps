@@ -173,6 +173,21 @@ export async function runPoTests({ test, assert, eq, rejects, fixture }) {
     eq(item.path, "DocLink/IREPS/PO/PO_27253922100240.pdf");
     eq(item.url, record.poPdfUrl);
     eq(item.label, "PO 27253922100240");
+    eq(JSON.stringify(item.ecm), JSON.stringify({ kind: "poCopy", fields: { customer_po_number: "27253922100240" } }), "ECM filing: PO copy with its PO number");
+  });
+
+  await test("downloadPo: an ECM save hook gets the item and its outcome is returned", async () => {
+    const { fetchImpl: searchFetch } = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(poPage) });
+    const combinedFetch = async (url, init) => ((init && init.method) === "POST" ? searchFetch(url, init) : new Response(fakePdfBytes(), { status: 200, headers: { "content-type": "application/pdf" } }));
+    const seen = [];
+    const saveFile = async (bytes, path, item) => {
+      seen.push(item);
+      return { filename: path.split("/").pop(), downloadId: null, ecm: { status: "stored", site: "hosur", uid: "u-1" } };
+    };
+    const result = await downloadPo("27253922100240", { fetch: combinedFetch, parseHtml, saveFile });
+    eq(seen[0].ecm.kind, "poCopy", "the hook sees how the PO is filed");
+    eq(result.ecm.status, "stored");
+    eq(result.downloadId, null, "nothing saved locally");
   });
 
   await test("downloadPo: search + download the PO PDF (never 'Manage Your Purchase Order'); missing link -> IREPS_PO_LINK_NOT_FOUND", async () => {

@@ -17,15 +17,19 @@
  * and then loads it into the reconciliation data exactly as a manual upload
  * would. Identical bytes are stored once (the response says deduplicated).
  *
- * Authentication is the Recon Engine's own sign-in: DocLink never asks for,
- * reads or stores Recon credentials. The user signs in to the Recon Engine
- * in this Chrome profile; the request carries that cookie
- * (credentials: "include"). The Recon origin must be in manifest.json
- * host_permissions, which is also what lets the service worker call it
- * without CORS. A 401 therefore means "sign in to the Recon Engine first".
+ * Authentication is the Recon Engine's own sign-in, made from DocLink's
+ * "Sign in to Recon Engine" page (services/recon-auth.js: password or Okta)
+ * or in a Recon Engine tab of this Chrome profile. Either way the backend
+ * sets its httponly session cookie in Chrome's cookie jar and the request
+ * carries it (credentials: "include"); DocLink never reads, stores or logs
+ * the cookie, and a typed password is sent once to the Recon Engine and kept
+ * nowhere. The Recon origin must be in manifest.json host_permissions, which
+ * is also what lets DocLink call it without CORS. A 401 therefore means
+ * "sign in to the Recon Engine first".
  *
- * Settings (config.json): reconBaseUrl, reconCustomerId and, optionally,
- * reconAppUrl (the page "Open Recon Engine" opens; defaults to reconBaseUrl).
+ * Settings (config.json): reconBaseUrl, reconCustomerId, optionally
+ * reconAppUrl (the page "Open Recon Engine" opens; defaults to reconBaseUrl)
+ * and okta (the Okta sign-in, see services/recon-auth.js).
  */
 
 import { logger } from "../utils/logger.js";
@@ -73,6 +77,7 @@ const UPLOAD_TIMEOUT_MS = 120000;
 let currentBaseUrl = "";
 let currentAppUrl = "";
 let currentCustomerId = DEFAULT_CUSTOMER_ID;
+let currentOkta = Object.freeze({ enabled: false, issuer: "", clientId: "", redirectPath: "okta" });
 let configLoaded = false;
 
 /** Live view of the Recon settings; mutable only through loadReconConfig(). */
@@ -86,6 +91,10 @@ export const RECON_CONFIG = Object.freeze({
   get customerId() {
     return currentCustomerId;
   },
+  /** Okta sign-in settings: { enabled, issuer, clientId, redirectPath }. Never a secret. */
+  get okta() {
+    return currentOkta;
+  },
   timeoutMs: UPLOAD_TIMEOUT_MS
 });
 
@@ -93,15 +102,30 @@ function trimUrl(value) {
   return typeof value === "string" ? value.trim().replace(/\/+$/, "") : "";
 }
 
+/** config.json "okta" -> the settings DocLink's Okta sign-in uses. */
+function oktaSettings(okta) {
+  const o = okta && typeof okta === "object" ? okta : {};
+  const text = (v) => (typeof v === "string" ? v.trim() : "");
+  const issuer = trimUrl(o.issuer);
+  const clientId = text(o.clientId);
+  return Object.freeze({
+    enabled: o.enabled !== false && Boolean(issuer && clientId),
+    issuer,
+    clientId,
+    redirectPath: text(o.redirectPath).replace(/^\/+/, "") || "okta"
+  });
+}
+
 /**
  * Apply Recon settings from a parsed config.json object (also used by the
  * tests, which have no extension context to read the file from).
- * @param {{ reconBaseUrl?: string, reconAppUrl?: string, reconCustomerId?: string }} config
+ * @param {{ reconBaseUrl?: string, reconAppUrl?: string, reconCustomerId?: string, okta?: object }} config
  */
 export function applyReconConfig(config) {
   currentBaseUrl = trimUrl(config && config.reconBaseUrl);
   currentAppUrl = trimUrl(config && config.reconAppUrl);
   currentCustomerId = (config && typeof config.reconCustomerId === "string" && config.reconCustomerId.trim()) || DEFAULT_CUSTOMER_ID;
+  currentOkta = oktaSettings(config && config.okta);
   configLoaded = true;
   return RECON_CONFIG;
 }
@@ -126,21 +150,34 @@ export async function loadReconConfig({ force = false } = {}) {
   return RECON_CONFIG;
 }
 
-/** Throws RECON_NOT_CONFIGURED unless reconBaseUrl is set, valid and covered by host_permissions. */
-function assertConfigured(baseUrl, hostPermissions) {
-  if (!baseUrl) throw new ReconError(RECON_ERROR.NOT_CONFIGURED, { detail: "reconBaseUrl is not set in config.json" });
+/**
+ * Why `${baseUrl}${path}` cannot be called, or "" when it can: reconBaseUrl must be set,
+ * valid and covered by host_permissions. Shared with the ECM upload (services/ecm-service.js).
+ */
+export function reconConfigProblem(baseUrl, hostPermissions, path) {
+  if (!baseUrl) return "reconBaseUrl is not set in config.json";
   try {
     new URL(baseUrl);
   } catch {
-    throw new ReconError(RECON_ERROR.NOT_CONFIGURED, { detail: `reconBaseUrl "${baseUrl}" is not a valid URL` });
+    return `reconBaseUrl "${baseUrl}" is not a valid URL`;
   }
-  if (!compileMatchPatterns(hostPermissions)(`${baseUrl}/api/documents`)) {
-    throw new ReconError(RECON_ERROR.NOT_CONFIGURED, { detail: `${new URL(baseUrl).origin} is missing from manifest.json host_permissions` });
-  }
+  if (!compileMatchPatterns(hostPermissions)(`${baseUrl}${path}`)) return `${new URL(baseUrl).origin} is missing from manifest.json host_permissions`;
+  return "";
+}
+
+/** host_permissions of this extension (the tests pass their own). */
+export function manifestHostPermissions() {
+  return typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getManifest ? chrome.runtime.getManifest().host_permissions || [] : [];
+}
+
+/** Throws RECON_NOT_CONFIGURED unless reconBaseUrl is set, valid and covered by host_permissions. */
+function assertConfigured(baseUrl, hostPermissions) {
+  const problem = reconConfigProblem(baseUrl, hostPermissions, "/api/documents");
+  if (problem) throw new ReconError(RECON_ERROR.NOT_CONFIGURED, { detail: problem });
 }
 
 /** The API's error text ({ detail: { error, detail } } or { detail: "..." }), or "". */
-function apiErrorDetail(body) {
+export function apiErrorDetail(body) {
   const d = body && body.detail;
   if (!d) return "";
   if (typeof d === "string") return d;
@@ -169,7 +206,7 @@ function apiErrorDetail(body) {
 export async function uploadToRecon(file, deps = {}) {
   await loadReconConfig();
   const baseUrl = RECON_CONFIG.baseUrl;
-  const hostPermissions = deps.hostPermissions || (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getManifest ? chrome.runtime.getManifest().host_permissions || [] : []);
+  const hostPermissions = deps.hostPermissions || manifestHostPermissions();
   assertConfigured(baseUrl, hostPermissions);
   if (!Object.values(RECON_DOC_TYPE).includes(file.docType)) throw new Error(`Unsupported Recon doc_type: ${file.docType}`);
 

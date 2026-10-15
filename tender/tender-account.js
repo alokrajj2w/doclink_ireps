@@ -3,70 +3,16 @@
 // nothing is hardcoded and nothing is cached across runs, so switching IREPS accounts is picked
 // up the next time this is called. No cookie / token / credential is read or stored.
 
-import { TenderError, SESSION_MSG, log, norm, getBaseUrl, irepsFetch, isLoginResponse, parseHtml } from './tender-core.js';
+import { TenderError, SESSION_MSG, log, getBaseUrl, irepsFetch, isLoginResponse, parseHtml } from './tender-core.js';
+import { HOME_PATH, accountFromHomeDocument } from '../utils/ireps-account.js';
 
-export const HOME_PATH = '/epsn/home/showHome.do';
+// The parsing is shared with the service worker (MA / PO / IC uploads to the ECM need the unit too).
+export { HOME_PATH, ACCOUNT_UNITS, parseWelcomeText, secondaryAccountIds } from '../utils/ireps-account.js';
 export const ACCOUNT_UNVERIFIED_MSG = 'Unable to verify the active IREPS account. Please open IREPS, confirm your account and retry.';
-
-// "A GIRIJA , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-HOSUR (IREPS ID- 833)"
-const WELCOME_RE = /^(.*?)\s*,\s*(.+?)\s*\(\s*IREPS\s*ID\s*[-:]?\s*(\d+)\s*\)\s*$/i;
-
-// The unit label is only taken when the company name itself spells it out:
-// "<...legal suffix>-<UNIT>", e.g. "...PRIVATE LIMITED-HOSUR".
-const UNIT_RE = /\b(?:LIMITED|LTD\.?|LLP|INC\.?|CORPORATION|CORP\.?|COMPANY|CO\.?)\s*-\s*([A-Z][A-Z0-9 .&]{1,40})$/i;
-
-/** Pure parser for the welcome text. Returns null when it does not look like an account line. */
-export function parseWelcomeText(text) {
-  const m = WELCOME_RE.exec(norm(text));
-  if (!m) return null;
-  const companyName = norm(m[2]);
-  const unit = UNIT_RE.exec(companyName)?.[1];
-  return {
-    userName: norm(m[1]),
-    companyName,
-    irepsAccountId: m[3],
-    operatingUnit: unit ? norm(unit).toUpperCase() : null,
-  };
-}
-
-/** Secondary evidence: account ids that the page's own scripts / links carry. */
-export function secondaryAccountIds(html) {
-  const ids = new Set();
-  for (const re of [/reqMod\s*:\s*["']SwitchUser["']\s*,\s*accountId\s*:\s*['"](\d+)['"]/gi, /viewAccountAction\.do\?accountId=(\d+)/gi, /useracctName\s*=\s*['"](\d+)['"]/gi]) {
-    for (const m of html.matchAll(re)) ids.add(m[1]);
-  }
-  return [...ids];
-}
 
 /** Parse an already-fetched home-page HTML document into an account context. */
 export function accountFromHomeHtml(html) {
-  const doc = parseHtml(html);
-  const labels = [...doc.querySelectorAll('.welcomeLabel')].map((e) => norm(e.textContent)).filter(Boolean);
-  let parsed = null;
-  for (const t of labels) {
-    parsed = parseWelcomeText(t);
-    if (parsed) break;
-  }
-  const secondary = secondaryAccountIds(html);
-  const loggedIn = !!parsed || /log\s*out|sign\s*out/i.test(norm(doc.body?.textContent).slice(0, 400000));
-
-  const ctx = {
-    irepsAccountId: parsed?.irepsAccountId || null,
-    companyName: parsed?.companyName || null,
-    operatingUnit: parsed?.operatingUnit || null,
-    authenticated: loggedIn,
-    verified: false,
-    source: 'ireps_home_page',
-    note: '',
-  };
-  if (!parsed) {
-    ctx.note = 'The IREPS account line was not found on the home page.';
-  } else if (secondary.length && !secondary.includes(parsed.irepsAccountId)) {
-    ctx.note = 'The account id shown on the page disagrees with the id in the page scripts.';
-  } else {
-    ctx.verified = true;
-  }
-  return ctx;
+  return accountFromHomeDocument(parseHtml(html), html);
 }
 
 /**

@@ -12,6 +12,8 @@
  */
 
 import { MESSAGE_TYPES, MA_STAGES, describeError } from "../utils/messages.js";
+import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
+import { SAVE_DESTINATION } from "../services/recon-service.js";
 
 const $ = (id) => document.getElementById(id);
 const ALL_RAILWAYS = "-1";
@@ -176,6 +178,10 @@ function chipFor(item) {
   }
   chip.className = `chip chip-${item.status}`;
   chip.textContent = STATUS_LABEL[item.status] || item.status;
+  if (item.status === "completed" && item.ecm) {
+    chip.textContent = item.ecm.status === ECM_OUTCOME.FAILED ? "Saved locally" : "In ECM";
+    chip.title = describeEcmOutcome(item.ecm);
+  }
   if (item.status === "failed" && item.error) {
     const described = describeError(item.error.code, { status: item.error.status, detail: item.error.detail });
     chip.title = `${described.title}: ${described.message}`;
@@ -281,7 +287,9 @@ function applyFilter() {
 function updateSelectionUi() {
   const n = selected.size;
   const busy = currentState && (currentState.status === "downloading" || currentState.status === "searching");
-  el.btnDownloadSelected.textContent = n ? `Download Selected (${n})` : "Download Selected";
+  const to = ctx && ctx.getDestination && ctx.getDestination() === SAVE_DESTINATION.RECON ? " to ECM" : "";
+  el.btnDownloadSelected.textContent = n ? `Download Selected (${n})${to}` : `Download Selected${to}`;
+  el.btnDownloadAll.textContent = `Download All${to}`;
   el.btnDownloadSelected.disabled = busy || n === 0;
   el.btnDownloadAll.disabled = busy || renderedIds.length === 0;
   const visible = visibleIds();
@@ -305,10 +313,13 @@ function renderDownloads(state) {
     el.downloadText.textContent = `${d.downloading} downloading · ${d.queued} queued · ${d.completed} completed · ${d.failed} failed`;
   } else {
     el.downloadTitle.textContent = d.failed === 0 ? `✓ ${d.completed} MA cop${d.completed === 1 ? "y" : "ies"} downloaded` : `${d.completed} downloaded, ${d.failed} failed`;
-    el.downloadText.textContent = d.failed === 0 ? "All selected MA PDFs were saved." : "Hover a Failed chip to see why. Failed MAs can be retried.";
+    const ecm = summariseEcm(d.items);
+    el.downloadText.textContent = [d.failed === 0 ? "All selected MA PDFs were saved." : "Hover a Failed chip to see why. Failed MAs can be retried.", ecm].filter(Boolean).join("\n");
   }
-  const folders = new Set((d.items || []).filter((i) => i.status === "completed" && i.path).map((i) => i.path.split("/").slice(0, -1).join("/")));
-  el.downloadFolder.textContent = folders.size === 1 ? `Downloads/${Array.from(folders)[0]}/` : "Downloads/DocLink/IREPS/MA/<MA date>/";
+  // only files saved on this computer (an MA stored in the ECM has no local copy)
+  const local = (d.items || []).filter((i) => i.status === "completed" && i.path && (!i.ecm || i.ecm.status === ECM_OUTCOME.FAILED));
+  const folders = new Set(local.map((i) => i.path.split("/").slice(0, -1).join("/")));
+  el.downloadFolder.textContent = folders.size === 1 ? `Downloads/${Array.from(folders)[0]}/` : local.length ? "Downloads/DocLink/IREPS/MA/<MA date>/" : "";
   const first = (d.items || []).find((i) => i.status === "completed" && i.downloadId !== null && i.downloadId !== undefined);
   el.btnShowFolder.hidden = !first;
   el.btnShowFolder.dataset.downloadId = first ? String(first.downloadId) : "";
@@ -430,7 +441,7 @@ async function startSearch(event) {
 
 async function startDownload(ids) {
   hideError();
-  const response = await ctx.send(MESSAGE_TYPES.MA_DOWNLOAD, { ids });
+  const response = await ctx.send(MESSAGE_TYPES.MA_DOWNLOAD, { ids, destination: ctx.getDestination() });
   if (!response) showError(describeError("NO_BACKGROUND_RESPONSE", { detail: "no reply to the MA download request" }));
   else if (response.started === false) showError(response.error || describeError("MA_BUSY"));
   else {
@@ -454,6 +465,11 @@ async function newSearch() {
 /* -------------------------------------------------------------------------- */
 /* Public API                                                                 */
 /* -------------------------------------------------------------------------- */
+
+/** Save to changed: the download buttons say where the MAs go. */
+export function refreshMaDestination() {
+  if (ctx) updateSelectionUi();
+}
 
 export function initMa(context) {
   ctx = context;

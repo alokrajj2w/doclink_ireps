@@ -26,6 +26,7 @@ import { SEARCH_PO_CRITERIA, errorCodesFor } from "../search-po/search-po-api.js
 import { searchIrepsDocuments, SEARCH_PO_FLOW_STAGES } from "../search-po/search-po-service.js";
 import { downloadIrepsDocuments, downloadIrepsDocument, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
 import { buildMaDownloadPath } from "../../utils/filename.js";
+import { ECM_KIND } from "../ecm-service.js";
 import { parseMaSearchResults, maDateKey } from "./ma-parser.js";
 
 /** Controlled error codes for the MA flow (mapped to UI text in utils/messages.js). */
@@ -149,7 +150,8 @@ export function maDownloadItems(records) {
     url: r.maPdfUrl || null,
     path: buildMaDownloadPath(r),
     label: `MA ${r.maNo || "?"} (PO ${r.poNo || "?"})`,
-    meta: { maNo: r.maNo, poNo: r.poNo, maDate: r.maDate, railwayUnit: r.railwayUnit }
+    meta: { maNo: r.maNo, poNo: r.poNo, maDate: r.maDate, railwayUnit: r.railwayUnit },
+    ecm: { kind: ECM_KIND.MODIFICATION_ADVISE, fields: { customer_po_number: r.poNo, modification_advise_number: r.maNo } }
   }));
 }
 

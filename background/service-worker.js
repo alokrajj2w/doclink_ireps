@@ -58,6 +58,8 @@ import { buildCrnExport } from "../services/crn/crn-export.js";
 import { buildRnoteExport } from "../services/rnote/rnote-export.js";
 import { searchMa, downloadMaPdfs, MA_ERROR, MA_FLOW_STAGES } from "../services/ma/ma-service.js";
 import { downloadBytes } from "../services/download-service.js";
+import { saveToEcmOrLocally } from "../services/ecm-service.js";
+import { HOME_PATH } from "../utils/ireps-account.js";
 import { downloadPo, PO_ERROR, PO_FLOW_STAGES } from "../services/po/po-service.js";
 import { downloadInspectionCertificates, IC_ERROR, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
 import { buildDocumentExportDownloadPath, buildDocumentExportFilename, buildBillStatusExportDownloadPath, buildBillStatusExportFilename } from "../utils/filename.js";
@@ -230,6 +232,68 @@ async function parseIcInOffscreen(html, poNo, options = {}) {
     }
     return response.result;
   });
+}
+
+/**
+ * The signed-in IREPS account (home page), parsed in the offscreen document.
+ * @returns {Promise<{ irepsAccountId: string|null, operatingUnit: string|null, verified: boolean, note?: string }>}
+ */
+async function parseAccountInOffscreen(html) {
+  return withOffscreen(async () => {
+    const response = await chrome.runtime.sendMessage({ target: TARGETS.OFFSCREEN, type: MESSAGE_TYPES.PARSE_IREPS_ACCOUNT, html });
+    if (!response || !response.ok) throw new Error(response && response.error ? response.error : "Account parser returned no result");
+    return response.result;
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Save to: ECM / S3 (IC, PO, MA)                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The account whose unit's ECM folder gets this run's documents, or null when it cannot be
+ * verified (the documents are then saved locally - a site is never guessed).
+ */
+async function irepsAccountForEcm() {
+  try {
+    await loadIrepsConfig();
+    const response = await fetch(`${IREPS_CONFIG.baseUrl}${HOME_PATH}`, { credentials: "include", redirect: "follow" });
+    if (!response.ok) {
+      logger.warn("ECM: IREPS home page not available; documents will be saved locally", { status: response.status });
+      return null;
+    }
+    // a login / session-expired page has no account line, so it comes back unverified
+    const account = await parseAccountInOffscreen(await response.text());
+    if (!account.verified) {
+      logger.warn(`ECM: IREPS account not verified (${account.note}); documents will be saved locally`);
+      return null;
+    }
+    logger.info(`ECM: IREPS account ${account.irepsAccountId} (${account.operatingUnit || "unit not stated"})`);
+    return { irepsAccountId: account.irepsAccountId, operatingUnit: account.operatingUnit };
+  } catch (error) {
+    logger.warn("ECM: could not read the IREPS account; documents will be saved locally", error);
+    return null;
+  }
+}
+
+/**
+ * The saveFile hook for a document run (services/search-po/document-downloader.js), or
+ * undefined for the default local save. Under "ECM / S3" each item that says how it is
+ * filed (item.ecm) goes to the ECM, and is saved locally instead when that fails.
+ */
+async function documentSaveFile(destination) {
+  if (destination !== SAVE_DESTINATION.RECON) return undefined;
+  const account = await irepsAccountForEcm();
+  return async (bytes, path, item) => {
+    const saveLocally = () => downloadBytes(bytes, { path, mimeType: "application/pdf" });
+    if (!item || !item.ecm) return saveLocally();
+    const filename = path.split("/").pop();
+    const { ecm, local } = await saveToEcmOrLocally(
+      { kind: item.ecm.kind, fields: item.ecm.fields, title: item.ecm.title, bytes, filename, account: account || {} },
+      saveLocally
+    );
+    return local ? { ...local, ecm } : { filename, downloadId: null, ecm };
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -862,8 +926,9 @@ async function startMaSearch(rawOptions) {
 
 /**
  * @param {string[]|"all"} selection   record ids to download, or "all"
+ * @param {string} [destination]        SAVE_DESTINATION ("recon" = ECM / S3)
  */
-async function startMaDownload(selection) {
+async function startMaDownload(selection, destination) {
   await restoreMaState();
   if (maRunning) return { started: false, error: describeError("MA_BUSY") };
   if (!Array.isArray(maState.records) || maState.records.length === 0) return { started: false, error: describeError(MA_ERROR.NOT_FOUND, { detail: "no MA list loaded" }) };
@@ -878,6 +943,7 @@ async function startMaDownload(selection) {
       await setMaState({ status: "downloading", stage: MA_STAGES.DOWNLOADING.id, message: `Downloading ${records.length} MA cop${records.length === 1 ? "y" : "ies"}...`, error: null });
       broadcast(MESSAGE_TYPES.MA_PROGRESS, { stage: MA_STAGES.DOWNLOADING.id, message: maState.message, status: "downloading" });
       const summary = await downloadMaPdfs(records, {
+        saveFile: await documentSaveFile(sanitiseDestination(destination)),
         onProgress: (snapshot) => {
           maState = { ...maState, downloads: snapshot, updatedAt: Date.now() };
           broadcast(MESSAGE_TYPES.MA_DOWNLOAD_PROGRESS, { downloads: snapshot });
@@ -987,7 +1053,7 @@ function sanitisePoNumber(raw) {
   return typeof raw === "string" ? raw.trim() : "";
 }
 
-async function startPoDownload(rawPoNo) {
+async function startPoDownload(rawPoNo, destination) {
   if (poRunning) return { started: false, error: describeError("PO_BUSY") };
   const poNo = sanitisePoNumber(rawPoNo);
   if (!poNo) return { started: false, error: describeError("IREPS_INVALID_REQUEST", { detail: "Please enter a PO Number." }) };
@@ -999,6 +1065,7 @@ async function startPoDownload(rawPoNo) {
       await setPoState({ status: "running", stage: PO_STAGES.CHECKING_SESSION.id, message: PO_STAGES.CHECKING_SESSION.label, poNumber: poNo, error: null, result: undefined });
       broadcast(MESSAGE_TYPES.PO_PROGRESS, { poNumber: poNo, stage: PO_STAGES.CHECKING_SESSION.id, message: PO_STAGES.CHECKING_SESSION.label });
       const result = await downloadPo(poNo, {
+        saveFile: await documentSaveFile(sanitiseDestination(destination)),
         parseHtml: (html, options) => parseSearchPoInOffscreen(html, { ...options, criteria: SEARCH_PO_CRITERIA.PO }),
         onProgress: (stage) => {
           const s = PO_STAGE_FOR_PROGRESS[stage];
@@ -1029,7 +1096,7 @@ async function startPoDownload(rawPoNo) {
   return { started: true };
 }
 
-async function startIcDownload(rawPoNo) {
+async function startIcDownload(rawPoNo, destination) {
   if (icRunning) return { started: false, error: describeError("IC_BUSY") };
   const poNo = sanitisePoNumber(rawPoNo);
   if (!poNo) return { started: false, error: describeError("IREPS_INVALID_REQUEST", { detail: "Please enter a PO Number." }) };
@@ -1042,6 +1109,7 @@ async function startIcDownload(rawPoNo) {
       broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: IC_STAGES.CHECKING_SESSION.id, message: IC_STAGES.CHECKING_SESSION.label, status: "searching" });
       let announcedCount = false;
       const result = await downloadInspectionCertificates(poNo, {
+        saveFile: await documentSaveFile(sanitiseDestination(destination)),
         parseHtml: (html, options) => parseIcInOffscreen(html, poNo, options),
         onProgress: (stage) => {
           const s = IC_STAGE_FOR_PROGRESS[stage];
@@ -1144,7 +1212,7 @@ const handlers = {
 
   // MA copies
   [MESSAGE_TYPES.MA_SEARCH]: (message) => startMaSearch(message.options),
-  [MESSAGE_TYPES.MA_DOWNLOAD]: (message) => startMaDownload(message.ids),
+  [MESSAGE_TYPES.MA_DOWNLOAD]: (message) => startMaDownload(message.ids, message.destination),
   [MESSAGE_TYPES.GET_MA_STATE]: async () => {
     await restoreMaState();
     return publicMaState();
@@ -1152,9 +1220,9 @@ const handlers = {
   [MESSAGE_TYPES.MA_RESET]: () => resetMaState(),
 
   // PO / Inspection Certificate (one PO number, two independent downloads)
-  [MESSAGE_TYPES.PO_DOWNLOAD]: (message) => startPoDownload(message.poNo),
+  [MESSAGE_TYPES.PO_DOWNLOAD]: (message) => startPoDownload(message.poNo, message.destination),
   [MESSAGE_TYPES.GET_PO_STATE]: () => ({ ...poState, running: poRunning }),
-  [MESSAGE_TYPES.IC_DOWNLOAD]: (message) => startIcDownload(message.poNo),
+  [MESSAGE_TYPES.IC_DOWNLOAD]: (message) => startIcDownload(message.poNo, message.destination),
   [MESSAGE_TYPES.GET_IC_STATE]: () => ({ ...icState, running: icRunning })
 };
 

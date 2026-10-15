@@ -166,6 +166,8 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
     eq(r1.callId, "6038184070");
     eq(r1.poSerial, "001");
     eq(r1.icPdfUrl, `${BASE}/ireps/etender/ct/tpi/ic/052026/3480517.pdf`);
+    eq(r1.icNumber, "3480517", "IC number = the IC PDF's file name (not the Call Id)");
+    eq(r2.icNumber, "2975517");
     eq(r1.id, "ic-6038184070");
     eq(r2.callId, "3778184071");
     eq(r2.poSerial, "002");
@@ -246,6 +248,24 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
     eq(items[0].path, "DocLink/IREPS/IC/27253922100240/IC_27253922100240_001_6038184070.pdf");
     eq(items[0].url, records[0].icPdfUrl);
     eq(items[0].label, "IC 6038184070 (PO Sr. 001)");
+    eq(items[0].ecm.kind, "inspectionCertificate");
+    eq(JSON.stringify(items[0].ecm.fields), JSON.stringify({ ic_number: "3480517", customer_po_number: "27253922100240", ic_date: records[0].icDate }), "ECM filing: IC number, PO number, IC date");
+  });
+
+  await test("downloadInspectionCertificates: an ECM save hook gets each item; its outcome lands on the item", async () => {
+    const { fetchImpl: searchFetch } = fakeIc({ listPage, onSearch: (b, t, respond) => respond(resultsPage) });
+    const fetch = async (url, init) => ((init && init.method) === "POST" ? searchFetch(url, init) : new Response(fakePdfBytes(), { status: 200, headers: { "content-type": "application/pdf" } }));
+    const saveFile = async (bytes, path, item) => ({
+      filename: path.split("/").pop(),
+      downloadId: item.ecm.fields.ic_number === "2975517" ? 9 : null,
+      ecm: item.ecm.fields.ic_number === "2975517" ? { status: "failed", code: "ECM_UNAVAILABLE" } : { status: "stored", site: "hosur", uid: `u-${item.ecm.fields.ic_number}` }
+    });
+    const result = await downloadInspectionCertificates("27253922100240", { fetch, parseHtml, saveFile, concurrency: 1 });
+    eq(result.downloads.completed, 4);
+    const byIc = Object.fromEntries(result.downloads.items.map((i) => [i.meta.icNumber, i]));
+    eq(byIc["3480517"].ecm.uid, "u-3480517");
+    eq(byIc["2975517"].ecm.status, "failed", "an ECM failure is kept on the item (it was saved locally)");
+    eq(byIc["2975517"].downloadId, 9);
   });
 
   await test("downloadInspectionCertificates: downloads every issued IC (never only the first), limited concurrency, per-item status", async () => {
