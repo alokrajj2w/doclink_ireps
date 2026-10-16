@@ -15,6 +15,8 @@
  *                                MA    services/ma/ma-parser.js       (searchPO.do MA results)
  *   PARSE_IC_RESULTS          -> services/inspection-certificate/ic-parser.js
  *                                (vendorInspectionCallList.do results, a different endpoint)
+ *   PARSE_IREPS_ACCOUNT       -> utils/ireps-account.js (home page: which IREPS account,
+ *                                and so which ECM unit, is signed in)
  */
 
 import { parseBillStatus } from "../services/bill-parser.js";
@@ -24,6 +26,7 @@ import { parseRnoteSearchResults } from "../services/rnote/rnote-parser.js";
 import { parseMaSearchResults } from "../services/ma/ma-parser.js";
 import { parseIcSearchResults } from "../services/inspection-certificate/ic-parser.js";
 import { SEARCH_PO_CRITERIA } from "../services/search-po/search-po-api.js";
+import { accountFromHomeDocument } from "../utils/ireps-account.js";
 
 const SEARCH_PO_PARSERS = {
   [SEARCH_PO_CRITERIA.PO]: parsePoSearchResults,
@@ -75,6 +78,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({ ok: false, error: error && error.message ? error.message : String(error) });
       });
     return true;
+  }
+
+  if (message.type === MESSAGE_TYPES.PARSE_IREPS_ACCOUNT) {
+    try {
+      const doc = new DOMParser().parseFromString(message.html || "", "text/html");
+      sendResponse({ ok: true, result: accountFromHomeDocument(doc, message.html || "") });
+    } catch (error) {
+      logger.error("Account parser failed", error);
+      sendResponse({ ok: false, error: error && error.message ? error.message : String(error) });
+    }
+    return false;
   }
 
   if (message.type === MESSAGE_TYPES.PARSE_IC_RESULTS) {

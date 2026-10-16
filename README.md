@@ -1,7 +1,12 @@
 # DocLink — IREPS Document Automation (Chrome Extension, Manifest V3)
 
 DocLink is a Chrome extension for users of the Indian Railways IREPS portal.
-Version 1.1.0 implements two independent downloads:
+Version 1.2.0 implements the downloads below. One **Save to: Local |
+ECM / S3** switch at the top of the panel applies to every download. Local saves
+under `Downloads/DocLink/`. ECM / S3 sends Bill Status, CRN and R-NOTE to the
+Recon Engine, which stores them in S3 and loads them into reconciliation, and
+files IC, PO, MA and tender documents in the ECM folder of the signed-in IREPS
+account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
 
 * **Download IREPS Bill Status** (since 1.0.0): retrieves the Bill Status page
   from the user's already-authenticated IREPS browser session, extracts the
@@ -85,7 +90,7 @@ corrected, reconciled or inferred.
 | Flow | `services/bill-status-service.js` | `fetchBillStatus(options)`: page → session check → token → Show Results → parse → validate |
 | Session | `services/session-service.js` | Content-based login / session-expired / Bill Status page detection |
 | Parsing | `services/bill-parser.js` | Label-driven extraction of every `table#table_id` block (plus legacy table fallback) → structured bills + printable HTML |
-| Recon | `services/recon-service.js` | Optional sender (disabled by default); never affects the download |
+| Recon | `services/recon-service.js` | "Save to: Recon (S3)": POSTs the export file to the Recon Engine's `/api/documents` with the user's Recon sign-in cookie; maps its answers to `RECON_*` errors (section 15) |
 | Bill Status export | `services/bill-status-export.js` | Bill Status columns (`BILL_FIELDS` order) handed to the shared table exporter → .xlsx |
 | PDF | `services/pdf-service.js` | Dependency-free PDF writer (Helvetica, wrapping, page breaks, headers/footers); used by the preview's "Download PDF" |
 | Download | `services/download-service.js` | `chrome.downloads` with `uniquify` conflict handling |
@@ -132,7 +137,8 @@ doclink-extension/
 │   ├── popup.css
 │   ├── popup.js
 │   ├── popup-documents.js
-│   └── popup-ma.js
+│   ├── popup-ma.js
+│   └── popup-recon-auth.js   Recon Engine sign-in page + RECON pill (login 2)
 ├── services/
 │   ├── search-po/
 │   │   ├── search-po-api.js  search-po-form.js  search-po-table.js  search-po-service.js  search-po-export.js  document-downloader.js
@@ -148,6 +154,8 @@ doclink-extension/
 │   ├── session-service.js
 │   ├── bill-parser.js
 │   ├── recon-service.js
+│   ├── recon-auth.js         Recon Engine sign-in: password + Okta (login 2)
+│   ├── ecm-service.js
 │   ├── pdf-service.js
 │   ├── download-service.js
 │   └── upload-service.js
@@ -185,7 +193,10 @@ doclink-extension/
 | `storage` | `chrome.storage.local` for non-sensitive metadata (last download time, filename, record count); `chrome.storage.session` (memory only) for job state and the last parsed result used by the preview |
 | `tabs` | Open IREPS / the preview page in a new tab |
 | `offscreen` | Create an invisible offscreen document so the parser can use `DOMParser`; MV3 service workers have no DOM |
+| `identity` | Only for **Sign in with Okta** to the Recon Engine (section 17): `chrome.identity.launchWebAuthFlow` opens the Okta sign-in window and returns to `https://<extension id>.chromiumapp.org/okta` |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both declared permanently) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
+
+| host `http://localhost:8000/*` (the Recon Engine; replace/add the deployed Recon URL) | Only for **Save to: ECM / S3**: the Recon Engine sign-in (section 17) and the uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
 
 Not requested: `cookies`, `<all_urls>`, `history`, `bookmarks`, `webRequest`,
 `debugger`. The extension never reads cookie values.
@@ -516,8 +527,13 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
 
 ## 11. Security notes
 
-* No credential, cookie, token or session id is read, stored, logged or put in
-  a URL. The Struts TOKEN is held in memory only for the duration of one
+* No IREPS credential, cookie, token or session id is read, stored, logged or
+  put in a URL. The one credential DocLink handles is the Recon Engine
+  password typed on its sign-in page (section 17): it is sent once to
+  `reconBaseUrl` and dropped - never stored, logged or read back. The Recon
+  session cookie that answer sets is httponly and stays in Chrome's own
+  cookie jar; DocLink never reads it. The Okta client secret is never in the
+  extension: the Recon backend exchanges Okta's code. The Struts TOKEN is held in memory only for the duration of one
   request. The logger (`utils/logger.js`) additionally redacts anything that
   looks like `Cookie:`, `JSESSIONID=`, `Authorization:`, `TOKEN=` or passwords.
 * Network calls are restricted to `IREPS_CONFIG.baseUrl`; `buildIrepsUrl`
@@ -560,7 +576,8 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
   portal; there is no lighter IREPS endpoint); the result is cached for 20 s.
 * Recovery Details is stored as the complete text ("GST TDS DEDUCTION: …\n…");
   structured deduction categories are not extracted yet.
-* Recon Engine sending is a disabled stub (`services/recon-service.js`).
+* Save to ECM / S3 needs the Recon Engine sign-in (section 17). Okta sign-in
+  works only once DocLink's redirect is registered in the Okta app.
 
 ## 14. Future upload implementation (Phase 2)
 
@@ -569,8 +586,9 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
 (SharePoint / OneDrive / Local), Select Document and Document Type and posts
 `UPLOAD_DOCUMENT` to the service worker. Implementing SharePoint / OneDrive
 access and the IREPS upload workflow touches only that module (plus any new
-permissions it requires). Scheduled downloads and automatic login are explicitly out of scope; Recon
-Engine sending is available as an optional, disabled-by-default step.
+permissions it requires). Scheduled downloads and automatic login are explicitly out of scope. Saving
+IREPS exports to the Recon Engine (S3) is a download destination, not part of
+this upload view (section 15).
 
 ---
 
@@ -814,8 +832,10 @@ download.
 
 The PO Search flows follow the same rules as Bill Status: no cookie,
 JSESSIONID or token is read, stored, logged or sent anywhere. The Struts
-token exists only in local variables inside `searchIrepsDocuments()`. The
-Recon Engine sender is not called for CRN or R-NOTE data.
+token exists only in local variables inside `searchIrepsDocuments()`. With
+Save to: Recon (S3), only the export file itself (the same .xlsx a local
+download would save) is sent to the Recon Engine - never IREPS HTML, cookies
+or tokens.
 
 ---
 
@@ -903,6 +923,165 @@ and grouped in a folder per MA date.
 | `IREPS_MA_INVALID_PDF` | IREPS returned something that is not a PDF (and not a login page) |
 | `IREPS_SESSION_EXPIRED` | login / expired page at any step, including a PDF request |
 
+---
+
+## 15. Save to: this computer or the Recon Engine (S3)
+
+One **Save to** switch at the top right of the main panel applies to the
+Bill Status, CRN and R-NOTE downloads (remembered in `chrome.storage.local`):
+
+| Choice | What happens to the export file |
+|---|---|
+| **Local** (default) | `chrome.downloads` into `Downloads/DocLink/IREPS/` (Bill Status), `.../CRN/`, `.../RNOTE/` - unchanged behaviour |
+| **Recon (S3)** | `POST {reconBaseUrl}/api/documents` (multipart `customer_id`, `doc_type`, `file`) on the Recon Engine (`recon-engine` repo, `backend/app/routes.py`) |
+
+The Recon Engine stores the file in its managed storage - S3 when it runs
+with `STORAGE_BACKEND=s3` - one directory per document type, content-addressed
+(identical bytes are stored once):
+
+```
+s3://<S3_BRONZE_BUCKET>/<S3_PREFIX>bronze/<customer>/bill_status/<sha256>.xlsx
+s3://<S3_BRONZE_BUCKET>/<S3_PREFIX>bronze/<customer>/rnote/<sha256>.xlsx
+s3://<S3_BRONZE_BUCKET>/<S3_PREFIX>bronze/<customer>/crn/<sha256>.xlsx
+```
+
+and then parses it into its reconciliation data (bills / lineage), exactly
+like a manual upload. The result panel shows the stored `s3://` path and the
+load counts ("Loaded into Recon: 12 new, 3 updated, 40 unchanged"). A Recon
+upload is always Excel (the Recon parsers read .xlsx only), so the CRN /
+R-NOTE format choice is locked while Recon (S3) is selected.
+
+**Sign-in.** The upload carries the Recon Engine's sign-in cookie, made on
+DocLink's own *Sign in to Recon Engine* page (section 17). DocLink asks for it
+before the run; if the session ends mid-run the card shows *Recon Engine
+sign-in required* with a **Sign in to Recon** button.
+
+**Settings** (`config.json`; reload DocLink after editing):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `reconBaseUrl` | `http://localhost:8000` | Recon Engine API origin. Its origin must also be in `manifest.json` `host_permissions` - add the deployed Recon URL there |
+| `reconCustomerId` | `default` | Recon customer key the files are filed under |
+| `reconAppUrl` | `reconBaseUrl` | The Recon Engine web app (e.g. the Vite dev UI on `:5173`); no longer needed for sign-in |
+| `okta` | see section 17 | Okta sign-in to the Recon Engine: `enabled`, `issuer`, `clientId`, `redirectPath` |
+
+**Errors** (`utils/messages.js`):
+
+| Code | Meaning |
+|---|---|
+| `RECON_NOT_CONFIGURED` | `reconBaseUrl` empty/invalid, or its origin missing from `host_permissions`; nothing sent |
+| `RECON_AUTH_REQUIRED` | HTTP 401 - not signed in to the Recon Engine; nothing saved |
+| `RECON_UNAVAILABLE` | network error or no answer within 2 minutes |
+| `RECON_REJECTED` | any other non-2xx (e.g. unknown customer); the Recon Engine's reason is shown |
+| `RECON_NOT_INGESTED` | HTTP 422 - the file **is stored** in S3 but could not be loaded; the parse error is shown |
+
+Tests: `test/recon-tests.js` (fake fetch; part of `test/run-tests.html`).
+
+## 16. Save to: ECM / S3 - IC, PO, MA and tender documents in the ECM
+
+The same switch (shown as **ECM / S3**, stored value `recon`) files the
+document PDFs in the ECM (Nuxeo) instead of Downloads, as the spec
+"TSG India Doculink ECM specifications.xlsx" › "ECM - Download speci-v1" asks.
+DocLink posts each one to the Recon Engine's ECM gateway with the same
+settings, sign-in cookie and host permission as section 15:
+
+`POST {reconBaseUrl}/api/ecm/documents`, multipart `kind`, `file`, `title`
+(tender documents), `fields` (JSON) and the routing `ireps_account_id` +
+`operating_unit` (`services/ecm-service.js`; gateway: recon-engine
+`backend/ECM`, mounted at `/api/ecm`).
+
+| Document | `kind` | `fields` |
+|---|---|---|
+| Inspection Certificate | `inspectionCertificate` | `ic_number` (the IC PDF's file name, e.g. `3480517`), `customer_po_number`, `ic_date` |
+| PO | `poCopy` | `customer_po_number` |
+| Modification Advice | `modificationAdvise` | `customer_po_number`, `modification_advise_number` |
+| NIT + attached documents | `nit` | `tender_number`, `tender_date` (the tender's closing / "Due Date/Time"; letters found by date look it up once per tender, correspondence reads it from its page; blank when IREPS does not show it) |
+| Corrigendum | `extension` | same |
+| Negotiation letter | `nbsp` | same |
+| Counter offer | `co` | same |
+| LOA (Advance Acceptance Letter) | `loi` | same + `loi_number` (letter id), `loi_date` (published) |
+| Correspondence | `crp` | same |
+
+* **Which folder.** The IREPS account is read from the home page's welcome
+  line (`utils/ireps-account.js`, parsed in the offscreen document for the
+  service worker and in the side panel for tenders). Account `833` is HOSUR
+  and `60828` is ROHTAK; the gateway maps them to the unit's ECM folder. An
+  account that cannot be verified is never guessed: the document is saved
+  locally.
+* **Nothing is lost.** When the ECM does not take a document (not signed in,
+  not configured, refused, unavailable) it is saved locally as with Local, and
+  the row says why (`ECM_*` codes in `utils/messages.js`).
+* **Duplicates.** The gateway stores a document once; a re-run answers
+  "Already in ECM".
+* **Stays local:** My Offer (no ECM type), the tender `download_manifest.json`
+  (it records each document's ECM uid), and the original `.html` kept beside a
+  print-ready letter's PDF rendering.
+
+Tests: `test/ecm-tests.js` (browser suite), the ECM cases in
+`test/ic-tests.js` / `ma-tests.js` / `po-tests.js`, and the "ECM:" tests in
+`tender/tests/run-tests.mjs`.
+
+## 17. Two logins: IREPS and the Recon Engine
+
+DocLink works with two separate logins:
+
+| | Login 1: IREPS | Login 2: Recon Engine |
+|---|---|---|
+| Who | The vendor's IREPS account | Your joulestowatts Recon Engine account (password) or Okta |
+| How | In the IREPS tab, with the e-sign / security key, as always | DocLink's **Sign in to Recon Engine** page |
+| Needed for | Everything (reading IREPS) | Only **Save to: ECM / S3** |
+| Header | `IREPS` pill | `RECON` pill (shown while ECM / S3 is selected; click to sign out) |
+| DocLink handles | Nothing - it only checks the session | The typed password, sent once to the Recon Engine |
+
+**When the page appears.** Picking **ECM / S3**, or starting any download
+(Bill Status, CRN, R-NOTE, MA, PO, IC, tender) while it is picked, asks the
+Recon Engine who is signed in (`GET /api/auth/me`). When nobody is, the sign-in
+page covers the panel (a running job is untouched). **Use Local instead**
+switches Save to back to Local and the run saves locally.
+
+**Password.** Any Recon Engine user (`scripts/create_user.py` in the
+recon-engine repo) signs in with `POST /api/auth/login`; wrong password,
+no role and the 5-minute lockout after 8 failures each have their own message.
+
+**Okta.** **Sign in with Okta** is offered when `config.json` `okta` is set
+and the Recon backend has Okta configured (`GET /api/auth/providers`):
+
+1. DocLink asks the backend for the authorize URL
+   (`GET /api/auth/okta/extension/start?redirect_uri=https://<extension id>.chromiumapp.org/okta`);
+   the backend keeps state, nonce and PKCE verifier in the session cookie.
+2. It opens it only if it is the Okta app `config.json` names (`issuer`,
+   `clientId`), with `chrome.identity.launchWebAuthFlow`.
+3. Okta returns `?code=&state=` to the extension redirect; DocLink hands them
+   to `GET /api/auth/okta/extension/finish`, where the backend exchanges the
+   code with its client secret and opens the same session as a password
+   sign-in.
+
+```json
+"okta": {
+  "enabled": true,
+  "issuer": "https://wabtec.oktapreview.com/oauth2/default",
+  "clientId": "0oa2uq0thn3v0mHWG0h8",
+  "redirectPath": "okta"
+}
+```
+
+**Okta setup (once per extension id).** Add
+`https://<extension id>.chromiumapp.org/okta` as a *Sign-in redirect URI* of
+the Recon Engine Okta app. The sign-in page shows the exact value under
+*Okta setup* (with Copy). An unpacked extension's id depends on the folder it
+was loaded from, so a new folder means a new redirect to register. Until it
+is registered Okta refuses the request and DocLink says so
+(`OKTA_REDIRECT_NOT_REGISTERED`); password sign-in keeps working. The client
+secret stays in the Recon backend (`OKTA_CLIENT_SECRET`), never here.
+
+**Errors** (`utils/messages.js`): `RECON_SIGNIN_INVALID`,
+`RECON_SIGNIN_NO_ACCESS`, `RECON_SIGNIN_LOCKED`, `RECON_SIGNIN_UNAVAILABLE`,
+`OKTA_NOT_CONFIGURED`, `OKTA_CANCELLED`, `OKTA_REDIRECT_NOT_REGISTERED`,
+`OKTA_FAILED`, `OKTA_NO_ACCESS`, `OKTA_INACTIVE`.
+
+Code: `services/recon-auth.js` (requests), `popup/popup-recon-auth.js` (page
+and pill). Tests: `test/recon-auth-tests.js` (browser suite).
+
 
 ---
 
@@ -934,6 +1113,11 @@ Unverified against the live portal: the exact response of `viewpubIndltr.do` (it
 
 Both live in the side panel under **Download PO / IC → "Download POs by date / ICs from notifications"**.
 They are download-only (no inspection call is submitted, approved, withdrawn or revalidated).
+The **Save to** switch applies to both, as to a single PO / IC download: under **ECM / S3**
+each PO is filed as `poCopy` (`customer_po_number`) and each IC as `inspectionCertificate`
+(`ic_number` from the PDF name, `customer_po_number`, `ic_date`), with the same Recon sign-in
+and the same local fallback when the ECM does not take a document (section 16). A retry uses
+the switch's current choice. The IC manifest records each document's ECM outcome.
 
 ### Download POs by PO Date
 `POST /epsn/searchPO.do searchParam=showPage` (token, session check) →

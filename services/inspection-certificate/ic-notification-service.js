@@ -28,7 +28,8 @@ import { buildIcDownloadPath } from "../../utils/filename.js";
 import { loadIcListPage, submitIcSearch, buildIcSearchRequest, buildIcPageRequest, extractIcPageCount, IC_ERROR } from "./ic-api.js";
 import { extractIcForm } from "./ic-form.js";
 import { validateIcSession } from "./ic-service.js";
-import { parseIcSearchResults } from "./ic-parser.js";
+import { parseIcSearchResults, icNumberFromUrl } from "./ic-parser.js";
+import { ECM_KIND } from "../ecm-service.js";
 
 export const IC_NOTIF_STATUS = Object.freeze({ ...DOCUMENT_DOWNLOAD_STATUS, SKIPPED: "skipped", DUPLICATE: "duplicate" });
 
@@ -155,6 +156,7 @@ function applySnapshot(state, snapshot) {
     item.status = s.status;
     item.filename = s.filename;
     item.downloadId = s.downloadId;
+    item.ecm = s.ecm || null;
     item.error = s.error;
   }
   if (snapshot.sessionExpired) state.sessionExpired = true;
@@ -190,6 +192,7 @@ function addRows(state, note, rows) {
       poNo: row.poNo,
       poSerial: row.poSerial,
       callId: row.callId,
+      icNumber: row.icNumber || icNumberFromUrl(url),
       icDate: row.icDate || null,
       refIdMatchesCallId: row.refIdMatchesCallId === true,
       url,
@@ -197,6 +200,7 @@ function addRows(state, note, rows) {
       status: url ? IC_NOTIF_STATUS.QUEUED : IC_NOTIF_STATUS.SKIPPED,
       filename: null,
       downloadId: null,
+      ecm: null,
       error: url ? null : { code: IC_ERROR.LINK_NOT_FOUND, detail: "the matching row has no IC PDF link" }
     };
     // Collision-safe path: the same Call Id with a different document gets a numeric suffix.
@@ -253,7 +257,14 @@ async function downloadQueued(state, deps) {
   if (queued.length === 0) return;
   const notify = () => typeof deps.onUpdate === "function" && deps.onUpdate(summarise(state));
   const batch = await downloadIrepsDocuments(
-    queued.map((i) => ({ id: i.id, url: i.url, path: i.path, label: i.label })),
+    // `ecm` says how the IC is filed under Save to: ECM / S3 (ignored by a local save)
+    queued.map((i) => ({
+      id: i.id,
+      url: i.url,
+      path: i.path,
+      label: i.label,
+      ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: i.icNumber, customer_po_number: i.poNo, ic_date: i.icDate } }
+    })),
     {
       fetch: deps.fetch,
       saveFile: deps.saveFile,
@@ -292,6 +303,7 @@ export function buildIcManifest(state) {
         refIdMatchesCallId: item.refIdMatchesCallId,
         icPdfUrl: item.url,
         filename: item.filename,
+        ecm: duplicate || !item.ecm ? null : { status: item.ecm.status, uid: item.ecm.uid || null, code: item.ecm.code || null },
         outcome: duplicate ? "duplicate_skipped" : item.status,
         error: duplicate ? null : item.error ? item.error.code : null,
         reason: duplicate ? `same document as ${id}` : item.error ? item.error.detail : null

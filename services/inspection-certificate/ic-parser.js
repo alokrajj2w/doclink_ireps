@@ -80,6 +80,23 @@ export function matchIcHeader(label) {
   return Object.prototype.hasOwnProperty.call(IC_HEADER_MAP, key) ? IC_HEADER_MAP[key] : null;
 }
 
+/**
+ * The IC number: IREPS names each IC PDF after it, e.g. ".../ct/tpi/ic/052026/3480517.pdf"
+ * -> "3480517" (the same number the row's revalidate link carries). The table has no
+ * IC-number column, and the Call Id is a different number.
+ */
+export function icNumberFromUrl(url) {
+  if (!url) return null;
+  let path;
+  try {
+    path = new URL(url, "https://ireps.invalid/").pathname;
+  } catch {
+    return null;
+  }
+  const m = /\/([A-Za-z0-9_-]+)\.pdf$/i.exec(path);
+  return m ? m[1] : null;
+}
+
 /** Typed fields of an IC record (excluding the compound poNoDate, split below). */
 export const IC_FIELDS = [
   "callDate",
@@ -102,6 +119,7 @@ function createEmptyIcRecord() {
   const record = { index: 0, id: "" };
   for (const key of IC_FIELDS) record[key] = null;
   record.icPdfUrl = null;
+  record.icNumber = null;
   record.links = [];
   record.rawColumns = {};
   return record;
@@ -197,6 +215,7 @@ export function parseIcRow(row, header, group, ordinal = 1, options = {}) {
 
   const icAnchor = record.links.find((l) => l.title.toLowerCase() === IC_LINK_TITLE);
   record.icPdfUrl = icAnchor ? icAnchor.url : null;
+  record.icNumber = icNumberFromUrl(record.icPdfUrl);
   if (!record.icPdfUrl) warnings.push(`IC row ${ordinal} (Call Id ${record.callId || "?"}): no "View/ Download IC PDF" link in the row.`);
   return { record, warnings };
 }

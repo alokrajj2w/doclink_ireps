@@ -29,6 +29,7 @@ import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/d
 import { NO_RECORDS_MARKERS } from "../session-service.js";
 import { buildPoDateDownloadPath } from "../../utils/filename.js";
 import { splitDateRange, irepsDateToIso } from "../batch-utils.js";
+import { ECM_KIND } from "../ecm-service.js";
 
 export const PO_DATE_ERROR = Object.freeze({
   ...errorCodesFor(SEARCH_PO_CRITERIA.PO),
@@ -176,6 +177,7 @@ export function poDateItems(records) {
       status: hasLink ? PO_ITEM_STATUS.QUEUED : PO_ITEM_STATUS.SKIPPED,
       filename: null,
       downloadId: null,
+      ecm: null,
       error: hasLink ? null : { code: PO_DATE_ERROR.LINK_NOT_FOUND, detail: "IREPS did not provide a PO PDF link for this row" }
     };
   });
@@ -200,6 +202,7 @@ function applySnapshot(state, snapshot) {
     item.status = s.status;
     item.filename = s.filename;
     item.downloadId = s.downloadId;
+    item.ecm = s.ecm || null;
     item.error = s.error;
   }
   state.sessionExpired = snapshot.sessionExpired === true;
@@ -208,7 +211,8 @@ function applySnapshot(state, snapshot) {
 async function downloadItems(state, items, deps) {
   const notify = () => typeof deps.onUpdate === "function" && deps.onUpdate(summarise(state));
   const batch = await downloadIrepsDocuments(
-    items.map((i) => ({ id: i.id, url: i.url, path: i.path, label: i.label })),
+    // `ecm` says how the PO is filed under Save to: ECM / S3 (ignored by a local save)
+    items.map((i) => ({ id: i.id, url: i.url, path: i.path, label: i.label, ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: i.poNo } } })),
     {
       fetch: deps.fetch,
       saveFile: deps.saveFile,

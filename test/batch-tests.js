@@ -226,6 +226,40 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(state.phase, "complete");
   });
 
+  /** A Save to: ECM / S3 saver: records how each item is filed; item `failAt` goes local instead. */
+  const ecmSaver = ({ failAt = 0 } = {}) => {
+    const filed = [];
+    return {
+      filed,
+      saveFile: async (bytes, path, item) => {
+        filed.push({ path, ecm: item.ecm });
+        const n = filed.length;
+        if (n === failAt) return { filename: path.split("/").pop(), downloadId: n, ecm: { status: "failed", code: "ECM_UNAVAILABLE" } };
+        return { filename: path.split("/").pop(), downloadId: null, ecm: { status: "stored", site: "hosur", uid: `u-${n}` } };
+      }
+    };
+  };
+
+  await test("PO date: under Save to ECM / S3 every PO is filed as poCopy with its PO number, and each item records where it went", async () => {
+    const pos = mkPos(3, "05/10/2026");
+    const sim = simulator(pages, { pos });
+    const ecm = ecmSaver({ failAt: 2 });
+    const state = await runPoDateDownload({ dateFrom: "05/10/2026", dateTo: "05/10/2026" }, { fetch: sim.fetchImpl, parseHtml: parsePoSearchResults, saveFile: ecm.saveFile, concurrency: 1, ...ZERO });
+    eq(state.counts.downloaded, 3);
+    eq(ecm.filed.length, 3);
+    assert(ecm.filed.every((f) => f.ecm.kind === "poCopy"), JSON.stringify(ecm.filed));
+    eq(ecm.filed.map((f) => f.ecm.fields.customer_po_number).sort().join(","), pos.map((p) => p.poNo).sort().join(","));
+    eq(state.items.map((i) => i.ecm && i.ecm.status).join(","), "stored,failed,stored");
+  });
+
+  await test("PO date: a local save (no ECM) leaves every item's ecm empty", async () => {
+    const sim = simulator(pages, { pos: mkPos(2, "05/10/2026") });
+    const { saveFile } = saved();
+    const state = await runPoDateDownload({ dateFrom: "05/10/2026", dateTo: "05/10/2026" }, { fetch: sim.fetchImpl, parseHtml: parsePoSearchResults, saveFile, ...ZERO });
+    eq(state.counts.downloaded, 2);
+    assert(state.items.every((i) => i.ecm === null), JSON.stringify(state.items.map((i) => i.ecm)));
+  });
+
   await test("PO date: a range with several PO dates downloads each into its own date folder", async () => {
     const sim = simulator(pages, { pos: [...mkPos(2, "03/10/2026"), ...mkPos(2, "04/10/2026", { prefix: "11111" }), ...mkPos(1, "20/10/2026", { prefix: "22222" })] });
     const { files, saveFile } = saved();
@@ -464,6 +498,22 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(manifest[0].refIdMatchesCallId, true);
     eq(manifest[0].outcome, "completed");
     assert(!JSON.stringify(manifest).toLowerCase().includes("token") && !JSON.stringify(manifest).toLowerCase().includes("cookie"), "manifest holds no secrets");
+  });
+
+  await test("IC notifications: under Save to ECM / S3 each IC is filed as inspectionCertificate (IC number from the PDF name, PO, IC date); the manifest records the ECM outcome", async () => {
+    const sim = simulator(pages, { notifications: [note(101, icMsg("L1000000000001", "001"), "Inspection", "8000000001")], icRows: [ic("L1000000000001", "001", "8000000001", true, { icDate: "12/10/2026" })] });
+    const ecm = ecmSaver();
+    const { state } = await runIc(sim, { saveFile: ecm.saveFile });
+    eq(state.counts.downloaded, 1);
+    eq(ecm.filed.length, 1);
+    const filed = ecm.filed[0].ecm;
+    eq(filed.kind, "inspectionCertificate");
+    eq(filed.fields.ic_number, "8000000001");
+    eq(filed.fields.customer_po_number, "L1000000000001");
+    eq(filed.fields.ic_date, "12/10/2026");
+    eq(state.items[0].ecm.status, "stored");
+    eq(state.manifest[0].ecm.status, "stored");
+    eq(state.manifest[0].ecm.uid, "u-1");
   });
 
   await test("IC notifications: several notifications with different POs are all processed in one run, with a fresh token per search", async () => {

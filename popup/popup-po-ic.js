@@ -18,6 +18,8 @@
  */
 
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
+import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
+import { SAVE_DESTINATION } from "../services/recon-service.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -76,7 +78,7 @@ let icFolderDownloadId = null;
 function setPoBusy(busy, label) {
   el.btnPoDownload.disabled = busy;
   el.btnPoDownload.classList.toggle("is-busy", busy);
-  el.poDownloadLabel.textContent = label || "Download PO";
+  el.poDownloadLabel.textContent = label || `Download PO${toEcm()}`;
 }
 
 function resetPoResults() {
@@ -93,13 +95,21 @@ function renderPoProgress(message) {
   ctx.setConnection("connected", "Connected");
 }
 
+const PO_ECM_TITLE = {
+  [ECM_OUTCOME.STORED]: "✓ PO saved to ECM",
+  [ECM_OUTCOME.ALREADY_STORED]: "✓ PO already in ECM",
+  [ECM_OUTCOME.FAILED]: "PO saved locally (not in ECM)"
+};
+
 function renderPoComplete(result) {
   resetPoResults();
   setPoBusy(false);
   ctx.setConnection("connected", "Connected");
   poDownloadId = result.downloadId ?? null;
-  el.poResultTitle.textContent = "✓ PO downloaded successfully";
-  el.poResultFilename.textContent = result.filename || "";
+  const ecm = result.ecm || null;
+  el.poResultTitle.textContent = ecm ? PO_ECM_TITLE[ecm.status] : "✓ PO downloaded successfully";
+  el.poResultFilename.textContent = ecm ? describeEcmOutcome(ecm) : result.filename || "";
+  el.btnPoShowFile.hidden = poDownloadId === null;
   el.poResult.hidden = false;
 }
 
@@ -122,7 +132,7 @@ async function startPoDownload() {
     return;
   }
   renderPoProgress("Searching PO...");
-  const response = await ctx.send(MESSAGE_TYPES.PO_DOWNLOAD, { poNo });
+  const response = await ctx.send(MESSAGE_TYPES.PO_DOWNLOAD, { poNo, destination: ctx.getDestination() });
   if (!response) renderPoError(describeError("NO_BACKGROUND_RESPONSE", { detail: "no reply to the PO download request" }));
   else if (response.started === false) renderPoError(response.error || describeError("PO_BUSY"));
 }
@@ -148,7 +158,7 @@ async function refreshPoState() {
 function setIcBusy(busy, label) {
   el.btnIcDownload.disabled = busy;
   el.btnIcDownload.classList.toggle("is-busy", busy);
-  el.icDownloadLabel.textContent = label || "Download Inspection Certificate";
+  el.icDownloadLabel.textContent = label || `Download Inspection Certificate${toEcm()}`;
 }
 
 function resetIcResults() {
@@ -187,11 +197,11 @@ function renderIcComplete(message, count, downloads) {
   el.icResultText.textContent =
     count === 0
       ? "No issued Inspection Certificates were found for this PO."
-      : downloads.failed === 0
-      ? "All issued Inspection Certificates were saved."
-      : "Hover a failed item, or use Retry, to see why.";
-  const folders = new Set((downloads && downloads.items ? downloads.items : []).filter((i) => i.status === "completed" && i.path).map((i) => i.path.split("/").slice(0, -1).join("/")));
-  el.icResultFolder.textContent = count === 0 ? "" : folders.size === 1 ? `Downloads/${Array.from(folders)[0]}/` : "Downloads/DocLink/IREPS/IC/<PO>/";
+      : [downloads.failed === 0 ? "All issued Inspection Certificates were saved." : "Hover a failed item, or use Retry, to see why.", summariseEcm(downloads.items)].filter(Boolean).join("\n");
+  // only files saved on this computer (an IC stored in the ECM has no local copy)
+  const local = (downloads && downloads.items ? downloads.items : []).filter((i) => i.status === "completed" && i.path && (!i.ecm || i.ecm.status === ECM_OUTCOME.FAILED));
+  const folders = new Set(local.map((i) => i.path.split("/").slice(0, -1).join("/")));
+  el.icResultFolder.textContent = count === 0 || local.length === 0 ? "" : folders.size === 1 ? `Downloads/${Array.from(folders)[0]}/` : "Downloads/DocLink/IREPS/IC/<PO>/";
   const first = ((downloads && downloads.items) || []).find((i) => i.status === "completed" && i.downloadId !== null && i.downloadId !== undefined);
   icFolderDownloadId = first ? first.downloadId : null;
   el.btnIcShowFolder.hidden = icFolderDownloadId === null;
@@ -218,7 +228,7 @@ async function startIcDownload() {
     return;
   }
   renderIcProgress("Searching issued ICs...");
-  const response = await ctx.send(MESSAGE_TYPES.IC_DOWNLOAD, { poNo });
+  const response = await ctx.send(MESSAGE_TYPES.IC_DOWNLOAD, { poNo, destination: ctx.getDestination() });
   if (!response) renderIcError(describeError("NO_BACKGROUND_RESPONSE", { detail: "no reply to the IC download request" }));
   else if (response.started === false) renderIcError(response.error || describeError("IC_BUSY"));
 }
@@ -254,6 +264,18 @@ async function openView() {
 /**
  * @param {{ send: Function, showView: Function, setConnection: Function, setConnectionForError: Function }} context
  */
+/** " to ECM" while Save to is ECM / S3. */
+function toEcm() {
+  return ctx && ctx.getDestination && ctx.getDestination() === SAVE_DESTINATION.RECON ? " to ECM" : "";
+}
+
+/** Save to changed: the idle download buttons say where the PO and ICs go. */
+export function refreshPoIcDestination() {
+  if (!ctx) return;
+  if (!el.btnPoDownload.classList.contains("is-busy")) setPoBusy(false);
+  if (!el.btnIcDownload.classList.contains("is-busy")) setIcBusy(false);
+}
+
 export function initPoIc(context) {
   ctx = context;
   bindElements();

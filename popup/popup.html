@@ -13,13 +13,31 @@
       <img class="brand-logo" src="../assets/logo.png" alt="Joules to Watts">
       <h1>DocLink</h1>
     </div>
-    <div class="connection" id="connection" data-state="checking" title="IREPS session status">
-      <span class="connection-label">IREPS</span>
-      <span class="connection-status"><span class="dot"></span><span id="connection-text">Checking…</span></span>
+    <div class="connections">
+      <!-- Login 1: IREPS (the user's own portal login with the e-sign key; DocLink only detects it) -->
+      <div class="connection" id="connection" data-state="checking" title="IREPS session status">
+        <span class="connection-label">IREPS</span>
+        <span class="connection-status"><span class="dot"></span><span id="connection-text">Checking…</span></span>
+      </div>
+      <!-- Login 2: Recon Engine (joulestowatts password or Okta), only for Save to: ECM / S3 -->
+      <button class="connection connection-recon" id="recon-connection" type="button" data-state="checking" title="Recon Engine sign-in (for Save to: ECM / S3)" hidden>
+        <span class="connection-label">RECON</span>
+        <span class="connection-status"><span class="dot"></span><span id="recon-connection-text">Checking…</span></span>
+      </button>
     </div>
   </header>
 
   <main class="app-main">
+    <!-- One Save to switch for every view. ECM / S3: IC, PO, MA and tender documents go to
+         the ECM folder of the signed-in IREPS account's unit; Bill Status, CRN and R-NOTE
+         go to Recon Engine storage (S3). -->
+    <div class="save-to" id="save-to" role="radiogroup" aria-label="Save downloads to">
+      <span class="save-to-label">Save to</span>
+      <div class="segmented">
+        <label title="Downloads/DocLink/ on this computer"><input type="radio" name="save-destination" value="local" checked> Local</label>
+        <label title="IC, PO, MA and tender documents: the ECM folder of your IREPS unit. Bill Status, CRN and R-NOTE: Recon Engine storage (S3)."><input type="radio" name="save-destination" value="recon"> ECM / S3</label>
+      </div>
+    </div>
     <!-- ===================== Not-on-IREPS gate =====================
          Shown instead of every other view (they keep their state) while the
          active tab is not the IREPS portal config.json targets. -->
@@ -62,6 +80,7 @@
           </div>
         </details>
 
+
         <button id="btn-download" class="btn btn-primary" type="button">
           <span class="btn-spinner" aria-hidden="true"></span>
           <span class="btn-label">Download Bill Status</span>
@@ -73,7 +92,7 @@
             <li data-stage="FETCHING">Retrieving Bill Status</li>
             <li data-stage="PROCESSING">Processing bills</li>
             <li data-stage="GENERATING_FILE">Generating Excel</li>
-            <li data-stage="DOWNLOADING">Downloading</li>
+            <li data-stage="DOWNLOADING" id="step-save">Downloading</li>
           </ol>
           <p class="progress-message" id="progress-message"></p>
         </div>
@@ -83,6 +102,7 @@
           <p id="error-message" class="result-text"></p>
           <div class="result-actions">
             <button id="btn-error-preview" class="btn btn-link" type="button" hidden>Open printable preview</button>
+            <button id="btn-error-open-recon" class="btn btn-link" type="button" hidden>Sign in to Recon</button>
             <button id="btn-error-retry" class="btn btn-link" type="button">Try again</button>
           </div>
         </div>
@@ -137,6 +157,41 @@
           <button id="btn-main-preview" class="btn btn-link" type="button" hidden>Open printable preview</button>
           <button id="btn-main-dismiss" class="btn btn-link" type="button">Dismiss</button>
         </div>
+      </article>
+    </section>
+
+    <!-- ===================== Recon Engine sign-in (login 2) =====================
+         Shown over every other view (they keep their state, like the gate) when
+         Save to is ECM / S3 and nobody is signed in to the Recon Engine. -->
+    <section id="view-recon-login" class="view" hidden>
+      <article class="card card-attention">
+        <h2>Sign in to Recon Engine</h2>
+        <p class="card-text">Needed to save to ECM / S3. This is separate from your IREPS login and e-sign key: use your joulestowatts Recon Engine account or Okta.</p>
+        <p class="recon-user" id="recon-user" hidden></p>
+        <form id="recon-login-form" class="form" autocomplete="on">
+          <label class="field">
+            <span class="field-label">Email</span>
+            <input id="recon-email" type="email" name="email" autocomplete="username" required spellcheck="false">
+          </label>
+          <label class="field">
+            <span class="field-label">Password</span>
+            <input id="recon-password" type="password" name="password" autocomplete="current-password" required>
+          </label>
+          <button id="btn-recon-sign-in" class="btn btn-primary" type="submit">Sign in</button>
+        </form>
+        <div class="recon-okta" id="recon-okta" hidden>
+          <div class="divider"><span>or</span></div>
+          <button id="btn-recon-okta" class="btn btn-secondary" type="button">Sign in with Okta</button>
+        </div>
+        <p id="recon-login-error" class="form-message form-message-error" role="alert" hidden></p>
+        <button id="btn-recon-use-local" class="btn btn-link" type="button">Use Local instead</button>
+        <button id="btn-recon-sign-out" class="btn btn-link" type="button" hidden>Sign out</button>
+        <details class="recon-okta-setup" id="recon-okta-setup" hidden>
+          <summary>Okta setup</summary>
+          <p>Okta must list this sign-in redirect URI for the Recon Engine Okta app:</p>
+          <code id="recon-okta-redirect"></code>
+          <button id="btn-recon-copy-redirect" class="btn btn-link" type="button">Copy</button>
+        </details>
       </article>
     </section>
 
@@ -551,9 +606,11 @@
         <label class="field">
           <span class="field-label">File format</span>
           <select data-role="format"></select>
+          <span class="field-hint" data-role="format-hint" hidden>Recon Engine uploads are always Excel.</span>
         </label>
       </div>
     </details>
+
 
     <button class="btn btn-primary" type="button" data-role="download">
       <span class="btn-spinner" aria-hidden="true"></span>
@@ -566,7 +623,7 @@
         <li data-stage="SEARCHING" data-role="step-search">Searching</li>
         <li data-stage="PARSING" data-role="step-parse">Reading records</li>
         <li data-stage="GENERATING_FILE">Building the export file</li>
-        <li data-stage="DOWNLOADING">Downloading</li>
+        <li data-stage="DOWNLOADING" data-role="step-save">Downloading</li>
       </ol>
       <p class="progress-message" data-role="progress-message"></p>
     </div>
@@ -576,6 +633,7 @@
       <p class="result-text" data-role="error-message"></p>
       <div class="result-actions">
         <button class="btn btn-link" type="button" data-role="open-ireps" hidden>Open IREPS</button>
+        <button class="btn btn-link" type="button" data-role="open-recon" hidden>Sign in to Recon</button>
         <button class="btn btn-link" type="button" data-role="retry">Try again</button>
       </div>
     </div>

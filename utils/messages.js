@@ -12,6 +12,8 @@ export const MESSAGE_TYPES = Object.freeze({
   GET_TAB_SCOPE: "GET_TAB_SCOPE",
   OPEN_PREVIEW: "OPEN_PREVIEW",
   UPLOAD_DOCUMENT: "UPLOAD_DOCUMENT",
+  // opens the Recon Engine (config.json reconAppUrl) so the user can sign in for "Save to: Recon Engine (S3)"
+  OPEN_RECON: "OPEN_RECON",
 
   // popup -> service worker: PO Search document workflows (CRN, R-NOTE), separate from Bill Status
   SEARCH_PO_LOAD_FORM: "SEARCH_PO_LOAD_FORM",
@@ -59,7 +61,8 @@ export const MESSAGE_TYPES = Object.freeze({
   // service worker -> offscreen document
   PARSE_BILL_STATUS: "PARSE_BILL_STATUS",
   PARSE_SEARCH_PO_RESULTS: "PARSE_SEARCH_PO_RESULTS",
-  PARSE_IC_RESULTS: "PARSE_IC_RESULTS"
+  PARSE_IC_RESULTS: "PARSE_IC_RESULTS",
+  PARSE_IREPS_ACCOUNT: "PARSE_IREPS_ACCOUNT"
 });
 
 /** Routing targets so broadcast messages are only handled where intended. */
@@ -321,6 +324,121 @@ export const ERROR_CATALOG = Object.freeze({
     message: "However, Chrome could not save the file. Check your download settings and retry.",
     connection: "connected"
   },
+
+  /* ------------------------------------- Recon Engine sign-in (the second login, not IREPS) */
+  RECON_SIGNIN_INVALID: {
+    title: "Recon Engine sign-in failed",
+    message: "The email or password is not right for the Recon Engine. This is your joulestowatts Recon account, not the IREPS login.",
+    connection: "connected"
+  },
+  RECON_SIGNIN_NO_ACCESS: {
+    title: "No Recon Engine access",
+    message: "This Recon Engine account has no access yet. Please contact the Recon Engine admin.",
+    connection: "connected"
+  },
+  RECON_SIGNIN_LOCKED: {
+    title: "Too many sign-in attempts",
+    message: "The Recon Engine paused sign-in for this email after several failed attempts. Wait 5 minutes, then try again.",
+    connection: "connected"
+  },
+  RECON_SIGNIN_UNAVAILABLE: {
+    title: "Recon Engine unavailable",
+    message: "DocLink could not reach the Recon Engine to sign in ({detail}). Check that it is running, or save locally.",
+    connection: "connected"
+  },
+  OKTA_NOT_CONFIGURED: {
+    title: "Okta sign-in not set up",
+    message: "Okta sign-in is not available: {detail}. Sign in with your Recon Engine email and password instead.",
+    connection: "connected"
+  },
+  OKTA_CANCELLED: {
+    title: "Okta sign-in cancelled",
+    message: "The Okta window was closed before sign-in finished. Nothing changed.",
+    connection: "connected"
+  },
+  OKTA_REDIRECT_NOT_REGISTERED: {
+    title: "Okta does not know DocLink yet",
+    message: "Okta refused DocLink's sign-in address. Ask the Okta admin to add {detail} as a sign-in redirect URI of the Recon Engine Okta app, or sign in with your email and password.",
+    connection: "connected"
+  },
+  OKTA_FAILED: {
+    title: "Okta sign-in failed",
+    message: "Okta sign-in did not complete ({detail}). Try again, or sign in with your email and password.",
+    connection: "connected"
+  },
+  OKTA_NO_ACCESS: {
+    title: "No Recon Engine access",
+    message: "Okta signed you in, but this person has no Recon Engine access. Please contact the Recon Engine admin.",
+    connection: "connected"
+  },
+  OKTA_INACTIVE: {
+    title: "Recon Engine account deactivated",
+    message: "Okta signed you in, but this Recon Engine account is deactivated. Please contact the Recon Engine admin.",
+    connection: "connected"
+  },
+
+  /* ------------------------------------- Save to: Recon Engine (S3) */
+  RECON_NOT_CONFIGURED: {
+    title: "Recon Engine not configured",
+    message: "DocLink cannot save to the Recon Engine: {detail}. Set reconBaseUrl in config.json (and add it to host_permissions in manifest.json), then reload DocLink.",
+    connection: "connected"
+  },
+  RECON_AUTH_REQUIRED: {
+    title: "Recon Engine sign-in required",
+    message: "Sign in to the Recon Engine (your joulestowatts or Okta account, not the IREPS login), then try again. Nothing was saved.",
+    reconSignIn: true,
+    connection: "connected"
+  },
+  RECON_UNAVAILABLE: {
+    title: "Recon Engine unavailable",
+    message: "The IREPS records were retrieved, but DocLink could not reach the Recon Engine ({detail}). Try again, or save locally.",
+    connection: "connected"
+  },
+  RECON_REJECTED: {
+    title: "Recon Engine refused the file",
+    message: "The Recon Engine did not accept the upload: {detail}. Nothing was saved.",
+    connection: "connected"
+  },
+  RECON_NOT_INGESTED: {
+    title: "Saved to S3, not loaded",
+    message: "The file was stored by the Recon Engine, but it could not be loaded into reconciliation: {detail}",
+    notice: true,
+    connection: "connected"
+  },
+
+  /* ------------------------------ Save to: ECM / S3 (IC, PO, MA, tender documents) */
+  // Per document: a failed ECM upload is saved locally instead and the row says why.
+  ECM_NOT_CONFIGURED: {
+    title: "ECM not configured",
+    message: "DocLink could not save to the ECM: {detail}. The document was saved locally.",
+    notice: true,
+    connection: "connected"
+  },
+  ECM_ACCOUNT_UNKNOWN: {
+    title: "IREPS account not verified",
+    message: "DocLink could not tell which IREPS account (unit) is signed in, so it did not pick an ECM folder. The document was saved locally.",
+    notice: true,
+    connection: "connected"
+  },
+  ECM_AUTH_REQUIRED: {
+    title: "Recon Engine sign-in required",
+    message: "Sign in to the Recon Engine (your joulestowatts or Okta account, not the IREPS login) to save to the ECM. The document was saved locally.",
+    reconSignIn: true,
+    notice: true,
+    connection: "connected"
+  },
+  ECM_REJECTED: {
+    title: "ECM refused the document",
+    message: "The ECM gateway did not accept the document: {detail}. It was saved locally.",
+    notice: true,
+    connection: "connected"
+  },
+  ECM_UNAVAILABLE: {
+    title: "ECM unavailable",
+    message: "DocLink could not reach the ECM ({detail}). The document was saved locally.",
+    notice: true,
+    connection: "connected"
+  },
   DOCUMENT_BUSY: {
     title: "Download Already Running",
     message: "Please wait for the current CRN / R-NOTE download to finish."
@@ -452,6 +570,7 @@ export function describeError(code, details = {}) {
     loginRequired: entry.loginRequired === true,
     previewAvailable: entry.previewAvailable === true,
     notice: entry.notice === true,
+    reconSignIn: entry.reconSignIn === true,
     connection: entry.connection || null
   };
 }
@@ -463,7 +582,10 @@ export const STORAGE_KEYS = Object.freeze({
   LAST_RNOTE_DOWNLOAD: "doclink.lastRnoteDownload",
   LAST_MA_DOWNLOAD: "doclink.lastMaDownload",
   LAST_PO_DOWNLOAD: "doclink.lastPoDownload",
-  LAST_IC_DOWNLOAD: "doclink.lastIcDownload"
+  LAST_IC_DOWNLOAD: "doclink.lastIcDownload",
+  // the panel-wide Save to switch: "local" | "recon" (shown as "ECM / S3": IC, PO, MA and
+  // tender documents go to the ECM, Bill Status, CRN and R-NOTE to the Recon Engine's S3)
+  SAVE_DESTINATION: "doclink.saveDestination"
 });
 
 /** chrome.storage.session keys (memory only, cleared when Chrome closes). */

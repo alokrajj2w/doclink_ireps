@@ -279,6 +279,7 @@ export async function runMaTests({ test, assert, eq, rejects, fixture }) {
     eq(items[0].path, "DocLink/IREPS/MA/2026-09-18/MA_07250369100001_007001.pdf");
     eq(items[0].label, "MA 007001 (PO 07250369100001)");
     eq(items[5].url, null, "row without an MA link is still listed so it can be reported");
+    eq(JSON.stringify(items[0].ecm), JSON.stringify({ kind: "modificationAdvise", fields: { customer_po_number: "07250369100001", modification_advise_number: "007001" } }), "ECM filing: MA kind with its PO and MA numbers");
   });
 
   await test("fetchIrepsDocument: valid PDF ok; login HTML -> IREPS_SESSION_EXPIRED; 404 / 500 / other HTML / non-PDF -> MA download errors", async () => {

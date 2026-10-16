@@ -28,6 +28,7 @@ import { searchIrepsDocuments, SEARCH_PO_FLOW_STAGES } from "../search-po/search
 import { downloadIrepsDocument } from "../search-po/document-downloader.js";
 import { buildPoDownloadPath } from "../../utils/filename.js";
 import { parsePoSearchResults } from "./po-parser.js";
+import { ECM_KIND } from "../ecm-service.js";
 
 /** Controlled error codes for the PO flow (mapped to UI text in utils/messages.js). */
 export const PO_ERROR = Object.freeze({
@@ -86,7 +87,8 @@ export function poDownloadItem(record, poNo) {
     url: record ? record.poPdfUrl : null,
     path: buildPoDownloadPath(poNo),
     label: `PO ${poNo}`,
-    meta: { poNo, poDate: record ? record.poDate : null, railwayUnit: record ? record.railwayUnit : null }
+    meta: { poNo, poDate: record ? record.poDate : null, railwayUnit: record ? record.railwayUnit : null },
+    ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: poNo } }
   };
 }
 
@@ -112,6 +114,7 @@ export async function downloadPo(poNumber, deps = {}) {
     url: item.url,
     filename: done.filename,
     downloadId: done.downloadId,
+    ecm: done.ecm,
     search: found.search
   };
 }

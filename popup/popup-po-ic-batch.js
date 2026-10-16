@@ -10,6 +10,8 @@
  */
 
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
+import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
+import { SAVE_DESTINATION } from "../services/recon-service.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -23,6 +25,24 @@ const KINDS = {
   "po-date": { prefix: "pod", name: "PO" },
   "ic-notif": { prefix: "icn", name: "IC" }
 };
+
+const IDLE_LABEL = { pod: "Download All Matching POs", icn: "Download IC from Notifications" };
+
+/** The idle button label; under Save to: ECM / S3 it reads "... to ECM", like the single PO / IC buttons. */
+function idleLabel(prefix) {
+  const toEcm = ctx && ctx.getDestination && ctx.getDestination() === SAVE_DESTINATION.RECON;
+  return `${IDLE_LABEL[prefix]}${toEcm ? " to ECM" : ""}`;
+}
+
+/**
+ * Where the finished documents went: the ECM summary when any went there, plus the
+ * Downloads folder when any were saved on this computer (Local, or an ECM upload that failed).
+ */
+function savedWhere(items, localFolder) {
+  const done = items.filter((i) => i.status === "completed");
+  const local = done.some((i) => !i.ecm || i.ecm.status === ECM_OUTCOME.FAILED);
+  return [summariseEcm(done), local ? `Saved to ${localFolder}.` : ""].filter(Boolean).join("\n");
+}
 
 function bind() {
   Object.assign(el, {
@@ -77,7 +97,7 @@ function showError(prefix, error) {
   const v = el[prefix];
   const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN", { detail: error && error.detail, status: error && error.status });
   hideAll(prefix);
-  setBusy(prefix, false, prefix === "pod" ? "Download All Matching POs" : "Download IC from Notifications");
+  setBusy(prefix, false, idleLabel(prefix));
   ctx.setConnectionForError(described);
   v.errorTitle.textContent = described.title;
   v.errorMessage.textContent = described.message;
@@ -142,7 +162,7 @@ function renderPoDate(state) {
   const v = el.pod;
   if (!state || state.phase === "idle") {
     hideAll("pod");
-    setBusy("pod", false, "Download All Matching POs");
+    setBusy("pod", false, idleLabel("pod"));
     v.details.hidden = true;
     return;
   }
@@ -176,7 +196,7 @@ function renderPoDate(state) {
     v.resultTitle.textContent = "";
     v.resultText.textContent = "";
   } else {
-    setBusy("pod", false, "Download All Matching POs");
+    setBusy("pod", false, idleLabel("pod"));
     ctx.setConnection("connected", "Connected");
     v.result.hidden = false;
     const retryable = state.items.filter((i) => i.status === "failed" && i.url).length;
@@ -187,11 +207,14 @@ function renderPoDate(state) {
     } else if (c.failed === 0 && c.skipped === 0) {
       v.result.className = "result result-success";
       v.resultTitle.textContent = `✓ ${c.downloaded} PO${c.downloaded === 1 ? "" : "s"} downloaded`;
-      v.resultText.textContent = "Saved to Downloads/DocLink/IREPS/PO/<PO date>/.";
+      v.resultText.textContent = savedWhere(state.items, "Downloads/DocLink/IREPS/PO/<PO date>/");
     } else {
       v.result.className = "result result-error is-notice";
       v.resultTitle.textContent = c.downloaded ? `Partly done: ${c.downloaded} downloaded, ${c.failed + c.skipped} not` : "No PO could be downloaded";
-      v.resultText.textContent = state.sessionExpired ? "Your IREPS session expired. Log in again, then retry the failed downloads." : "Open the list below to see why each PO failed or was skipped.";
+      v.resultText.textContent = [
+        state.sessionExpired ? "Your IREPS session expired. Log in again, then retry the failed downloads." : "Open the list below to see why each PO failed or was skipped.",
+        summariseEcm(state.items.filter((i) => i.status === "completed"))
+      ].filter(Boolean).join("\n");
     }
     v.retry.hidden = retryable === 0;
   }
@@ -199,7 +222,7 @@ function renderPoDate(state) {
   v.details.hidden = state.items.length === 0;
   v.list.replaceChildren(
     ...state.items.map((i) => {
-      const why = i.error ? errorText(i.error) || i.error.detail : null;
+      const why = i.error ? errorText(i.error) || i.error.detail : describeEcmOutcome(i.ecm) || null;
       return listItem(`PO ${i.poNo || "?"}`, [i.poDate, i.railwayUnit, i.poValue ? `₹${i.poValue}` : null].filter(Boolean).join(" · "), i.status, ITEM_LABEL, why);
     })
   );
@@ -213,7 +236,7 @@ function renderIcNotif(state) {
   const v = el.icn;
   if (!state || state.phase === "idle") {
     hideAll("icn");
-    setBusy("icn", false, "Download IC from Notifications");
+    setBusy("icn", false, idleLabel("icn"));
     v.details.hidden = true;
     return;
   }
@@ -253,7 +276,7 @@ function renderIcNotif(state) {
     v.resultTitle.textContent = "";
     v.resultText.textContent = "";
   } else {
-    setBusy("icn", false, "Download IC from Notifications");
+    setBusy("icn", false, idleLabel("icn"));
     ctx.setConnection("connected", "Connected");
     v.result.hidden = false;
     const problems = c.failed + c.skipped + c.unparsed + c.notFound + c.searchErrors + c.noLink;
@@ -265,11 +288,14 @@ function renderIcNotif(state) {
     } else if (problems === 0) {
       v.result.className = "result result-success";
       v.resultTitle.textContent = `✓ ${c.downloaded} IC${c.downloaded === 1 ? "" : "s"} downloaded`;
-      v.resultText.textContent = "Saved to Downloads/DocLink/IREPS/IC/<PO>/." + (state.manifestFile ? ` Manifest: ${state.manifestFile}.` : "");
+      v.resultText.textContent = savedWhere(state.items, "Downloads/DocLink/IREPS/IC/<PO>/") + (state.manifestFile ? ` Manifest: ${state.manifestFile}.` : "");
     } else {
       v.result.className = "result result-error is-notice";
       v.resultTitle.textContent = c.downloaded ? `Partly done: ${c.downloaded} downloaded, ${problems} problem${problems === 1 ? "" : "s"}` : "No IC could be downloaded";
-      v.resultText.textContent = state.sessionExpired ? "Your IREPS session expired. Log in again, then retry." : "Open the list below to see each notification's outcome.";
+      v.resultText.textContent = [
+        state.sessionExpired ? "Your IREPS session expired. Log in again, then retry." : "Open the list below to see each notification's outcome.",
+        summariseEcm(state.items.filter((i) => i.status === "completed"))
+      ].filter(Boolean).join("\n");
     }
     v.retry.hidden = retryable === 0;
   }
@@ -284,7 +310,8 @@ function renderIcNotif(state) {
       const i = state.items.find((x) => x.id === id);
       if (!i) continue;
       const dup = (n.duplicateOf || []).includes(id);
-      rows.push(listItem(`   IC Call ${i.callId || "?"}`, [i.icDate, i.filename].filter(Boolean).join(" · "), dup ? "duplicate" : i.status, ITEM_LABEL, !dup && i.error ? errorText(i.error) || i.error.detail : null));
+      const why = dup ? null : i.error ? errorText(i.error) || i.error.detail : describeEcmOutcome(i.ecm) || null;
+      rows.push(listItem(`   IC Call ${i.callId || "?"}`, [i.icDate, i.filename].filter(Boolean).join(" · "), dup ? "duplicate" : i.status, ITEM_LABEL, why));
     }
   }
   v.list.replaceChildren(...rows);
@@ -303,6 +330,7 @@ async function start(kind) {
     message.dateFrom = el.from.value;
     message.dateTo = el.to.value;
   }
+  message.destination = ctx.getDestination();
   hideAll(prefix);
   setBusy(prefix, true, "Starting...");
   const response = await ctx.send(MESSAGE_TYPES.BATCH_START, message);
@@ -311,7 +339,7 @@ async function start(kind) {
 }
 
 async function retry(kind) {
-  const response = await ctx.send(MESSAGE_TYPES.BATCH_RETRY, { kind });
+  const response = await ctx.send(MESSAGE_TYPES.BATCH_RETRY, { kind, destination: ctx.getDestination() });
   if (!response || response.started === false) showError(KINDS[kind].prefix, (response && response.error) || describeError("NO_BACKGROUND_RESPONSE", { detail: "no reply to the retry request" }));
 }
 
@@ -336,6 +364,14 @@ export function initBatch(context) {
     el[prefix].button.addEventListener("click", () => start(kind));
     el[prefix].retry.addEventListener("click", () => retry(kind));
     el[prefix].openIreps.addEventListener("click", () => ctx.send(MESSAGE_TYPES.OPEN_IREPS));
+  }
+}
+
+/** Save to changed: the idle download buttons say where the POs and ICs go. */
+export function refreshBatchDestination() {
+  if (!ctx) return;
+  for (const { prefix } of Object.values(KINDS)) {
+    if (!el[prefix].button.classList.contains("is-busy")) setBusy(prefix, false, idleLabel(prefix));
   }
 }
 
