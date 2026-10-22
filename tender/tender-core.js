@@ -289,7 +289,7 @@ export function elementActions(root) {
       if (first) addReq(first, post ? 'POST' : 'GET', { fn: c.fn, args: c.args });
     }
     // anything URL-shaped that parseCalls did not classify (e.g. nested handlers)
-    for (const m of (href + ' ' + onclick).matchAll(/['"]([^'"\s]*?(?:\.do|\.pdf)[^'"\s]*)['"]/gi)) {
+    for (const m of (href + ' ' + onclick).replace(/(['"])\s*\+\s*(['"])/g, '').matchAll(/['"]([^'"\s]*?(?:\.do|\.pdf)[^'"\s]*)['"]/gi)) {
       if (!reqs.some((r) => r.url === m[1])) addReq(m[1], 'GET', { fn: 'other' });
     }
     const urls = [...new Set(reqs.map((r) => r.url))];
