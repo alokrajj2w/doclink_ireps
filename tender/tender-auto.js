@@ -155,3 +155,17 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
 }
 
 export { dmyOf };
+
+/**
+ * One kind of letter (Negotiation / Counter Offer / Advance Acceptance Letter) for the selected Letter Dates,
+ * optionally for one Tender Number. Only published letters are downloaded - nothing is submitted or changed.
+ * @param status  'MyNegotiation' | 'MyCounterOffer' | 'MyAdvanceAcceptanceLetter'
+ */
+export async function runLetterType({ status, from, to, tenderNo = '', onProgress = () => {}, onAccount = () => {} }) {
+  if (!(from instanceof Date) || !(to instanceof Date) || from > to) throw new TenderError('INPUT', 'Choose a valid From / To date.');
+  const job = await beginJob({ onProgress, onAccount });
+  const dates = dayRange(from, to);
+  const letters = await downloadLettersByDate({ job, dates, statuses: [status], tenderNo, onProgress });
+  await job.ledger.save();
+  return { range: { from: dates[0], to: dates[dates.length - 1] }, letters };
+}

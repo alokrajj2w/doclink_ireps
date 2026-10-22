@@ -452,6 +452,13 @@
           <span class="btn-spinner" aria-hidden="true"></span>
           <span class="btn-label">Scan My Messages &amp; Download</span>
         </button>
+        <div class="tender-letters">
+          <p class="card-text">Download only one kind of published letter, by its Letter Date (From / To above, both included):</p>
+          <label class="field"><span class="field-label">Tender Number (optional)</span><input id="letter-tender-no" type="text" autocomplete="off" spellcheck="false"></label>
+          <button id="btn-letter-negotiation" class="btn btn-secondary" type="button" data-status="MyNegotiation"><span class="btn-label">Negotiation</span></button>
+          <button id="btn-letter-counter" class="btn btn-secondary" type="button" data-status="MyCounterOffer"><span class="btn-label">Counter Offer</span></button>
+          <button id="btn-letter-loa" class="btn btn-secondary" type="button" data-status="MyAdvanceAcceptanceLetter"><span class="btn-label">Advance Acceptance Letter</span></button>
+        </div>
         <button id="btn-auto-retry" class="btn btn-link" type="button" hidden>Retry failed</button>
         <button id="btn-copy-diag" class="btn btn-link" type="button">Copy diagnostics</button>
         <div id="tender-progress" class="progress" hidden>

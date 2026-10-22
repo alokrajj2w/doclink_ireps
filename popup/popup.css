@@ -992,3 +992,5 @@ body[data-gate="on"] #view-recon-login {
   margin: 4px 0;
   color: var(--text);
 }
+
+.tender-letters { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }

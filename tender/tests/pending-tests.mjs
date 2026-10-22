@@ -123,7 +123,9 @@ const go = (o = {}) => P.downloadPendingCorrespondence({ sleep: noSleep, pace: 0
 const letterPdf = (tag) => () => ({ status: 200, bytes: PDF(tag), type: 'application/pdf', extra: {} });
 const letterHtml = (body) => () => ({ status: 200, bytes: enc(`<html><head><title>Letter</title></head><body><table><tr><td>${body}</td></tr></table></body></html>`), type: 'text/html', extra: {} });
 const pdfs = () => saved.filter((s) => s.filename.endsWith('.pdf'));
-const manifestSaved = () => JSON.parse(new TextDecoder().decode([...saved].reverse().find((s) => s.filename.endsWith('download_manifest.json')).bytes));
+// progress is kept in extension storage only; download_manifest.json is never saved to Downloads
+const stored = () => { const s = store['doclink.tender.ledger.833'].manifests['pending-correspondence']; return { records: Object.values(s.records), letters: Object.values(s.letters) }; };
+const noManifestFile = () => assert.ok(!saved.some((s) => /manifest/i.test(s.filename)), saved.map((s) => s.filename).join('\n'));
 const submitCalls = () => server.log.filter((l) => /SubmitReply|vendorCorresSubmit/i.test(l.path));
 beforeEach(() => mk());
 
@@ -237,9 +239,10 @@ test('T1/T2/T3/T6/T7/T9 full run: every pending record, every letter, attachment
   // the HTML letter was rendered to a real PDF that contains the letter text
   const rendered = pdfs().find((s) => /Correspondence_502/.test(s.filename));
   assert.match(new TextDecoder('latin1').decode(rendered.bytes), /please confirm the offer validity/);
-  // manifest
-  const m = manifestSaved();
-  assert.equal(m.account.irepsAccountId, '833');
+  // no manifest file; the record is in extension storage
+  noManifestFile();
+  const m = stored();
+  assert.equal(r.account.irepsAccountId, '833');
   assert.equal(m.records.length, 3);
   assert.equal(m.records.find((x) => x.nitOid === '103').status, 'NO_PENDING_LETTERS');
   assert.equal(m.records.find((x) => x.nitOid === '103').reason, 'NO_PENDING_LETTERS_AT_DOWNLOAD_TIME');
@@ -253,7 +256,7 @@ test('T1/T2/T3/T6/T7/T9 full run: every pending record, every letter, attachment
   // live UI events were emitted for every letter
   assert.ok(events.filter((e) => e.type === 'letter' && e.letter.status === 'DOWNLOADED').length >= 3);
   // T9: nothing secret persisted
-  const blob = JSON.stringify(store) + JSON.stringify({ ...m, notes: [] });
+  const blob = JSON.stringify(store);
   assert.doesNotMatch(blob, /JSESSIONID|password|cookie|TOKEN/i);
 });
 
@@ -292,7 +295,8 @@ test('T8 failure then retry: failed letter does not stop the next one; retry fet
   // a plain second "Download All" also never duplicates
   await go();
   assert.equal(pdfs().length, 2);
-  assert.equal(manifestSaved().letters.filter((l) => l.status === 'DOWNLOADED').length, 2);
+  assert.equal(stored().letters.filter((l) => l.status === 'DOWNLOADED').length, 2);
+  noManifestFile();
 });
 
 test('T8b a failed attachment keeps the letter saved; retry downloads only the missing attachment', async () => {
@@ -341,7 +345,7 @@ test('session expiry mid-run stops safely, marks the rest SESSION_EXPIRED, saves
   assert.equal(r.summary.sessionExpired, 1);
   assert.equal(pdfs().length, 1);
   assert.equal(server.log.filter((l) => l.path === REPLY).length, 1, 'record B was not requested after expiry');
-  assert.equal(manifestSaved().aborted.code, 'SESSION_EXPIRED');
+  noManifestFile();
 });
 
 test('not logged in at start -> SESSION_EXPIRED error; unverifiable account -> ACCOUNT error and no correspondence request', async () => {

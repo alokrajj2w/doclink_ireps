@@ -24,7 +24,6 @@ export const LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
 export const REPLY_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
 export const VIEW_FALLBACK_PATH = '/epsn/corres/rly/viewpubIndltr.do';
 const MANIFEST_KEY = 'pending-correspondence';
-export const MANIFEST_FILE = 'download_manifest.json';
 
 export const STATUS = {
   PENDING: 'PENDING', IN_PROGRESS: 'IN_PROGRESS', DOWNLOADED: 'DOWNLOADED', NO_PENDING_LETTERS: 'NO_PENDING_LETTERS',
@@ -457,21 +456,6 @@ function summarize(state, run) {
 const publicLetter = ({ key, req, ...l }) => ({ ...l, key: undefined, files: l.files.map(({ downloadId, ...f }) => f) });
 const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, companyName: a.companyName, operatingUnit: a.operatingUnit });
 
-function buildManifest(account, state, run, extra) {
-  const recs = Object.values(state.records);
-  return {
-    generatedAt: new Date().toISOString(),
-    feature: 'pending_correspondence',
-    account: publicAccount(account),
-    summary: summarize(state, run),
-    records: recs.map(({ letterKeys, ...r }) => ({ ...r, inCurrentRun: run.has(r.nitOid), lettersDiscovered: letterKeys.length })),
-    letters: Object.values(state.letters).map((l) => ({ ...publicLetter(l), inCurrentRun: run.has(l.key) })),
-    skippedRows: extra.skipped || [],
-    aborted: extra.aborted || null,
-    notes: ['Read/download only: vendorCorresSubmitReply.do is never requested.', 'No cookies, tokens or credentials are stored in this file.'],
-  };
-}
-
 /**
  * Download every letter currently shown as pending.
  *   mode 'all'   : every pending record (letters already saved are skipped, never duplicated)
@@ -496,14 +480,9 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   let aborted = null;
   let skipped = [];
 
-  const persist = async (final = false) => {
+  const persist = async () => {
     ledger.setManifest(MANIFEST_KEY, state);
-    await ledger.save();
-    try {
-      await jobSaver.saveJson(MANIFEST_FILE, buildManifest(account, state, run, { skipped, aborted }));
-    } catch (e) {
-      if (final) log('Pending', `manifest file not saved: ${e.message}`);
-    }
+    await ledger.save(); // progress is kept in extension storage only; no download_manifest.json is saved
   };
   const emitLetter = (l) => onEvent({ type: 'letter', letter: publicLetter(l), key: l.key });
   const emitRecord = (r) => onEvent({ type: 'record', record: { ...r, letterKeys: undefined }, nitOid: r.nitOid });
@@ -542,7 +521,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
 
   if (!records.length) {
     onProgress('No pending correspondence found');
-    await persist(true);
+    await persist();
     emitSummary();
     return { account: publicAccount(account), empty: true, summary: summarize(state, run), skipped, aborted, folder: `Downloads/${jobSaver.root}/` };
   }
@@ -676,7 +655,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
     emitSummary();
   }
 
-  await persist(true);
+  await persist();
   emitSummary();
   onProgress(aborted ? 'Stopped: ' + aborted.message : 'Pending correspondence download complete.');
   return { account: publicAccount(account), empty: false, summary: summarize(state, run), skipped, aborted, folder: `Downloads/${jobSaver.root}/` };

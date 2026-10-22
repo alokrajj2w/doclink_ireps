@@ -1,12 +1,12 @@
 {
   "//": "DocLink target switch. Change \"target\" to \"mock\" or \"real\", save this file, then reload DocLink in chrome://extensions. No other file needs to change and no command needs to run.",
-  "target": "mock",
+  "target": "real",
   "mockBaseUrl": "http://localhost:8765",
   "realBaseUrl": "https://www.ireps.gov.in",
   "//recon": "Save to: Recon (S3). reconBaseUrl = the Recon Engine API (its origin must also be in manifest.json host_permissions); reconCustomerId = the Recon customer the files belong to; reconAppUrl (optional) = the page 'Open Recon Engine' opens for sign-in, defaults to reconBaseUrl.",
-  "reconBaseUrl": "http://localhost:8000",
+  "reconBaseUrl": "https://wabtec.reconalpha-staging.joulestowatts.com",
   "reconCustomerId": "default",
-  "reconAppUrl": "http://localhost:5173",
+  "reconAppUrl": "https://wabtec.reconalpha-staging.joulestowatts.com",
   "//okta": "Recon Engine sign-in with Okta (the second login, after IREPS). DocLink opens this Okta app through chrome.identity; register the redirect https://<extension id>.chromiumapp.org/okta in the Okta app (DocLink's sign-in page shows the exact value). The client SECRET never goes here: the Recon backend exchanges the code. enabled=false hides the Okta button.",
   "okta": {
     "enabled": true,

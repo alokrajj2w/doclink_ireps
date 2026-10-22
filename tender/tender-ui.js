@@ -1,5 +1,5 @@
 // "Download Tender Documents" view: account panel + automatic discovery from My Messages.
-import { runAutomatic } from './tender-auto.js';
+import { runAutomatic, runLetterType } from './tender-auto.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { SESSION_MSG, getLogTail } from './tender-core.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
@@ -28,6 +28,7 @@ function setBusy(busy) {
   running = busy;
   $('btn-auto-run').disabled = busy;
   $('btn-auto-retry').disabled = busy;
+  document.querySelectorAll('[data-status]').forEach((b) => { b.disabled = busy; });
   $('btn-account-refresh').disabled = busy;
   $('btn-auto-run').classList.toggle('is-busy', busy);
 }
@@ -89,6 +90,8 @@ const catText = (c) => {
 const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : ''))].filter(Boolean).join('\n');
 const LABEL = { tenderPdf: 'NIT', attachments: 'Attachments', myOffer: 'My Offer', corrigenda: 'Corrigenda', negotiation: 'Negotiation', counterOffer: 'Counter offer', loa: 'LOA', correspondence: 'Correspondence' };
 
+const LETTER_PAGE = { MyNegotiation: 'Negotiation', MyCounterOffer: 'Counter Offer', MyAdvanceAcceptanceLetter: 'Advance Acceptance Letter' };
+
 const tenderRows = new Map(); // tenderNo -> <li>, updated live as each tender finishes
 function renderDiscovered(ev) {
   $('auto-discovered').hidden = false;
@@ -122,6 +125,7 @@ function renderResult(r) {
   if (r.letters) {
     const n = r.letters.summary?.newLetters || 0;
     body.append(li('Negotiation / Counter offer / LOA letters (by date)', n ? `${n} downloaded` : 'none for these dates', n ? 'tender-ok' : 'tender-muted', r.letters.error || '', r.letters.error || ''));
+    for (const [st, msg] of Object.entries(r.letters.listErrors || {})) body.append(li(`  ${LETTER_PAGE[st]}`, 'failed', 'tender-bad', '', msg));
     for (const t of r.letters.tenders) {
       const parts = Object.entries(t.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
       body.append(li(`  ${t.tenderNo}`, t.error ? 'failed' : parts.join(' · '), t.error ? 'tender-bad' : 'tender-ok', '', t.error || Object.values(t.categories).map(reasons).filter(Boolean).join('\n')));
@@ -141,6 +145,98 @@ function renderResult(r) {
     $('tender-error-message').textContent = `Stopped early: ${r.aborted.message}`;
     $('tender-error').hidden = false;
   }
+}
+
+// ---------------------------------------------------------------- one letter type
+
+function renderLetterResult(status, r) {
+  const name = LETTER_PAGE[status];
+  const body = $('tender-result-rows');
+  body.replaceChildren();
+  const l = r.letters;
+  const n = l.summary?.newLetters || 0;
+  const err = l.listErrors?.[status];
+  body.append(li(`${name} letters (by Letter Date)`, err ? 'failed' : n ? `${n} downloaded` : 'none for these dates', err ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', err || ''));
+  for (const t of l.tenders) {
+    const parts = Object.entries(t.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
+    body.append(li(`  ${t.tenderNo}`, t.error ? 'failed' : parts.join(' · '), t.error ? 'tender-bad' : 'tender-ok', '', t.error || Object.values(t.categories).map(reasons).filter(Boolean).join('\n')));
+  }
+  $('tender-result-tender').textContent = `${name} letters with Letter Date ${r.range.from} - ${r.range.to}${l.listed ? `: ${l.listed} found` : ''}`;
+  $('tender-result-totals').textContent = `Downloaded: ${n}`;
+  $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/';
+  $('btn-tender-show').hidden = true;
+  $('tender-result').hidden = false;
+  $('btn-auto-retry').hidden = true;
+  if (l.aborted) {
+    $('tender-error-message').textContent = `Stopped early: ${l.aborted.message}`;
+    $('tender-error').hidden = false;
+  }
+}
+
+async function runLetters(status) {
+  if (running) return;
+  $('tender-error').hidden = true;
+  $('tender-result').hidden = true;
+  $('auto-discovered').hidden = true;
+  let from;
+  let to;
+  try {
+    from = fromIso($('auto-from').value);
+    to = fromIso($('auto-to').value);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) throw new Error('Choose a valid From / To date.');
+  } catch (e) {
+    $('tender-error-message').textContent = e.message;
+    $('tender-error').hidden = false;
+    return;
+  }
+  setBusy(true);
+  $('tender-progress').hidden = false;
+  const stopGuard = guardTabs();
+  try {
+    renderLetterResult(status, await runLetterType({
+      status, from, to, tenderNo: $('letter-tender-no').value,
+      onProgress: (m) => ($('tender-progress-message').textContent = m),
+      onAccount: renderAccount,
+    }));
+  } catch (e) {
+    $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
+    $('tender-error').hidden = false;
+    console.error('[DocLink][Tender] letters failed:', e.code || '', e.message);
+  } finally {
+    stopGuard();
+    $('tender-progress').hidden = true;
+    setBusy(false);
+  }
+}
+
+// ---------------------------------------------------------------- keep the user on the IREPS tab while downloading
+
+/**
+ * While a download run is going, a tab that Chrome opens for a saved file (PDF viewer, file:// or blob: page,
+ * the downloads page) is closed again and the IREPS tab the run started on is brought back, so DocLink
+ * stays on the IREPS portal. Pages the user opens themselves (normal http/https sites) are left alone.
+ */
+function guardTabs() {
+  let origin = null;
+  const strays = (url) => /^(blob:|file:|filesystem:|data:|chrome:\/\/downloads)/i.test(url || '') || /\.pdf([?#]|$)/i.test(url || '');
+  chrome.tabs.query({ active: true, currentWindow: true }).then(([t]) => { origin = t || null; }).catch(() => {});
+  const restore = () => { if (origin) chrome.tabs.update(origin.id, { active: true }).catch(() => {}); };
+  const check = (tab) => {
+    if (!tab || origin === null || tab.id === origin.id) return;
+    if (strays(tab.url) || strays(tab.pendingUrl)) chrome.tabs.remove(tab.id).then(restore).catch(() => {});
+  };
+  const onCreated = (tab) => check(tab);
+  const onUpdated = (_id, change, tab) => { if (change.url || change.status) check(tab); };
+  // a downloaded file's tab can take focus before its URL is known: look again as soon as it becomes the active tab
+  const onActivated = ({ tabId }) => { if (origin && tabId !== origin.id) chrome.tabs.get(tabId).then(check).catch(() => {}); };
+  chrome.tabs.onCreated.addListener(onCreated);
+  chrome.tabs.onUpdated.addListener(onUpdated);
+  chrome.tabs.onActivated.addListener(onActivated);
+  return () => {
+    chrome.tabs.onActivated.removeListener(onActivated);
+    chrome.tabs.onCreated.removeListener(onCreated);
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+  };
 }
 
 // ---------------------------------------------------------------- run
@@ -163,6 +259,7 @@ async function run() {
   }
   setBusy(true);
   $('tender-progress').hidden = false;
+  const stopGuard = guardTabs();
   try {
     const r = await runAutomatic({
       from, to,
@@ -177,6 +274,7 @@ async function run() {
     if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') renderAccount(await getActiveIrepsAccountContext().catch(() => null));
     console.error('[DocLink][Tender] run failed:', e.code || '', e.message);
   } finally {
+    stopGuard();
     $('tender-progress').hidden = true;
     setBusy(false);
   }
@@ -185,6 +283,7 @@ async function run() {
 $('btn-tender-open').addEventListener('click', () => show(true));
 $('btn-tender-back').addEventListener('click', () => show(false));
 $('btn-auto-run').addEventListener('click', run);
+document.querySelectorAll('[data-status]').forEach((b) => b.addEventListener('click', () => runLetters(b.dataset.status)));
 $('btn-auto-retry').addEventListener('click', run); // already-downloaded documents are skipped via the ledger
 $('btn-account-refresh').addEventListener('click', refreshAccount);
 $('btn-copy-diag').addEventListener('click', async () => {

@@ -537,9 +537,19 @@ function hasMorePages(doc, pageNo) {
   return false;
 }
 
+/**
+ * Negotiation and Counter Offer pages are often very slow to open on IREPS. Their requests get up to
+ * fetchSettings.waitMs (3 minutes) instead of the usual 45 seconds, retrying while IREPS cannot be reached.
+ */
+const WAIT_FOR_PAGE = new Set(['MyNegotiation', 'MyCounterOffer']);
+function pageWait(run, status) {
+  if (!WAIT_FOR_PAGE.has(status)) return null;
+  return { what: `${LETTER_KINDS[status].page} page`, onWait: (msg) => run.onProgress?.(msg) };
+}
+
 async function loadInboxForm(run, status) {
   for (const method of ['POST', 'GET']) {
-    const g = await irepsFetch(run.base, INBOX_PATH, { method, form: { menuLink: 'PostTenders', status } });
+    const g = await irepsFetch(run.base, INBOX_PATH, { method, form: { menuLink: 'PostTenders', status }, wait: pageWait(run, status) });
     assertSession(g);
     if (g.status !== 200) continue;
     const gdoc = parseHtml(g.text());
@@ -595,7 +605,7 @@ async function scanInboxRows(run, status) {
       if (visited.has(pageKey)) break;
       visited.add(pageKey);
 
-      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined });
+      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined, wait: pageWait(run, status) });
       assertSession(res);
       if (res.status !== 200) break;
       entry.pages++;
@@ -668,7 +678,7 @@ export async function scanPostTenderList(run, status, { windows = [[-90, 0], [0,
       const p = new URLSearchParams(form.defaults);
       Object.entries({ menuLink: 'PostTenders', status, tenderNo: '', startDate: win.startDate, endDate: win.endDate, pageNo: String(pageNo), listType: status }).forEach(([k, v]) => p.set(k, v));
       if (!p.get('raStatus')) p.set('raStatus', '-1');
-      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p });
+      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, wait: pageWait(run, status) });
       assertSession(res);
       if (res.status !== 200) break;
       const doc = parseHtml(res.text());
@@ -709,9 +719,9 @@ function bidderMismatch(run, url) {
 }
 
 export const LETTER_KINDS = {
-  MyNegotiation: { category: 'NEGOTIATION', tag: 'Negotiation', subdir: 'Negotiation', file: 'Negotiation' },
-  MyCounterOffer: { category: 'COUNTER_OFFER', tag: 'CounterOffer', subdir: 'Counter_Offers', file: 'Counter_Offer' },
-  MyAdvanceAcceptanceLetter: { category: 'LOA', tag: 'LOA', subdir: 'Advance_Acceptance_LOA', file: 'LOA' },
+  MyNegotiation: { category: 'NEGOTIATION', tag: 'Negotiation', subdir: 'Negotiation', file: 'Negotiation', page: 'Negotiation' },
+  MyCounterOffer: { category: 'COUNTER_OFFER', tag: 'CounterOffer', subdir: 'Counter_Offers', file: 'Counter_Offer', page: 'Counter Offer' },
+  MyAdvanceAcceptanceLetter: { category: 'LOA', tag: 'LOA', subdir: 'Advance_Acceptance_LOA', file: 'LOA', page: 'Advance Acceptance Letter' },
 };
 
 /**
@@ -742,7 +752,7 @@ export async function downloadLetterItems(run, status, items, scripts = '') {
   for (const it of items) noteIds(run, it.url, 'inbox'); // nitOId etc. straight from the live letter action
   ctx.discoveredActions[LETTER_SPECS[status].key] = items.map((i) => ({ method: loaAck ? 'POST' : i.rq.method, path: prefix + pathOf(i.url) }));
   for (const it of items) {
-    it.req = { ...toRequest(it.url, loaAck ? 'POST' : it.rq.method, { prefix }), relativeTo: ctx.searchUrl };
+    it.req = { ...toRequest(it.url, loaAck ? 'POST' : it.rq.method, { prefix }), relativeTo: ctx.searchUrl, wait: pageWait(run, status) };
     if (status !== 'MyNegotiation') it.skip = bidderMismatch(run, it.url);
     if (loaAck) it.docId = it.rq.args?.[1] || qparam(it.url, 'letterId');
   }
@@ -923,6 +933,7 @@ export async function runSteps(run, keys, onProgress = () => {}) {
       return;
     }
     onProgress(started++ === 0 ? msg : `${msg} (in parallel)`);
+    run.onProgress = onProgress;
     try {
       await assertSameAccount(run.account, { base: run.base });
       categories[key] = await fn(run);
@@ -987,27 +998,6 @@ export async function downloadTenderDocuments(rawTenderNo, { onProgress = () => 
     context: ctxPublic,
   };
 
-  // The manifest names the account used. It holds no cookies, tokens or credentials.
-  try {
-    const manifest = {
-      generatedAt: new Date().toISOString(),
-      account: result.account,
-      tender: { ...result.tender, railwayUnit: found.railwayUnit, department: found.department, status: found.tenderStatus },
-      categories: Object.fromEntries(CATEGORY_KEYS.filter((k) => categories[k]).map((k) => [k, {
-        status: categories[k].status, discovered: categories[k].discovered, downloaded: categories[k].downloaded, failed: categories[k].failed,
-        note: categories[k].note, warnings: categories[k].warnings,
-        files: categories[k].files.map(({ downloadId, ...f }) => f),
-      }])),
-      exclusions: result.exclusions,
-      summary: result.summary,
-      aborted,
-    };
-    const saved = await saver.saveJson('download_manifest.json', manifest);
-    result.manifest = saved.relPath;
-  } catch (e) {
-    log('Download', `manifest not saved: ${e.message}`);
-    result.manifest = null;
-  }
   onProgress('Tender documents download complete.');
   return result;
 }

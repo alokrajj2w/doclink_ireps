@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DocLink",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Download IREPS Bill Status, CRN and R-NOTE reports to this computer or to the Recon Engine (S3); upload business documents.",
   "minimum_chrome_version": "116",
   "icons": {
@@ -21,7 +21,8 @@
   "host_permissions": [
     "http://localhost:8765/*",
     "https://www.ireps.gov.in/*",
-    "http://localhost:8000/*"
+    "http://localhost:8000/*",
+    "https://wabtec.reconalpha-staging.joulestowatts.com/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",
