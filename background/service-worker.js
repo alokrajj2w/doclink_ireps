@@ -59,9 +59,14 @@ import { buildRnoteExport } from "../services/rnote/rnote-export.js";
 import { searchMa, downloadMaPdfs, MA_ERROR, MA_FLOW_STAGES } from "../services/ma/ma-service.js";
 import { downloadBytes } from "../services/download-service.js";
 import { saveToEcmOrLocally } from "../services/ecm-service.js";
+import { loadDownloadLogConfig, isDownloadLogEnabled, preflightDownloads, logDownload, flushDownloadLog, downloadRecord, downloadKey, exportFingerprint, runDestination, LOG_DESTINATION } from "../services/download-log.js";
 import { HOME_PATH } from "../utils/ireps-account.js";
 import { downloadPo, PO_ERROR, PO_FLOW_STAGES } from "../services/po/po-service.js";
 import { downloadInspectionCertificates, IC_ERROR, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
+import { runPoDateDownload, retryPoDateFailures } from "../services/po/po-date-service.js";
+import { runIcNotificationDownload, retryIcNotificationFailures, publicIcState } from "../services/inspection-certificate/ic-notification-service.js";
+import { isoToIrepsDate } from "../services/batch-utils.js";
+import { IC_DOWNLOAD_SUBFOLDER } from "../utils/filename.js";
 import { buildDocumentExportDownloadPath, buildDocumentExportFilename, buildBillStatusExportDownloadPath, buildBillStatusExportFilename } from "../utils/filename.js";
 import { MESSAGE_TYPES, TARGETS, STAGES, DOCUMENT_STAGES, MA_STAGES, PO_STAGES, IC_STAGES, documentStageLabel, describeError, STORAGE_KEYS, SESSION_KEYS } from "../utils/messages.js";
 import { logger, installLogCollector, installConsoleHelpers } from "../utils/logger.js";
@@ -252,38 +257,86 @@ async function parseAccountInOffscreen(html) {
 
 /**
  * The account whose unit's ECM folder gets this run's documents, or null when it cannot be
- * verified (the documents are then saved locally - a site is never guessed).
+ * verified (the documents are then saved locally - a site is never guessed). A Local run
+ * reads it only for the download log (forEcm: false), where a missing account is no warning.
  */
-async function irepsAccountForEcm() {
+async function irepsAccountForEcm({ forEcm = true } = {}) {
+  const warn = (text, extra) => (forEcm ? logger.warn(`ECM: ${text}; documents will be saved locally`, extra) : logger.debug(`Download log: ${text}`, extra));
   try {
     await loadIrepsConfig();
     const response = await fetch(`${IREPS_CONFIG.baseUrl}${HOME_PATH}`, { credentials: "include", redirect: "follow" });
     if (!response.ok) {
-      logger.warn("ECM: IREPS home page not available; documents will be saved locally", { status: response.status });
+      warn("IREPS home page not available", { status: response.status });
       return null;
     }
     // a login / session-expired page has no account line, so it comes back unverified
     const account = await parseAccountInOffscreen(await response.text());
     if (!account.verified) {
-      logger.warn(`ECM: IREPS account not verified (${account.note}); documents will be saved locally`);
+      warn(`IREPS account not verified (${account.note})`);
       return null;
     }
-    logger.info(`ECM: IREPS account ${account.irepsAccountId} (${account.operatingUnit || "unit not stated"})`);
+    logger.info(`${forEcm ? "ECM" : "Download log"}: IREPS account ${account.irepsAccountId} (${account.operatingUnit || "unit not stated"})`);
     return { irepsAccountId: account.irepsAccountId, operatingUnit: account.operatingUnit };
   } catch (error) {
-    logger.warn("ECM: could not read the IREPS account; documents will be saved locally", error);
+    warn("could not read the IREPS account", error);
     return null;
   }
 }
 
+/** How long a run waits for the panel's "download again?" answer before skipping those files. */
+const REDOWNLOAD_ANSWER_TIMEOUT_MS = 4 * 60 * 1000;
+
 /**
- * The saveFile hook for a document run (services/search-po/document-downloader.js), or
- * undefined for the default local save. Under "ECM / S3" each item that says how it is
- * filed (item.ecm) goes to the ECM, and is saved locally instead when that fails.
+ * The `ask` of preflightDownloads for a run started from the side panel of tab `panelTabId`:
+ * that panel shows which files are already downloaded / in the ECM and answers which to
+ * download again. No answer (panel closed, or no choice within 4 minutes) = download none
+ * of them again.
  */
-async function documentSaveFile(destination) {
-  if (destination !== SAVE_DESTINATION.RECON) return undefined;
-  const account = await irepsAccountForEcm();
+function askPanel(panelTabId) {
+  return async (question) => {
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), REDOWNLOAD_ANSWER_TIMEOUT_MS);
+    });
+    try {
+      const answer = await Promise.race([
+        chrome.runtime.sendMessage({ target: TARGETS.POPUP, type: MESSAGE_TYPES.CONFIRM_REDOWNLOAD, panelTabId: panelTabId ?? null, question }).catch(() => null),
+        timeout
+      ]);
+      if (!answer) logger.info("Download again? not answered: those files are skipped");
+      return answer;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
+/**
+ * Everything a document run (MA, PO, IC, the batches) hands to its service, as deps:
+ *   saveFile   Save to: ECM / S3 -> the ECM (else undefined: the default local save)
+ *   preflight  the already-downloaded / already-in-ECM check, asked in the panel
+ *   onSaved    each saved document goes to the download log
+ * preflight and onSaved only while the download log is on (config.json "downloadLog").
+ * `preflight: false` leaves the check out (a retry only fetches what failed).
+ */
+async function documentRunHooks(rawDestination, panelTabId, { preflight = true } = {}) {
+  const destination = sanitiseDestination(rawDestination);
+  const toEcm = destination === SAVE_DESTINATION.RECON;
+  const logging = await loadDownloadLogConfig();
+  const account = toEcm || logging ? await irepsAccountForEcm({ forEcm: toEcm }) : null;
+  return {
+    saveFile: toEcm ? ecmSaveFile(account) : undefined,
+    preflight: logging && preflight ? (items) => preflightDownloads(items, { destination: runDestination(destination), account, ask: askPanel(panelTabId) }) : undefined,
+    onSaved: logging ? (item, done) => item.log && logDownload(downloadRecord(item.log, { filename: done.filename, ecm: done.ecm, account })) : undefined
+  };
+}
+
+/**
+ * The saveFile hook of a run under "ECM / S3" (services/search-po/document-downloader.js):
+ * each item that says how it is filed (item.ecm) goes to the ECM, and is saved locally
+ * instead when that fails.
+ */
+function ecmSaveFile(account) {
   return async (bytes, path, item) => {
     const saveLocally = () => downloadBytes(bytes, { path, mimeType: "application/pdf" });
     if (!item || !item.ecm) return saveLocally();
@@ -361,6 +414,30 @@ const STAGE_FOR_PROGRESS = {
  * @returns {Promise<{ destination: string, downloadId: number|null, filename: string, storedPath: string|null, deduplicated: boolean, ingestStats: object|null }>}
  */
 async function saveExportFile(file, target) {
+  // The download log: an export is "the same" when it has the same rows in the same format
+  // (its file name and bytes carry the run's time). Asked before saving; logged after.
+  const log = (await loadDownloadLogConfig()) ? { docType: target.docType, key: downloadKey.export(target.docType, await exportFingerprint(file.format || file.extension, target.records)) } : null;
+  const destination = target.destination === SAVE_DESTINATION.RECON ? LOG_DESTINATION.S3 : LOG_DESTINATION.LOCAL;
+  let warnings = [];
+  if (log) {
+    const n = (target.records || []).length;
+    const checked = await preflightDownloads([{ id: "export", label: `${target.label} export: the same ${n} record${n === 1 ? "" : "s"}`, log }], { destination, ask: askPanel(target.panelTabId) });
+    warnings = checked.warnings;
+    const skip = checked.skip.get("export");
+    if (skip) {
+      logger.info(`${target.label}: identical export already downloaded; not saved again`, { date: skip.date, time: skip.time, count: skip.count });
+      return { destination: target.destination, downloadId: null, filename: null, storedPath: null, deduplicated: false, ingestStats: null, skipped: true, skip, warnings };
+    }
+  }
+  const saved = await saveExportFileTo(file, target);
+  if (log) {
+    await logDownload(downloadRecord(log, { filename: saved.filename, destination }));
+    flushDownloadLog();
+  }
+  return { ...saved, warnings };
+}
+
+async function saveExportFileTo(file, target) {
   if (target.destination === SAVE_DESTINATION.RECON) {
     try {
       const stored = await uploadToRecon({ docType: target.docType, bytes: file.bytes, filename: target.filename, mimeType: file.mimeType });
@@ -387,7 +464,7 @@ function sanitiseDestination(value) {
 /**
  * @param {{ mode?: string, zone?: string, dateFrom?: string, dateTo?: string, destination?: string }} options
  */
-async function runDownloadWorkflow(options) {
+async function runDownloadWorkflow(options, panelTabId) {
   const startedAt = new Date();
   const { destination, ...searchOptions } = options;
 
@@ -440,7 +517,10 @@ async function runDownloadWorkflow(options) {
     docType: RECON_DOC_TYPE.BILL_STATUS,
     localPath: buildBillStatusExportDownloadPath(startedAt),
     filename: buildBillStatusExportFilename(startedAt),
-    localErrorCode: "DOWNLOAD_ERROR"
+    localErrorCode: "DOWNLOAD_ERROR",
+    records: result.records,
+    label: "Bill Status",
+    panelTabId
   });
 
   const summary = {
@@ -450,6 +530,9 @@ async function runDownloadWorkflow(options) {
     storedPath: saved.storedPath,
     deduplicated: saved.deduplicated,
     ingestStats: saved.ingestStats,
+    skipped: saved.skipped === true,
+    skip: saved.skip || null,
+    warnings: saved.warnings || [],
     recordCount: result.recordCount,
     skippedCount: result.skippedCount || 0,
     warningCount: (result.warnings || []).length,
@@ -464,7 +547,7 @@ async function runDownloadWorkflow(options) {
       lastDownloadFilename: summary.storedPath || summary.filename,
       lastRecordCount: summary.recordCount,
       lastFilter: summary.filter,
-      lastStatus: toRecon ? "Saved to Recon Engine (S3)" : "Downloaded successfully"
+      lastStatus: saved.skipped ? "Not saved again: identical export already downloaded" : toRecon ? "Saved to Recon Engine (S3)" : "Downloaded successfully"
     }
   });
   return summary;
@@ -493,7 +576,7 @@ function sanitiseOptions(raw) {
   return out;
 }
 
-async function startDownloadJob(rawOptions) {
+async function startDownloadJob(rawOptions, panelTabId) {
   if (jobRunning) return { started: false, error: describeError("BUSY") };
   jobRunning = true;
   const options = sanitiseOptions(rawOptions);
@@ -502,7 +585,7 @@ async function startDownloadJob(rawOptions) {
 
   (async () => {
     try {
-      const summary = await runDownloadWorkflow(options);
+      const summary = await runDownloadWorkflow(options, panelTabId);
       await setJobState({ status: "complete", stage: STAGES.COMPLETE.id, message: STAGES.COMPLETE.label, result: summary, error: undefined });
       broadcast(MESSAGE_TYPES.IREPS_DOWNLOAD_COMPLETE, summary);
       logger.info(`Bill Status complete: ${summary.recordCount} bills saved as ${summary.storedPath || summary.filename}`, summary);
@@ -634,7 +717,7 @@ async function loadSearchPoFormInfo({ useCache = true } = {}) {
  * @param {string} criteria   "CRN" | "RNOTE"
  * @param {{ format: string, destination: string, mode?: string, railway?: string, poNo?: string, dateFrom?: string, dateTo?: string, recordsPerPage?: number }} options
  */
-async function runDocumentDownloadWorkflow(criteria, options) {
+async function runDocumentDownloadWorkflow(criteria, options, panelTabId) {
   const startedAt = new Date();
   const { format, destination, ...searchOptions } = options;
   const label = typeLabel(criteria);
@@ -680,7 +763,10 @@ async function runDocumentDownloadWorkflow(criteria, options) {
     docType: RECON_DOC_TYPES[criteria],
     localPath: buildDocumentExportDownloadPath(criteria, startedAt, file.extension),
     filename: buildDocumentExportFilename(criteria, startedAt, file.extension),
-    localErrorCode: "DOCUMENT_DOWNLOAD_ERROR"
+    localErrorCode: "DOCUMENT_DOWNLOAD_ERROR",
+    records: result.records,
+    label,
+    panelTabId
   });
 
   const summary = {
@@ -692,6 +778,9 @@ async function runDocumentDownloadWorkflow(criteria, options) {
     storedPath: saved.storedPath,
     deduplicated: saved.deduplicated,
     ingestStats: saved.ingestStats,
+    skipped: saved.skipped === true,
+    skip: saved.skip || null,
+    warnings: saved.warnings || [],
     format: file.format,
     recordCount: result.recordCount,
     columnCount: file.columnCount,
@@ -711,14 +800,14 @@ async function runDocumentDownloadWorkflow(criteria, options) {
         lastDownloadFilename: summary.storedPath || summary.filename,
         lastRecordCount: summary.recordCount,
         lastFilter: summary.filter,
-        lastStatus: toRecon ? "Saved to Recon Engine (S3)" : "Downloaded successfully"
+        lastStatus: saved.skipped ? "Not saved again: identical export already downloaded" : toRecon ? "Saved to Recon Engine (S3)" : "Downloaded successfully"
       }
     });
   }
   return summary;
 }
 
-async function startDocumentDownloadJob(rawCriteria, rawOptions) {
+async function startDocumentDownloadJob(rawCriteria, rawOptions, panelTabId) {
   const criteria = SEARCH_PO_DOCUMENT_TYPES.some((t) => t.criteria === rawCriteria) ? rawCriteria : null;
   if (!criteria) return { started: false, error: describeError(SEARCH_PO_ERROR.UNSUPPORTED_CRITERIA, { detail: String(rawCriteria) }) };
   if (documentJobRunning) return { started: false, error: describeError("DOCUMENT_BUSY") };
@@ -728,7 +817,7 @@ async function startDocumentDownloadJob(rawCriteria, rawOptions) {
 
   (async () => {
     try {
-      const summary = await runDocumentDownloadWorkflow(criteria, options);
+      const summary = await runDocumentDownloadWorkflow(criteria, options, panelTabId);
       const doneLabel = documentStageLabel(DOCUMENT_STAGES.COMPLETE, typeLabel(criteria));
       await setDocumentJob(criteria, { status: "complete", stage: DOCUMENT_STAGES.COMPLETE.id, message: doneLabel, result: summary, error: undefined });
       broadcast(MESSAGE_TYPES.DOCUMENT_DOWNLOAD_COMPLETE, summary);
@@ -928,7 +1017,7 @@ async function startMaSearch(rawOptions) {
  * @param {string[]|"all"} selection   record ids to download, or "all"
  * @param {string} [destination]        SAVE_DESTINATION ("recon" = ECM / S3)
  */
-async function startMaDownload(selection, destination) {
+async function startMaDownload(selection, destination, panelTabId) {
   await restoreMaState();
   if (maRunning) return { started: false, error: describeError("MA_BUSY") };
   if (!Array.isArray(maState.records) || maState.records.length === 0) return { started: false, error: describeError(MA_ERROR.NOT_FOUND, { detail: "no MA list loaded" }) };
@@ -943,7 +1032,7 @@ async function startMaDownload(selection, destination) {
       await setMaState({ status: "downloading", stage: MA_STAGES.DOWNLOADING.id, message: `Downloading ${records.length} MA cop${records.length === 1 ? "y" : "ies"}...`, error: null });
       broadcast(MESSAGE_TYPES.MA_PROGRESS, { stage: MA_STAGES.DOWNLOADING.id, message: maState.message, status: "downloading" });
       const summary = await downloadMaPdfs(records, {
-        saveFile: await documentSaveFile(sanitiseDestination(destination)),
+        ...(await documentRunHooks(destination, panelTabId)),
         onProgress: (snapshot) => {
           maState = { ...maState, downloads: snapshot, updatedAt: Date.now() };
           broadcast(MESSAGE_TYPES.MA_DOWNLOAD_PROGRESS, { downloads: snapshot });
@@ -957,7 +1046,7 @@ async function startMaDownload(selection, destination) {
       await setMaState({
         status: "complete",
         stage: MA_STAGES.COMPLETE.id,
-        message: `${summary.completed} of ${summary.total} MA cop${summary.total === 1 ? "y" : "ies"} downloaded`,
+        message: `${summary.completed} of ${summary.total} MA cop${summary.total === 1 ? "y" : "ies"} downloaded${summary.skipped ? ` (${summary.skipped} skipped: already downloaded)` : ""}`,
         downloads: summary,
         error: described
       });
@@ -972,7 +1061,8 @@ async function startMaDownload(selection, destination) {
         }
       });
       broadcast(MESSAGE_TYPES.MA_DOWNLOAD_COMPLETE, { downloads: summary, error: described, message: maState.message });
-      logger.info("MA download finished", { completed: summary.completed, failed: summary.failed, sessionExpired: summary.sessionExpired });
+      logger.info("MA download finished", { completed: summary.completed, failed: summary.failed, skipped: summary.skipped, sessionExpired: summary.sessionExpired });
+      flushDownloadLog();
     } catch (error) {
       const described = maErrorFrom(error);
       logger.warn(`MA download stopped: ${described.title}`, { code: described.code, message: described.message, status: (error && error.status) ?? null });
@@ -1053,7 +1143,7 @@ function sanitisePoNumber(raw) {
   return typeof raw === "string" ? raw.trim() : "";
 }
 
-async function startPoDownload(rawPoNo, destination) {
+async function startPoDownload(rawPoNo, destination, panelTabId) {
   if (poRunning) return { started: false, error: describeError("PO_BUSY") };
   const poNo = sanitisePoNumber(rawPoNo);
   if (!poNo) return { started: false, error: describeError("IREPS_INVALID_REQUEST", { detail: "Please enter a PO Number." }) };
@@ -1065,7 +1155,7 @@ async function startPoDownload(rawPoNo, destination) {
       await setPoState({ status: "running", stage: PO_STAGES.CHECKING_SESSION.id, message: PO_STAGES.CHECKING_SESSION.label, poNumber: poNo, error: null, result: undefined });
       broadcast(MESSAGE_TYPES.PO_PROGRESS, { poNumber: poNo, stage: PO_STAGES.CHECKING_SESSION.id, message: PO_STAGES.CHECKING_SESSION.label });
       const result = await downloadPo(poNo, {
-        saveFile: await documentSaveFile(sanitiseDestination(destination)),
+        ...(await documentRunHooks(destination, panelTabId)),
         parseHtml: (html, options) => parseSearchPoInOffscreen(html, { ...options, criteria: SEARCH_PO_CRITERIA.PO }),
         onProgress: (stage) => {
           const s = PO_STAGE_FOR_PROGRESS[stage];
@@ -1075,12 +1165,16 @@ async function startPoDownload(rawPoNo, destination) {
           broadcast(MESSAGE_TYPES.PO_PROGRESS, { poNumber: poNo, stage: s.id, message: s.label });
         }
       });
-      await setPoState({ status: "complete", stage: PO_STAGES.COMPLETE.id, message: PO_STAGES.COMPLETE.label, result, error: null });
-      await chrome.storage.local.set({
-        [STORAGE_KEYS.LAST_PO_DOWNLOAD]: { lastDownloadAt: new Date().toISOString(), lastDownloadFilename: result.filename, lastPoNumber: poNo, lastStatus: "Downloaded successfully" }
-      });
+      const message = result.skipped ? `PO ${poNo} not downloaded again` : PO_STAGES.COMPLETE.label;
+      await setPoState({ status: "complete", stage: PO_STAGES.COMPLETE.id, message, result, error: null });
+      if (!result.skipped) {
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.LAST_PO_DOWNLOAD]: { lastDownloadAt: new Date().toISOString(), lastDownloadFilename: result.filename, lastPoNumber: poNo, lastStatus: "Downloaded successfully" }
+        });
+      }
       broadcast(MESSAGE_TYPES.PO_DOWNLOAD_COMPLETE, { poNumber: poNo, ...result });
-      logger.info("PO download complete", { poNo, filename: result.filename });
+      logger.info(result.skipped ? "PO download skipped: already downloaded" : "PO download complete", { poNo, filename: result.filename, skip: result.skip ? result.skip.reason : null });
+      flushDownloadLog();
     } catch (error) {
       const described = error instanceof IrepsError ? describeError(error.code, { status: error.status, detail: error.detail }) : describeError("UNKNOWN", { detail: errorDetail(error) });
       if (!(error instanceof IrepsError)) logger.error("PO download failed", error);
@@ -1096,7 +1190,7 @@ async function startPoDownload(rawPoNo, destination) {
   return { started: true };
 }
 
-async function startIcDownload(rawPoNo, destination) {
+async function startIcDownload(rawPoNo, destination, panelTabId) {
   if (icRunning) return { started: false, error: describeError("IC_BUSY") };
   const poNo = sanitisePoNumber(rawPoNo);
   if (!poNo) return { started: false, error: describeError("IREPS_INVALID_REQUEST", { detail: "Please enter a PO Number." }) };
@@ -1109,7 +1203,7 @@ async function startIcDownload(rawPoNo, destination) {
       broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: IC_STAGES.CHECKING_SESSION.id, message: IC_STAGES.CHECKING_SESSION.label, status: "searching" });
       let announcedCount = false;
       const result = await downloadInspectionCertificates(poNo, {
-        saveFile: await documentSaveFile(sanitiseDestination(destination)),
+        ...(await documentRunHooks(destination, panelTabId)),
         parseHtml: (html, options) => parseIcInOffscreen(html, poNo, options),
         onProgress: (stage) => {
           const s = IC_STAGE_FOR_PROGRESS[stage];
@@ -1135,7 +1229,7 @@ async function startIcDownload(rawPoNo, destination) {
       const message =
         result.count === 0
           ? "No issued Inspection Certificates were found for this PO."
-          : `${result.downloads.completed} of ${result.downloads.total} Inspection Certificate${result.downloads.total === 1 ? "" : "s"} downloaded`;
+          : `${result.downloads.completed} of ${result.downloads.total} Inspection Certificate${result.downloads.total === 1 ? "" : "s"} downloaded${result.downloads.skipped ? ` (${result.downloads.skipped} skipped: already downloaded)` : ""}`;
       await setIcState({ status: "complete", stage: IC_STAGES.COMPLETE.id, message, count: result.count, downloads: result.downloads, error: described });
       await chrome.storage.local.set({
         [STORAGE_KEYS.LAST_IC_DOWNLOAD]: {
@@ -1148,7 +1242,8 @@ async function startIcDownload(rawPoNo, destination) {
         }
       });
       broadcast(MESSAGE_TYPES.IC_DOWNLOAD_COMPLETE, { poNumber: poNo, count: result.count, downloads: result.downloads, error: described, message });
-      logger.info("IC download finished", { poNo, count: result.count, completed: result.downloads.completed, failed: result.downloads.failed });
+      logger.info("IC download finished", { poNo, count: result.count, completed: result.downloads.completed, failed: result.downloads.failed, skipped: result.downloads.skipped });
+      flushDownloadLog();
     } catch (error) {
       const described = error instanceof IrepsError ? describeError(error.code, { status: error.status, detail: error.detail }) : describeError("UNKNOWN", { detail: errorDetail(error) });
       if (!(error instanceof IrepsError)) logger.error("IC download failed", error);
@@ -1164,6 +1259,156 @@ async function startIcDownload(rawPoNo, destination) {
   return { started: true };
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* Batch downloads: PO by date, IC from main-page notifications               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Both batch workflows keep one state object each (kind "po-date" /
+ * "ic-notif"); the popup is a pure view of it. The state is broadcast
+ * (throttled) as BATCH_UPDATE, mirrored into chrome.storage.session for a
+ * popup that opens later, and the full state (including what a retry needs)
+ * stays in memory here.
+ */
+const batch = { "po-date": null, "ic-notif": null };
+const batchRunning = { "po-date": false, "ic-notif": false };
+const batchTimers = {};
+
+function publicBatchState(kind) {
+  const state = batch[kind];
+  if (!state) return { kind, phase: "idle", running: batchRunning[kind] };
+  return { ...(kind === "ic-notif" ? publicIcState(state) : state), running: batchRunning[kind] };
+}
+
+function pushBatchState(kind, { immediately = false } = {}) {
+  const send = () => {
+    batchTimers[kind] = null;
+    const snapshot = publicBatchState(kind);
+    broadcast(MESSAGE_TYPES.BATCH_UPDATE, { kind, state: snapshot });
+    chrome.storage.session.set({ [`${SESSION_KEYS.BATCH_STATE}.${kind}`]: snapshot }).catch(() => {});
+  };
+  if (immediately) {
+    if (batchTimers[kind]) clearTimeout(batchTimers[kind]);
+    send();
+  } else if (!batchTimers[kind]) {
+    batchTimers[kind] = setTimeout(send, 250);
+  }
+}
+
+async function restoreBatchState(kind) {
+  if (batch[kind] || batchRunning[kind]) return;
+  try {
+    const stored = await chrome.storage.session.get(`${SESSION_KEYS.BATCH_STATE}.${kind}`);
+    const saved = stored[`${SESSION_KEYS.BATCH_STATE}.${kind}`];
+    // A run that was in flight when the worker stopped cannot continue; show it as stopped.
+    if (saved) {
+      const { running, ...rest } = saved;
+      batch[kind] = rest.phase === "complete" || rest.phase === "error" ? rest : { ...rest, phase: "error", error: describeError("UNKNOWN", { detail: "the download was interrupted" }) };
+    }
+  } catch (error) {
+    logger.debug("Could not restore batch state", error);
+  }
+}
+
+/** The state to hand to the retry functions: re-adds the working indexes of the IC run after a restore. */
+function ensureIcIndexes(state) {
+  if (state.urlIndex) return state;
+  state.urlIndex = new Map(state.items.filter((i) => i.url).map((i) => [i.url, i]));
+  state.pathIndex = new Set(state.items.map((i) => i.path));
+  state.lookupCache = new Map();
+  return state;
+}
+
+function batchErrorState(kind, previous, error) {
+  const described = error instanceof IrepsError ? describeError(error.code, { status: error.status, detail: error.detail }) : describeError("UNKNOWN", { detail: errorDetail(error) });
+  if (!(error instanceof IrepsError)) logger.error(`${kind} batch failed`, error);
+  else logger.warn(`${kind} batch stopped: ${described.title}`, { code: error.code, status: error.status ?? null });
+  if (described.code === "IREPS_SESSION_EXPIRED") lastSessionCheck = null;
+  return { ...(previous || { kind }), kind, phase: "error", error: described, finishedAt: new Date().toISOString() };
+}
+
+/** Save the IC manifest (identifiers and outcomes only - never cookies, tokens or headers). */
+async function saveIcManifest(state) {
+  if (!state.manifest || state.manifest.length === 0) return;
+  try {
+    const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
+    const payload = { generatedAt: new Date().toISOString(), counts: state.counts, records: state.manifest };
+    const saved = await downloadBytes(new TextEncoder().encode(JSON.stringify(payload, null, 2)), {
+      path: `${IC_DOWNLOAD_SUBFOLDER}/IC_notifications_manifest_${stamp}.json`,
+      mimeType: "application/json"
+    });
+    state.manifestFile = saved.filename;
+  } catch (error) {
+    logger.warn("Could not save the IC manifest", error);
+  }
+}
+
+async function runBatch(kind, work) {
+  batchRunning[kind] = true;
+  const update = (state) => {
+    batch[kind] = state;
+    pushBatchState(kind);
+  };
+  try {
+    const finalState = await work(update);
+    batch[kind] = finalState;
+    if (kind === "ic-notif") await saveIcManifest(finalState);
+    if (finalState.sessionExpired) lastSessionCheck = null;
+    await chrome.storage.local.set({ [`doclink.last.${kind}`]: { at: new Date().toISOString(), counts: finalState.counts } }).catch(() => {});
+  } catch (error) {
+    batch[kind] = batchErrorState(kind, batch[kind], error);
+  } finally {
+    batchRunning[kind] = false;
+    pushBatchState(kind, { immediately: true });
+    flushDownloadLog();
+  }
+}
+
+/** Parser bridges to the offscreen document, per workflow. */
+function batchParser(kind) {
+  return kind === "po-date"
+    ? (html, options) => parseSearchPoInOffscreen(html, { ...options, criteria: SEARCH_PO_CRITERIA.PO })
+    : (html, options) => parseIcInOffscreen(html, (options && options.poNo) || null, options);
+}
+
+/**
+ * Save to (Local / ECM / S3) applies to a batch as to a single PO or IC download: each run and
+ * each retry takes the user's current choice. The saver is built inside the run, so an
+ * account lookup that fails ends as the batch's error state, not an unanswered message.
+ */
+async function startBatch(message) {
+  const kind = message.kind;
+  if (kind !== "po-date" && kind !== "ic-notif") return { started: false, error: describeError("UNKNOWN", { detail: "unknown download type" }) };
+  if (batchRunning["po-date"] || batchRunning["ic-notif"]) return { started: false, error: describeError("BATCH_BUSY") };
+  const destination = sanitiseDestination(message.destination);
+  if (kind === "po-date") {
+    const dateFrom = isoToIrepsDate(message.dateFrom) || message.dateFrom;
+    const dateTo = isoToIrepsDate(message.dateTo) || message.dateTo;
+    batch[kind] = null;
+    runBatch(kind, async (update) => runPoDateDownload({ dateFrom, dateTo }, { parseHtml: batchParser(kind), ...(await documentRunHooks(destination, message.panelTabId)), onUpdate: update }));
+  } else {
+    batch[kind] = null;
+    runBatch(kind, async (update) => runIcNotificationDownload({ parseHtml: batchParser(kind), ...(await documentRunHooks(destination, message.panelTabId)), onUpdate: update }));
+  }
+  pushBatchState(kind, { immediately: true });
+  return { started: true };
+}
+
+async function retryBatch(kind, rawDestination, panelTabId) {
+  await restoreBatchState(kind);
+  if (batchRunning["po-date"] || batchRunning["ic-notif"]) return { started: false, error: describeError("BATCH_BUSY") };
+  const state = batch[kind];
+  if (!state || state.phase !== "complete") return { started: false, error: describeError("UNKNOWN", { detail: "nothing to retry" }) };
+  const destination = sanitiseDestination(rawDestination);
+  // a retry only fetches what failed, so it is not checked against the log again
+  const hooks = async () => documentRunHooks(destination, panelTabId, { preflight: false });
+  if (kind === "po-date") runBatch(kind, async (update) => retryPoDateFailures(state, { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }).then(() => state));
+  else runBatch(kind, async (update) => retryIcNotificationFailures(ensureIcIndexes(state), { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }));
+  pushBatchState(kind, { immediately: true });
+  return { started: true };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Message router                                                             */
 /* -------------------------------------------------------------------------- */
@@ -1173,7 +1418,7 @@ const handlers = {
     const result = await performSessionCheck({ useCache: !message.force });
     return publicSessionInfo(result);
   },
-  [MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS]: (message) => startDownloadJob(message.options),
+  [MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS]: (message) => startDownloadJob(message.options, message.panelTabId),
   [MESSAGE_TYPES.GET_JOB_STATE]: () => jobState,
   [MESSAGE_TYPES.OPEN_IREPS]: async (message) => {
     const url = `${IREPS_CONFIG.baseUrl}${IREPS_CONFIG.homePath}`;
@@ -1207,12 +1452,12 @@ const handlers = {
 
   // PO Search document workflows (CRN, R-NOTE)
   [MESSAGE_TYPES.SEARCH_PO_LOAD_FORM]: (message) => loadSearchPoFormInfo({ useCache: !message.force }),
-  [MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS]: (message) => startDocumentDownloadJob(message.criteria, message.options),
+  [MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS]: (message) => startDocumentDownloadJob(message.criteria, message.options, message.panelTabId),
   [MESSAGE_TYPES.GET_DOCUMENT_JOB_STATE]: (message) => ({ ...documentJob(message.criteria), criteria: message.criteria, running: documentJobRunning }),
 
   // MA copies
   [MESSAGE_TYPES.MA_SEARCH]: (message) => startMaSearch(message.options),
-  [MESSAGE_TYPES.MA_DOWNLOAD]: (message) => startMaDownload(message.ids, message.destination),
+  [MESSAGE_TYPES.MA_DOWNLOAD]: (message) => startMaDownload(message.ids, message.destination, message.panelTabId),
   [MESSAGE_TYPES.GET_MA_STATE]: async () => {
     await restoreMaState();
     return publicMaState();
@@ -1220,10 +1465,18 @@ const handlers = {
   [MESSAGE_TYPES.MA_RESET]: () => resetMaState(),
 
   // PO / Inspection Certificate (one PO number, two independent downloads)
-  [MESSAGE_TYPES.PO_DOWNLOAD]: (message) => startPoDownload(message.poNo, message.destination),
+  [MESSAGE_TYPES.PO_DOWNLOAD]: (message) => startPoDownload(message.poNo, message.destination, message.panelTabId),
   [MESSAGE_TYPES.GET_PO_STATE]: () => ({ ...poState, running: poRunning }),
-  [MESSAGE_TYPES.IC_DOWNLOAD]: (message) => startIcDownload(message.poNo, message.destination),
-  [MESSAGE_TYPES.GET_IC_STATE]: () => ({ ...icState, running: icRunning })
+  [MESSAGE_TYPES.IC_DOWNLOAD]: (message) => startIcDownload(message.poNo, message.destination, message.panelTabId),
+  [MESSAGE_TYPES.GET_IC_STATE]: () => ({ ...icState, running: icRunning }),
+
+  // Batch downloads: PO by date, IC from notifications
+  [MESSAGE_TYPES.BATCH_START]: (message) => startBatch(message),
+  [MESSAGE_TYPES.BATCH_RETRY]: (message) => retryBatch(message.kind, message.destination, message.panelTabId),
+  [MESSAGE_TYPES.BATCH_GET_STATE]: async (message) => {
+    await restoreBatchState(message.kind);
+    return publicBatchState(message.kind);
+  }
 };
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

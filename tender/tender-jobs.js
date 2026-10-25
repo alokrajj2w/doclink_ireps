@@ -8,7 +8,7 @@
 //
 // Financial and Commercial Tabulation are not part of any job.
 
-import { TenderError, SESSION_MSG, log, norm, getBaseUrl } from './tender-core.js';
+import { TenderError, SESSION_MSG, IREPS_DOWN_CODES, log, norm, getBaseUrl } from './tender-core.js';
 import { assertSameAccount } from './tender-account.js';
 import { getActiveIrepsAccountContext, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { searchTender, fmtDate } from './tender-search.js';
@@ -16,12 +16,13 @@ import { openLedger } from './tender-ledger.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
 } from './tender-workflows.js';
-import { tenderEcmSink } from './tender-ecm.js';
+import { tenderEcmSink, ensureDownloadSignIn } from './tender-ecm.js';
 
 const DAY = 86400000;
 const ddmmyyyy = (d) => fmtDate(d);
 
 export async function beginJob({ onProgress, onAccount }) {
+  await ensureDownloadSignIn(); // Recon sign-in: every download is logged for the signed-in user
   const base = await getBaseUrl();
   onProgress('Verifying IREPS account...');
   const account = await getActiveIrepsAccountContext({ base });
@@ -30,7 +31,8 @@ export async function beginJob({ onProgress, onAccount }) {
   if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
   const folderLabel = accountFolderLabel(account);
   const ledger = await openLedger(account.irepsAccountId);
-  return { base, account, folderLabel, ledger };
+  // "same answer for the rest of this run" of the download-again prompt, shared by its tenders
+  return { base, account, folderLabel, ledger, redownloadMemo: {} };
 }
 
 /** dd/mm/yyyy strings from `from` to `to` inclusive. */
@@ -67,6 +69,7 @@ export async function openTender(job, tenderNo, preferWindows, onProgress) {
   const { run } = startTenderRun(job.base, job.account, found, job.folderLabel);
   run.ledger = job.ledger;
   run.ledgerMode = 'skip';
+  run.redownloadMemo = job.redownloadMemo;
   return run;
 }
 
@@ -74,7 +77,7 @@ export async function openTender(job, tenderNo, preferWindows, onProgress) {
 // ---------------------------------------------------------------- manifest
 
 /**
- * Create/update download_manifest.json for a tender: the verified account, the tender, the source
+ * Create/update the download record for a tender (kept in extension storage, never downloaded): the verified account, the tender, the source
  * messages, every document (category, title, source date, saved name, validation, timestamp, status/reason)
  * and every run with its date range. The merged record is kept in the ledger so each run adds to it.
  * Holds no cookies, tokens or credentials.
@@ -103,12 +106,7 @@ export async function recordManifest(job, run, categories, { range = null, sourc
       categories: Object.fromEntries(Object.entries(categories).map(([k, c]) => [k, { status: c.status, discovered: c.discovered, downloaded: c.downloaded, failed: c.failed, note: c.note || '' }])),
     }],
   };
-  job.ledger.setManifest(ctx.tenderNo, manifest);
-  try {
-    await run.saver.saveJson('download_manifest.json', manifest);
-  } catch (e) {
-    log('Download', `manifest not saved: ${e.message}`);
-  }
+  job.ledger.setManifest(ctx.tenderNo, manifest); // kept in extension storage only; no download_manifest.json is saved
 }
 
 // ---------------------------------------------------------------- NIT documents (daily)
@@ -201,16 +199,27 @@ export async function downloadTodaysCorrigenda({ onProgress = () => {}, onAccoun
  * is only ever downloaded once - one published later in the day is simply picked up by the next run.
  * Pass `dateStr` (dd/mm/yyyy) to fetch one specific day.
  */
-export async function downloadLettersByDate({ onProgress = () => {}, onAccount = () => {}, today = new Date(), dateStr = '', dates: datesOverride = null, job: sharedJob = null } = {}) {
+export async function downloadLettersByDate({ onProgress = () => {}, onAccount = () => {}, today = new Date(), dateStr = '', dates: datesOverride = null, job: sharedJob = null, statuses: onlyStatuses = null, tenderNo: onlyTender = '' } = {}) {
   const job = sharedJob || (await beginJob({ onProgress, onAccount }));
   const last = job.ledger.meta('lastLetterDate');
   const dates = datesOverride || (dateStr ? [dateStr] : dayRange(last ? parseDmy(last) : today, today));
   const wanted = new Set(dates);
-  const probe = { base: job.base, ctx: { tenderNo: '' }, inboxCache: new Map() };
+  const probe = { base: job.base, ctx: { tenderNo: '' }, inboxCache: new Map(), onProgress };
 
-  onProgress(`Reading Negotiation, Counter Offer and LOA lists for ${dates[0]}${dates.length > 1 ? ` - ${dates[dates.length - 1]}` : ''}...`);
-  const statuses = Object.keys(LETTER_SPECS);
-  const scans = await Promise.all(statuses.map((st) => scanPostTenderList(probe, st))); // independent lists, read together
+  const statuses = onlyStatuses || Object.keys(LETTER_SPECS);
+  const wantTender = norm(onlyTender).toLowerCase(); // optional exact (normalized) Tender Number filter
+  onProgress(`Reading ${statuses.map((st) => LETTER_KINDS[st].page).join(', ')} list(s) for ${dates[0]}${dates.length > 1 ? ` - ${dates[dates.length - 1]}` : ''}...`);
+  // independent lists, read together; one that IREPS fails to open is reported on its own and never blocks the others
+  const settled = await Promise.allSettled(statuses.map((st) => scanPostTenderList(probe, st)));
+  const listErrors = {};
+  const scans = settled.map((s, i) => {
+    if (s.status === 'fulfilled') return s.value;
+    const e = s.reason;
+    if (e.code === 'SESSION_EXPIRED') throw e;
+    listErrors[statuses[i]] = IREPS_DOWN_CODES.has(e.code) ? `IREPS failed to open the ${LETTER_KINDS[statuses[i]].page} page - IREPS is not responding.` : `Could not read the ${LETTER_KINDS[statuses[i]].page} page: ${e.message}`;
+    log('Letters', `${statuses[i]} list failed: ${e.message}`);
+    return { entries: [], scripts: '', unparsed: 0 };
+  });
 
   const byTender = new Map(); // tenderNo -> { categories, folder }
   // Save to: ECM / S3 (asked once, and only when there is a letter to save), or null
@@ -221,7 +230,7 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
   let listed = 0;
   for (const [i, status] of statuses.entries()) {
     const { entries, scripts } = scans[i];
-    const todays = entries.filter((e) => wanted.has(e.date));
+    const todays = entries.filter((e) => wanted.has(e.date) && (!wantTender || norm(e.tenderNo).toLowerCase() === wantTender)); // Letter Date only
     listed += todays.length;
     const tenders = [...new Set(todays.map((e) => e.tenderNo))];
     log('Letters', `${status}: ${todays.length} letter(s) dated ${[...wanted].join(', ')} for ${tenders.length} tender(s)`);
@@ -232,6 +241,7 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
       onProgress(`${LETTER_KINDS[status].tag} letters for ${tenderNo}...`);
       try {
         const run = startLetterRun(job, tenderNo);
+        run.onProgress = onProgress;
         await assertSameAccount(job.account, { base: job.base });
         run.ecm = await ecmSink();
         if (run.ecm) run.ctx.closingDate = await closingDateFor(job, tenderNo, onProgress);
@@ -250,7 +260,7 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
   }
   if (!aborted && !dateStr && !datesOverride) job.ledger.setMeta('lastLetterDate', ddmmyyyy(today)); // today is re-read next time
   if (!sharedJob) await job.ledger.save();
-  return { account: publicAccount(job.account), dates, listed, tenders: [...byTender.values()], aborted, summary: { newLetters } };
+  return { account: publicAccount(job.account), dates, listed, tenders: [...byTender.values()], aborted, listErrors, summary: { newLetters } };
 }
 
 /** The 3-4x-a-day check: letters dated since the last run (normally just today). */
@@ -261,5 +271,6 @@ export function startLetterRun(job, tenderNo) {
   const { run } = startTenderRun(job.base, job.account, found, job.folderLabel);
   run.ledger = job.ledger;
   run.ledgerMode = 'skip';
+  run.redownloadMemo = job.redownloadMemo;
   return run;
 }

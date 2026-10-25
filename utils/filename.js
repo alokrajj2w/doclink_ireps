@@ -219,3 +219,28 @@ export function buildIcDownloadPath(record) {
   const po = String((record && record.poNo) || "").trim() || "unknown-po";
   return `${IC_DOWNLOAD_SUBFOLDER}/${sanitiseFilename(po)}/${buildIcFilename(po, record && record.poSerial, record && record.callId)}`;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Purchase Orders downloaded by PO date (batch)                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * PO_<PO-NO>_<YYYY-MM-DD>.pdf, or PO_<PO-NO>_<UNIT>_<YYYY-MM-DD>.pdf when the
+ * same PO number appears for several railway units on that date.
+ * @param {{ poNo?: string|null, railwayUnit?: string|null, dateKey?: string|null }} record
+ * @param {{ withUnit?: boolean, suffix?: number }} [options]
+ */
+export function buildPoDateFilename(record, options = {}) {
+  const po = String((record && record.poNo) || "").trim() || "unknown-po";
+  const date = /^\d{4}-\d{2}-\d{2}$/.test((record && record.dateKey) || "") ? record.dateKey : "undated";
+  const unit = options.withUnit ? String((record && record.railwayUnit) || "").trim() : "";
+  const parts = ["PO", po, unit, date].filter(Boolean);
+  const suffix = options.suffix > 1 ? `_${options.suffix}` : "";
+  return sanitiseFilename(`${parts.join("_")}${suffix}.pdf`);
+}
+
+/** Downloads-relative path: DocLink/IREPS/PO/<YYYY-MM-DD>/PO_<PO>_<YYYY-MM-DD>.pdf. */
+export function buildPoDateDownloadPath(record, options = {}) {
+  const folder = /^\d{4}-\d{2}-\d{2}$/.test((record && record.dateKey) || "") ? record.dateKey : "undated";
+  return `${PO_DOWNLOAD_SUBFOLDER}/${folder}/${buildPoDateFilename(record, options)}`;
+}

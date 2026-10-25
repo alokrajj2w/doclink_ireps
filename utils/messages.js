@@ -32,6 +32,11 @@ export const MESSAGE_TYPES = Object.freeze({
   IC_DOWNLOAD: "IC_DOWNLOAD",
   GET_IC_STATE: "GET_IC_STATE",
 
+  // popup -> service worker: batch downloads (PO by date, IC from notifications)
+  BATCH_START: "BATCH_START",
+  BATCH_RETRY: "BATCH_RETRY",
+  BATCH_GET_STATE: "BATCH_GET_STATE",
+
   // service worker -> popup (broadcast)
   IREPS_PROGRESS: "IREPS_PROGRESS",
   IREPS_DOWNLOAD_COMPLETE: "IREPS_DOWNLOAD_COMPLETE",
@@ -51,6 +56,11 @@ export const MESSAGE_TYPES = Object.freeze({
   IC_DOWNLOAD_PROGRESS: "IC_DOWNLOAD_PROGRESS",
   IC_DOWNLOAD_COMPLETE: "IC_DOWNLOAD_COMPLETE",
   IC_DOWNLOAD_ERROR: "IC_DOWNLOAD_ERROR",
+  BATCH_UPDATE: "BATCH_UPDATE",
+
+  // service worker -> popup (request / response): "these files are already downloaded /
+  // in the ECM - download which again?" (services/download-log.js, popup/popup-redownload.js)
+  CONFIRM_REDOWNLOAD: "CONFIRM_REDOWNLOAD",
 
   // service worker -> offscreen document
   PARSE_BILL_STATUS: "PARSE_BILL_STATUS",
@@ -423,7 +433,7 @@ export const ERROR_CATALOG = Object.freeze({
   },
   ECM_REJECTED: {
     title: "ECM refused the document",
-    message: "The ECM gateway did not accept the document: {detail}. It was saved locally.",
+    message: "The ECM did not accept the document: {detail}. It was saved locally.",
     notice: true,
     connection: "connected"
   },
@@ -432,6 +442,16 @@ export const ERROR_CATALOG = Object.freeze({
     message: "DocLink could not reach the ECM ({detail}). The document was saved locally.",
     notice: true,
     connection: "connected"
+  },
+  DOWNLOAD_LOG_SIGN_IN_REQUIRED: {
+    title: "Recon Engine sign-in required",
+    message: "Sign in to the Recon Engine to download: DocLink records every download for the signed-in user, and checks what you already downloaded. Nothing was downloaded.",
+    reconSignIn: true
+  },
+  DOWNLOAD_LOG_UNAVAILABLE: {
+    title: "Download log unavailable",
+    message: "DocLink could not reach the Recon Engine's download log ({detail}). The files are downloaded anyway and recorded once it is back.",
+    notice: true
   },
   DOCUMENT_BUSY: {
     title: "Download Already Running",
@@ -521,6 +541,20 @@ export const ERROR_CATALOG = Object.freeze({
     message: "Your IREPS session has expired.\n\nPlease log in again and retry the IC download.",
     connection: "login"
   },
+  IREPS_NOTIFICATIONS_FAILED: {
+    title: "Unable to load IREPS notifications",
+    message: "DocLink could not read the notifications on the IREPS main page ({detail}). Check your network connection and try again.",
+    connection: "offline"
+  },
+  IREPS_NOTIFICATIONS_INVALID: {
+    title: "Unable to read IREPS notifications",
+    message: "IREPS returned a notification list that DocLink could not read ({detail}).",
+    connection: "connected"
+  },
+  BATCH_BUSY: {
+    title: "Download Already Running",
+    message: "Please wait for the current download to finish."
+  },
   IC_BUSY: {
     title: "IC Download Already Running",
     message: "Please wait for the current Inspection Certificate download to finish."
@@ -575,5 +609,6 @@ export const SESSION_KEYS = Object.freeze({
   DOCUMENT_JOBS: "doclink.documentJobs",
   MA_STATE: "doclink.maState",
   PO_STATE: "doclink.poState",
-  IC_STATE: "doclink.icState"
+  IC_STATE: "doclink.icState",
+  BATCH_STATE: "doclink.batchState"
 });

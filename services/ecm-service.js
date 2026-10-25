@@ -24,10 +24,19 @@
  *
  * Bill Status, CRN and R-NOTE are not ECM documents: under the same switch they keep
  * going to the Recon Engine (S3).
+ *
+ * Direct mode (config.json "ecmBackendAws": false, for local testing): the same document
+ * goes straight to the ECM (Nuxeo) from DocLink instead (services/ecm-direct.js), with
+ * the same folders, metadata, answer and error codes. "ecmBackendAws": true is the
+ * gateway described above.
  */
 
 import { logger } from "../utils/logger.js";
 import { RECON_CONFIG, loadReconConfig, reconConfigProblem, manifestHostPermissions, apiErrorDetail } from "./recon-service.js";
+import { loadEcmConfig, isDirectEcm } from "./ecm-config.js";
+import { uploadToNuxeo, findInFolder } from "./ecm-direct.js";
+
+const CHECK_TIMEOUT_MS = 30000;
 
 /** ECM document kinds (InvoiceCertificateSchema:type) DocLink uploads. */
 export const ECM_KIND = Object.freeze({
@@ -128,7 +137,8 @@ export function ecmFields(fields) {
  */
 
 /**
- * Upload one document to the ECM folder of the account's unit.
+ * Upload one document to the ECM folder of the account's unit: through the Recon Engine's
+ * ECM gateway ("ecmBackendAws": true) or straight to the ECM (false, services/ecm-direct.js).
  *
  * @param {{ kind: string, bytes: Uint8Array, filename: string, title?: string, fields?: object,
  *           account: EcmAccount, mimeType?: string }} doc
@@ -136,6 +146,12 @@ export function ecmFields(fields) {
  * @returns {Promise<EcmUploadResult>}
  */
 export async function uploadToEcm(doc, deps = {}) {
+  await loadEcmConfig();
+  return isDirectEcm() ? uploadToNuxeo(doc, deps) : uploadViaGateway(doc, deps);
+}
+
+/** POST {reconBaseUrl}/api/ecm/documents (see the top of this file). */
+async function uploadViaGateway(doc, deps) {
   await loadReconConfig();
   const baseUrl = RECON_CONFIG.baseUrl;
   const problem = reconConfigProblem(baseUrl, deps.hostPermissions || manifestHostPermissions(), ENDPOINT);
@@ -192,6 +208,74 @@ export async function uploadToEcm(doc, deps = {}) {
   const result = { uid: body.uid, path: body.path ?? null, title: body.title ?? null, site: body.site ?? null, deduplicated: body.deduplicated === true };
   logger.info(`ECM ${result.deduplicated ? "already had" : "stored"} ${doc.filename}`, { kind: doc.kind, site: result.site, uid: result.uid });
   return result;
+}
+
+/**
+ * @typedef {Object} EcmCandidate
+ * @property {string} ref        the caller's id for it
+ * @property {object} fields     plain field keys, as for an upload
+ * @property {string} [title]    compared too when given (tender documents: one tender holds several of a kind)
+ */
+
+/**
+ * Before a run under Save to: ECM / S3: which of these documents are already in the folder
+ * their upload would go to (the account's unit, the kind's location). Matched on the field
+ * values (dates aside) and the title when given, not on file names: other tools store the
+ * same document under other names. Through the gateway or straight to the ECM, like
+ * uploadToEcm. Never throws: when the check cannot be made it answers { ok: false } and
+ * the documents are downloaded (an upload is still not stored twice).
+ *
+ * @param {{ kind: string, account: EcmAccount, candidates: EcmCandidate[] }} query
+ * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
+ * @returns {Promise<{ ok: boolean, found: Map<string, { uid: string, path: string|null, title: string|null }>, code?: string, detail?: string }>}
+ */
+export async function findInEcm(query, deps = {}) {
+  const candidates = (query.candidates || []).map((c) => ({ ref: String(c.ref), fields: ecmFields(c.fields), title: c.title || undefined }));
+  if (candidates.length === 0) return { ok: true, found: new Map() };
+  try {
+    await loadEcmConfig();
+    const account = query.account || {};
+    if (!account.irepsAccountId && !account.operatingUnit) throw new EcmError(ECM_ERROR.ACCOUNT_UNKNOWN, { detail: "the IREPS account could not be verified" });
+    const found = isDirectEcm() ? await findInFolder({ kind: query.kind, account, candidates }, deps) : await findViaGateway({ kind: query.kind, account, candidates }, deps);
+    logger.info(`ECM check: ${found.size} of ${candidates.length} ${query.kind} document(s) already in the ECM`);
+    return { ok: true, found };
+  } catch (error) {
+    if (!(error instanceof EcmError)) logger.warn("ECM check failed", error);
+    else logger.warn(`ECM check not made (${error.code})`, { status: error.status, detail: error.detail });
+    return { ok: false, found: new Map(), code: error.code || "UNKNOWN", detail: error.detail || null };
+  }
+}
+
+/** POST {reconBaseUrl}/api/ecm/documents/exists (the gateway's find_in_folder). */
+async function findViaGateway({ kind, account, candidates }, deps) {
+  await loadReconConfig();
+  const baseUrl = RECON_CONFIG.baseUrl;
+  const path = `${ENDPOINT}/exists`;
+  const problem = reconConfigProblem(baseUrl, deps.hostPermissions || manifestHostPermissions(), path);
+  if (problem) throw new EcmError(ECM_ERROR.NOT_CONFIGURED, { detail: problem });
+  const body = { kind, candidates };
+  if (account.irepsAccountId) body.ireps_account_id = String(account.irepsAccountId);
+  if (account.operatingUnit) body.operating_unit = String(account.operatingUnit);
+  const fetchImpl = deps.fetch || globalThis.fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetchImpl(`${baseUrl}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), credentials: "include", signal: controller.signal });
+  } catch {
+    throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: `could not reach ${new URL(baseUrl).origin}` });
+  } finally {
+    clearTimeout(timer);
+  }
+  let answer = null;
+  try {
+    answer = await response.json();
+  } catch {
+    answer = null;
+  }
+  if (response.status === 401 || response.status === 403) throw new EcmError(ECM_ERROR.AUTH_REQUIRED, { status: response.status, detail: apiErrorDetail(answer) });
+  if (!response.ok || !answer || typeof answer.found !== "object") throw new EcmError(response.status < 500 ? ECM_ERROR.REJECTED : ECM_ERROR.UNAVAILABLE, { status: response.status, detail: apiErrorDetail(answer) || `HTTP ${response.status}` });
+  return new Map(Object.entries(answer.found).map(([ref, d]) => [ref, { uid: d.uid, path: d.path ?? null, title: d.title ?? null }]));
 }
 
 /**

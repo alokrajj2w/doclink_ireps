@@ -152,7 +152,15 @@ export function parseIcRow(row, header, group, ordinal = 1, options = {}) {
   record.index = ordinal;
   const warnings = [];
   const cells = Array.from(row.cells);
-  const missing = header.keys.length - cells.length; // leading grouped columns this row does not repeat
+  // The live page prints one more data cell than it has headers, between IC Date and
+  // Passed Qty. (a second date); parseIcSearchResults() measures that surplus once per
+  // table as header.extra. A positional mapping would shift Passed Qty. / Call Status /
+  // Actions by one, so the columns after IC Date are aligned from the right instead and
+  // the surplus cell(s) are left unmapped.
+  const extra = Math.max(Number(header.extra) || 0, 0);
+  const fullWidth = header.keys.length + extra;
+  const missing = fullWidth - cells.length; // leading grouped columns this row does not repeat
+  const lead = Math.max(missing, 0);
 
   if (missing > 0) {
     for (const key of GROUPED_KEYS.slice(0, missing)) {
@@ -165,10 +173,21 @@ export function parseIcRow(row, header, group, ordinal = 1, options = {}) {
     }
   }
 
+  const icDateIndex = header.keys.indexOf("icDate");
+  const tailLength = icDateIndex === -1 ? 0 : header.keys.length - (icDateIndex + 1);
+  const tailStart = icDateIndex === -1 ? Infinity : icDateIndex + 1 - lead; // first cell after IC Date
+  const headerIndexFor = (i) => {
+    if (extra > 0 && i >= tailStart) {
+      const fromRight = cells.length - 1 - i; // 0 = last cell
+      return fromRight < tailLength ? header.keys.length - 1 - fromRight : -1; // -1: surplus cell
+    }
+    return lead + i;
+  };
+
   cells.forEach((cell, i) => {
-    const offset = missing > 0 ? missing : 0;
-    const key = header.keys[i + offset] !== undefined ? header.keys[i + offset] : null;
-    const label = header.labels[i + offset] !== undefined ? header.labels[i + offset] : `Column ${i + offset + 1}`;
+    const hi = headerIndexFor(i);
+    const key = hi >= 0 && header.keys[hi] !== undefined ? header.keys[hi] : null;
+    const label = hi >= 0 && header.labels[hi] !== undefined ? header.labels[hi] : `Column ${i + 1}`;
     const text = cellText(cell);
     for (const a of anchorsOf(cell)) {
       record.links.push({ text: a.text, title: a.title, href: a.href, url: resolveIcUrl(a.href, options.baseUrl), column: label, key });
@@ -217,6 +236,11 @@ export function parseIcSearchResults(html, expectedPoNumber = null, options = {}
   if (!Parser) throw new Error("DOMParser is not available in this context");
   const source = String(html || "");
   const doc = new Parser().parseFromString(source, "text/html");
+  // On the real page the result table sits INSIDE <form name="inspectionCallForm">
+  // (its navigate() paging submits that form). stripDangerousNodes() removes <form>
+  // elements together with their contents, so unwrap them first - the table is kept,
+  // the form (and every script / handler) is still dropped.
+  for (const form of Array.from(doc.querySelectorAll("form"))) form.replaceWith(...Array.from(form.childNodes));
   stripDangerousNodes(doc);
 
   const warnings = [];
@@ -231,12 +255,14 @@ export function parseIcSearchResults(html, expectedPoNumber = null, options = {}
     const { table, headerRow, keys, labels } = located;
     const group = { values: {} };
     let ordinal = startIndex;
+    const widest = Math.max(0, ...Array.from(table.rows).filter((r) => r !== headerRow && !isMarkupHeaderRow(r)).map((r) => r.cells.length));
+    const extra = widest > keys.length ? widest - keys.length : 0;
     for (const row of Array.from(table.rows)) {
       if (row === headerRow || isMarkupHeaderRow(row)) continue;
       const cells = Array.from(row.cells);
       if (cells.length < 6) continue; // spacer / message rows
       rowCount++;
-      const { record, warnings: rowWarnings } = parseIcRow(row, { labels, keys }, group, ordinal, { baseUrl: options.baseUrl });
+      const { record, warnings: rowWarnings } = parseIcRow(row, { labels, keys, extra }, group, ordinal, { baseUrl: options.baseUrl });
       warnings.push(...rowWarnings);
       if (!record.callId) continue; // unreadable row, not counted as a record
       if (wantPo && record.poNo && record.poNo !== wantPo) {

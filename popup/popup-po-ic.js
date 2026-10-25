@@ -20,6 +20,7 @@
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
 import { SAVE_DESTINATION } from "../services/recon-service.js";
+import { describeSkip } from "../services/download-log.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -107,8 +108,14 @@ function renderPoComplete(result) {
   ctx.setConnection("connected", "Connected");
   poDownloadId = result.downloadId ?? null;
   const ecm = result.ecm || null;
-  el.poResultTitle.textContent = ecm ? PO_ECM_TITLE[ecm.status] : "✓ PO downloaded successfully";
-  el.poResultFilename.textContent = ecm ? describeEcmOutcome(ecm) : result.filename || "";
+  if (result.skipped) {
+    // already downloaded by this user / already in the ECM, and not chosen to download again
+    el.poResultTitle.textContent = `PO ${result.poNumber || ""} not downloaded again`.replace(/\s+/g, " ");
+    el.poResultFilename.textContent = [describeSkip(result.skip), ...(result.warnings || [])].filter(Boolean).join("\n");
+  } else {
+    el.poResultTitle.textContent = ecm ? PO_ECM_TITLE[ecm.status] : "✓ PO downloaded successfully";
+    el.poResultFilename.textContent = [ecm ? describeEcmOutcome(ecm) : result.filename || "", ...(result.warnings || [])].filter(Boolean).join("\n");
+  }
   el.btnPoShowFile.hidden = poDownloadId === null;
   el.poResult.hidden = false;
 }
@@ -197,7 +204,12 @@ function renderIcComplete(message, count, downloads) {
   el.icResultText.textContent =
     count === 0
       ? "No issued Inspection Certificates were found for this PO."
-      : [downloads.failed === 0 ? "All issued Inspection Certificates were saved." : "Hover a failed item, or use Retry, to see why.", summariseEcm(downloads.items)].filter(Boolean).join("\n");
+      : [
+          downloads.failed === 0 ? (downloads.skipped ? "Every other issued Inspection Certificate was saved." : "All issued Inspection Certificates were saved.") : "Hover a failed item, or use Retry, to see why.",
+          ...((downloads.items || []).filter((i) => i.status === "skipped" && i.skip).map((i) => `${i.label}: ${describeSkip(i.skip)}`)),
+          summariseEcm(downloads.items),
+          ...(downloads.warnings || [])
+        ].filter(Boolean).join("\n");
   // only files saved on this computer (an IC stored in the ECM has no local copy)
   const local = (downloads && downloads.items ? downloads.items : []).filter((i) => i.status === "completed" && i.path && (!i.ecm || i.ecm.status === ECM_OUTCOME.FAILED));
   const folders = new Set(local.map((i) => i.path.split("/").slice(0, -1).join("/")));

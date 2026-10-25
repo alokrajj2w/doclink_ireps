@@ -1,7 +1,7 @@
 // Save to: ECM / S3, for tender documents.
 // Under that choice each tender document is filed in the ECM (Nuxeo) folder of the IREPS account's
 // unit instead of Downloads ("TSG India Doculink ECM specifications.xlsx", "ECM - Download speci-v1"),
-// through the Recon Engine's ECM gateway (services/ecm-service.js). A document the ECM does not take
+// through the Recon Engine's ECM gateway, or straight to the ECM (services/ecm-service.js). A document the ECM does not take
 // is saved locally as before; My Offer has no ECM type and always stays local.
 //
 // This module only READS the panel's Save to preference from chrome.storage.local; it stores nothing.
@@ -10,6 +10,21 @@ import { STORAGE_KEYS } from '../utils/messages.js';
 import { SAVE_DESTINATION } from '../services/recon-service.js';
 import { ECM_KIND, saveToEcmOrLocally } from '../services/ecm-service.js';
 import { confirmReconSignIn } from '../services/recon-auth.js';
+import { loadEcmConfig, isDirectEcm } from '../services/ecm-config.js';
+import { loadDownloadLogConfig } from '../services/download-log.js';
+import { TenderError } from './tender-core.js';
+
+export const SIGN_IN_REQUIRED_MSG = 'Sign in to the Recon Engine to download: DocLink records every download for the signed-in user. Nothing was downloaded.';
+
+/**
+ * Before any tender download: with the download log on (config.json "downloadLog") the user
+ * must be signed in to the Recon Engine, whatever Save to says - the sign-in page asks, and
+ * cancelling it stops the run (TenderError SIGN_IN_REQUIRED). A no-op with the log off.
+ */
+export async function ensureDownloadSignIn() {
+  if (!(await loadDownloadLogConfig())) return;
+  if (!(await confirmReconSignIn({ always: true }))) throw new TenderError('SIGN_IN_REQUIRED', SIGN_IN_REQUIRED_MSG);
+}
 
 /** Tender category (tender-workflows newCategory) -> ECM kind. Categories not listed stay local. */
 export const CATEGORY_ECM_KIND = Object.freeze({
@@ -68,14 +83,16 @@ export function ecmDocumentFor(category, action, ctx) {
 
 /**
  * The run's ECM sink, or null when the Save to choice is Local (or the user chose Local
- * on the Recon Engine sign-in page).
+ * on the Recon Engine sign-in page, which is only shown when the gateway is used).
  *   sink.save(doc, saveLocally) -> { ecm, local }   (see ecm-service saveToEcmOrLocally)
  * The account is the run's verified IREPS account; its unit picks the ECM folder.
  */
 export async function tenderEcmSink(account, deps = {}) {
   if ((await savedDestination()) !== SAVE_DESTINATION.RECON) return null;
   // Login 2: the Recon Engine sign-in page answers before the run; "Use Local instead" -> local.
-  if (!(await confirmReconSignIn())) return null;
+  // Not needed when the documents go straight to the ECM (config.json "ecmBackendAws": false).
+  await loadEcmConfig();
+  if (!isDirectEcm() && !(await confirmReconSignIn())) return null;
   const acct = account?.verified ? { irepsAccountId: account.irepsAccountId, operatingUnit: account.operatingUnit } : {};
   return { save: (doc, saveLocally) => saveToEcmOrLocally({ ...doc, account: acct }, saveLocally, deps) };
 }

@@ -12,7 +12,8 @@ import {
 } from './tender-core.js';
 import { getActiveIrepsAccountContext, assertSameAccount, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
-import { ecmDocumentFor, tenderEcmSink } from './tender-ecm.js';
+import { ecmDocumentFor, tenderEcmSink, ensureDownloadSignIn, CATEGORY_ECM_KIND } from './tender-ecm.js';
+import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
 
 const INBOX_PATH = '/epsn/vendorInboxLink.do';
 const DEFAULT_AJAX_PATH = '/epsn/supply/tds/ajxdata.do';
@@ -90,6 +91,11 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
     saved = await run.saver.save(action.subdir, fileName, doc.bytes);
   }
   const size = saved ? saved.size : doc.bytes.length;
+  // the download log (no-op when it is off); the HTML companion of a rendered page is not a document of its own
+  logDownload(downloadRecord(
+    { docType: TENDER_DOC_TYPE[action.category] || 'tender_document', key: downloadKey.tender(action.category, run.ctx.tenderNo, action.id) },
+    { filename: saved ? saved.relPath.split('/').pop() : fileName, ecm, account: run.account }
+  ));
   const out = [{ fileName: saved ? saved.relPath.split('/').pop() : fileName, relPath: saved ? saved.relPath : null, status: 'DOWNLOADED', id: action.id || '', downloadId: saved ? saved.downloadId : null, size, converted: !!doc.converted,
     title: action.meta?.title || '', docDate: action.meta?.docDate || '', downloadedAt: new Date().toISOString(),
     validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '', bytes: size },
@@ -105,35 +111,99 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
 
 const LEDGER_BUCKET = { CORRIGENDA: 'corrigenda', NEGOTIATION: 'letters', COUNTER_OFFER: 'letters', LOA: 'letters', CORRESPONDENCE: 'letters' };
 
+const ITEM_CONCURRENCY = 3;
+
+/**
+ * The download log's check (services/download-log.js): which of a category's documents this
+ * user already downloaded to the same destination, or (Save to: ECM) the ECM already holds.
+ * The panel asks which to download again; a "same answer for the rest of this run" is kept
+ * on run.redownloadMemo (shared by every tender of a job). null when the log is off.
+ */
+const itemId = (it) => String(it.id ?? '') || '-'; // the NIT itself may have no id
+
+async function checkAlreadyDownloaded(run, result, items, build) {
+  if (!items.length || !(await loadDownloadLogConfig())) return null;
+  const toEcm = Boolean(run.ecm && CATEGORY_ECM_KIND[result.category]);
+  const candidates = items.map((it) => ({
+    id: itemId(it),
+    label: `${run.ctx.tenderNo} - ${build(it).meta?.title || it.id || result.category}`,
+    log: { docType: TENDER_DOC_TYPE[result.category] || 'tender_document', key: downloadKey.tender(result.category, run.ctx.tenderNo, it.id) },
+    ecm: toEcm ? ecmDocumentFor(result.category, build(it), run.ctx) : null,
+  }));
+  const memo = run.redownloadMemo || (run.redownloadMemo = {});
+  const ask = (question) => {
+    // categories run in parallel: their questions wait in turn, so a remembered answer applies at once
+    const answered = (memo.turn || Promise.resolve()).then(async () => {
+      const ids = [...new Set([...question.alreadyDownloaded, ...question.inEcm].map((q) => q.id))];
+      if (memo.answer === 'skip') return { redownload: [] };
+      if (memo.answer === 'all') return { redownload: ids };
+      const answer = await confirmRedownload({ ...question, forRun: true });
+      if (answer && answer.sameForRun) memo.answer = answer.redownload.length === 0 ? 'skip' : answer.redownload.length === ids.length ? 'all' : undefined;
+      return answer;
+    });
+    memo.turn = answered.catch(() => {});
+    return answered;
+  };
+  const checked = await preflightDownloads(candidates, { destination: toEcm ? LOG_DESTINATION.ECM : LOG_DESTINATION.LOCAL, account: run.account, ask });
+  for (const w of checked.warnings) result.warnings.push(w);
+  return checked;
+}
+
 async function downloadItems(run, result, items, build) {
   items = dedupeItems(items);
   const bucket = LEDGER_BUCKET[result.category];
   const ledgerKey = (it) => `${result.category}|${run.ctx.tenderNo}|${it.id}`;
-  if (run.ledger && bucket && run.ledgerMode === 'skip') {
-    // scheduled jobs: only what has not been downloaded before
+  const logged = await checkAlreadyDownloaded(run, result, items, build);
+  if (logged && logged.checked) {
+    // the signed-in user's own download log decides (the ledger is still kept, below)
+    result.skippedFiles = items.filter((it) => logged.skip.has(itemId(it))).map((it) => ({ id: it.id || '', title: build(it).meta?.title || '', skip: logged.skip.get(itemId(it)) }));
+    result.alreadyDownloaded = result.skippedFiles.length;
+    items = items.filter((it) => !logged.skip.has(itemId(it)));
+  } else if (run.ledger && bucket && run.ledgerMode === 'skip') {
+    // scheduled jobs: only what has not been downloaded before (also when the download log cannot answer)
     const fresh = items.filter((it) => !run.ledger.has(bucket, ledgerKey(it)));
     result.alreadyDownloaded = items.length - fresh.length;
     items = fresh;
   }
   result.discovered = items.length;
-  for (const item of items) {
-    try {
-      if (item.skip) throw new TenderError(item.skip.code, item.skip.message);
-      const { files, converted } = await resolveAndDownloadIrepsDocument({ category: result.category, ...build(item) }, run);
+  if (items.length) await assertSameAccount(run.account, { base: run.base }); // steps run in parallel: re-check before this category starts saving
+  // up to ITEM_CONCURRENCY documents of one category download at the same time; results keep the list order
+  const outcomes = new Array(items.length);
+  let next = 0;
+  let fatal = null;
+  const worker = async () => {
+    while (!fatal && next < items.length) {
+      const i = next++;
+      const item = items[i];
+      try {
+        if (item.skip) throw new TenderError(item.skip.code, item.skip.message);
+        const { files, converted } = await resolveAndDownloadIrepsDocument({ category: result.category, ...build(item) }, run);
+        if (run.ledger && bucket) run.ledger.mark(bucket, ledgerKey(item));
+        outcomes[i] = { ok: true, files, converted };
+      } catch (e) {
+        if (e.code === 'SESSION_EXPIRED' || e.code === 'EXCLUDED') { fatal = fatal || e; return; }
+        outcomes[i] = { ok: false, item, error: e };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(ITEM_CONCURRENCY, items.length) }, worker));
+  if (fatal) throw fatal;
+  for (const o of outcomes) {
+    if (!o) continue;
+    if (o.ok) {
       result.downloaded++;
-      if (run.ledger && bucket) run.ledger.mark(bucket, ledgerKey(item));
-      result.files.push(...files);
-      if (converted) {
+      result.files.push(...o.files);
+      if (o.converted) {
         result.warnings.push('Some documents were printable web pages. A text-only PDF rendering and the complete original .html were saved; the PDF does not keep the page layout.');
       }
-    } catch (e) {
-      if (e.code === 'SESSION_EXPIRED' || e.code === 'EXCLUDED') throw e;
+    } else {
       result.failed++;
-      result.files.push({ fileName: '', id: item.id || '', status: 'FAILED', error: e.message, code: e.code || '' });
-      log(result.category, `failed ${item.id || ''}: ${e.message}`);
+      result.files.push({ fileName: '', id: o.item.id || '', status: 'FAILED', error: o.error.message, code: o.error.code || '' });
+      log(result.category, `failed ${o.item.id || ''}: ${o.error.message}`);
     }
   }
   result.warnings = [...new Set(result.warnings)];
+  flushDownloadLog();
   return finalize(result);
 }
 
@@ -232,8 +302,13 @@ const inlineScripts = (doc) => [...doc.querySelectorAll('script:not([src])')].ma
 
 // ---------------------------------------------------------------- NIT page (shared)
 
-async function nitPage(run) {
-  if (run.nit) return run.nit;
+function nitPage(run) {
+  // cached as a promise so steps running in parallel share one request
+  if (!run.nitP) run.nitP = loadNitPage(run).catch((e) => { run.nitP = null; throw e; });
+  return run.nitP;
+}
+
+async function loadNitPage(run) {
   const act = allReqs(run.ctx.row.actions).find((r) => /nitPublish\.do/i.test(pathOf(r.url)));
   if (!act) throw new TenderError('NO_NIT', 'The tender row has no View NIT action.');
   noteIds(run, act.url, 'row_action');
@@ -242,9 +317,8 @@ async function nitPage(run) {
   assertSession(res);
   if (res.status !== 200) throw new TenderError('HTTP', `View NIT page returned HTTP ${res.status}.`);
   const doc = parseHtml(res.text());
-  run.nit = { res, doc, actions: elementActions(doc.body || doc) };
   log('Tender', `View NIT page loaded (title "${norm(doc.title)}")`);
-  return run.nit;
+  return { res, doc, actions: elementActions(doc.body || doc) };
 }
 
 // ---------------------------------------------------------------- A. Tender / NIT PDF
@@ -512,9 +586,19 @@ function hasMorePages(doc, pageNo) {
   return false;
 }
 
+/**
+ * Negotiation and Counter Offer pages are often very slow to open on IREPS. Their requests get up to
+ * fetchSettings.waitMs (3 minutes) instead of the usual 45 seconds, retrying while IREPS cannot be reached.
+ */
+const WAIT_FOR_PAGE = new Set(['MyNegotiation', 'MyCounterOffer']);
+function pageWait(run, status) {
+  if (!WAIT_FOR_PAGE.has(status)) return null;
+  return { what: `${LETTER_KINDS[status].page} page`, onWait: (msg) => run.onProgress?.(msg) };
+}
+
 async function loadInboxForm(run, status) {
   for (const method of ['POST', 'GET']) {
-    const g = await irepsFetch(run.base, INBOX_PATH, { method, form: { menuLink: 'PostTenders', status } });
+    const g = await irepsFetch(run.base, INBOX_PATH, { method, form: { menuLink: 'PostTenders', status }, wait: pageWait(run, status) });
     assertSession(g);
     if (g.status !== 200) continue;
     const gdoc = parseHtml(g.text());
@@ -538,8 +622,15 @@ function inboxWindows(defaults, today = new Date()) {
 }
 
 /** All rows for the exact tender in a Post Tenders list, across date windows and result pages. */
-async function inbox(run, status) {
-  if (run.inboxCache.has(status)) return run.inboxCache.get(status);
+function inbox(run, status) {
+  // cached as a promise so parallel steps share one scan of the same list
+  if (!run.inboxCache.has(status)) {
+    run.inboxCache.set(status, scanInboxRows(run, status).catch((e) => { run.inboxCache.delete(status); throw e; }));
+  }
+  return run.inboxCache.get(status);
+}
+
+async function scanInboxRows(run, status) {
   const entry = { status, rows: [], scripts: '', windows: 0, pages: 0 };
   const form = await loadInboxForm(run, status);
   entry.scripts = form.scripts;
@@ -563,7 +654,7 @@ async function inbox(run, status) {
       if (visited.has(pageKey)) break;
       visited.add(pageKey);
 
-      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined });
+      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined, wait: pageWait(run, status) });
       assertSession(res);
       if (res.status !== 200) break;
       entry.pages++;
@@ -587,7 +678,6 @@ async function inbox(run, status) {
     }
   }
   log('Inbox', `${status}: ${entry.rows.length} matching row(s) over ${entry.windows} date window(s), ${entry.pages} page(s)`);
-  run.inboxCache.set(status, entry);
   return entry;
 }
 
@@ -637,7 +727,7 @@ export async function scanPostTenderList(run, status, { windows = [[-90, 0], [0,
       const p = new URLSearchParams(form.defaults);
       Object.entries({ menuLink: 'PostTenders', status, tenderNo: '', startDate: win.startDate, endDate: win.endDate, pageNo: String(pageNo), listType: status }).forEach(([k, v]) => p.set(k, v));
       if (!p.get('raStatus')) p.set('raStatus', '-1');
-      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p });
+      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, wait: pageWait(run, status) });
       assertSession(res);
       if (res.status !== 200) break;
       const doc = parseHtml(res.text());
@@ -678,9 +768,9 @@ function bidderMismatch(run, url) {
 }
 
 export const LETTER_KINDS = {
-  MyNegotiation: { category: 'NEGOTIATION', tag: 'Negotiation', subdir: 'Negotiation', file: 'Negotiation' },
-  MyCounterOffer: { category: 'COUNTER_OFFER', tag: 'CounterOffer', subdir: 'Counter_Offers', file: 'Counter_Offer' },
-  MyAdvanceAcceptanceLetter: { category: 'LOA', tag: 'LOA', subdir: 'Advance_Acceptance_LOA', file: 'LOA' },
+  MyNegotiation: { category: 'NEGOTIATION', tag: 'Negotiation', subdir: 'Negotiation', file: 'Negotiation', page: 'Negotiation' },
+  MyCounterOffer: { category: 'COUNTER_OFFER', tag: 'CounterOffer', subdir: 'Counter_Offers', file: 'Counter_Offer', page: 'Counter Offer' },
+  MyAdvanceAcceptanceLetter: { category: 'LOA', tag: 'LOA', subdir: 'Advance_Acceptance_LOA', file: 'LOA', page: 'Advance Acceptance Letter' },
 };
 
 /**
@@ -711,7 +801,7 @@ export async function downloadLetterItems(run, status, items, scripts = '') {
   for (const it of items) noteIds(run, it.url, 'inbox'); // nitOId etc. straight from the live letter action
   ctx.discoveredActions[LETTER_SPECS[status].key] = items.map((i) => ({ method: loaAck ? 'POST' : i.rq.method, path: prefix + pathOf(i.url) }));
   for (const it of items) {
-    it.req = { ...toRequest(it.url, loaAck ? 'POST' : it.rq.method, { prefix }), relativeTo: ctx.searchUrl };
+    it.req = { ...toRequest(it.url, loaAck ? 'POST' : it.rq.method, { prefix }), relativeTo: ctx.searchUrl, wait: pageWait(run, status) };
     if (status !== 'MyNegotiation') it.skip = bidderMismatch(run, it.url);
     if (loaAck) it.docId = it.rq.args?.[1] || qparam(it.url, 'letterId');
   }
@@ -763,8 +853,13 @@ export function pageClosingDate(doc) {
 }
 
 /** nitOid for the correspondence page: inbox rows first, then the correspondence list, then the tender row's oid. */
-async function ensureNitOid(run) {
-  if (run.ids.nitOid) return run.ids.nitOid;
+function ensureNitOid(run) {
+  if (run.ids.nitOid) return Promise.resolve(run.ids.nitOid);
+  if (!run.nitOidP) run.nitOidP = findNitOid(run).finally(() => { run.nitOidP = null; });
+  return run.nitOidP;
+}
+
+async function findNitOid(run) {
   try {
     const res = await irepsFetch(run.base, CORRES_LIST_PATH, { method: 'POST', form: {} });
     assertSession(res);
@@ -870,26 +965,33 @@ export function summarize(categories) {
 
 export const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, companyName: a.companyName, operatingUnit: a.operatingUnit, verified: !!a.verified });
 
-/** Run the given category steps in order; stops (and says why) if the account changes or the session ends. */
+/**
+ * Run the given category steps at the same time: whatever IREPS has ready (NIT, attachments, LOA, counter offer...)
+ * downloads straight away, and a slow or empty list (e.g. Negotiation) never holds the others back.
+ * The run stops (and says why) if the account changes or the session ends.
+ */
 export async function runSteps(run, keys, onProgress = () => {}) {
   const categories = {};
   let aborted = null;
   if (run.ecm === undefined) run.ecm = await tenderEcmSink(run.account); // Save to: ECM / S3, or null
-  for (const [key, msg, fn] of STEPS.filter(([k]) => keys.includes(k))) {
+  const steps = STEPS.filter(([k]) => keys.includes(k));
+  let started = 0;
+  await Promise.all(steps.map(async ([key, msg, fn]) => {
     if (aborted) {
       categories[key] = failedCategory(TYPE[key], `Skipped: ${aborted.message}`);
-      continue;
+      return;
     }
-    onProgress(msg);
+    onProgress(started++ === 0 ? msg : `${msg} (in parallel)`);
+    run.onProgress = onProgress;
     try {
       await assertSameAccount(run.account, { base: run.base });
       categories[key] = await fn(run);
     } catch (e) {
-      if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
+      if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = aborted || { code: e.code, message: e.message };
       else log(TYPE[key], `failed: ${e.message}`);
       categories[key] = failedCategory(TYPE[key], e.message);
     }
-  }
+  }));
   return { categories, aborted };
 }
 
@@ -913,6 +1015,7 @@ export function startTenderRun(base, account, found, folderLabel) {
 export async function downloadTenderDocuments(rawTenderNo, { onProgress = () => {}, onAccount = () => {}, only = CATEGORY_KEYS } = {}) {
   const tenderNo = norm(rawTenderNo);
   if (!tenderNo) throw new TenderError('INPUT', 'Enter a Tender Number.');
+  await ensureDownloadSignIn();
 
   const base = await getBaseUrl();
   onProgress('Verifying IREPS account...');
@@ -945,27 +1048,6 @@ export async function downloadTenderDocuments(rawTenderNo, { onProgress = () => 
     context: ctxPublic,
   };
 
-  // The manifest names the account used. It holds no cookies, tokens or credentials.
-  try {
-    const manifest = {
-      generatedAt: new Date().toISOString(),
-      account: result.account,
-      tender: { ...result.tender, railwayUnit: found.railwayUnit, department: found.department, status: found.tenderStatus },
-      categories: Object.fromEntries(CATEGORY_KEYS.filter((k) => categories[k]).map((k) => [k, {
-        status: categories[k].status, discovered: categories[k].discovered, downloaded: categories[k].downloaded, failed: categories[k].failed,
-        note: categories[k].note, warnings: categories[k].warnings,
-        files: categories[k].files.map(({ downloadId, ...f }) => f),
-      }])),
-      exclusions: result.exclusions,
-      summary: result.summary,
-      aborted,
-    };
-    const saved = await saver.saveJson('download_manifest.json', manifest);
-    result.manifest = saved.relPath;
-  } catch (e) {
-    log('Download', `manifest not saved: ${e.message}`);
-    result.manifest = null;
-  }
   onProgress('Tender documents download complete.');
   return result;
 }

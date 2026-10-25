@@ -52,6 +52,10 @@ const wf = await import('../tender-workflows.js');
 const jobs = await import('../tender-jobs.js');
 const auto = await import('../tender-auto.js');
 const msgs = await import('../tender-messages.js');
+const dlog = await import('../../services/download-log.js');
+// the download log needs a Recon Engine: off here, on only in the "Download log" tests at the end
+dlog.applyDownloadLogConfig({ downloadLog: { enabled: false } });
+dlog.configureDownloadLog({ flushDelayMs: 0 });
 const store = {};
 globalThis.chrome.storage = { local: { get: async (k) => ({ [k]: store[k] }), set: async (o) => Object.assign(store, JSON.parse(JSON.stringify(o))) } };
 
@@ -97,6 +101,22 @@ test('elementActions: window.open=GET, postRequest*=POST, loaLetterViewActivity=
   <a onclick=loaLetterViewActivity('/supply/c.do?z=3','77')>c</a><a href="#" class="linkStyle postRequest" url=/d.do?q=4>d</a><a href=/e.do?k=5>e</a>`).window.document;
   const m = core.elementActions(d.body).flatMap((a) => a.reqs).map((r) => `${r.method} ${r.url}`);
   assert.deepEqual(m, ['GET /a.do?x=1', 'POST /b.do?y=2', 'POST /supply/c.do?z=3', 'POST /d.do?q=4', 'GET /e.do?k=5']);
+});
+test('elementActions: a letter URL built by string concatenation is read as one URL', () => {
+  const d = new JSDOM(`<a onclick="postRequestNewWindow('/epsn/supply/tds/publishIndiNegotiationLetter.do?nitOId=5' + '&negoLetterId=229935' + '&opValue=ViewPublishedLetter','toolbar=0')">v</a>`).window.document;
+  const r = core.elementActions(d.body).flatMap((a) => a.reqs);
+  assert.deepEqual(r.map((x) => `${x.method} ${x.url}`), ['POST /epsn/supply/tds/publishIndiNegotiationLetter.do?nitOId=5&negoLetterId=229935&opValue=ViewPublishedLetter']);
+});
+test('viewer page embedding the document through an extension-less iframe resolves to the real PDF', async () => {
+  const realFetch = globalThis.fetch;
+  const html = '<html><body><p>Negotiation letter viewer page with enough text to be real</p><iframe src="/epsn/supply/tds/showLetter.do?id=1"></iframe></body></html>';
+  globalThis.fetch = async (u) => (String(u).includes('showLetter')
+    ? new Response(PDF, { status: 200, headers: { 'content-type': 'application/pdf' } })
+    : new Response(html, { status: 200, headers: { 'content-type': 'text/html' } }));
+  try {
+    const out = await core.fetchDocument('https://www.ireps.gov.in', { method: 'POST', url: '/epsn/supply/tds/publishIndiNegotiationLetter.do', form: new URLSearchParams({ a: '1' }) }, { allowHtml: true, allowAnyFile: true });
+    assert.equal(out.kind, 'file'); assert.equal(out.ext, '.pdf'); assert.equal(out.converted, false);
+  } finally { globalThis.fetch = realFetch; }
 });
 test('isLoginResponse recognises the real IREPS login page shape and not the authenticated pages', () => {
   const mk = (h) => { const bytes = new TextEncoder().encode(h); return { url: 'https://www.ireps.gov.in/epsn/x.do', contentType: 'text/html', bytes, text: () => h }; };
@@ -170,15 +190,15 @@ test('4. Switching accounts refreshes the context', async () => {
   const b = await acct.getActiveIrepsAccountContext();
   assert.deepEqual([b.irepsAccountId, b.operatingUnit], ['55', 'DELHI']);
 });
-test('4b. Account switch DURING a run stops the remaining categories', async () => {
+test('4b. Account switch DURING a run stops the categories that have not started downloading (steps run in parallel)', async () => {
   mk({ tenders: [T({})] });
   let n = 0;
   const orig = server.handle.bind(server);
   server.handle = async (m, u, b) => { if (u.includes('showHome.do') && ++n === 4) server.s.account = { id: '55', company: 'OTHER LTD-DELHI' }; return orig(m, u, b); };
   const r = await run();
   assert.equal(r.aborted.code, 'ACCOUNT_CHANGED');
-  assert.equal(r.categories.tenderPdf.status, 'DOWNLOADED');
-  assert.ok(Object.values(r.categories).slice(3).every((c) => c.status === 'FAILED'));
+  const failed = Object.values(r.categories).filter((c) => c.status === 'FAILED');
+  assert.ok(failed.length >= 1 && failed.every((c) => /account|Skipped/i.test(c.note || c.error || JSON.stringify(c))));
 });
 
 // =========================== search (5-9) ===================================================
@@ -249,7 +269,7 @@ const letters = (no) => ({
   MyAdvanceAcceptanceLetter: [{ no, oid: '107200478', letter: '1461928', date: daysAgo(5) }],
 });
 
-test('10-14,15-19 full run: every category, correct methods, account in manifest', async () => {
+test('10-14,15-19 full run: every category, correct methods, no manifest file downloaded', async () => {
   mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: { 107200478: { nitOid: '107200478', tenderNo: '29263265', letters: [{ no: '306789', id: '306789', corresId: '225319', subject: 'Withdrawal' }, { no: '306790', id: '306790', corresId: '225320', subject: 'Clarif' }] } } });
   const r = await run();
   const c = r.categories;
@@ -263,16 +283,15 @@ test('10-14,15-19 full run: every category, correct methods, account in manifest
   assert.deepEqual([c.correspondence.status, c.correspondence.downloaded], ['DOWNLOADED', 2]);
   assert.equal(r.summary.failed, 0);
   const n = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
-  for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'My_Offer/My_Offer_29263265.pdf', 'download_manifest.json', 'NIT_and_Supporting_Documents/Attachment_01_Annexure.pdf', 'NIT_and_Supporting_Documents/Attachment_02_IRS_CONDITIONS_5595304.pdf', 'NIT_and_Supporting_Documents/Attachment_04_drawing.zip',
+  for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'My_Offer/My_Offer_29263265.pdf', 'NIT_and_Supporting_Documents/Attachment_01_Annexure.pdf', 'NIT_and_Supporting_Documents/Attachment_02_IRS_CONDITIONS_5595304.pdf', 'NIT_and_Supporting_Documents/Attachment_04_drawing.zip',
     'Corrigenda/Corrigendum_01_29263265.pdf', 'Corrigenda/Corrigendum_02_29263265.pdf', 'Corrigenda/Corrigendum_02_29263265.html', 'Negotiation/Negotiation_29263265_224222.pdf', 'Negotiation/Negotiation_29263265_224300.pdf',
     'Counter_Offers/Counter_Offer_29263265_1461275.pdf', 'Advance_Acceptance_LOA/LOA_29263265_1461928.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(n.includes(want), `missing ${want}\n${n.join('\n')}`);
   // identifier discipline
   assert.equal(r.tender.nitId, '5569207'); assert.equal(r.tender.nitOid, '107200478'); assert.equal(r.context.tenderOID, '107200478');
-  // manifest: account recorded, no secrets
-  const mf = JSON.parse(new TextDecoder().decode(saved.find((s) => s.filename.endsWith('download_manifest.json')).bytes));
-  assert.deepEqual([mf.account.irepsAccountId, mf.account.operatingUnit, mf.account.verified], ['833', 'HOSUR', true]);
-  assert.ok(!/JSESSIONID|cookie|token|password/i.test(JSON.stringify(mf)));
-  assert.deepEqual(mf.exclusions, ['Financial Tabulation', 'Commercial/Techno-Commercial Tabulation']);
+  // no download_manifest.json in Downloads; the result still names the account and exclusions
+  assert.ok(!n.some((x) => /manifest/i.test(x)), n.join('\n'));
+  assert.deepEqual([r.account.irepsAccountId, r.account.operatingUnit, r.account.verified], ['833', 'HOSUR', true]);
+  assert.deepEqual(r.exclusions, ['Financial Tabulation', 'Commercial/Techno-Commercial Tabulation']);
 });
 test('10b. Tender PDF is validated: HTML/login response is never saved as .pdf (21)', async () => {
   mk({ tenders: [T({})], failPaths: [] });
@@ -363,7 +382,8 @@ test('21. Session expiry mid-run is reported and nothing HTML is saved as a docu
   server.handle = async (m, u, b) => { if (u.includes('upload/att/5595304')) server.s.loggedIn = false; return orig(m, u, b); };
   const r = await run();
   assert.equal(r.aborted.code, 'SESSION_EXPIRED');
-  assert.ok(saved.every((s) => s.filename.endsWith('.json') || sniffOk(s.bytes)));
+  // the .html files are the deliberately saved originals of printable pages; no .pdf may be a web page
+  assert.ok(saved.every((s) => !s.filename.endsWith('.pdf') || sniffOk(s.bytes)));
 });
 function sniffOk(b) { return core.sniffKind(b) !== 'html'; }
 test('22. Pagination: letters on later pages are found; loop terminates', async () => {
@@ -691,13 +711,14 @@ test('C. No matching documents for the dates => nothing downloaded', async () =>
   const r = await autoRun();
   assert.equal(r.summary.downloaded, 0); assert.equal(r.tenders.length, 0);
 });
-test('D. Another account (not Hosur) is used for the folder; manifest records source message, dates and validation', async () => {
+test('D. Another account (not Hosur) is used for the folder; the stored record keeps source message, dates and validation (no manifest file)', async () => {
   mk({ account: { id: '4711', company: 'ACME RAIL PRIVATE LIMITED-PUNE' }, tenders: [futureT({ no: 'P1', nitId: '1', oid: '10', attachments: att('p'), offer: true, offerAcct: '4711' })], messages: [nitMsg('P1', undefined, 'Title P1')] });
   const r = await autoRun();
   assert.ok(savedNames().some((n) => n.startsWith('DocLink/PUNE/Tender_P1/')));
   assert.ok(!savedNames().some((n) => n.includes('/HOSUR/')));
   assert.ok(savedNames().includes('DocLink/PUNE/Tender_P1/My_Offer/My_Offer_P1.pdf'));
-  const mf = JSON.parse(new TextDecoder().decode(saved.filter((s) => s.filename.endsWith('download_manifest.json')).pop().bytes));
+  assert.ok(!savedNames().some((n) => /manifest/i.test(n)));
+  const mf = store['doclink.tender.ledger.4711'].manifests.P1;
   assert.deepEqual([mf.account.irepsAccountId, mf.account.operatingUnit], ['4711', 'PUNE']);
   assert.equal(mf.tender.tenderNo, 'P1'); assert.ok(mf.tender.nitId);
   assert.equal(mf.sources.length, 1); assert.match(mf.sources[0].subject, /Tender Number: P1/);
@@ -739,11 +760,14 @@ test('no password / cookie / token is stored by the extension code', async () =>
 // =========================== Save to: ECM / S3 ==============================================
 const tecm = await import('../tender-ecm.js');
 const recon = await import('../../services/recon-service.js');
+const ecmCfg = await import('../../services/ecm-config.js');
 const ECM_URL = 'http://localhost:8000/api/ecm/documents';
+const NUXEO = 'http://ecm.test:8080';
 const CORRES = { 107200478: { nitOid: '107200478', tenderNo: '29263265', letters: [{ no: '306789', id: '306789', corresId: '225319', subject: 'Withdrawal' }, { no: '306790', id: '306790', corresId: '225320', subject: 'Clarif' }] } };
 
 /** Run fn with the ECM gateway faked: respond(post, n) -> [status, body]. Records every upload. */
 async function withEcm(respond, fn) {
+  ecmCfg.applyEcmConfig({ ecmBackendAws: true });
   recon.applyReconConfig({ reconBaseUrl: 'http://localhost:8000' });
   chrome.runtime.getManifest = () => ({ host_permissions: ['http://localhost:8000/*'] });
   const prev = globalThis.fetch;
@@ -761,6 +785,43 @@ async function withEcm(respond, fn) {
   } finally {
     globalThis.fetch = prev;
     delete chrome.runtime.getManifest;
+  }
+}
+
+/**
+ * Run fn with ECM documents going straight to a fake ECM (Nuxeo) ("ecmBackendAws": false).
+ * fn gets { creates, gateway, asked }: each created document, gateway calls, Recon sign-in asks.
+ */
+async function withDirectEcm(fn) {
+  ecmCfg.applyEcmConfig({ ecmBackendAws: false, ecm: { env: 'TEST', domain: NUXEO, clientId: 'id', clientSecret: 'secret' } });
+  chrome.runtime.getManifest = () => ({ host_permissions: [`${NUXEO}/*`, 'http://localhost:8000/*'] });
+  const prev = globalThis.fetch;
+  const prevDocument = globalThis.document;
+  const seen = { creates: [], gateway: [], asked: 0 };
+  // the panel's Recon sign-in page answers this event; count whether it is asked at all
+  globalThis.document = { dispatchEvent: () => { seen.asked += 1; return true; } };
+  const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u === ECM_URL) seen.gateway.push(u);
+    if (!u.startsWith(NUXEO)) return prev(url, init);
+    const path = new URL(u).pathname;
+    if (path === '/nuxeo/oauth2/token') return json(200, { access_token: 'tok', expires_in: 3600 });
+    if (path === '/nuxeo/api/v1/search/lang/NXQL/execute') return json(200, { entries: [], isNextPageAvailable: false });
+    if (path === '/nuxeo/api/v1/upload') return json(201, { batchId: 'b' });
+    if (path.startsWith('/nuxeo/api/v1/upload/')) return json(201, { uploaded: 'true' });
+    const body = JSON.parse(init.body);
+    seen.creates.push({ folder: path.replace('/nuxeo/api/v1/id/', ''), ...body.properties });
+    return json(201, { uid: `n-${seen.creates.length}`, path: `/x/${body.name}`, title: body.properties['dc:title'] });
+  };
+  try {
+    return await fn(seen);
+  } finally {
+    globalThis.fetch = prev;
+    if (prevDocument === undefined) delete globalThis.document;
+    else globalThis.document = prevDocument;
+    delete chrome.runtime.getManifest;
+    ecmCfg.applyEcmConfig({ ecmBackendAws: true });
   }
 }
 
@@ -803,16 +864,15 @@ test('ECM: Save to ECM / S3 files every tender document in the Hosur folder; My 
     assert.deepEqual([loi.title, loi.fields.loi_number], ['29263265 - LOA 1461928', '1461928']);
     assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(loi.fields.loi_date), 'LOI date from the published stamp');
     assert.equal(new Set(posts.map((p) => p.title)).size, posts.length, 'every title is unique within the tender');
-    // nothing that went to the ECM is in Downloads; My Offer (no ECM kind) and the manifest are
+    // nothing that went to the ECM is in Downloads; My Offer (no ECM kind) is, and no manifest file is
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
-    assert.ok(local.includes('My_Offer/My_Offer_29263265.pdf') && local.includes('download_manifest.json'));
+    assert.ok(local.includes('My_Offer/My_Offer_29263265.pdf') && !local.some((n) => /manifest/i.test(n)));
     assert.ok(!local.some((n) => /^(NIT_and_Supporting_Documents|Negotiation|Counter_Offers|Advance_Acceptance_LOA|Correspondence)\//.test(n)), local.join('\n'));
     assert.ok(local.includes('Corrigenda/Corrigendum_02_29263265.html'), 'a print-ready letter keeps its original HTML locally');
     assert.equal(c.tenderPdf.files[0].ecm.status, 'stored');
     assert.equal(c.tenderPdf.files[0].relPath, null);
     assert.equal(c.myOffer.files[0].ecm, undefined);
-    const mf = JSON.parse(new TextDecoder().decode(saved.find((s) => s.filename.endsWith('download_manifest.json')).bytes));
-    assert.equal(mf.categories.loa.files[0].ecm.uid, `u-${posts.indexOf(loi) + 1}`, 'the manifest records where each document went');
+    assert.equal(c.loa.files[0].ecm.uid, `u-${posts.indexOf(loi) + 1}`, 'the result records where each document went');
   });
 });
 test('ECM: when the ECM refuses or is down, each document is saved locally instead and the reason is kept', async () => {
@@ -828,6 +888,27 @@ test('ECM: when the ECM refuses or is down, each document is saved locally inste
     assert.deepEqual([nit.ecm.status, nit.ecm.code, nit.ecm.detail], ['failed', 'ECM_REJECTED', 'nit requires tender_number']);
     assert.equal(r.categories.loa.files[0].ecm.code, 'ECM_UNAVAILABLE');
   });
+});
+test('ECM direct: with ecmBackendAws false every tender document goes straight to the Hosur TEST Tenders folder, without the Recon sign-in', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: CORRES });
+  store['doclink.saveDestination'] = 'recon';
+  await withDirectEcm(async ({ creates, gateway, asked }) => {
+    const r = await run();
+    assert.equal(r.summary.failed, 0);
+    assert.equal(gateway.length, 0, 'the Recon Engine gateway is not called');
+    const kinds = creates.reduce((m, p) => ({ ...m, [p['InvoiceCertificateSchema:type']]: (m[p['InvoiceCertificateSchema:type']] || 0) + 1 }), {});
+    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2 });
+    assert.ok(creates.every((p) => p.folder === 'aa28acbe-add1-49d3-b0ab-16ab1263996c' && p['InvoiceCertificateSchema:tenderNumber'] === '29263265'));
+    const loi = creates.find((p) => p['InvoiceCertificateSchema:type'] === 'loi');
+    assert.deepEqual([loi['dc:title'], loi['InvoiceCertificateSchema:loiNumber']], ['29263265 - LOA 1461928', '1461928']);
+    assert.equal(r.categories.tenderPdf.files[0].ecm.status, 'stored');
+    assert.equal(r.categories.tenderPdf.files[0].ecm.uid.startsWith('n-'), true);
+    const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
+    assert.ok(local.includes('My_Offer/My_Offer_29263265.pdf'));
+    assert.ok(!local.some((n) => /^NIT_and_Supporting_Documents\//.test(n)), 'nothing that went to the ECM is in Downloads');
+  });
+  const asked = await withDirectEcm(async (seen) => seen.asked);
+  assert.equal(asked, 0, 'no Recon sign-in asked in direct mode');
 });
 test('ECM: letters by date go to the ECM with the tender date looked up once per tender (a Local run never searches)', async () => {
   const at = (n) => new Date(NOW() - n * D);
@@ -860,4 +941,209 @@ test('ECM: the correspondence page\'s Closing Date fills the tender date when th
   const doc = new JSDOM(new TextDecoder().decode(corresPage({ nitOid: '1', tenderNo: 'X1', letters: [] }))).window.document;
   assert.equal(wf.pageClosingDate(doc), '09/09/2026');
   assert.equal(wf.pageClosingDate(new JSDOM('<table><tr><td>Tender No</td><td>X</td></tr></table>').window.document), '');
+});
+
+// =========================== parallel scanning =============================================
+const isNegoList = (b) => { const p = new URLSearchParams(b || ''); return p.get('status') === 'MyNegotiation' && p.has('pageNo'); };
+test('P1. A slow Negotiation list does not hold back NIT, LOA, counter offer or the rest; negotiation downloads when it arrives', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265') });
+  const orig = server.handle.bind(server);
+  server.handle = async (m, u, b) => {
+    if (isNegoList(b)) await new Promise((r) => setTimeout(r, 400));
+    return orig(m, u, b);
+  };
+  const r = await run();
+  const order = saved.map((s) => s.filename);
+  const idx = (re) => order.findIndex((f) => re.test(f));
+  const nego = idx(/\/Negotiation\//), loa = idx(/Advance_Acceptance_LOA/), co = idx(/Counter_Offers/), nit = idx(/NIT_and_Supporting_Documents\/NIT_/);
+  assert.ok(nego >= 0 && loa >= 0 && co >= 0 && nit >= 0, order.join('\n'));
+  assert.ok(nego > loa && nego > co && nego > nit, `negotiation must be saved last:\n${order.join('\n')}`);
+  assert.equal(r.categories.negotiation.status, 'DOWNLOADED');
+  assert.equal(r.categories.loa.status, 'DOWNLOADED');
+  assert.equal(r.categories.counterOffer.status, 'DOWNLOADED');
+});
+
+const listOf = (status) => (b) => { const p = new URLSearchParams(b || ''); return p.get('status') === status && p.has('pageNo'); };
+const abortableFetch = (shim) => (url, init = {}) => new Promise((resolve, reject) => {
+  init.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+  shim(url, init).then(resolve, reject);
+});
+test('P2. Negotiation and Counter Offer get longer than the normal limit: DocLink waits for the page to open and downloads', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265') });
+  const orig = server.handle.bind(server);
+  const slow = (b) => isNegoList(b) || listOf('MyCounterOffer')(b);
+  server.handle = async (m, u, b) => { if (slow(b)) await new Promise((r) => setTimeout(r, 900)); return orig(m, u, b); }; // well past the limit
+  const shim = globalThis.fetch;
+  globalThis.fetch = abortableFetch(shim);
+  core.fetchSettings.timeoutMs = 300;
+  try {
+    const r = await run();
+    assert.equal(r.categories.negotiation.status, 'DOWNLOADED');
+    assert.equal(r.categories.counterOffer.status, 'DOWNLOADED');
+    assert.equal(r.categories.tenderPdf.status, 'DOWNLOADED');
+    assert.equal(r.aborted, null);
+  } finally { globalThis.fetch = shim; core.fetchSettings.timeoutMs = 45000; }
+});
+test('P2d. Negotiation waits up to waitMs (3 minutes) and then fails as not responding; the rest still download', async () => {
+  assert.equal(core.fetchSettings.waitMs, 180000);
+  mk({ tenders: [FULL()], inbox: letters('29263265') });
+  const orig = server.handle.bind(server);
+  server.handle = (m, u, b) => (isNegoList(b) ? new Promise(() => {}) : orig(m, u, b)); // never answers
+  const shim = globalThis.fetch;
+  globalThis.fetch = abortableFetch(shim);
+  core.fetchSettings.waitMs = 400;
+  try {
+    const r = await run();
+    assert.equal(r.categories.negotiation.status, 'FAILED');
+    assert.match(JSON.stringify(r.categories.negotiation), /Negotiation page did not open within/);
+    assert.equal(r.categories.counterOffer.status, 'DOWNLOADED');
+    assert.equal(r.categories.loa.status, 'DOWNLOADED');
+    assert.equal(r.aborted, null);
+  } finally { globalThis.fetch = shim; core.fetchSettings.waitMs = 180000; }
+});
+test('P2b. Other pages keep the time limit: an LOA list that never answers fails on its own; the rest download', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265') });
+  const orig = server.handle.bind(server);
+  server.handle = (m, u, b) => (listOf('MyAdvanceAcceptanceLetter')(b) ? new Promise(() => {}) : orig(m, u, b)); // never answers
+  const shim = globalThis.fetch;
+  globalThis.fetch = abortableFetch(shim);
+  core.fetchSettings.timeoutMs = 300;
+  try {
+    const r = await run();
+    assert.equal(r.categories.loa.status, 'FAILED');
+    assert.match(JSON.stringify(r.categories.loa), /not responding/);
+    assert.equal(r.categories.negotiation.status, 'DOWNLOADED');
+    assert.equal(r.categories.counterOffer.status, 'DOWNLOADED');
+    assert.equal(r.aborted, null);
+  } finally { globalThis.fetch = shim; core.fetchSettings.timeoutMs = 45000; }
+});
+test('P2c. While IREPS cannot be reached / answers 503, the Negotiation page is retried (with a waiting message) until it opens', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265') });
+  const orig = server.handle.bind(server);
+  let negoTries = 0;
+  const shim = globalThis.fetch;
+  globalThis.fetch = (url, init = {}) => {
+    if (isNegoList(init.body) && ++negoTries <= 2) return Promise.reject(new TypeError('Failed to fetch'));
+    return shim(url, init);
+  };
+  let coTries = 0;
+  server.handle = (m, u, b) => (listOf('MyCounterOffer')(b) && ++coTries <= 1 ? { status: 503, type: 'text/html', bytes: new TextEncoder().encode('Service Unavailable') } : orig(m, u, b));
+  Object.assign(core.fetchSettings, { waitRetryMs: 20, waitRetryMaxMs: 50 });
+  const progress = [];
+  try {
+    const r = await run('29263265', { onProgress: (m) => progress.push(m) });
+    assert.equal(r.categories.negotiation.status, 'DOWNLOADED');
+    assert.equal(r.categories.counterOffer.status, 'DOWNLOADED');
+    assert.ok(negoTries > 2 && coTries > 1);
+    assert.ok(progress.some((m) => /Waiting for IREPS to open the Negotiation page/.test(m)), progress.join('\n'));
+    assert.ok(progress.some((m) => /Waiting for IREPS to open the Counter Offer page/.test(m)), progress.join('\n'));
+  } finally { globalThis.fetch = shim; Object.assign(core.fetchSettings, { waitRetryMs: 5000, waitRetryMaxMs: 60000 }); }
+});
+
+
+// =========================== Download log ===================================================
+/**
+ * Run fn with the download log on and a fake Recon Engine: `already(key)` says whether the user
+ * downloaded a key before. fn gets { checks, logged, prompts, signIns, answer }: check bodies,
+ * logged records, download-again questions and Recon sign-in asks; set answer(question) to reply.
+ */
+async function withDownloadLog(already, fn) {
+  dlog.applyDownloadLogConfig({});
+  recon.applyReconConfig({ reconBaseUrl: 'http://localhost:8000' });
+  chrome.runtime.getManifest = () => ({ host_permissions: ['http://localhost:8000/*'] });
+  const prev = globalThis.fetch;
+  const prevDocument = globalThis.document;
+  const seen = { checks: [], logged: [], prompts: [], signIns: 0, answer: () => ({ redownload: [], sameForRun: true }) };
+  globalThis.document = {
+    // the panel's sign-in page and download-again prompt answer these events
+    dispatchEvent: (event) => {
+      if (event.type === dlog.REDOWNLOAD_EVENT) {
+        seen.prompts.push(event.detail.question);
+        event.detail.resolve(seen.answer(event.detail.question));
+      } else {
+        seen.signIns += 1;
+        event.detail.resolve(true);
+      }
+      return false;
+    },
+  };
+  const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u === 'http://localhost:8000/api/doclink/downloads/check') {
+      const body = JSON.parse(init.body);
+      seen.checks.push(body);
+      const downloaded = Object.fromEntries(body.keys.filter(already).map((k) => [k, { count: 1, filename: 'old.pdf', downloaded_at: '2026-10-01T04:30:00+00:00', date: '2026-10-01', time: '10:00:00' }]));
+      return json(200, { destination: body.destination, downloaded });
+    }
+    if (u === 'http://localhost:8000/api/doclink/downloads') {
+      seen.logged.push(...JSON.parse(init.body).records);
+      return json(201, { logged: 1 });
+    }
+    return prev(url, init);
+  };
+  try {
+    return await fn(seen);
+  } finally {
+    globalThis.fetch = prev;
+    if (prevDocument === undefined) delete globalThis.document;
+    else globalThis.document = prevDocument;
+    delete chrome.runtime.getManifest;
+    dlog.applyDownloadLogConfig({ downloadLog: { enabled: false } });
+  }
+}
+
+test('Download log: documents this user already downloaded are skipped after one question, the rest are downloaded and logged', async () => {
+  mk({ tenders: [FULL()] });
+  const before = (k) => k.startsWith('tender:TENDER_PDF|29263265|') || k.startsWith('tender:CORRIGENDA|29263265|');
+  await withDownloadLog(before, async (seen) => {
+    const r = await run();
+    const c = r.categories;
+    assert.equal(seen.signIns, 1, 'the Recon sign-in is asked once, before anything is fetched');
+    assert.equal(seen.prompts.length, 1, 'one question; "same answer for the rest of this run" answers the next category');
+    assert.ok(seen.prompts[0].alreadyDownloaded.every((a) => a.date === '2026-10-01'));
+    assert.ok(seen.checks.every((b) => b.destination === 'local'));
+    assert.deepEqual([c.tenderPdf.alreadyDownloaded, c.tenderPdf.downloaded, c.corrigenda.alreadyDownloaded, c.corrigenda.downloaded], [1, 0, 2, 0]);
+    assert.equal(c.tenderPdf.skippedFiles[0].skip.reason, 'already_downloaded');
+    assert.ok(!savedNames().some((n) => /NIT_29263265\.pdf|Corrigendum_/.test(n)), 'skipped documents are not fetched');
+    assert.equal(c.attachments.downloaded, 4);
+    await dlog.flushDownloadLog();
+    const types = seen.logged.reduce((m, x) => ({ ...m, [x.doc_type]: (m[x.doc_type] || 0) + 1 }), {});
+    assert.deepEqual(types, { tender_attachment: 4, my_offer: 1 });
+    assert.ok(seen.logged.every((x) => x.destination === 'local' && x.ireps_account_id === '833' && x.doc_key.startsWith('tender:') && x.filename));
+  });
+});
+test('Download log: "download again" fetches the chosen documents and logs them again', async () => {
+  mk({ tenders: [FULL()] });
+  await withDownloadLog((k) => k.startsWith('tender:TENDER_PDF|'), async (seen) => {
+    seen.answer = (q) => ({ redownload: q.alreadyDownloaded.map((a) => a.id), sameForRun: false });
+    const r = await run();
+    assert.equal(r.categories.tenderPdf.downloaded, 1);
+    assert.equal(r.categories.tenderPdf.alreadyDownloaded, 0);
+    await dlog.flushDownloadLog();
+    assert.ok(seen.logged.some((x) => x.doc_type === 'tender_nit'));
+  });
+});
+test('Download log: when the log cannot be reached the run downloads everything and says so', async () => {
+  mk({ tenders: [FULL()] });
+  await withDownloadLog(() => true, async (seen) => {
+    const shim = globalThis.fetch;
+    globalThis.fetch = async (url, init) => (String(url).includes('/api/doclink/') ? new Response('{}', { status: 503 }) : shim(url, init));
+    try {
+      const r = await run();
+      assert.equal(seen.prompts.length, 0);
+      assert.equal(r.categories.tenderPdf.downloaded, 1);
+      assert.ok(r.categories.tenderPdf.warnings.some((w) => /Download log unavailable/.test(w)));
+    } finally {
+      globalThis.fetch = shim;
+    }
+  });
+});
+test('Download log: cancelling the Recon sign-in stops the run before anything is fetched', async () => {
+  mk({ tenders: [FULL()] });
+  await withDownloadLog(() => false, async () => {
+    globalThis.document.dispatchEvent = (event) => { event.detail.resolve(false); return false; };
+    await assert.rejects(run(), (e) => e.code === 'SIGN_IN_REQUIRED');
+    assert.equal(server.log.length, 0, 'IREPS was not called');
+  });
 });

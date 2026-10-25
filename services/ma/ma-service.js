@@ -25,6 +25,7 @@ import { IrepsError, parseIrepsDate, validateDateRange } from "../ireps-api.js";
 import { SEARCH_PO_CRITERIA, errorCodesFor } from "../search-po/search-po-api.js";
 import { searchIrepsDocuments, SEARCH_PO_FLOW_STAGES } from "../search-po/search-po-service.js";
 import { downloadIrepsDocuments, downloadIrepsDocument, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
+import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { buildMaDownloadPath } from "../../utils/filename.js";
 import { ECM_KIND } from "../ecm-service.js";
 import { parseMaSearchResults, maDateKey } from "./ma-parser.js";
@@ -151,7 +152,8 @@ export function maDownloadItems(records) {
     path: buildMaDownloadPath(r),
     label: `MA ${r.maNo || "?"} (PO ${r.poNo || "?"})`,
     meta: { maNo: r.maNo, poNo: r.poNo, maDate: r.maDate, railwayUnit: r.railwayUnit },
-    ecm: { kind: ECM_KIND.MODIFICATION_ADVISE, fields: { customer_po_number: r.poNo, modification_advise_number: r.maNo } }
+    ecm: { kind: ECM_KIND.MODIFICATION_ADVISE, fields: { customer_po_number: r.poNo, modification_advise_number: r.maNo } },
+    log: logInfo(LOG_DOC_TYPE.MA, downloadKey.ma(r.poNo, r.maNo))
   }));
 }
 
@@ -168,7 +170,7 @@ export function downloadMaPdf(record, options = {}) {
 /**
  * Download the MA PDFs of several records with limited concurrency.
  * @param {object[]} records
- * @param {{ concurrency?: number, fetch?: typeof fetch, saveFile?: Function, onProgress?: Function }} [options]
+ * @param {{ concurrency?: number, fetch?: typeof fetch, saveFile?: Function, onProgress?: Function, preflight?: Function, onSaved?: Function }} [options]
  */
 export function downloadMaPdfs(records, options = {}) {
   return downloadIrepsDocuments(maDownloadItems(records), { ...options, codes: DOWNLOAD_CODES });

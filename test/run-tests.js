@@ -36,8 +36,11 @@ import { runRnoteTests } from "./rnote-tests.js";
 import { runMaTests } from "./ma-tests.js";
 import { runPoTests } from "./po-tests.js";
 import { runIcTests } from "./ic-tests.js";
+import { runBatchTests } from "./batch-tests.js";
 import { runReconTests } from "./recon-tests.js";
 import { runEcmTests } from "./ecm-tests.js";
+import { runEcmDirectTests } from "./ecm-direct-tests.js";
+import { runDownloadLogTests } from "./download-log-tests.js";
 import { runReconAuthTests } from "./recon-auth-tests.js";
 import { compileMatchPatterns, compileMatchPattern, classifyTabUrl, TAB_SCOPE } from "../utils/url-scope.js";
 
@@ -919,7 +922,10 @@ await runPoTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 await runIcTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 await runReconTests({ test, assert, eq });
 await runEcmTests({ test, assert, eq });
+await runEcmDirectTests({ test, assert, eq });
+await runDownloadLogTests({ test, assert, eq });
 await runReconAuthTests({ test, assert, eq });
+await runBatchTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 
 /* ---------------------------------------------------------------- report */
 

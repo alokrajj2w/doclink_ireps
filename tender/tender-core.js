@@ -5,6 +5,9 @@
 
 export const SESSION_MSG = 'IREPS session expired. Please log in to IREPS and try again.';
 
+/** Error codes meaning "IREPS itself did not answer" (as opposed to a rejected or invalid document). */
+export const IREPS_DOWN_CODES = new Set(['TIMEOUT', 'UNREACHABLE']);
+
 export class TenderError extends Error {
   constructor(code, message) {
     super(message);
@@ -77,7 +80,46 @@ export function isExcludedUrl(url) {
 }
 
 /** Authenticated request. `form` is an object / URLSearchParams (body for POST, query for GET). */
-export async function irepsFetch(base, ref, { method = 'GET', form = null, relativeTo } = {}) {
+export const fetchSettings = { timeoutMs: 45000, waitMs: 180000, waitRetryMs: 5000, waitRetryMaxMs: 60000 };
+
+/** IREPS answers these while a page is still coming up (gateway / overloaded); worth waiting out. */
+const STILL_OPENING = new Set([502, 503, 504]);
+
+/**
+ * `wait` (Negotiation / Counter Offer): DocLink waits up to fetchSettings.waitMs (3 minutes) for IREPS to open
+ * the page. Within that time a slow answer is waited for, and while IREPS cannot be reached or answers
+ * 502/503/504 the request is retried with backoff (5s, 10s ... 60s); after it, the page fails as not responding.
+ * `wait = { what, onWait(msg) }` names the page for the progress line.
+ */
+export async function irepsFetch(base, ref, opts = {}) {
+  const { wait = null } = opts;
+  if (!wait) return irepsFetchOnce(base, ref, opts);
+  const what = wait.what || 'page';
+  const minutes = `${+(fetchSettings.waitMs / 60000).toFixed(1)} minute${fetchSettings.waitMs === 60000 ? '' : 's'}`;
+  const deadline = Date.now() + fetchSettings.waitMs;
+  const giveUp = (why) => new TenderError('TIMEOUT', `Failed because IREPS is not responding (the ${what} did not open within ${minutes}; ${why}).`);
+  for (let attempt = 1; ; attempt++) {
+    let why;
+    try {
+      const res = await irepsFetchOnce(base, ref, { ...opts, timeoutMs: Math.max(deadline - Date.now(), 1) });
+      if (!STILL_OPENING.has(res.status)) return res;
+      why = `IREPS answered HTTP ${res.status}`;
+    } catch (e) {
+      if (e.code === 'TIMEOUT') throw giveUp('no answer');
+      if (e.code !== 'UNREACHABLE') throw e;
+      why = 'IREPS could not be reached';
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) throw giveUp(why);
+    const delay = Math.min(fetchSettings.waitRetryMs * 2 ** Math.min(attempt - 1, 10), fetchSettings.waitRetryMaxMs, left);
+    const msg = `Waiting for IREPS to open the ${what} (${why}; trying again in ${Math.round(delay / 1000)}s, attempt ${attempt}, up to ${minutes} in all)...`;
+    log('Wait', msg);
+    wait.onWait?.(msg);
+    await new Promise((r) => setTimeout(r, delay));
+  }
+}
+
+async function irepsFetchOnce(base, ref, { method = 'GET', form = null, relativeTo, timeoutMs = fetchSettings.timeoutMs } = {}) {
   let url = absUrl(base, ref, relativeTo);
   if (isExcludedUrl(url)) throw new TenderError('EXCLUDED', 'Financial/Commercial Tabulation downloads are excluded from DocLink tender downloads.');
   const init = { method, credentials: 'include', redirect: 'follow', headers: {} };
@@ -92,8 +134,22 @@ export async function irepsFetch(base, ref, { method = 'GET', form = null, relat
       init.headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
   }
-  const res = await fetch(url, init);
-  const bytes = new Uint8Array(await res.arrayBuffer());
+  // A portal page that never answers must not stall the whole run: give up after timeoutMs (0 = wait as long as it takes).
+  const ctl = new AbortController();
+  init.signal = ctl.signal;
+  const timer = timeoutMs > 0 ? setTimeout(() => ctl.abort(), timeoutMs) : null;
+  let res;
+  let bytes;
+  try {
+    res = await fetch(url, init);
+    bytes = new Uint8Array(await res.arrayBuffer());
+  } catch (e) {
+    if (ctl.signal.aborted) throw new TenderError('TIMEOUT', `Failed because IREPS is not responding (no answer within ${timeoutMs / 1000} seconds for ${new URL(url).pathname}).`);
+    if (e instanceof TypeError) throw new TenderError('UNREACHABLE', `Failed because IREPS is not responding (could not reach ${new URL(url).pathname}).`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   const contentType = res.headers.get('content-type') || '';
   let cached = null;
   return {
@@ -168,6 +224,7 @@ export function findForm(doc, pred) {
 
 /** Parse `fn('a','b',c)` invocations out of an inline handler. -> [{ fn, args: string[] }] */
 export function parseCalls(src) {
+  src = String(src).replace(/(['"])\s*\+\s*(['"])/g, ''); // 'a' + 'b' -> 'ab' (IREPS builds some letter URLs by concatenation)
   const calls = [];
   const re = /([A-Za-z_$][\w$.]*)\s*\(/g;
   let m;
@@ -232,7 +289,7 @@ export function elementActions(root) {
       if (first) addReq(first, post ? 'POST' : 'GET', { fn: c.fn, args: c.args });
     }
     // anything URL-shaped that parseCalls did not classify (e.g. nested handlers)
-    for (const m of (href + ' ' + onclick).matchAll(/['"]([^'"\s]*?(?:\.do|\.pdf)[^'"\s]*)['"]/gi)) {
+    for (const m of (href + ' ' + onclick).replace(/(['"])\s*\+\s*(['"])/g, '').matchAll(/['"]([^'"\s]*?(?:\.do|\.pdf)[^'"\s]*)['"]/gi)) {
       if (!reqs.some((r) => r.url === m[1])) addReq(m[1], 'GET', { fn: 'other' });
     }
     const urls = [...new Set(reqs.map((r) => r.url))];
@@ -333,6 +390,12 @@ function docCandidates(doc, pageUrl, base, allowAnyFile) {
     const v = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data') || '';
     if (isDoc.test(v)) raw.push(v);
   }
+  // viewers often embed the real file through a servlet URL with no extension; tried after the obvious ones,
+  // and only accepted when the response is actually a document (see resolveIrepsDocument)
+  for (const el of doc.querySelectorAll('iframe[src],frame[src],embed[src],object[data]')) {
+    const v = el.getAttribute('src') || el.getAttribute('data') || '';
+    if (v && !/^(about:|javascript:|#|data:)/i.test(v) && !raw.includes(v)) raw.push(v);
+  }
   const inline = [...doc.querySelectorAll('[onclick]')].map((e) => e.getAttribute('onclick')).join(' ') +
     ' ' + [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join(' ');
   for (const m of inline.matchAll(new RegExp(`['"]([^'"\\s]*\\.${ext}(?:\\?[^'"\\s]*)?)['"]`, 'gi'))) raw.push(m[1]);
@@ -355,7 +418,7 @@ function metaRedirect(doc, html) {
   return u || '';
 }
 
-function looksLikeErrorPage(doc) {
+export function looksLikeErrorPage(doc) {
   const title = norm(doc.querySelector('title')?.textContent);
   const text = norm(doc.body?.textContent);
   if (text.length < 40) return 'The IREPS page was empty.';
@@ -370,7 +433,7 @@ function looksLikeErrorPage(doc) {
  * Throws SESSION_EXPIRED for login pages; NO_DOCUMENT when nothing usable is found.
  * A login / error page is never returned as a document.
  */
-export async function resolveIrepsDocument(base, res, { allowHtml = true, allowAnyFile = false, nameHint = '', depth = 0 } = {}) {
+export async function resolveIrepsDocument(base, res, { allowHtml = true, allowAnyFile = false, nameHint = '', depth = 0, wait = null } = {}) {
   assertSession(res);
   if (res.status !== 200) throw new TenderError('HTTP', `IREPS returned HTTP ${res.status}.`);
   const kind = sniffKind(res.bytes);
@@ -388,7 +451,7 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
   const doc = parseHtml(html);
 
   for (const url of docCandidates(doc, res.url, base, allowAnyFile)) {
-    const r = await irepsFetch(base, url);
+    const r = await irepsFetch(base, url, { wait });
     assertSession(r);
     const k = sniffKind(r.bytes);
     if (r.status === 200 && (k === 'pdf' || (allowAnyFile && BINARY_DOC_KINDS.has(k)))) {
@@ -399,8 +462,8 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
   if (depth < 1) {
     const next = metaRedirect(doc, html);
     if (next) {
-      const r = await irepsFetch(base, next, { relativeTo: res.url });
-      return resolveIrepsDocument(base, r, { allowHtml, allowAnyFile, nameHint, depth: depth + 1 });
+      const r = await irepsFetch(base, next, { relativeTo: res.url, wait });
+      return resolveIrepsDocument(base, r, { allowHtml, allowAnyFile, nameHint, depth: depth + 1, wait });
     }
   }
 
@@ -417,8 +480,8 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
  * and resolve the response into a validated document.
  */
 export async function fetchDocument(base, req, opts = {}) {
-  const res = await irepsFetch(base, req.url, { method: req.method || 'GET', form: req.form || null, relativeTo: req.relativeTo });
-  return resolveIrepsDocument(base, res, opts);
+  const res = await irepsFetch(base, req.url, { method: req.method || 'GET', form: req.form || null, relativeTo: req.relativeTo, wait: req.wait || null });
+  return resolveIrepsDocument(base, res, { ...opts, wait: req.wait || null });
 }
 
 // ---------------------------------------------------------------- HTML -> text lines -> PDF
@@ -578,8 +641,11 @@ const MIME = { '.pdf': 'application/pdf', '.html': 'text/html', '.json': 'applic
  * Saves into Downloads/DocLink/<accountLabel>/Tender_<tenderNo>/<subdir>/<file>.
  * Names are unique within a run (no silent overwrite) and every path is sanitised.
  */
-export function createSaver({ accountLabel, tenderNo }) {
-  const root = `${DOWNLOAD_ROOT}/${safeSegment(accountLabel)}/Tender_${safeSegment(tenderNo)}`;
+export function createSaver({ accountLabel, tenderNo, subPath = null, conflict = 'uniquify' }) {
+  // `subPath` (e.g. ['Correspondence','Pending',<tenderNo>]) replaces the default Tender_<no> folder.
+  const root = subPath
+    ? [DOWNLOAD_ROOT, safeSegment(accountLabel), ...subPath.map((p) => safeSegment(p))].join('/')
+    : `${DOWNLOAD_ROOT}/${safeSegment(accountLabel)}/Tender_${safeSegment(tenderNo)}`;
   const used = new Set();
 
   function uniquePath(subdir, fileName) {
@@ -603,7 +669,7 @@ export function createSaver({ accountLabel, tenderNo }) {
     const rel = uniquePath(subdir, fileName);
     const url = URL.createObjectURL(new Blob([bytes], { type: mime || MIME[ext] || 'application/octet-stream' }));
     try {
-      const id = await chrome.downloads.download({ url, filename: `${root}/${rel}`, conflictAction: 'uniquify', saveAs: false });
+      const id = await chrome.downloads.download({ url, filename: `${root}/${rel}`, conflictAction: conflict, saveAs: false });
       await waitForDownload(id);
       log('Download', `File saved ${rel}`);
       return { relPath: rel, downloadId: id, size: bytes.length };
@@ -612,20 +678,7 @@ export function createSaver({ accountLabel, tenderNo }) {
     }
   }
 
-  /** The manifest is rewritten in place (not uniquified), so there is always exactly one download_manifest.json. */
-  async function saveJson(fileName, obj) {
-    const bytes = new TextEncoder().encode(JSON.stringify(obj, null, 2));
-    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/json' }));
-    try {
-      const id = await chrome.downloads.download({ url, filename: `${root}/${fileName}`, conflictAction: 'overwrite', saveAs: false });
-      await waitForDownload(id);
-      log('Download', `File saved ${fileName}`);
-      return { relPath: fileName, downloadId: id, size: bytes.length };
-    } finally {
-      URL.revokeObjectURL(url);
-    }
-  }
-  return { root, save, saveJson };
+  return { root, save };
 }
 
 function waitForDownload(id, timeoutMs = 60000) {

@@ -10,12 +10,17 @@
 import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError } from "../utils/messages.js";
 import { UPLOAD_SOURCES, DOCUMENT_TYPES } from "../services/upload-service.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
+import { loadEcmConfig, isDirectEcm } from "../services/ecm-config.js";
+import { loadDownloadLogConfig, configureDownloadLog, describeSkip, DOWNLOAD_LOG_ERROR } from "../services/download-log.js";
+import { initRedownload } from "./popup-redownload.js";
 import { formatFriendlyDateTime } from "../utils/filename.js";
 import { initDocuments, handleDocumentMessage, restoreDocuments, refreshDocumentsDestination } from "./popup-documents.js";
 import { initMa, handleMaMessage, restoreMa, refreshMaDestination } from "./popup-ma.js";
 import { initPoIc, handlePoIcMessage, restorePoIc, refreshPoIcDestination } from "./popup-po-ic.js";
+import { initBatch, handleBatchMessage, restoreBatch, refreshBatchDestination } from "./popup-po-ic-batch.js";
 import { initGate, currentPanelTabId } from "./popup-gate.js";
-import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus } from "./popup-recon-auth.js";
+import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser } from "./popup-recon-auth.js";
+import { initDownloads } from "./popup-downloads.js";
 import { logger, mirrorLogToConsole, installConsoleHelpers } from "../utils/logger.js";
 
 const $ = (id) => document.getElementById(id);
@@ -28,6 +33,8 @@ const el = {
   viewUpload: $("view-upload"),
   viewMa: $("view-ma"),
   viewPoIc: $("view-po-ic"),
+  viewPoIcBatch: $("view-po-ic-batch"),
+  viewDownloads: $("view-downloads"),
   saveTo: $("save-to"),
   options: $("options"),
   optionsSummary: $("options-summary"),
@@ -100,8 +107,20 @@ const RUN_TYPES = new Set([
   MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS,
   MESSAGE_TYPES.MA_DOWNLOAD,
   MESSAGE_TYPES.PO_DOWNLOAD,
-  MESSAGE_TYPES.IC_DOWNLOAD
+  MESSAGE_TYPES.IC_DOWNLOAD,
+  MESSAGE_TYPES.BATCH_START,
+  MESSAGE_TYPES.BATCH_RETRY
 ]);
+
+/** The runs that save to the Recon Engine (S3): Bill Status, CRN and R-NOTE. The rest save ECM documents. */
+const S3_RUN_TYPES = new Set([MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS, MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS]);
+
+/** Whether a run under Save to: ECM / S3 needs the Recon sign-in: always for S3, and for ECM documents unless they go straight to the ECM. */
+async function needsReconSignIn(type) {
+  if (S3_RUN_TYPES.has(type)) return true;
+  await loadEcmConfig();
+  return !isDirectEcm();
+}
 
 function payloadDestination(payload) {
   return payload.destination || (payload.options && payload.options.destination) || SAVE_DESTINATION.LOCAL;
@@ -116,9 +135,20 @@ function toLocal(payload) {
 }
 
 async function send(type, payload = {}) {
-  // Login 2 (Recon Engine) before an ECM / S3 run; login 1 (IREPS) is checked by the run itself.
-  if (RUN_TYPES.has(type) && payloadDestination(payload) === SAVE_DESTINATION.RECON && !(await ensureReconSignedIn())) {
-    payload = toLocal(payload);
+  // Login 2 (Recon Engine) before a run; login 1 (IREPS) is checked by the run itself.
+  if (RUN_TYPES.has(type)) {
+    if (await loadDownloadLogConfig()) {
+      // every download is logged for the signed-in user (services/download-log.js): no sign-in, no run
+      if (!(await ensureReconSignedIn({ always: true }))) {
+        logger.info(`Panel action not started (no Recon sign-in): ${type}`);
+        return { started: false, error: describeError(DOWNLOAD_LOG_ERROR.SIGN_IN_REQUIRED) };
+      }
+    } else if (payloadDestination(payload) === SAVE_DESTINATION.RECON && (await needsReconSignIn(type)) && !(await ensureReconSignedIn())) {
+      payload = toLocal(payload);
+    }
+    // the run asks this panel (not another tab's) which already-downloaded files to download again
+    const panelTabId = await currentPanelTabId();
+    if (panelTabId !== null) payload = { ...payload, panelTabId };
   }
   // Every "Open Recon Engine" button now opens DocLink's own Recon sign-in page.
   if (type === MESSAGE_TYPES.OPEN_RECON) {
@@ -150,6 +180,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (handleDocumentMessage(message)) return false;
   if (handleMaMessage(message)) return false;
   if (handlePoIcMessage(message)) return false;
+  if (handleBatchMessage(message)) return false;
   switch (message.type) {
     case MESSAGE_TYPES.IREPS_PROGRESS:
       renderProgress(message.stage, message.message);
@@ -176,7 +207,10 @@ function showView(name) {
   el.viewUpload.hidden = name !== "upload";
   el.viewMa.hidden = name !== "ma";
   el.viewPoIc.hidden = name !== "po-ic";
-  el.saveTo.hidden = name === "login" || name === "upload";
+  el.saveTo.hidden = name === "login" || name === "upload" || name === "downloads";
+  el.viewPoIcBatch.hidden = name !== "po-ic-batch";
+  el.viewDownloads.hidden = name !== "downloads";
+  $("btn-downloads-open").setAttribute("aria-pressed", String(name === "downloads"));
 }
 
 /** Shared "IREPS login required" view (used by Bill Status and CRN). */
@@ -277,6 +311,19 @@ function renderComplete(summary) {
   setConnection("connected", "Connected");
   const n = summary.recordCount ?? 0;
   const toRecon = summary.destination === SAVE_DESTINATION.RECON;
+  if (summary.skipped) {
+    // the same rows were already downloaded by this user (the download log) and not saved again
+    showResult({
+      title: "Bill Status not saved again",
+      summary: [`Records found: ${n}. ${describeSkip(summary.skip)}: the same records, so no new file was made.`, ...(summary.warnings || [])].join("\n"),
+      filter: summary.filter ? `Search: ${summary.filter}` : "",
+      filename: summary.skip && summary.skip.filename ? `Earlier file: ${summary.skip.filename}` : "",
+      downloadId: null,
+      preview: true
+    });
+    refreshMeta();
+    return;
+  }
   const extras = [];
   if (summary.skippedCount) extras.push(`${summary.skippedCount} incomplete record${summary.skippedCount === 1 ? "" : "s"} skipped`);
   if (toRecon && summary.deduplicated) extras.push("identical file already stored");
@@ -362,6 +409,7 @@ function updateDestination() {
   refreshDocumentsDestination();
   refreshMaDestination();
   refreshPoIcDestination();
+  refreshBatchDestination();
   for (const [selector, label] of ECM_BUTTONS) {
     const button = document.querySelector(selector);
     if (button) button.textContent = toRecon ? `${label} to ECM` : label;
@@ -571,7 +619,8 @@ async function onIrepsTabActive() {
     const documentRestored = restored ? false : await restoreDocuments();
     const maRestored = restored || documentRestored ? false : await restoreMa();
     const poIcRestored = restored || documentRestored || maRestored ? false : await restorePoIc();
-    if (!restored && !documentRestored && !maRestored && !poIcRestored) showView("main");
+    const batchRestored = restored || documentRestored || maRestored || poIcRestored ? false : await restoreBatch();
+    if (!restored && !documentRestored && !maRestored && !poIcRestored && !batchRestored) showView("main");
     const state = await send(MESSAGE_TYPES.GET_JOB_STATE);
     if (!state || state.status !== "running") {
       if (restored && state && state.status === "error" && state.error && state.error.loginRequired) {
@@ -598,11 +647,18 @@ async function onIrepsTabActive() {
   refreshMeta();
   initDocuments({ send, showView, setConnection, setConnectionForError, showLogin, showResult, hideResult, getDestination: selectedDestination });
   initReconAuth({ getDestination: selectedDestination, setDestination });
+  // tender downloads run in this panel: their download-log queue is the panel's own
+  configureDownloadLog({ context: "panel" });
+  initRedownload({ currentTabId: currentPanelTabId });
   await restoreDestination();
-  if (selectedDestination() === SAVE_DESTINATION.RECON) refreshReconStatus();
+  // with the download log on, every run needs the Recon sign-in: show who is signed in
+  if (selectedDestination() === SAVE_DESTINATION.RECON || (await loadDownloadLogConfig())) refreshReconStatus();
   initMa({ send, showView, setConnection, setConnectionForError, showLogin, getDestination: selectedDestination });
   initPoIc({ send, showView, setConnection, setConnectionForError, getDestination: selectedDestination });
   updateDestination(); // the MA / PO / IC labels, now that those cards are wired
+  initBatch({ send, showView, setConnection, setConnectionForError, getDestination: selectedDestination });
+  refreshBatchDestination();
+  initDownloads({ showView, ensureSignedIn: () => ensureReconSignedIn({ always: true }), currentUser: currentReconUser, openSignIn: openReconSignIn });
   // Nothing talks to IREPS until the active tab is the configured portal.
   await initGate({ send, setConnection, onActive: onIrepsTabActive });
 })();

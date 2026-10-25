@@ -28,6 +28,7 @@ import { MESSAGE_TYPES, DOCUMENT_STAGES, documentStageLabel, describeError } fro
 import { EXPORT_FORMATS } from "../services/search-po/search-po-export.js";
 import { SEARCH_PO_DOCUMENT_TYPES, SEARCH_PO_CRITERIA } from "../services/search-po/search-po-api.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
+import { describeSkip } from "../services/download-log.js";
 
 const ALL_RAILWAYS = "-1";
 /** The document types that have a card here (PO and MA have their own views). */
@@ -228,6 +229,18 @@ class DocumentCard {
     const n = summary.recordCount ?? 0;
     const pages = summary.pagesFetched > 1 ? ` across ${summary.pagesFetched} result pages` : "";
     const toRecon = summary.destination === SAVE_DESTINATION.RECON;
+    if (summary.skipped) {
+      // the same rows were already downloaded by this user (the download log) and not saved again
+      ctx.showView("main");
+      ctx.showResult({
+        title: `${this.label} export not saved again`,
+        summary: [`${this.label} records found: ${n}${pages}. ${describeSkip(summary.skip)}: the same records, so no new file was made.`, ...(summary.warnings || [])].join("\n"),
+        filter: summary.filter ? `Search: ${summary.filter}` : "",
+        filename: summary.skip && summary.skip.filename ? `Earlier file: ${summary.skip.filename}` : "",
+        downloadId: null
+      });
+      return;
+    }
     const stored = toRecon && summary.deduplicated ? ", identical file already stored" : "";
     const loaded = toRecon ? describeIngestStats(summary.ingestStats) : "";
     ctx.showView("main");

@@ -14,10 +14,11 @@
 import { MESSAGE_TYPES, MA_STAGES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
 import { SAVE_DESTINATION } from "../services/recon-service.js";
+import { describeSkip, skipChipText } from "../services/download-log.js";
 
 const $ = (id) => document.getElementById(id);
 const ALL_RAILWAYS = "-1";
-const STATUS_LABEL = { queued: "Queued", downloading: "Downloading", completed: "Completed", failed: "Failed" };
+const STATUS_LABEL = { queued: "Queued", downloading: "Downloading", completed: "Completed", failed: "Failed", skipped: "Skipped" };
 
 let ctx = null;
 let currentState = null;
@@ -186,6 +187,10 @@ function chipFor(item) {
     const described = describeError(item.error.code, { status: item.error.status, detail: item.error.detail });
     chip.title = `${described.title}: ${described.message}`;
   }
+  if (item.status === "skipped" && item.skip) {
+    chip.textContent = skipChipText(item.skip);
+    chip.title = describeSkip(item.skip);
+  }
   return chip;
 }
 
@@ -314,7 +319,8 @@ function renderDownloads(state) {
   } else {
     el.downloadTitle.textContent = d.failed === 0 ? `✓ ${d.completed} MA cop${d.completed === 1 ? "y" : "ies"} downloaded` : `${d.completed} downloaded, ${d.failed} failed`;
     const ecm = summariseEcm(d.items);
-    el.downloadText.textContent = [d.failed === 0 ? "All selected MA PDFs were saved." : "Hover a Failed chip to see why. Failed MAs can be retried.", ecm].filter(Boolean).join("\n");
+    const skipped = d.skipped ? `${d.skipped} skipped: already downloaded or already in the ECM (hover the chip for when / where).` : "";
+    el.downloadText.textContent = [d.failed === 0 ? (d.skipped ? "Every other selected MA PDF was saved." : "All selected MA PDFs were saved.") : "Hover a Failed chip to see why. Failed MAs can be retried.", skipped, ecm, ...(d.warnings || [])].filter(Boolean).join("\n");
   }
   // only files saved on this computer (an MA stored in the ECM has no local copy)
   const local = (d.items || []).filter((i) => i.status === "completed" && i.path && (!i.ecm || i.ecm.status === ECM_OUTCOME.FAILED));
