@@ -925,6 +925,38 @@ body[data-gate="on"] .app-footer {
 .connection-recon[hidden] {
   display: none;
 }
+
+/* small icon buttons at the right of the header (My downloads) */
+.header-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  align-self: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--brand-teal);
+  cursor: pointer;
+}
+.header-icon:hover {
+  background: var(--primary-soft);
+}
+.header-icon[aria-pressed="true"] {
+  background: var(--brand-teal);
+  border-color: var(--brand-teal);
+  color: #fff;
+}
+.header-icon:focus-visible {
+  outline: 2px solid var(--brand-teal);
+  outline-offset: 2px;
+}
+/* off the IREPS portal only the gate is shown */
+body[data-gate="on"] .header-icon {
+  display: none;
+}
 .connection-recon:focus-visible {
   outline: 2px solid var(--brand-teal);
   outline-offset: 2px;
@@ -938,6 +970,191 @@ body[data-recon-login="on"] .app-main > .save-to {
 }
 body[data-gate="on"] #view-recon-login {
   display: none !important;
+}
+
+/* My downloads */
+.downloads-who {
+  margin-top: -4px;
+  font-size: 13px;
+}
+.downloads-all {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 4px 0 10px;
+  font-size: 13px;
+}
+.downloads-all[hidden] {
+  display: none;
+}
+.downloads-summary {
+  margin: 10px 0 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.downloads-table-wrap {
+  max-height: 60vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.downloads-table-wrap[hidden] {
+  display: none;
+}
+/* fixed columns, the file name gets the rest; narrower than this the table scrolls sideways */
+.downloads-table {
+  width: 100%;
+  min-width: 340px;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+.downloads-col-date {
+  width: 76px;
+}
+.downloads-col-type {
+  width: 66px;
+}
+.downloads-col-location {
+  width: 96px;
+}
+.downloads-table th {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.downloads-table .chip-dest {
+  white-space: normal;
+}
+.downloads-table th,
+.downloads-table td {
+  padding-left: 6px !important;
+  padding-right: 6px !important;
+}
+.downloads-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.downloads-table td {
+  padding: 7px 8px;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+.downloads-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.downloads-table tbody tr:nth-child(even) td {
+  background: var(--surface-muted);
+}
+.downloads-table td:first-child {
+  white-space: nowrap;
+}
+.downloads-date {
+  font-weight: 600;
+}
+.downloads-muted {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.downloads-file {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.downloads-path {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+.downloads-user {
+  margin-top: 2px;
+  color: var(--brand-teal-dark);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.chip-dest {
+  white-space: nowrap;
+}
+.chip-dest-local {
+  background: var(--surface-muted);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.chip-dest-ecm {
+  background: var(--primary-soft);
+  color: var(--primary-hover);
+}
+.chip-dest-s3 {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+/* "Already downloaded - download again?" covers the panel the same way. */
+body[data-redownload="on"] .app-main > .view:not(#view-redownload),
+body[data-redownload="on"] .app-main > .save-to {
+  display: none !important;
+}
+body[data-gate="on"] #view-redownload {
+  display: none !important;
+}
+.redownload-select-all {
+  align-self: flex-end;
+}
+.redownload-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid var(--border, #d9dee5);
+  border-radius: 8px;
+}
+.redownload-item + .redownload-item {
+  border-top: 1px solid var(--border, #d9dee5);
+}
+.redownload-item label {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.redownload-item input {
+  grid-row: span 2;
+  margin-top: 2px;
+}
+.redownload-label {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.redownload-detail {
+  font-size: 12px;
+  color: var(--text-muted, #5b6573);
+  overflow-wrap: anywhere;
+}
+.redownload-remember {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.redownload-remember[hidden] {
+  display: none;
+}
+#view-redownload .btn + .btn {
+  margin-top: 8px;
 }
 
 .field input[type="email"],

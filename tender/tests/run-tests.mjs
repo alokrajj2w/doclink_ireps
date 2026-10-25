@@ -52,6 +52,10 @@ const wf = await import('../tender-workflows.js');
 const jobs = await import('../tender-jobs.js');
 const auto = await import('../tender-auto.js');
 const msgs = await import('../tender-messages.js');
+const dlog = await import('../../services/download-log.js');
+// the download log needs a Recon Engine: off here, on only in the "Download log" tests at the end
+dlog.applyDownloadLogConfig({ downloadLog: { enabled: false } });
+dlog.configureDownloadLog({ flushDelayMs: 0 });
 const store = {};
 globalThis.chrome.storage = { local: { get: async (k) => ({ [k]: store[k] }), set: async (o) => Object.assign(store, JSON.parse(JSON.stringify(o))) } };
 
@@ -756,11 +760,14 @@ test('no password / cookie / token is stored by the extension code', async () =>
 // =========================== Save to: ECM / S3 ==============================================
 const tecm = await import('../tender-ecm.js');
 const recon = await import('../../services/recon-service.js');
+const ecmCfg = await import('../../services/ecm-config.js');
 const ECM_URL = 'http://localhost:8000/api/ecm/documents';
+const NUXEO = 'http://ecm.test:8080';
 const CORRES = { 107200478: { nitOid: '107200478', tenderNo: '29263265', letters: [{ no: '306789', id: '306789', corresId: '225319', subject: 'Withdrawal' }, { no: '306790', id: '306790', corresId: '225320', subject: 'Clarif' }] } };
 
 /** Run fn with the ECM gateway faked: respond(post, n) -> [status, body]. Records every upload. */
 async function withEcm(respond, fn) {
+  ecmCfg.applyEcmConfig({ ecmBackendAws: true });
   recon.applyReconConfig({ reconBaseUrl: 'http://localhost:8000' });
   chrome.runtime.getManifest = () => ({ host_permissions: ['http://localhost:8000/*'] });
   const prev = globalThis.fetch;
@@ -778,6 +785,43 @@ async function withEcm(respond, fn) {
   } finally {
     globalThis.fetch = prev;
     delete chrome.runtime.getManifest;
+  }
+}
+
+/**
+ * Run fn with ECM documents going straight to a fake ECM (Nuxeo) ("ecmBackendAws": false).
+ * fn gets { creates, gateway, asked }: each created document, gateway calls, Recon sign-in asks.
+ */
+async function withDirectEcm(fn) {
+  ecmCfg.applyEcmConfig({ ecmBackendAws: false, ecm: { env: 'TEST', domain: NUXEO, clientId: 'id', clientSecret: 'secret' } });
+  chrome.runtime.getManifest = () => ({ host_permissions: [`${NUXEO}/*`, 'http://localhost:8000/*'] });
+  const prev = globalThis.fetch;
+  const prevDocument = globalThis.document;
+  const seen = { creates: [], gateway: [], asked: 0 };
+  // the panel's Recon sign-in page answers this event; count whether it is asked at all
+  globalThis.document = { dispatchEvent: () => { seen.asked += 1; return true; } };
+  const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u === ECM_URL) seen.gateway.push(u);
+    if (!u.startsWith(NUXEO)) return prev(url, init);
+    const path = new URL(u).pathname;
+    if (path === '/nuxeo/oauth2/token') return json(200, { access_token: 'tok', expires_in: 3600 });
+    if (path === '/nuxeo/api/v1/search/lang/NXQL/execute') return json(200, { entries: [], isNextPageAvailable: false });
+    if (path === '/nuxeo/api/v1/upload') return json(201, { batchId: 'b' });
+    if (path.startsWith('/nuxeo/api/v1/upload/')) return json(201, { uploaded: 'true' });
+    const body = JSON.parse(init.body);
+    seen.creates.push({ folder: path.replace('/nuxeo/api/v1/id/', ''), ...body.properties });
+    return json(201, { uid: `n-${seen.creates.length}`, path: `/x/${body.name}`, title: body.properties['dc:title'] });
+  };
+  try {
+    return await fn(seen);
+  } finally {
+    globalThis.fetch = prev;
+    if (prevDocument === undefined) delete globalThis.document;
+    else globalThis.document = prevDocument;
+    delete chrome.runtime.getManifest;
+    ecmCfg.applyEcmConfig({ ecmBackendAws: true });
   }
 }
 
@@ -844,6 +888,27 @@ test('ECM: when the ECM refuses or is down, each document is saved locally inste
     assert.deepEqual([nit.ecm.status, nit.ecm.code, nit.ecm.detail], ['failed', 'ECM_REJECTED', 'nit requires tender_number']);
     assert.equal(r.categories.loa.files[0].ecm.code, 'ECM_UNAVAILABLE');
   });
+});
+test('ECM direct: with ecmBackendAws false every tender document goes straight to the Hosur TEST Tenders folder, without the Recon sign-in', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: CORRES });
+  store['doclink.saveDestination'] = 'recon';
+  await withDirectEcm(async ({ creates, gateway, asked }) => {
+    const r = await run();
+    assert.equal(r.summary.failed, 0);
+    assert.equal(gateway.length, 0, 'the Recon Engine gateway is not called');
+    const kinds = creates.reduce((m, p) => ({ ...m, [p['InvoiceCertificateSchema:type']]: (m[p['InvoiceCertificateSchema:type']] || 0) + 1 }), {});
+    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2 });
+    assert.ok(creates.every((p) => p.folder === 'aa28acbe-add1-49d3-b0ab-16ab1263996c' && p['InvoiceCertificateSchema:tenderNumber'] === '29263265'));
+    const loi = creates.find((p) => p['InvoiceCertificateSchema:type'] === 'loi');
+    assert.deepEqual([loi['dc:title'], loi['InvoiceCertificateSchema:loiNumber']], ['29263265 - LOA 1461928', '1461928']);
+    assert.equal(r.categories.tenderPdf.files[0].ecm.status, 'stored');
+    assert.equal(r.categories.tenderPdf.files[0].ecm.uid.startsWith('n-'), true);
+    const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
+    assert.ok(local.includes('My_Offer/My_Offer_29263265.pdf'));
+    assert.ok(!local.some((n) => /^NIT_and_Supporting_Documents\//.test(n)), 'nothing that went to the ECM is in Downloads');
+  });
+  const asked = await withDirectEcm(async (seen) => seen.asked);
+  assert.equal(asked, 0, 'no Recon sign-in asked in direct mode');
 });
 test('ECM: letters by date go to the ECM with the tender date looked up once per tender (a Local run never searches)', async () => {
   const at = (n) => new Date(NOW() - n * D);
@@ -973,4 +1038,112 @@ test('P2c. While IREPS cannot be reached / answers 503, the Negotiation page is 
     assert.ok(progress.some((m) => /Waiting for IREPS to open the Negotiation page/.test(m)), progress.join('\n'));
     assert.ok(progress.some((m) => /Waiting for IREPS to open the Counter Offer page/.test(m)), progress.join('\n'));
   } finally { globalThis.fetch = shim; Object.assign(core.fetchSettings, { waitRetryMs: 5000, waitRetryMaxMs: 60000 }); }
+});
+
+
+// =========================== Download log ===================================================
+/**
+ * Run fn with the download log on and a fake Recon Engine: `already(key)` says whether the user
+ * downloaded a key before. fn gets { checks, logged, prompts, signIns, answer }: check bodies,
+ * logged records, download-again questions and Recon sign-in asks; set answer(question) to reply.
+ */
+async function withDownloadLog(already, fn) {
+  dlog.applyDownloadLogConfig({});
+  recon.applyReconConfig({ reconBaseUrl: 'http://localhost:8000' });
+  chrome.runtime.getManifest = () => ({ host_permissions: ['http://localhost:8000/*'] });
+  const prev = globalThis.fetch;
+  const prevDocument = globalThis.document;
+  const seen = { checks: [], logged: [], prompts: [], signIns: 0, answer: () => ({ redownload: [], sameForRun: true }) };
+  globalThis.document = {
+    // the panel's sign-in page and download-again prompt answer these events
+    dispatchEvent: (event) => {
+      if (event.type === dlog.REDOWNLOAD_EVENT) {
+        seen.prompts.push(event.detail.question);
+        event.detail.resolve(seen.answer(event.detail.question));
+      } else {
+        seen.signIns += 1;
+        event.detail.resolve(true);
+      }
+      return false;
+    },
+  };
+  const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u === 'http://localhost:8000/api/doclink/downloads/check') {
+      const body = JSON.parse(init.body);
+      seen.checks.push(body);
+      const downloaded = Object.fromEntries(body.keys.filter(already).map((k) => [k, { count: 1, filename: 'old.pdf', downloaded_at: '2026-10-01T04:30:00+00:00', date: '2026-10-01', time: '10:00:00' }]));
+      return json(200, { destination: body.destination, downloaded });
+    }
+    if (u === 'http://localhost:8000/api/doclink/downloads') {
+      seen.logged.push(...JSON.parse(init.body).records);
+      return json(201, { logged: 1 });
+    }
+    return prev(url, init);
+  };
+  try {
+    return await fn(seen);
+  } finally {
+    globalThis.fetch = prev;
+    if (prevDocument === undefined) delete globalThis.document;
+    else globalThis.document = prevDocument;
+    delete chrome.runtime.getManifest;
+    dlog.applyDownloadLogConfig({ downloadLog: { enabled: false } });
+  }
+}
+
+test('Download log: documents this user already downloaded are skipped after one question, the rest are downloaded and logged', async () => {
+  mk({ tenders: [FULL()] });
+  const before = (k) => k.startsWith('tender:TENDER_PDF|29263265|') || k.startsWith('tender:CORRIGENDA|29263265|');
+  await withDownloadLog(before, async (seen) => {
+    const r = await run();
+    const c = r.categories;
+    assert.equal(seen.signIns, 1, 'the Recon sign-in is asked once, before anything is fetched');
+    assert.equal(seen.prompts.length, 1, 'one question; "same answer for the rest of this run" answers the next category');
+    assert.ok(seen.prompts[0].alreadyDownloaded.every((a) => a.date === '2026-10-01'));
+    assert.ok(seen.checks.every((b) => b.destination === 'local'));
+    assert.deepEqual([c.tenderPdf.alreadyDownloaded, c.tenderPdf.downloaded, c.corrigenda.alreadyDownloaded, c.corrigenda.downloaded], [1, 0, 2, 0]);
+    assert.equal(c.tenderPdf.skippedFiles[0].skip.reason, 'already_downloaded');
+    assert.ok(!savedNames().some((n) => /NIT_29263265\.pdf|Corrigendum_/.test(n)), 'skipped documents are not fetched');
+    assert.equal(c.attachments.downloaded, 4);
+    await dlog.flushDownloadLog();
+    const types = seen.logged.reduce((m, x) => ({ ...m, [x.doc_type]: (m[x.doc_type] || 0) + 1 }), {});
+    assert.deepEqual(types, { tender_attachment: 4, my_offer: 1 });
+    assert.ok(seen.logged.every((x) => x.destination === 'local' && x.ireps_account_id === '833' && x.doc_key.startsWith('tender:') && x.filename));
+  });
+});
+test('Download log: "download again" fetches the chosen documents and logs them again', async () => {
+  mk({ tenders: [FULL()] });
+  await withDownloadLog((k) => k.startsWith('tender:TENDER_PDF|'), async (seen) => {
+    seen.answer = (q) => ({ redownload: q.alreadyDownloaded.map((a) => a.id), sameForRun: false });
+    const r = await run();
+    assert.equal(r.categories.tenderPdf.downloaded, 1);
+    assert.equal(r.categories.tenderPdf.alreadyDownloaded, 0);
+    await dlog.flushDownloadLog();
+    assert.ok(seen.logged.some((x) => x.doc_type === 'tender_nit'));
+  });
+});
+test('Download log: when the log cannot be reached the run downloads everything and says so', async () => {
+  mk({ tenders: [FULL()] });
+  await withDownloadLog(() => true, async (seen) => {
+    const shim = globalThis.fetch;
+    globalThis.fetch = async (url, init) => (String(url).includes('/api/doclink/') ? new Response('{}', { status: 503 }) : shim(url, init));
+    try {
+      const r = await run();
+      assert.equal(seen.prompts.length, 0);
+      assert.equal(r.categories.tenderPdf.downloaded, 1);
+      assert.ok(r.categories.tenderPdf.warnings.some((w) => /Download log unavailable/.test(w)));
+    } finally {
+      globalThis.fetch = shim;
+    }
+  });
+});
+test('Download log: cancelling the Recon sign-in stops the run before anything is fetched', async () => {
+  mk({ tenders: [FULL()] });
+  await withDownloadLog(() => false, async () => {
+    globalThis.document.dispatchEvent = (event) => { event.detail.resolve(false); return false; };
+    await assert.rejects(run(), (e) => e.code === 'SIGN_IN_REQUIRED');
+    assert.equal(server.log.length, 0, 'IREPS was not called');
+  });
 });

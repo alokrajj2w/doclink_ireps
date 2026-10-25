@@ -26,6 +26,7 @@ import { IrepsError, parseIrepsDate } from "../ireps-api.js";
 import { SEARCH_PO_CRITERIA, SEARCH_PO_MODE, errorCodesFor } from "../search-po/search-po-api.js";
 import { searchIrepsDocuments } from "../search-po/search-po-service.js";
 import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
+import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { NO_RECORDS_MARKERS } from "../session-service.js";
 import { buildPoDateDownloadPath } from "../../utils/filename.js";
 import { splitDateRange, irepsDateToIso } from "../batch-utils.js";
@@ -190,6 +191,7 @@ function summarise(state) {
   c.downloaded = count(PO_ITEM_STATUS.COMPLETED);
   c.failed = count(PO_ITEM_STATUS.FAILED);
   c.skipped = count(PO_ITEM_STATUS.SKIPPED);
+  c.alreadyDownloaded = state.items.filter((i) => i.status === PO_ITEM_STATUS.SKIPPED && i.skip).length;
   c.inProgress = count(PO_ITEM_STATUS.DOWNLOADING) + count(PO_ITEM_STATUS.QUEUED);
   return state;
 }
@@ -204,18 +206,22 @@ function applySnapshot(state, snapshot) {
     item.downloadId = s.downloadId;
     item.ecm = s.ecm || null;
     item.error = s.error;
+    item.skip = s.skip || null;
   }
   state.sessionExpired = snapshot.sessionExpired === true;
+  if (snapshot.warnings && snapshot.warnings.length) state.warnings = [...new Set([...(state.warnings || []), ...snapshot.warnings])];
 }
 
 async function downloadItems(state, items, deps) {
   const notify = () => typeof deps.onUpdate === "function" && deps.onUpdate(summarise(state));
   const batch = await downloadIrepsDocuments(
     // `ecm` says how the PO is filed under Save to: ECM / S3 (ignored by a local save)
-    items.map((i) => ({ id: i.id, url: i.url, path: i.path, label: i.label, ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: i.poNo } } })),
+    items.map((i) => ({ id: i.id, url: i.url, path: i.path, label: i.label, ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: i.poNo } }, log: logInfo(LOG_DOC_TYPE.PO, downloadKey.po(i.poNo)) })),
     {
       fetch: deps.fetch,
       saveFile: deps.saveFile,
+      preflight: deps.preflight,
+      onSaved: deps.onSaved,
       concurrency: deps.concurrency,
       retries: deps.retries ?? 2,
       retryDelayMs: deps.retryDelayMs,

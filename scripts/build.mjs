@@ -1,5 +1,6 @@
 /**
- * Builds a shareable copy of DocLink in dist/doclink/ and zips it.
+ * Builds a shareable copy of DocLink in dist/doclink/ and zips it to
+ * dist/doclink-<version>-<timestamp>.zip. Earlier zips are left in place.
  *
  * Each JS entry point (with its module graph under services/, utils/ and
  * tender/) is bundled into one file, minified, then run through
@@ -100,8 +101,18 @@ function copyStatic() {
   }
 }
 
+/** Local time as YYYYMMDD-HHMMSS, so every build gets its own zip. */
+function timestamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-` +
+    `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+  );
+}
+
 function zip(version) {
-  const zipName = `doclink-${version}.zip`;
+  const zipName = `doclink-${version}-${timestamp()}.zip`;
   // -r recurse, -X drop macOS extended attrs, run from dist/ so paths are relative.
   execFileSync("zip", ["-r", "-X", zipName, "doclink"], {
     cwd: DIST,
@@ -116,7 +127,8 @@ async function main() {
   );
 
   log(`Building DocLink ${manifest.version} -> dist/doclink/`);
-  rmSync(DIST, { recursive: true, force: true });
+  // Only clear the unpacked folder; earlier zips in dist/ are kept.
+  rmSync(OUT, { recursive: true, force: true });
   mkdirSync(OUT, { recursive: true });
 
   for (const entry of ENTRY_POINTS) {

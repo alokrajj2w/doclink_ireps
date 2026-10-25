@@ -19,6 +19,12 @@ import {
 import { getActiveIrepsAccountContext, accountFolderLabel, assertSameAccount, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { openLedger } from './tender-ledger.js';
 import { inferRoute } from './tender-workflows.js';
+import { ensureDownloadSignIn } from './tender-ecm.js';
+import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
+
+/** The download log of one saved file (letters keep their own "already saved" check: force / Download again). */
+const logPending = (entry, role, saved) =>
+  logDownload(downloadRecord({ docType: TENDER_DOC_TYPE.PENDING_CORRESPONDENCE, key: downloadKey.pending(entry.key, role) }, { filename: saved.relPath, destination: LOG_DESTINATION.LOCAL }));
 
 export const LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
 export const REPLY_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
@@ -464,6 +470,7 @@ const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, companyName: a
  * Callbacks: onProgress(text), onAccount(account), onEvent({type:'records'|'record'|'letter'|'summary', ...}).
  */
 export async function downloadPendingCorrespondence({ mode = 'all', force = false, onProgress = () => {}, onAccount = () => {}, onEvent = () => {}, sleep = defaultSleep, pace = 200 } = {}) {
+  await ensureDownloadSignIn(); // Recon sign-in: every download is logged for the signed-in user
   const base = await getBaseUrl();
   onProgress('Verifying IREPS account...');
   const account = await getActiveIrepsAccountContext({ base });
@@ -657,6 +664,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
 
   await persist();
   emitSummary();
+  flushDownloadLog();
   onProgress(aborted ? 'Stopped: ' + aborted.message : 'Pending correspondence download complete.');
   return { account: publicAccount(account), empty: false, summary: summarize(state, run), skipped, aborted, folder: `Downloads/${jobSaver.root}/` };
 }
@@ -689,6 +697,7 @@ async function processLetter({ base, saver, state, rec, entry, letter, page, det
     if (taken(name)) name = letterFileName(letter, opened.ext, { withId: true });
     const saved = await saver.save('', name, opened.bytes);
     const check = await verifySaved(saved, opened.bytes, 'letter');
+    logPending(entry, 'letter', saved);
     files.push({
       role: 'letter', fileName: saved.relPath, relPath: saved.relPath, status: 'DOWNLOADED', size: saved.size, downloadedAt: new Date().toISOString(), downloadId: saved.downloadId,
       validation: { ok: true, kind: opened.form === 'html' ? 'pdf (rendered from HTML)' : opened.form, source: opened.via, extension: opened.ext, httpStatus: opened.httpStatus, contentType: opened.contentType, pdfSignature: opened.ext === '.pdf' ? isPdfBytes(opened.bytes) : null, ...check },
@@ -713,6 +722,7 @@ async function processLetter({ base, saver, state, rec, entry, letter, page, det
       const name = `Attachment_${safeSegment(letter.letterNo || letter.letterId, 40)}_${got.fileName}`;
       const saved = await saver.save('', name, got.bytes);
       const check = await verifySaved(saved, got.bytes, 'attachment');
+      logPending(entry, `attachment:${att.id}`, saved);
       files.push({
         role: 'attachment', attId: att.id, fileName: saved.relPath, relPath: saved.relPath, originalName: got.fileName, status: 'DOWNLOADED', size: saved.size, downloadedAt: new Date().toISOString(), downloadId: saved.downloadId,
         validation: { ok: true, kind: got.kind, extension: got.ext, httpStatus: got.httpStatus, contentType: got.contentType, ...check },

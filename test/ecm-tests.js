@@ -3,6 +3,8 @@
  * Recon Engine's ECM gateway, POST /api/ecm/documents (services/ecm-service.js), with a
  * fake fetch - request shape, unit routing, date handling, every error path, the local
  * fallback and the result lines. No extension APIs are used. Invoked from run-tests.js.
+ * Runs with config.json "ecmBackendAws": true (the gateway); the direct upload to the ECM
+ * is covered by ecm-direct-tests.js.
  */
 
 import {
@@ -10,6 +12,7 @@ import {
   EcmError, ECM_ERROR, ECM_KIND, ECM_OUTCOME
 } from "../services/ecm-service.js";
 import { applyReconConfig } from "../services/recon-service.js";
+import { applyEcmConfig } from "../services/ecm-config.js";
 import { describeError } from "../utils/messages.js";
 
 const BASE = "http://localhost:8000";
@@ -40,6 +43,8 @@ function fakeFetch(respond) {
 const CREATED = { uid: "u-1", path: "/FT/workspaces/Sites/HSR/x/3480517", title: "3480517", site: "hosur", deduplicated: false };
 
 export async function runEcmTests({ test, assert, eq }) {
+  applyEcmConfig({ ecmBackendAws: true });
+
   async function rejectsEcm(promise, code, message) {
     try {
       await promise;

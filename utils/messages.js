@@ -58,6 +58,10 @@ export const MESSAGE_TYPES = Object.freeze({
   IC_DOWNLOAD_ERROR: "IC_DOWNLOAD_ERROR",
   BATCH_UPDATE: "BATCH_UPDATE",
 
+  // service worker -> popup (request / response): "these files are already downloaded /
+  // in the ECM - download which again?" (services/download-log.js, popup/popup-redownload.js)
+  CONFIRM_REDOWNLOAD: "CONFIRM_REDOWNLOAD",
+
   // service worker -> offscreen document
   PARSE_BILL_STATUS: "PARSE_BILL_STATUS",
   PARSE_SEARCH_PO_RESULTS: "PARSE_SEARCH_PO_RESULTS",
@@ -429,7 +433,7 @@ export const ERROR_CATALOG = Object.freeze({
   },
   ECM_REJECTED: {
     title: "ECM refused the document",
-    message: "The ECM gateway did not accept the document: {detail}. It was saved locally.",
+    message: "The ECM did not accept the document: {detail}. It was saved locally.",
     notice: true,
     connection: "connected"
   },
@@ -438,6 +442,16 @@ export const ERROR_CATALOG = Object.freeze({
     message: "DocLink could not reach the ECM ({detail}). The document was saved locally.",
     notice: true,
     connection: "connected"
+  },
+  DOWNLOAD_LOG_SIGN_IN_REQUIRED: {
+    title: "Recon Engine sign-in required",
+    message: "Sign in to the Recon Engine to download: DocLink records every download for the signed-in user, and checks what you already downloaded. Nothing was downloaded.",
+    reconSignIn: true
+  },
+  DOWNLOAD_LOG_UNAVAILABLE: {
+    title: "Download log unavailable",
+    message: "DocLink could not reach the Recon Engine's download log ({detail}). The files are downloaded anyway and recorded once it is back.",
+    notice: true
   },
   DOCUMENT_BUSY: {
     title: "Download Already Running",

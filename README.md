@@ -1021,6 +1021,61 @@ Tests: `test/ecm-tests.js` (browser suite), the ECM cases in
 `test/ic-tests.js` / `ma-tests.js` / `po-tests.js`, and the "ECM:" tests in
 `tender/tests/run-tests.mjs`.
 
+### Direct mode (local testing): DocLink calls the ECM itself
+
+`config.json` `"ecmBackendAws"` picks the path for these ECM documents:
+
+* `true`: the Recon Engine's ECM gateway, as described above.
+* `false` (the default): DocLink calls the ECM (Nuxeo) REST API directly
+  (`services/ecm-direct.js`), following `ECM_API_DOC`. It gets a client-credentials token,
+  checks for an existing copy with an NXQL query, opens a batch upload, uploads the file
+  and creates an `InvoiceCertificate` in the unit's folder.
+
+Folders, metadata, dedup rule, answer and `ECM_*` error codes are the same as the
+gateway's, so the panel, the local fallback and the manifests work unchanged.
+The folders and metadata come from `services/ecm-catalog.js`, a copy of recon-engine
+`backend/ECM/ecm_client/config/`.
+
+Bill Status, CRN and R-NOTE still go to S3 through the Recon Engine. Only those runs ask
+for the Recon sign-in in direct mode.
+
+```json
+"ecmBackendAws": false,
+"ecm": { "env": "TEST", "domain": "http://wctsrvecmtstsn1.wabtec.com:8080",
+         "clientId": "abc", "clientSecret": "abc", "timeoutMs": 120000 }
+```
+
+* **Credentials.** The `abc` values in `config.json` are placeholders. Put the real
+  `clientId` / `clientSecret` in **`config.local.json`**, which uses the same shape:
+  - top-level keys replace those in `config.json`, and `ecm` is merged key by key;
+  - it is gitignored and never packaged by `scripts/build.mjs`.
+
+  Reload DocLink after editing either file. The secret and the token are never logged or
+  stored. A built extension has no `config.local.json`, so in direct mode it reports
+  "ECM not configured" and saves locally.
+* **`env`** picks the folders:
+
+  | env | Site | `ecm:ancestorId` | Folders |
+  |---|---|---|---|
+  | `TEST` | Hosur (833) | `ad5090e5-648d-4f75-8c14-7052e8ac3b72` | Inputs `d440070d-…`, Tenders `aa28acbe-…` |
+  | `TEST` | Rohtak (60828) | `34a61f51-10fe-44ce-a669-2ea14dc86ff4` | Inputs `93a37d6e-…`, Tenders `a6594520-…` |
+  | `PROD` | Hosur | `7dfe3fc0-3157-489d-826a-9435e65631fc` | `/FT/workspaces/Sites/HSR/Invoice Certificate/Inputs` (path looked up once) |
+  | `PROD` | Rohtak | `f2a5bf87-877b-4e4c-b4fc-7301cabfd236` | `/FT/workspaces/Sites/HPD/Invoice Certificate/Input` (path looked up once) |
+
+  IC, PO and MA go to Inputs. NIT, LOI, corrigendum, negotiation, counter offer and
+  correspondence go to Tenders. PROD has no Tenders folder yet, so tender documents on
+  PROD are refused and saved locally.
+* **Host permission.** The `ecm.domain` origin must be in `manifest.json`
+  `host_permissions`. `http://wctsrvecmtstsn1.wabtec.com:8080/*` is already there. The
+  server is on the Wabtec network.
+* **Finding what was stored.** Use the spreadsheet's query, with straight quotes:
+  `SELECT * FROM Document WHERE InvoiceCertificateSchema:type = 'poCopy' AND ecm:ancestorId = '<site id>'`.
+  `buildEcmQuery()` / `findEcmDocuments()` in `services/ecm-direct.js` build and run it,
+  optionally filtered by `customer_po_number`, `ic_number`, `tender_number`, and so on.
+
+Tests: `test/ecm-direct-tests.js` (browser suite) and the "ECM direct:" test in
+`tender/tests/run-tests.mjs`.
+
 ## 17. Two logins: IREPS and the Recon Engine
 
 DocLink works with two separate logins:
@@ -1029,15 +1084,18 @@ DocLink works with two separate logins:
 |---|---|---|
 | Who | The vendor's IREPS account | Your joulestowatts Recon Engine account (password) or Okta |
 | How | In the IREPS tab, with the e-sign / security key, as always | DocLink's **Sign in to Recon Engine** page |
-| Needed for | Everything (reading IREPS) | Only **Save to: ECM / S3** |
-| Header | `IREPS` pill | `RECON` pill (shown while ECM / S3 is selected; click to sign out) |
+| Needed for | Everything (reading IREPS) | Every download while the download log is on (§18, the default); only **Save to: ECM / S3** when it is off |
+| Header | `IREPS` pill | `RECON` pill (always shown while the download log is on, else while ECM / S3 is selected; click to sign out) |
 | DocLink handles | Nothing - it only checks the session | The typed password, sent once to the Recon Engine |
 
-**When the page appears.** Picking **ECM / S3**, or starting any download
-(Bill Status, CRN, R-NOTE, MA, PO, IC, tender) while it is picked, asks the
-Recon Engine who is signed in (`GET /api/auth/me`). When nobody is, the sign-in
-page covers the panel (a running job is untouched). **Use Local instead**
-switches Save to back to Local and the run saves locally.
+**When the page appears.** With the download log on (§18), starting any
+download (Bill Status, CRN, R-NOTE, MA, PO, IC, the batches, tender, pending
+correspondence), Local or ECM / S3, asks the Recon Engine who is signed in
+(`GET /api/auth/me`). When nobody is, the sign-in page covers the panel (a
+running job is untouched); **Cancel** leaves the run unstarted
+(`DOWNLOAD_LOG_SIGN_IN_REQUIRED`). With the log off (`"downloadLog": {
+"enabled": false }`) only ECM / S3 runs ask, and **Use Local instead** switches
+Save to back to Local and the run saves locally.
 
 **Password.** Any Recon Engine user (`scripts/create_user.py` in the
 recon-engine repo) signs in with `POST /api/auth/login`; wrong password,
@@ -1082,6 +1140,90 @@ secret stays in the Recon backend (`OKTA_CLIENT_SECRET`), never here.
 Code: `services/recon-auth.js` (requests), `popup/popup-recon-auth.js` (page
 and pill). Tests: `test/recon-auth-tests.js` (browser suite).
 
+
+---
+
+## 18. Download log: who downloaded what, and "already downloaded"
+
+Every file DocLink saves is recorded in the Recon Engine for the **signed-in
+Recon user** (login 2, §17): document type, file name, destination (Local /
+ECM / S3), date and time (server time; the API also returns the IREPS-style
+IST date and time). Before a run DocLink asks which of the documents it is
+about to fetch **this user already downloaded to the same destination**, and,
+under **Save to: ECM / S3**, which are **already in the ECM folder** they would
+go to. When there are any, a page covers the panel:
+
+> **Already downloaded** - 2 files were already downloaded by you to your
+> Downloads folder. 1 file is already in the ECM folder they would go to.
+> Tick the ones to download again; the others are skipped.
+
+Each row says when (`Downloaded on 2026-10-22 at 10:05 as PO_x.pdf`) or where
+(`In ECM: /FT/workspaces/Sites/HSR/Invoice Certificate - TS/Inputs/007012`).
+Nothing is ticked by default; **Skip them, download only new files** or
+**Download N files again**. Unanswered for 4 minutes = skip. Skipped documents
+are not fetched from IREPS at all and show an **Already downloaded** /
+**Already in ECM** chip (hover for when / where); the summaries count them.
+
+| Flow | Checked first | Logged |
+|---|---|---|
+| MA, PO, IC (single) | yes | yes |
+| PO by date, IC from notifications | yes (a retry is not re-checked) | yes |
+| Tender documents (all categories, jobs and single tender) | yes, one question per run: *Same answer for the rest of this run* | yes |
+| Pending correspondence | its own "already saved / Download again" (unchanged) | yes |
+| Bill Status, CRN, R-NOTE | yes: the **same rows** (a SHA-256 of the format and the rows IREPS returned) already downloaded to the same destination -> "not saved again" unless you choose to; new or changed rows make a new file | yes (`s3` under ECM / S3) |
+
+**Which document is "the same".** A key built from the document's numbers,
+never the file name (`services/download-log.js` `downloadKey`): `po:<PO>`,
+`ma:<PO>|<MA>`, `ic:<PO>|<PO Sr.>|<Call Id>`, `tender:<category>|<tender>|<id>`,
+and for an export `export:<type>:<fingerprint of its rows>` (its file name and
+bytes carry the time of the run, so they never repeat).
+"Already downloaded" is per user **and** per destination: a PO saved locally
+last week is still new when you pick ECM. The ECM check matches the kind's
+numbers in the upload folder (`ecm:parentId`), dates aside, and the title for
+tender documents - not file names, because other tools store the same
+document under other names. Through the Recon gateway
+(`POST /api/ecm/documents/exists`) or, in direct mode, the same NXQL from
+DocLink (one `... IN (...)` query per kind).
+
+**Never blocking.** If the log or the ECM cannot be checked, the run downloads
+everything and says so ("Download log unavailable"). Records are queued in
+`chrome.storage.local` (`doclink.downloadLog.queue.sw` / `.panel`) and posted
+in batches of up to 500; a failed post (backend down, sign-in expired) keeps
+them for the next one. Tender jobs fall back to their local ledger when the
+log does not answer.
+
+**Recon Engine API** (`recon-engine` `backend/app/downloads.py`, table
+`doclink_downloads`, migration `a7d3c9e15b20`; any signed-in role, viewers too):
+
+| Endpoint | Body / query | Answer |
+|---|---|---|
+| `POST /api/doclink/downloads` | `{records:[{doc_type, doc_key, filename, destination, ireps_account_id?, ecm?}]}` (≤ 500) | `201 {logged}` |
+| `POST /api/doclink/downloads/check` | `{destination, keys:[...]}` (≤ 1000) | `{downloaded: {key: {count, filename, downloaded_at, date, time}}}` (the caller's own) |
+| `GET /api/doclink/downloads` | `?from=&to=` (IST days), `doc_type`, `destination`, `limit`, `offset`; an admin may add `user_id=` or `all=true` | rows with user email / name, date and time in IST |
+
+**My Downloads.** The download icon at the top right of the panel (next to the
+IREPS / RECON pills; click again to go back) shows what the log holds for the
+signed-in user as a table, newest first: **Date** (dd/mm/yyyy and time, IST),
+**Type**, **File** (with the IREPS account) and **Location** (**Local**,
+**ECM · Hosur** / **ECM · Rohtak** with its folder - hover for the full path -
+and "already there" when the ECM already had it, or **S3**). Filters: date range
+(last 7 days by default), **Location** (All, Local, ECM - all sites, ECM -
+Hosur, ECM - Rohtak, S3) and **Document type**; 50 rows at a time with **Load
+more**. An admin also gets **All users**, which adds each row's user under the
+file name. It reads `GET /api/doclink/downloads` (`destination`, `site`,
+`doc_type`, `from`, `to`; `popup/popup-downloads.js`).
+
+**Switch.** `config.json` `"downloadLog": { "enabled": true }` (default).
+`false` turns off the log, the check and the required sign-in; DocLink then
+behaves as before. `config.local.json` may override it.
+
+Code: `services/download-log.js` (keys, check, queue, pre-flight),
+`popup/popup-redownload.js` (the page), `services/ecm-service.js` `findInEcm`
+and `services/ecm-direct.js` `findInFolder` (ECM check), the `preflight` /
+`onSaved` hooks of `services/search-po/document-downloader.js`.
+Tests: `test/download-log-tests.js` (browser suite), the "Download log" tests
+of `tender/tests/run-tests.mjs`, and `backend/tests/test_doclink_downloads.py`
+plus the `find_in_folder` tests in the recon-engine repo.
 
 ---
 

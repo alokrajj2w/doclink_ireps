@@ -12,7 +12,8 @@ import {
 } from './tender-core.js';
 import { getActiveIrepsAccountContext, assertSameAccount, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
-import { ecmDocumentFor, tenderEcmSink } from './tender-ecm.js';
+import { ecmDocumentFor, tenderEcmSink, ensureDownloadSignIn, CATEGORY_ECM_KIND } from './tender-ecm.js';
+import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
 
 const INBOX_PATH = '/epsn/vendorInboxLink.do';
 const DEFAULT_AJAX_PATH = '/epsn/supply/tds/ajxdata.do';
@@ -90,6 +91,11 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
     saved = await run.saver.save(action.subdir, fileName, doc.bytes);
   }
   const size = saved ? saved.size : doc.bytes.length;
+  // the download log (no-op when it is off); the HTML companion of a rendered page is not a document of its own
+  logDownload(downloadRecord(
+    { docType: TENDER_DOC_TYPE[action.category] || 'tender_document', key: downloadKey.tender(action.category, run.ctx.tenderNo, action.id) },
+    { filename: saved ? saved.relPath.split('/').pop() : fileName, ecm, account: run.account }
+  ));
   const out = [{ fileName: saved ? saved.relPath.split('/').pop() : fileName, relPath: saved ? saved.relPath : null, status: 'DOWNLOADED', id: action.id || '', downloadId: saved ? saved.downloadId : null, size, converted: !!doc.converted,
     title: action.meta?.title || '', docDate: action.meta?.docDate || '', downloadedAt: new Date().toISOString(),
     validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '', bytes: size },
@@ -107,12 +113,54 @@ const LEDGER_BUCKET = { CORRIGENDA: 'corrigenda', NEGOTIATION: 'letters', COUNTE
 
 const ITEM_CONCURRENCY = 3;
 
+/**
+ * The download log's check (services/download-log.js): which of a category's documents this
+ * user already downloaded to the same destination, or (Save to: ECM) the ECM already holds.
+ * The panel asks which to download again; a "same answer for the rest of this run" is kept
+ * on run.redownloadMemo (shared by every tender of a job). null when the log is off.
+ */
+const itemId = (it) => String(it.id ?? '') || '-'; // the NIT itself may have no id
+
+async function checkAlreadyDownloaded(run, result, items, build) {
+  if (!items.length || !(await loadDownloadLogConfig())) return null;
+  const toEcm = Boolean(run.ecm && CATEGORY_ECM_KIND[result.category]);
+  const candidates = items.map((it) => ({
+    id: itemId(it),
+    label: `${run.ctx.tenderNo} - ${build(it).meta?.title || it.id || result.category}`,
+    log: { docType: TENDER_DOC_TYPE[result.category] || 'tender_document', key: downloadKey.tender(result.category, run.ctx.tenderNo, it.id) },
+    ecm: toEcm ? ecmDocumentFor(result.category, build(it), run.ctx) : null,
+  }));
+  const memo = run.redownloadMemo || (run.redownloadMemo = {});
+  const ask = (question) => {
+    // categories run in parallel: their questions wait in turn, so a remembered answer applies at once
+    const answered = (memo.turn || Promise.resolve()).then(async () => {
+      const ids = [...new Set([...question.alreadyDownloaded, ...question.inEcm].map((q) => q.id))];
+      if (memo.answer === 'skip') return { redownload: [] };
+      if (memo.answer === 'all') return { redownload: ids };
+      const answer = await confirmRedownload({ ...question, forRun: true });
+      if (answer && answer.sameForRun) memo.answer = answer.redownload.length === 0 ? 'skip' : answer.redownload.length === ids.length ? 'all' : undefined;
+      return answer;
+    });
+    memo.turn = answered.catch(() => {});
+    return answered;
+  };
+  const checked = await preflightDownloads(candidates, { destination: toEcm ? LOG_DESTINATION.ECM : LOG_DESTINATION.LOCAL, account: run.account, ask });
+  for (const w of checked.warnings) result.warnings.push(w);
+  return checked;
+}
+
 async function downloadItems(run, result, items, build) {
   items = dedupeItems(items);
   const bucket = LEDGER_BUCKET[result.category];
   const ledgerKey = (it) => `${result.category}|${run.ctx.tenderNo}|${it.id}`;
-  if (run.ledger && bucket && run.ledgerMode === 'skip') {
-    // scheduled jobs: only what has not been downloaded before
+  const logged = await checkAlreadyDownloaded(run, result, items, build);
+  if (logged && logged.checked) {
+    // the signed-in user's own download log decides (the ledger is still kept, below)
+    result.skippedFiles = items.filter((it) => logged.skip.has(itemId(it))).map((it) => ({ id: it.id || '', title: build(it).meta?.title || '', skip: logged.skip.get(itemId(it)) }));
+    result.alreadyDownloaded = result.skippedFiles.length;
+    items = items.filter((it) => !logged.skip.has(itemId(it)));
+  } else if (run.ledger && bucket && run.ledgerMode === 'skip') {
+    // scheduled jobs: only what has not been downloaded before (also when the download log cannot answer)
     const fresh = items.filter((it) => !run.ledger.has(bucket, ledgerKey(it)));
     result.alreadyDownloaded = items.length - fresh.length;
     items = fresh;
@@ -155,6 +203,7 @@ async function downloadItems(run, result, items, build) {
     }
   }
   result.warnings = [...new Set(result.warnings)];
+  flushDownloadLog();
   return finalize(result);
 }
 
@@ -966,6 +1015,7 @@ export function startTenderRun(base, account, found, folderLabel) {
 export async function downloadTenderDocuments(rawTenderNo, { onProgress = () => {}, onAccount = () => {}, only = CATEGORY_KEYS } = {}) {
   const tenderNo = norm(rawTenderNo);
   if (!tenderNo) throw new TenderError('INPUT', 'Enter a Tender Number.');
+  await ensureDownloadSignIn();
 
   const base = await getBaseUrl();
   onProgress('Verifying IREPS account...');

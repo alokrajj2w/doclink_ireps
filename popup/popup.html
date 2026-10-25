@@ -24,6 +24,12 @@
         <span class="connection-label">RECON</span>
         <span class="connection-status"><span class="dot"></span><span id="recon-connection-text">Checking…</span></span>
       </button>
+      <!-- My downloads (the download log, popup-downloads.js); a second click goes back -->
+      <button class="header-icon" id="btn-downloads-open" type="button" title="My downloads" aria-label="My downloads" aria-pressed="false">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/>
+        </svg>
+      </button>
     </div>
   </header>
 
@@ -166,7 +172,7 @@
     <section id="view-recon-login" class="view" hidden>
       <article class="card card-attention">
         <h2>Sign in to Recon Engine</h2>
-        <p class="card-text">Needed to save to ECM / S3. This is separate from your IREPS login and e-sign key: use your joulestowatts Recon Engine account or Okta.</p>
+        <p class="card-text" id="recon-login-intro">Needed to save to ECM / S3. This is separate from your IREPS login and e-sign key: use your joulestowatts Recon Engine account or Okta.</p>
         <p class="recon-user" id="recon-user" hidden></p>
         <form id="recon-login-form" class="form" autocomplete="on">
           <label class="field">
@@ -192,6 +198,24 @@
           <code id="recon-okta-redirect"></code>
           <button id="btn-recon-copy-redirect" class="btn btn-link" type="button">Copy</button>
         </details>
+      </article>
+    </section>
+
+    <!-- ===================== Already downloaded: download again? =====================
+         Shown over every other view (they keep their state) when a run finds files the
+         signed-in user already downloaded, or files already in the ECM (popup-redownload.js). -->
+    <section id="view-redownload" class="view" hidden>
+      <article class="card card-attention">
+        <h2>Already downloaded</h2>
+        <p class="card-text" id="redownload-summary"></p>
+        <button id="btn-redownload-all" class="btn btn-link redownload-select-all" type="button">Select all</button>
+        <ul class="redownload-list" id="redownload-list"></ul>
+        <label class="redownload-remember" id="redownload-remember" hidden>
+          <input type="checkbox" id="redownload-remember-box" checked>
+          <span>Same answer for the rest of this run</span>
+        </label>
+        <button id="btn-redownload-skip" class="btn btn-primary" type="button">Skip them, download only new files</button>
+        <button id="btn-redownload-again" class="btn btn-secondary" type="button" disabled>Download selected again</button>
       </article>
     </section>
 
@@ -421,6 +445,66 @@
           <div class="result-actions"><button id="btn-icn-retry" class="btn btn-link" type="button" hidden>Retry failed</button></div>
         </div>
         <details id="icn-details" class="batch-details" hidden><summary>Notifications and documents</summary><ul class="doc-list" id="icn-list"></ul></details>
+      </article>
+    </section>
+
+    <!-- ===================== My downloads (the download log, popup-downloads.js) ===================== -->
+    <section id="view-downloads" class="view" hidden>
+      <article class="card">
+        <div class="card-heading">
+          <h2>My Downloads</h2>
+          <button id="btn-downloads-back" class="btn btn-link" type="button">Back</button>
+        </div>
+        <p class="card-text downloads-who" id="downloads-who"></p>
+        <div class="date-row">
+          <label class="field"><span class="field-label">From</span><input type="date" id="downloads-from"></label>
+          <label class="field"><span class="field-label">To</span><input type="date" id="downloads-to"></label>
+        </div>
+        <div class="date-row">
+          <label class="field">
+            <span class="field-label">Location</span>
+            <select id="downloads-destination">
+              <option value="">All</option>
+              <option value="local">Local</option>
+              <option value="ecm">ECM (all sites)</option>
+              <option value="ecm:hosur">ECM - Hosur</option>
+              <option value="ecm:rohtak">ECM - Rohtak</option>
+              <option value="s3">S3</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Document type</span>
+            <select id="downloads-type"><option value="">All</option></select>
+          </label>
+        </div>
+        <label class="downloads-all" id="downloads-all-wrap" hidden>
+          <input type="checkbox" id="downloads-all">
+          <span>All users (admin)</span>
+        </label>
+        <button id="btn-downloads-refresh" class="btn btn-primary" type="button">Refresh</button>
+        <div id="downloads-error" class="result result-error" hidden>
+          <div class="result-title" id="downloads-error-title"></div>
+          <p id="downloads-error-message" class="result-text"></p>
+          <div class="result-actions"><button id="btn-downloads-sign-in" class="btn btn-link" type="button" hidden>Sign in to Recon</button></div>
+        </div>
+        <p class="downloads-summary" id="downloads-summary"></p>
+        <div class="downloads-table-wrap" id="downloads-table-wrap" hidden>
+          <table class="downloads-table">
+            <colgroup>
+              <col class="downloads-col-date"><col class="downloads-col-type"><col class="downloads-col-file"><col class="downloads-col-location">
+            </colgroup>
+            <thead>
+              <tr>
+                <th scope="col">Date</th>
+                <th scope="col" title="Document type">Type</th>
+                <th scope="col">File</th>
+                <th scope="col">Location</th>
+              </tr>
+            </thead>
+            <tbody id="downloads-list"></tbody>
+          </table>
+        </div>
+        <button id="btn-downloads-more" class="btn btn-link" type="button" hidden>Load more</button>
       </article>
     </section>
 

@@ -12,6 +12,7 @@
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
 import { SAVE_DESTINATION } from "../services/recon-service.js";
+import { describeSkip, skipChipText } from "../services/download-log.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -125,15 +126,15 @@ function errorText(error) {
   return `${d.title}: ${d.message}`;
 }
 
-function chip(status, labels, title) {
+function chip(status, labels, title, text) {
   const c = document.createElement("span");
   c.className = `chip chip-${status}`;
-  c.textContent = labels[status] || status;
+  c.textContent = text || labels[status] || status;
   if (title) c.title = title;
   return c;
 }
 
-function listItem(title, meta, status, labels, why) {
+function listItem(title, meta, status, labels, why, chipText) {
   const li = document.createElement("li");
   li.className = "doc-item batch-item";
   const body = document.createElement("div");
@@ -150,7 +151,7 @@ function listItem(title, meta, status, labels, why) {
     w.textContent = why;
     body.append(w);
   }
-  li.append(body, chip(status, labels, why));
+  li.append(body, chip(status, labels, why, chipText));
   return li;
 }
 
@@ -172,13 +173,17 @@ function renderPoDate(state) {
   }
   const c = state.counts;
   const done = c.downloaded + c.failed + c.skipped;
+  // "skipped" holds both: rows without a PDF link, and POs the user already has (not a problem)
+  const already = c.alreadyDownloaded || 0;
+  const noLink = c.skipped - already;
   renderCounts("pod", [
     ["Date range searched", `${state.dateFrom} – ${state.dateTo}`],
     ["Matching PO records found", c.found],
     ["PDFs downloaded", c.downloaded],
+    ["Already downloaded (skipped)", already],
     ["Duplicates skipped", c.duplicates],
     ["Failed", c.failed, true],
-    ["Skipped (no PDF link)", c.skipped, true]
+    ["Skipped (no PDF link)", noLink, true]
   ]);
 
   const running = state.running || state.phase === "searching" || state.phase === "downloading";
@@ -204,16 +209,18 @@ function renderPoDate(state) {
       v.result.className = "result result-error is-notice";
       v.resultTitle.textContent = "No matching PO records";
       v.resultText.textContent = `IREPS returned no Purchase Orders dated ${state.dateFrom}${state.dateFrom === state.dateTo ? "" : " to " + state.dateTo}.`;
-    } else if (c.failed === 0 && c.skipped === 0) {
+    } else if (c.failed === 0 && noLink === 0) {
       v.result.className = "result result-success";
       v.resultTitle.textContent = `✓ ${c.downloaded} PO${c.downloaded === 1 ? "" : "s"} downloaded`;
-      v.resultText.textContent = savedWhere(state.items, "Downloads/DocLink/IREPS/PO/<PO date>/");
+      v.resultText.textContent = [savedWhere(state.items, "Downloads/DocLink/IREPS/PO/<PO date>/"), already ? `${already} already downloaded before: skipped (see the list).` : "", ...(state.warnings || [])].filter(Boolean).join("\n");
     } else {
       v.result.className = "result result-error is-notice";
-      v.resultTitle.textContent = c.downloaded ? `Partly done: ${c.downloaded} downloaded, ${c.failed + c.skipped} not` : "No PO could be downloaded";
+      v.resultTitle.textContent = c.downloaded ? `Partly done: ${c.downloaded} downloaded, ${c.failed + noLink} not` : already && !c.failed && !noLink ? "Nothing new to download" : "No PO could be downloaded";
       v.resultText.textContent = [
         state.sessionExpired ? "Your IREPS session expired. Log in again, then retry the failed downloads." : "Open the list below to see why each PO failed or was skipped.",
-        summariseEcm(state.items.filter((i) => i.status === "completed"))
+        already ? `${already} already downloaded before: skipped.` : "",
+        summariseEcm(state.items.filter((i) => i.status === "completed")),
+        ...(state.warnings || [])
       ].filter(Boolean).join("\n");
     }
     v.retry.hidden = retryable === 0;
@@ -222,8 +229,8 @@ function renderPoDate(state) {
   v.details.hidden = state.items.length === 0;
   v.list.replaceChildren(
     ...state.items.map((i) => {
-      const why = i.error ? errorText(i.error) || i.error.detail : describeEcmOutcome(i.ecm) || null;
-      return listItem(`PO ${i.poNo || "?"}`, [i.poDate, i.railwayUnit, i.poValue ? `₹${i.poValue}` : null].filter(Boolean).join(" · "), i.status, ITEM_LABEL, why);
+      const why = i.skip ? describeSkip(i.skip) : i.error ? errorText(i.error) || i.error.detail : describeEcmOutcome(i.ecm) || null;
+      return listItem(`PO ${i.poNo || "?"}`, [i.poDate, i.railwayUnit, i.poValue ? `₹${i.poValue}` : null].filter(Boolean).join(" · "), i.status, ITEM_LABEL, why, i.skip ? skipChipText(i.skip) : undefined);
     })
   );
 }
@@ -250,8 +257,9 @@ function renderIcNotif(state) {
     ["IC-issued notifications found", c.icNotifications],
     ["Inspection-call records matched", c.matchedRecords],
     ["IC PDFs downloaded", c.downloaded],
+    ["Already downloaded (skipped)", c.alreadyDownloaded || 0],
     ["Duplicate PDFs skipped", c.duplicates],
-    ["Failed / skipped documents", c.failed + c.skipped, true],
+    ["Failed / skipped documents", c.failed + c.skipped - (c.alreadyDownloaded || 0), true],
     ["Notifications not processed", c.unparsed + c.notFound + c.searchErrors + c.noLink, true]
   ]);
 
@@ -279,7 +287,8 @@ function renderIcNotif(state) {
     setBusy("icn", false, idleLabel("icn"));
     ctx.setConnection("connected", "Connected");
     v.result.hidden = false;
-    const problems = c.failed + c.skipped + c.unparsed + c.notFound + c.searchErrors + c.noLink;
+    const already = c.alreadyDownloaded || 0;
+    const problems = c.failed + c.skipped - already + c.unparsed + c.notFound + c.searchErrors + c.noLink;
     const retryable = state.items.filter((i) => i.status === "failed" && i.url).length + state.notifications.filter((n) => n.outcome === "error" || n.outcome === "session_expired").length;
     if (c.icNotifications === 0) {
       v.result.className = "result result-error is-notice";
@@ -288,13 +297,15 @@ function renderIcNotif(state) {
     } else if (problems === 0) {
       v.result.className = "result result-success";
       v.resultTitle.textContent = `✓ ${c.downloaded} IC${c.downloaded === 1 ? "" : "s"} downloaded`;
-      v.resultText.textContent = savedWhere(state.items, "Downloads/DocLink/IREPS/IC/<PO>/") + (state.manifestFile ? ` Manifest: ${state.manifestFile}.` : "");
+      v.resultText.textContent = [savedWhere(state.items, "Downloads/DocLink/IREPS/IC/<PO>/") + (state.manifestFile ? ` Manifest: ${state.manifestFile}.` : ""), already ? `${already} already downloaded before: skipped (see the list).` : "", ...(state.warnings || [])].filter(Boolean).join("\n");
     } else {
       v.result.className = "result result-error is-notice";
       v.resultTitle.textContent = c.downloaded ? `Partly done: ${c.downloaded} downloaded, ${problems} problem${problems === 1 ? "" : "s"}` : "No IC could be downloaded";
       v.resultText.textContent = [
         state.sessionExpired ? "Your IREPS session expired. Log in again, then retry." : "Open the list below to see each notification's outcome.",
-        summariseEcm(state.items.filter((i) => i.status === "completed"))
+        already ? `${already} already downloaded before: skipped.` : "",
+        summariseEcm(state.items.filter((i) => i.status === "completed")),
+        ...(state.warnings || [])
       ].filter(Boolean).join("\n");
     }
     v.retry.hidden = retryable === 0;
@@ -310,8 +321,8 @@ function renderIcNotif(state) {
       const i = state.items.find((x) => x.id === id);
       if (!i) continue;
       const dup = (n.duplicateOf || []).includes(id);
-      const why = dup ? null : i.error ? errorText(i.error) || i.error.detail : describeEcmOutcome(i.ecm) || null;
-      rows.push(listItem(`   IC Call ${i.callId || "?"}`, [i.icDate, i.filename].filter(Boolean).join(" · "), dup ? "duplicate" : i.status, ITEM_LABEL, why));
+      const why = dup ? null : i.skip ? describeSkip(i.skip) : i.error ? errorText(i.error) || i.error.detail : describeEcmOutcome(i.ecm) || null;
+      rows.push(listItem(`   IC Call ${i.callId || "?"}`, [i.icDate, i.filename].filter(Boolean).join(" · "), dup ? "duplicate" : i.status, ITEM_LABEL, why, !dup && i.skip ? skipChipText(i.skip) : undefined));
     }
   }
   v.list.replaceChildren(...rows);

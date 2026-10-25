@@ -22,6 +22,7 @@
 
 import { IrepsError, IREPS_ERROR } from "../ireps-api.js";
 import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
+import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { fetchNotifications, selectIcNotifications, NOTIFICATION_ERROR } from "../notifications/notification-service.js";
 import { withRetry } from "../batch-utils.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
@@ -140,6 +141,7 @@ function summarise(state) {
   c.downloaded = n(IC_NOTIF_STATUS.COMPLETED);
   c.failed = n(IC_NOTIF_STATUS.FAILED);
   c.skipped = n(IC_NOTIF_STATUS.SKIPPED);
+  c.alreadyDownloaded = items.filter((i) => i.status === IC_NOTIF_STATUS.SKIPPED && i.skip).length;
   c.inProgress = n(IC_NOTIF_STATUS.QUEUED) + n(IC_NOTIF_STATUS.DOWNLOADING);
   c.unparsed = noteCount(NOTIFICATION_OUTCOME.UNPARSED);
   c.notFound = noteCount(NOTIFICATION_OUTCOME.NOT_FOUND);
@@ -158,8 +160,10 @@ function applySnapshot(state, snapshot) {
     item.downloadId = s.downloadId;
     item.ecm = s.ecm || null;
     item.error = s.error;
+    item.skip = s.skip || null;
   }
   if (snapshot.sessionExpired) state.sessionExpired = true;
+  if (snapshot.warnings && snapshot.warnings.length) state.warnings = [...new Set([...(state.warnings || []), ...snapshot.warnings])];
 }
 
 /** The public error info stored on state objects (no stack, no cause). */
@@ -263,11 +267,14 @@ async function downloadQueued(state, deps) {
       url: i.url,
       path: i.path,
       label: i.label,
-      ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: i.icNumber, customer_po_number: i.poNo, ic_date: i.icDate } }
+      ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: i.icNumber, customer_po_number: i.poNo, ic_date: i.icDate } },
+      log: logInfo(LOG_DOC_TYPE.IC, downloadKey.ic({ poNo: i.poNo, poSerial: i.poSerial, callId: i.callId, icNumber: i.icNumber }))
     })),
     {
       fetch: deps.fetch,
       saveFile: deps.saveFile,
+      preflight: deps.preflight,
+      onSaved: deps.onSaved,
       concurrency: deps.concurrency,
       retries: deps.retries ?? 2,
       retryDelayMs: deps.retryDelayMs,

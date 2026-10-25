@@ -16,12 +16,13 @@ import { openLedger } from './tender-ledger.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
 } from './tender-workflows.js';
-import { tenderEcmSink } from './tender-ecm.js';
+import { tenderEcmSink, ensureDownloadSignIn } from './tender-ecm.js';
 
 const DAY = 86400000;
 const ddmmyyyy = (d) => fmtDate(d);
 
 export async function beginJob({ onProgress, onAccount }) {
+  await ensureDownloadSignIn(); // Recon sign-in: every download is logged for the signed-in user
   const base = await getBaseUrl();
   onProgress('Verifying IREPS account...');
   const account = await getActiveIrepsAccountContext({ base });
@@ -30,7 +31,8 @@ export async function beginJob({ onProgress, onAccount }) {
   if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
   const folderLabel = accountFolderLabel(account);
   const ledger = await openLedger(account.irepsAccountId);
-  return { base, account, folderLabel, ledger };
+  // "same answer for the rest of this run" of the download-again prompt, shared by its tenders
+  return { base, account, folderLabel, ledger, redownloadMemo: {} };
 }
 
 /** dd/mm/yyyy strings from `from` to `to` inclusive. */
@@ -67,6 +69,7 @@ export async function openTender(job, tenderNo, preferWindows, onProgress) {
   const { run } = startTenderRun(job.base, job.account, found, job.folderLabel);
   run.ledger = job.ledger;
   run.ledgerMode = 'skip';
+  run.redownloadMemo = job.redownloadMemo;
   return run;
 }
 
@@ -268,5 +271,6 @@ export function startLetterRun(job, tenderNo) {
   const { run } = startTenderRun(job.base, job.account, found, job.folderLabel);
   run.ledger = job.ledger;
   run.ledgerMode = 'skip';
+  run.redownloadMemo = job.redownloadMemo;
   return run;
 }

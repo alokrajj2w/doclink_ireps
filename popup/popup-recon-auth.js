@@ -1,11 +1,16 @@
 /**
  * The panel's Recon Engine sign-in (login 2; IREPS is login 1).
  *
- * Only "Save to: ECM / S3" needs it. Picking ECM / S3, or starting a download while it
- * is picked, asks the Recon Engine who is signed in (GET /api/auth/me); when nobody is,
+ * With the download log on (config.json "downloadLog", services/download-log.js) every
+ * download run needs it, Local or ECM / S3: downloads are recorded for the signed-in user.
+ * Starting a run asks the Recon Engine who is signed in (GET /api/auth/me); when nobody is,
  * the "Sign in to Recon Engine" page covers the panel until the user signs in (password
- * or Okta) or chooses Local instead. The RECON pill in the header shows the result and
- * opens the same page (with Sign out) on click.
+ * or Okta) or cancels, and the run does not start.
+ *
+ * With the log off only "Save to: ECM / S3" needs it (and, when config.json "ecmBackendAws"
+ * is false, only for Bill Status, CRN and R-NOTE: ECM documents then go straight to the
+ * ECM); there the page offers "Use Local instead". The RECON pill in the header shows the
+ * result and opens the same page (with Sign out) on click.
  *
  * Nothing is stored here: the sign-in state is always the Recon Engine's answer, and the
  * password field is cleared as soon as it has been sent.
@@ -13,6 +18,8 @@
 
 import { describeError } from "../utils/messages.js";
 import { SAVE_DESTINATION, RECON_CONFIG, loadReconConfig } from "../services/recon-service.js";
+import { loadEcmConfig, isDirectEcm } from "../services/ecm-config.js";
+import { loadDownloadLogConfig, isDownloadLogEnabled } from "../services/download-log.js";
 import { reconWhoAmI, reconSignIn, reconSignOut, reconOktaSignIn, reconProviders, oktaRedirectUri, ReconAuthError, RECON_AUTH_ERROR, RECON_SIGN_IN_EVENT } from "../services/recon-auth.js";
 import { logger } from "../utils/logger.js";
 
@@ -22,7 +29,7 @@ let el = null;
 let ctx = null;
 /** @type {{ signedIn: boolean, user?: object, reason?: string } | null} */
 let status = null;
-/** The pending ensureSignedIn() waiting for the page: { resolve } */
+/** The pending ensureSignedIn() waiting for the page: { resolve, required } */
 let waiting = null;
 
 function setPill(state, text) {
@@ -31,12 +38,12 @@ function setPill(state, text) {
 }
 
 function renderPill() {
-  el.pill.hidden = ctx.getDestination() !== SAVE_DESTINATION.RECON;
+  el.pill.hidden = ctx.getDestination() !== SAVE_DESTINATION.RECON && !isDownloadLogEnabled();
   if (!status) setPill("checking", "Checking…");
   else if (status.signedIn) setPill("connected", status.user.name || status.user.email);
   else if (status.reason === "UNAVAILABLE") setPill("offline", "Unavailable");
   else setPill("login", "Sign in");
-  el.pill.title = status && status.signedIn ? `Recon Engine: signed in as ${status.user.email} (${status.user.role}). Click to sign out.` : "Recon Engine sign-in (for Save to: ECM / S3)";
+  el.pill.title = status && status.signedIn ? `Recon Engine: signed in as ${status.user.email}${status.user.role ? ` (${status.user.role})` : ""}. Click to sign out.` : isDownloadLogEnabled() ? "Recon Engine sign-in (needed to download: downloads are logged per user)" : "Recon Engine sign-in (for Save to: ECM / S3)";
 }
 
 function showError(described) {
@@ -79,7 +86,10 @@ function openPage() {
   el.user.textContent = signedIn ? `Signed in as ${status.user.name} (${status.user.email})` : "";
   el.form.hidden = signedIn;
   el.btnSignOut.hidden = !signedIn;
-  el.btnUseLocal.textContent = signedIn ? "Back" : "Use Local instead";
+  // a run that needs the sign-in whatever Save to says can only be cancelled, not moved to Local
+  const required = Boolean(waiting && waiting.required) || ctx.getDestination() !== SAVE_DESTINATION.RECON;
+  el.btnUseLocal.textContent = signedIn ? "Back" : required ? "Cancel" : "Use Local instead";
+  el.intro.textContent = isDownloadLogEnabled() ? INTRO_LOGGED : INTRO_ECM;
   if (!signedIn) refreshOkta();
   el.view.hidden = false;
   document.body.dataset.reconLogin = "on";
@@ -101,6 +111,11 @@ function settle(signedIn) {
   }
 }
 
+/** The signed-in Recon user ({ id, email, name, roles, role, isAdmin }) as last checked, or null. */
+export function currentReconUser() {
+  return status && status.signedIn ? status.user : null;
+}
+
 /** Ask the Recon Engine who is signed in; never throws. */
 export async function refreshReconStatus() {
   try {
@@ -112,20 +127,29 @@ export async function refreshReconStatus() {
   return status;
 }
 
+const INTRO_ECM = "Needed to save to ECM / S3. This is separate from your IREPS login and e-sign key: use your joulestowatts Recon Engine account or Okta.";
+const INTRO_LOGGED = "Needed to download: DocLink records each download for the signed-in user and checks what you already downloaded. This is separate from your IREPS login and e-sign key: use your joulestowatts Recon Engine account or Okta.";
+
 /**
- * Before anything is saved to ECM / S3: resolves true when someone is signed in to the
- * Recon Engine (asking on the sign-in page if needed), false when the user chose Local.
- * Always true while Save to is Local.
+ * Before a run: resolves true when someone is signed in to the Recon Engine (asking on the
+ * sign-in page if needed), false when the user cancelled or chose Local. Without `always`
+ * it is only asked under Save to: ECM / S3 (always true while Save to is Local); with it
+ * (the download log) whatever Save to says.
+ * @param {{ always?: boolean }} [options]
  */
-export async function ensureReconSignedIn() {
-  if (ctx.getDestination() !== SAVE_DESTINATION.RECON) return true;
+export async function ensureReconSignedIn({ always = false } = {}) {
+  if (!always && ctx.getDestination() !== SAVE_DESTINATION.RECON) return true;
   const current = await refreshReconStatus();
   if (current.signedIn) return true;
-  if (waiting) return new Promise((resolve) => waiting.also.push(resolve));
+  if (waiting) {
+    waiting.required = waiting.required || always;
+    return new Promise((resolve) => waiting.also.push(resolve));
+  }
   return new Promise((resolve) => {
     const also = [];
     waiting = {
       also,
+      required: always,
       resolve: (value) => {
         resolve(value);
         for (const r of also) r(value);
@@ -184,16 +208,27 @@ async function onSignOut() {
 
 function onUseLocal() {
   const signedIn = Boolean(status && status.signedIn);
-  if (!signedIn) ctx.setDestination(SAVE_DESTINATION.LOCAL);
+  // "Use Local instead" (an ECM / S3 run without the log); "Cancel" leaves Save to alone
+  if (!signedIn && !(waiting && waiting.required) && ctx.getDestination() === SAVE_DESTINATION.RECON) ctx.setDestination(SAVE_DESTINATION.LOCAL);
   renderPill();
   settle(signedIn);
 }
 
-/** Called when the Save to switch changes: ECM / S3 checks (and asks for) the sign-in. */
+/**
+ * Called when the Save to switch changes: ECM / S3 checks (and asks for) the sign-in.
+ * When ECM documents go straight to the ECM (config.json "ecmBackendAws": false) only the
+ * S3 runs need it, so it is only checked here and asked for when such a run starts.
+ */
 export async function onReconDestinationChange() {
   renderPill();
-  if (ctx.getDestination() === SAVE_DESTINATION.RECON) await ensureReconSignedIn();
-  else if (!el.view.hidden) settle(false);
+  if (await loadDownloadLogConfig()) {
+    // every run asks for the sign-in when it starts; here only the pill is brought up to date
+    await refreshReconStatus();
+  } else if (ctx.getDestination() === SAVE_DESTINATION.RECON) {
+    await loadEcmConfig();
+    if (isDirectEcm()) await refreshReconStatus();
+    else await ensureReconSignedIn();
+  } else if (!el.view.hidden && !(waiting && waiting.required)) settle(false);
 }
 
 /** Open the sign-in page from an error panel ("Sign in to Recon"). */
@@ -213,6 +248,7 @@ export function initReconAuth(context) {
     pillText: $("recon-connection-text"),
     view: $("view-recon-login"),
     user: $("recon-user"),
+    intro: $("recon-login-intro"),
     form: $("recon-login-form"),
     email: $("recon-email"),
     password: $("recon-password"),
@@ -234,7 +270,7 @@ export function initReconAuth(context) {
   // The tender view (a separate script) asks through this event before an ECM run.
   document.addEventListener(RECON_SIGN_IN_EVENT, (event) => {
     event.preventDefault();
-    ensureReconSignedIn().then(event.detail.resolve);
+    ensureReconSignedIn({ always: Boolean(event.detail.always) }).then(event.detail.resolve);
   });
   el.pill.addEventListener("click", () => {
     if (status && status.signedIn) openPage();

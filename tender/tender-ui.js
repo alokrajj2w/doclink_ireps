@@ -3,6 +3,7 @@ import { runAutomatic, runLetterType } from './tender-auto.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { SESSION_MSG, getLogTail } from './tender-core.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
+import { describeSkip } from '../services/download-log.js';
 
 const $ = (id) => document.getElementById(id);
 const main = $('view-main');
@@ -84,10 +85,13 @@ function li(label, value, cls, title, reason) {
 // Save to: ECM / S3 - how many of a category's documents the ECM holds; a document the ECM did not take was saved locally
 const inEcm = (c) => (c.files || []).filter((f) => f.ecm && f.ecm.status !== ECM_OUTCOME.FAILED).length;
 const catText = (c) => {
-  const text = c.status === 'NOT_AVAILABLE' ? 'none' : c.status === 'FAILED' ? 'failed' : c.status === 'PARTIAL' ? `${c.downloaded} ok, ${c.failed} failed` : `${c.downloaded} downloaded`;
-  return inEcm(c) ? `${text} (${inEcm(c)} in ECM)` : text;
+  // all of a category already downloaded (skipped) reads "already downloaded", not "none"
+  const text = c.status === 'NOT_AVAILABLE' ? (c.alreadyDownloaded ? 'already downloaded' : 'none') : c.status === 'FAILED' ? 'failed' : c.status === 'PARTIAL' ? `${c.downloaded} ok, ${c.failed} failed` : `${c.downloaded} downloaded`;
+  const extra = [inEcm(c) ? `${inEcm(c)} in ECM` : '', c.alreadyDownloaded && c.status !== 'NOT_AVAILABLE' ? `${c.alreadyDownloaded} already downloaded` : ''].filter(Boolean);
+  return extra.length ? `${text} (${extra.join(', ')})` : text;
 };
-const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : ''))].filter(Boolean).join('\n');
+// download-log skips say when / where, the ledger's only that they were skipped
+const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : '')), ...(c.skippedFiles || []).map((f) => `${f.title || f.id}: ${describeSkip(f.skip)}`), ...(c.warnings || []).filter((w) => /download log|ECM could not be checked/i.test(w))].filter(Boolean).join('\n');
 const LABEL = { tenderPdf: 'NIT', attachments: 'Attachments', myOffer: 'My Offer', corrigenda: 'Corrigenda', negotiation: 'Negotiation', counterOffer: 'Counter offer', loa: 'LOA', correspondence: 'Correspondence' };
 
 const LETTER_PAGE = { MyNegotiation: 'Negotiation', MyCounterOffer: 'Counter Offer', MyAdvanceAcceptanceLetter: 'Advance Acceptance Letter' };
