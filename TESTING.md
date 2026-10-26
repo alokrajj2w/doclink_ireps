@@ -272,13 +272,58 @@ After any successful download, click **Open printable preview**.
 Expected: a new tab with the same bills rendered as cards. **Download PDF**
 saves another copy; **Print / Save as PDF** opens Chrome's print dialog.
 
-### C9. Test: upload placeholder
+### C9. Test: Upload Bill to IREPS (bill upload) with the mock portal
 
-1. In the popup click **Upload Document**.
-2. Choose a Source, pick any file, choose a Document Type, click **Upload**.
+The mock answers the supplier bill calls (`/epsn/ct/*`) and the ECM calls of the
+bill upload (`test/mock/mock-bill-upload.mjs`), so the whole flow runs without
+creating a real draft bill. To use the mock ECM as well, add to
+`config.local.json` (and reload DocLink):
 
-Expected: "Upload integration will be implemented in Phase 2." No network
-request is made.
+```json
+{ "ecm": { "domain": "http://localhost:8765", "clientId": "mock", "clientSecret": "mock" } }
+```
+
+Remove it again afterwards: IC / PO / MA "Save to ECM" needs the real ECM.
+
+1. Logged in on the mock, scenario `auto`. Open DocLink and click
+   **Upload Bill** on the *Upload Bill to IREPS* card.
+2. PO Number `11260000100001`, **Find R-Notes / CRNs**. Expected: R-Note
+   4800000001 (87 Set, RO 48300000001) selectable; with the PO left blank
+   the four R-NOTE fixture rows and the mock's CRN rows appear, and only
+   4800000001 and 4400000004 can be selected - e.g. 0600000002 shows
+   "Rnote Not Published", 1000000003 "IREPS already shows bill 3999001", the
+   CRNs "Paid" / "Signed" / ...
+3. Select 4800000001, keep **Find it in ECM**, click **Prepare bill**.
+   Expected (mock terminal): `fetchPODetails`, `populatePayAuthList`,
+   `populatePOSrList`, `getAjaxData`, `populateROList`, `populateRODetails`
+   and `[mock-ecm] RetrieveInvoiceData` - no `saveBillHeader`. The header
+   shows invoice 1331000901, 812656.56, supplier GSTIN 33AAGCS8525B1ZL
+   (source "ECM division WABHSR"), state of supply 37 Andhra Pradesh, place
+   DLS/VSKP, no checks.
+4. Change *Place of supply*: **Create draft bill** is disabled until you click
+   **Apply my changes and check again**.
+5. Tick the confirmation, click **Create draft bill in IREPS**. Expected:
+   "Draft bill 3900001 created in IREPS", dispatch no. 4900001, item values
+   688692.00 + 123964.56 = 812656.56, IGST 18 %, inspection agency TPI.
+   The mock terminal shows `draft bill 3900001 created` and `item saved`.
+6. **Get documents from ECM**. Expected: Invoice, GC/WC, Modvat, WTC, IC and
+   PO copy saved to `Downloads/DocLink/IREPS/BillUpload/1331000901/`, each
+   with the description to type; E-Declaration "not in ECM (if applicable)".
+   *Finish in IREPS* lists the remaining manual steps.
+7. **Start over**, search the same PO again: R-Note 4800000001 is now greyed
+   out with "IREPS already shows bill 3900001". (Restart the mock to reset.)
+8. PO `05260000100004` (R-Note 4400000004): the place of supply
+   "Coaching Depot/Guwahati" is cut to 20 characters - a warning that must be
+   ticked as read before **Create** is enabled; IGST to Assam, CONSG, and
+   E-Declaration instead of IC among the documents.
+9. **Enter it by hand** instead of ECM: leave the HSN empty and click
+   **Prepare bill** - "Invoice details incomplete". With every field filled
+   the flow is the same as with ECM.
+
+### C9a. Test: R-NOTE downloads still work with the captured layout
+
+The mock's R-NOTE results now use the captured layout (`rnote-results-real.html`),
+see C9c.
 
 ### C9b. CRN download with the mock portal
 
@@ -350,10 +395,17 @@ Open the workbook and check:
 ### C9c. R-NOTE download with the mock portal
 
 R-NOTE uses the same PO Search flow; the mock answers `searchCriteria=RNOTE`
-with an **assumed** R-NOTE table (the real layout is not captured yet):
-`#, PO No., PO Date, Rly, PO Sr, R-Note No., R-Note Date, Challan No.,
-Challan Date, Invoice No., Invoice Date, Qty Received, Status, Action`, with
-fake document links under `/ireps/etender/ct/MOCK/RNOTE/…`.
+with the **captured** R-NOTE layout (`test/fixtures/rnote-results-real.html`,
+fictitious values): `Sr. No., Dept / Rly. Unit, PO No., PO Date, PO_SR,
+RNOTE No., RNOTE Date, RNOTE Qty, RO No., RO Date, DRR No., Bill Claim`, the
+payment columns and `Action(s)`, with R-Note PDFs under
+`/ireps/etender/pdfdocs/MMIS/RN/…`. (The automated R-NOTE tests still use the
+older assumed layout, `rnote-results-page.html`, to show the parser does not
+depend on the column set.)
+
+With the captured layout the counts below are 4 rows and 26 columns (24 page
+columns, then *R-Note Document Link* and *Other Links*); row 1 is
+4800000001 with its R-Note PDF link, row 3 carries bill 3999001.
 
 1. Logged in on the mock, scenario `auto`. Open DocLink; the *Download IREPS
    R-NOTE* card has its own **Search options** (same controls as CRN).
@@ -627,6 +679,8 @@ HTTP status). Cookies, session ids and form tokens are always redacted.
 | 12 | R-NOTE: search → result table saved as .xlsx with page columns + document links | C9c / D10 | ☐ |
 | 13 | MA: today's MAs listed, MA copies (not PO PDFs) saved under the date folder | C9d / D11 | ☐ |
 | 14 | MA: session expiry during PDF download → session message, nothing saved as .pdf | C9d `ma-pdf-login` | ☐ |
+| 15 | Bill upload: Prepare writes nothing; Create saves header + item; documents saved with descriptions | C9 | ☐ |
+| 16 | Bill upload: the same receipt is never billed twice; errors / unread warnings block Create | C9 steps 4, 7, 8 | ☐ |
 
 
 ---

@@ -53,16 +53,55 @@ export function cellText(cell) {
 }
 
 /**
- * Every anchor of a cell: { href (as written), text, title }.
+ * Every anchor of a cell: { href (as written), text, title, onclick }.
  * "#" / javascript: hrefs are kept so callers can tell "no document" from
  * "document link"; use resolveIrepsUrl() to turn href into an absolute URL.
+ * `onclick` carries the portal's postRequest('/epsn/...') targets (e.g. Bill Claim); after
+ * stripDangerousNodes() it is the inert data-onclick copy.
  */
 export function anchorsOf(cell) {
   return Array.from(cell.querySelectorAll("a[href]")).map((a) => ({
     href: (a.getAttribute("href") || "").trim(),
     text: normaliseText(a.textContent),
-    title: normaliseText(a.getAttribute("title") || "")
+    title: normaliseText(a.getAttribute("title") || ""),
+    onclick: (a.getAttribute("onclick") || a.getAttribute("data-onclick") || "").trim()
   }));
+}
+
+/**
+ * The "Bill Claim" link of an R-NOTE / CRN result row:
+ *   onclick="postRequest('/epsn/ct/fetchPODetails.do?rly=11&poKey=6749760')"
+ * @param {{ onclick?: string }[]} anchors
+ * @returns {{ rly: string, poKey: string }|null}
+ */
+export function billClaimOf(anchors) {
+  for (const a of anchors) {
+    const m = /\/epsn\/ct\/fetchPODetails\.do\?([^'"]*)/.exec(decodeEntities(a.onclick || ""));
+    if (!m) continue;
+    const params = new URLSearchParams(m[1]);
+    const rly = (params.get("rly") || "").trim();
+    const poKey = (params.get("poKey") || "").trim();
+    if (rly && poKey) return { rly, poKey };
+  }
+  return null;
+}
+
+/**
+ * The draft / submitted bill a result row already carries in its "Bill Reg No." cell:
+ *   onclick="postRequestNewWindow('/epsn/ct/generateBillPreview.do?billRegNo=3816672')"  (draft)
+ *   href=".../ct/sbill/082026/FAIVEL_833_3738579.pdf"> 3738579                          (submitted)
+ * IREPS renders the draft link with an empty billRegNo when the row has no bill.
+ * @param {{ onclick?: string }[]} anchors
+ * @param {string|null} text  the cell text
+ * @returns {string|null}
+ */
+export function billRegNoOf(anchors, text) {
+  for (const a of anchors) {
+    const m = /generateBillPreview\.do\?[^'"]*billRegNo=(\d+)/.exec(decodeEntities(a.onclick || ""));
+    if (m) return m[1];
+  }
+  const digits = /\b(\d{5,})\b/.exec(String(text || ""));
+  return digits ? digits[1] : null;
 }
 
 /**

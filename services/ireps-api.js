@@ -192,7 +192,9 @@ export function buildIrepsUrl(path) {
  * Perform one request with the browser session. Returns the response text
  * plus minimal metadata; never returns headers, so cookies cannot leak.
  *
- * @param {{ path: string, method?: string, body?: string|null }} request
+ * @param {{ path: string, method?: string, body?: string|null, headers?: Record<string, string> }} request
+ *        headers: extra application-level headers (e.g. the bill page's jQuery AJAX ones);
+ *        they override the defaults below
  * @param {{ fetch?: typeof fetch }} [deps]  injectable fetch for tests
  * @returns {Promise<IrepsResponse>}
  */
@@ -217,6 +219,7 @@ export async function requestIreps(request, deps = {}) {
     init.headers["Content-Type"] = "application/x-www-form-urlencoded";
     init.body = request.body == null ? "" : String(request.body);
   }
+  if (request.headers) Object.assign(init.headers, request.headers);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), IREPS_CONFIG.timeoutMs);

@@ -130,14 +130,19 @@ async function bearer(conn) {
   return token.value;
 }
 
-/** An authenticated API call; on 401 the token is dropped and the call retried once. */
-async function call(conn, method, path, { headers = {}, body } = {}) {
+/** An authenticated request to a full path; on 401 the token is dropped and the call retried once. */
+async function authed(conn, method, fullPath, { headers = {}, body } = {}) {
   for (let attempt = 1; ; attempt += 1) {
-    const response = await send(conn, method, `${API}${path}`, { headers: { Authorization: `Bearer ${await bearer(conn)}`, ...headers }, body });
+    const response = await send(conn, method, fullPath, { headers: { Authorization: `Bearer ${await bearer(conn)}`, ...headers }, body });
     if (response.status !== 401 || attempt === 2) return response;
     logger.warn("ECM returned 401; fetching a new token and retrying once");
     token = null;
   }
+}
+
+/** An authenticated REST API call (path below /nuxeo/api/v1). */
+function call(conn, method, path, options) {
+  return authed(conn, method, `${API}${path}`, options);
 }
 
 /** A non-2xx answer as an EcmError: 4xx -> ECM_REJECTED (the reason kept), else ECM_UNAVAILABLE. */
@@ -180,6 +185,57 @@ async function search(conn, nxql, { limit = 200, pageSize = 100, properties = "*
  */
 export async function searchEcm(nxql, options = {}, deps = {}) {
   return search(await connection(deps), nxql, options);
+}
+
+/**
+ * Run a Nuxeo automation operation at the path "Meta data from ECM Bill upload" gives
+ * (the bill upload's RetrieveInvoiceData / GetAttachmentFromInvoice):
+ *   POST {domain}/nuxeo/site/api/v1/automation/<operation>   application/json+nxrequest  {"params":{...}}
+ * The answer's shape is not documented yet, so it is returned as received: parsed JSON, or
+ * { bytes, contentType } for anything else (a blob).
+ * @param {string} operation
+ * @param {object} params
+ * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
+ */
+export async function callEcmAutomation(operation, params, deps = {}) {
+  const conn = await connection(deps);
+  const path = `/nuxeo/site/api/v1/automation/${encodeURIComponent(operation)}`;
+  const response = await authed(conn, "POST", path, {
+    headers: { "Content-Type": "application/json+nxrequest", Accept: "application/json, */*" },
+    body: JSON.stringify({ params: params || {} })
+  });
+  const contentType = response.headers.get("content-type") || "";
+  if (/json/i.test(contentType)) {
+    const body = await readJson(response);
+    if (!response.ok) throw httpError(response, body, `automation ${operation}`);
+    return body;
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (!response.ok) throw httpError(response, null, `automation ${operation}`);
+  // Nuxeo answers 204 when the operation returns nothing
+  if (bytes.length === 0) return null;
+  return { bytes, contentType };
+}
+
+/**
+ * The main file of a document: GET /nuxeo/api/v1/id/{uid}/@blob/file:content.
+ * @returns {Promise<{ bytes: Uint8Array, contentType: string, filename: string|null }>}
+ */
+export async function fetchEcmBlob(uid, deps = {}) {
+  const conn = await connection(deps);
+  const response = await call(conn, "GET", `/id/${encodeURIComponent(uid)}/@blob/file:content`);
+  if (!response.ok) throw httpError(response, await readJson(response), "GET document file");
+  const disposition = response.headers.get("content-disposition") || "";
+  const named = /filename\*=UTF-8''([^;]+)/i.exec(disposition) || /filename="?([^";]+)"?/i.exec(disposition);
+  let filename = null;
+  if (named) {
+    try {
+      filename = decodeURIComponent(named[1]);
+    } catch {
+      filename = named[1];
+    }
+  }
+  return { bytes: new Uint8Array(await response.arrayBuffer()), contentType: response.headers.get("content-type") || "", filename };
 }
 
 /** Documents of a kind in a site, e.g. findEcmDocuments({ site: "hosur", kind: "poCopy", filters: { customer_po_number: "PO-1" } }). */

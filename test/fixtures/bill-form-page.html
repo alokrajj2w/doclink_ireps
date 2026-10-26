@@ -1,0 +1,98 @@
+<!--
+  IREPS supplier bill entry page (POST /epsn/ct/fetchPODetails.do), trimmed to what DocLink
+  reads (services/bill-upload/bill-form.js). Structure copied from the captured page (stock
+  HAR #55): the saveBillHeader() script literals, frmVals, checkPaymentTerms(), the prefilled
+  bank inputs and the supplierGSTIN / payingRly / stateOfSupply / rlyGSTINFinal selects.
+  Business values are fictitious (PO, nitOid, bank account, company); the supplier GSTINs are
+  the ones the division rule maps to, the railway GSTINs follow the portal's list.
+  Served by the mock IREPS server for every poKey, with the {{...}} slots filled in.
+-->
+<html lang="en">
+<head><title>Bill Data Entry</title></head>
+<body>
+<form name="supplierBillForm" method="post" action="/epsn/ct/fetchPODetails.do">
+	<input type="hidden" name="organization" value="01">
+	<input type="hidden" name="department" value="19">
+	<input type="hidden" name="unit" value="{{unit}}">
+	<input type="hidden" id="billRegNo" name="billRegNo" value="0" />
+<table class="tblStyle">
+<tr><td class="formLabel">Select Paying Railway</td>
+<td class="dataText"><select name="payingRly" onchange="populatePayAuthList();" style="width: 300px;" id="payingRlySelect"><option value="-1">Select</option>
+<option value="{{rly}}" selected="selected">{{railwayName}}</option></select></td></tr>
+<tr><td class="formLabel">Bank Account No</td>
+<td class="dataText"><input type="text" name="bankAccountNo" maxlength="18" value="000111222333" onkeypress="return blockNonIntegral(event);" disabled="disabled" id="bankAccountNo"></td>
+<td class="formLabel">IFSC Code</td>
+<td class="dataText"><input type="text" name="ifscCode" maxlength="11" value="TEST0000001" disabled="disabled" style="text-transform: uppercase" id="ifscCode"></td></tr>
+<tr><td class="formLabel">Supplier GSTIN</td>
+<td class="dataText"><select name="supplierGSTIN" onchange="selectSupplierState();" id="supplierGSTIN"><option value="-1">Select</option>
+<option value="06AAGCS8525B1ZI">06AAGCS8525B1ZI</option>
+<option value="02AAGCS8525B1ZQ">02AAGCS8525B1ZQ</option>
+<option value="33AAGCS8525B1ZL">33AAGCS8525B1ZL</option></select></td></tr>
+<tr><td class="formLabel">State for Place of Supply</td>
+<td class="dataText"><select name="stateOfSupply" id="stateOfSupply"><option value="-1">Select</option>
+<option value="18">Assam</option>
+<option value="29">Karnataka</option>
+<option value="33">Tamil Nadu</option>
+<option value="37">Andhra Pradesh</option>
+<option value="04">Chandigarh</option>
+<option value="09">Uttar Pradesh</option></select></td>
+<td class="formLabel">Place of Supply</td><td class="dataText"><input type="text" name="placeOfSupply" maxlength="20" value="" id="placeOfSupply"></td></tr>
+<tr><td class="formLabel">RLY GSTIN</td>
+<td><select name="rlyGSTIN" id="rlyGSTINFinal" class="rlyGSTINSelCls"><option value="-1">Select</option>
+<option value="18AAAGM0289C1ZI">18AAAGM0289C1ZI-Assam</option>
+<option value="29AAAGM0289C1ZF">29AAAGM0289C1ZF-Karnataka</option>
+<option value="33AAAGM0289C1ZQ">33AAAGM0289C1ZQ-Tamil Nadu</option>
+<option value="37AAAGM0289C1ZI">37AAAGM0289C1ZI-Andhra Pradesh</option>
+<option value="04AAAGM0289C1ZR">04AAAGM0289C1ZR-Chandigarh</option>
+<option value="09AAAGM0289C1ZH">09AAAGM0289C1ZH-Uttar Pradesh</option>
+<option value="18AAACI0681C1ZY">18AAACI0681C1ZY-~Assam-IRFC</option></select></td></tr>
+</table>
+</form>
+<script type="text/javascript">
+var frmVals = ["{{rly}}","{{poKey}}","{{poNumber}}","{{poDate}}","Not Applicable",":{{vendor}}"];
+
+function saveBillHeader() {
+ 	var hdrIds = ['invoiceNo', 'invoiceDate', 'paymentType', 'paymentPercent', 'billDesc','bankAccountNo', 'ifscCode', 'invoiceAmtTxt'];
+	var payAuth = $('#payingAuthority').val(),
+     companyName = '{{companyName}}',
+     address = '/epsn' + '/ct/saveBillHeader.do',
+     supplementaryBillType = null;
+		if (confirm("Bill header once saved is not editable. Please check carefully before submitting!")) {
+            $.ajax({
+                type: "POST",
+                url: address,
+                dataType: 'text',
+                data: {
+                	invoiceAmount:$('#invoiceAmtTxt').val(),
+                	billType:'S',
+                	spmBillRegNo:'null',
+                	organization:'01',
+                	department:'19',
+                	unit:'{{unit}}',
+					rly:'{{rly}}',
+                    poKey: '{{poKey}}',
+                    poNumber:'{{poNumber}}',
+                    poDate: '{{poDate}}',
+                    companyName: companyName,
+                    pvc: 'N',
+                    svcFlag:'Y',
+                    vendorCode: ':{{vendor}}',
+					nitOid:'{{nitOid}}',
+					supplementaryBillType:supplementaryBillType,
+					paymentCode:'000000',
+					totalBalanceAmtWraDouble:0.0
+                },
+                success: function(result) {
+                    var resultArray = result.split("^^");
+                }
+            });
+		}
+}
+
+function checkPaymentTerms(){
+	var advancePercent = parseInt( '0');
+	var finalPercent =parseInt( '0');
+}
+</script>
+</body>
+</html>

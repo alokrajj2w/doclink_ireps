@@ -1211,3 +1211,133 @@ body[data-gate="on"] #view-redownload {
 }
 
 .tender-letters { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+
+/* ------------------------------------------------------------- bill upload */
+
+.bill-upload .doc-results + .doc-results {
+  margin-top: 4px;
+}
+.bill-upload input[type="text"],
+.bill-upload input[type="date"],
+.bill-upload select {
+  font: inherit;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  width: 100%;
+}
+.bill-manual {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+.bill-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.bill-item {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bill-item + .bill-item {
+  border-top: 1px solid var(--border);
+}
+.bill-item label {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  cursor: pointer;
+}
+.bill-item label input {
+  grid-row: span 3;
+  margin-top: 2px;
+}
+.bill-item.is-disabled {
+  color: var(--text-muted);
+}
+.bill-item.is-disabled label {
+  cursor: default;
+}
+.bill-item-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.bill-item-detail {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.bill-item-note {
+  font-size: 12px;
+  color: var(--warning);
+  overflow-wrap: anywhere;
+}
+.bill-doc-saved .bill-item-title {
+  color: var(--success);
+}
+.bill-doc-missing .bill-item-title,
+.bill-doc-invalid .bill-item-title,
+.bill-doc-too-large .bill-item-title,
+.bill-doc-failed .bill-item-title {
+  color: var(--danger);
+}
+.bill-review {
+  display: grid;
+  grid-template-columns: minmax(96px, 35%) 1fr;
+  gap: 6px 10px;
+  margin: 8px 0;
+}
+.bill-review dt {
+  font-weight: 600;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.bill-review dd {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+.bill-source {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.bill-checks {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.bill-check {
+  padding: 6px 9px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.bill-check-error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.bill-check-warning {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.bill-confirm {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 8px 0;
+}
+.bill-confirm input {
+  margin-top: 2px;
+}

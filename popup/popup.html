@@ -143,13 +143,10 @@
         <button id="btn-pending-open" class="btn btn-primary" type="button">Pending Correspondence</button>
       </article>
 
-      <article class="card card-muted" id="card-upload">
-        <div class="card-heading">
-          <h2>Upload Document</h2>
-          <span class="badge">Coming Soon</span>
-        </div>
-        <p class="card-text">Upload documents to the configured IREPS workflow.</p>
-        <button id="btn-upload" class="btn btn-secondary" type="button">Upload Document</button>
+      <article class="card" id="card-upload">
+        <h2>Upload Bill to IREPS</h2>
+        <p class="card-text">Bill an ECM invoice against an IREPS R-Note / CRN. DocLink fills the bill; you sign and submit it in IREPS.</p>
+        <button id="btn-upload" class="btn btn-primary" type="button">Upload Bill</button>
       </article>
 
       <!-- Last completed download (Bill Status, CRN, R-NOTE): pinned to the bottom of the main view -->
@@ -630,34 +627,113 @@
       </article>
     </section>
 
-    <!-- ===================== Upload view (Phase 2 placeholder) ===================== -->
+    <!-- ===================== Bill upload view (popup-bill-upload.js) =====================
+         ECM invoice -> IREPS supplier bill, step by step, started by hand. Nothing is written
+         to IREPS before "Create draft bill"; signing and submitting stay in IREPS. -->
     <section id="view-upload" class="view" hidden>
-      <article class="card">
+      <article class="card bill-upload">
         <div class="card-heading">
-          <h2>Upload Document</h2>
-          <span class="badge">Phase 2</span>
+          <h2>Upload Bill to IREPS</h2>
+          <button id="btn-bill-back" class="btn btn-link" type="button">Back</button>
         </div>
+        <p class="card-text">DocLink reads the receipt in IREPS and the invoice in ECM, checks them, and fills the bill header and item. You then attach the documents, sign and submit in IREPS.</p>
 
-        <form id="upload-form" class="form" novalidate>
+        <section class="doc-results" id="bill-step-find">
+          <h3 class="section-heading">1. Receipt</h3>
           <label class="field">
-            <span class="field-label">Source:</span>
-            <select id="upload-source"></select>
+            <span class="field-label">PO Number</span>
+            <input id="bill-po" type="text" autocomplete="off" maxlength="30" placeholder="leave blank for the last 180 days">
           </label>
+          <button id="btn-bill-search" class="btn btn-primary" type="button">
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label">Find R-Notes / CRNs</span>
+          </button>
+          <ul id="bill-receipts" class="bill-list" hidden></ul>
+          <p id="bill-receipt-warnings" class="field-hint" hidden></p>
+        </section>
 
-          <label class="field">
-            <span class="field-label">Select Document:</span>
-            <input id="upload-file" type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png">
-          </label>
+        <section class="doc-results" id="bill-step-invoice" hidden>
+          <h3 class="section-heading">2. Invoice</h3>
+          <fieldset class="field">
+            <label class="radio"><input type="radio" name="bill-invoice-mode" value="ecm" checked> Find it in ECM (customer PO, PO Sr, quantity)</label>
+            <label class="radio"><input type="radio" name="bill-invoice-mode" value="manual"> Enter it by hand</label>
+          </fieldset>
+          <div id="bill-manual" class="bill-manual" hidden>
+            <label class="field"><span class="field-label">Tax invoice no.</span><input id="bill-inv-number" type="text" maxlength="16" autocomplete="off"></label>
+            <label class="field"><span class="field-label">Tax invoice date</span><input id="bill-inv-date" type="date"></label>
+            <label class="field"><span class="field-label">Invoice amount incl. GST</span><input id="bill-inv-amount" type="text" inputmode="decimal" autocomplete="off"></label>
+            <label class="field"><span class="field-label">Quantity</span><input id="bill-inv-qty" type="text" inputmode="decimal" autocomplete="off"></label>
+            <label class="field"><span class="field-label">HSN code</span><input id="bill-inv-hsn" type="text" inputmode="numeric" maxlength="8" autocomplete="off"></label>
+            <label class="field">
+              <span class="field-label">Invoicing plant (decides the supplier GSTIN)</span>
+              <select id="bill-inv-division">
+                <option value="">Choose in the next step</option>
+                <option value="WABHSR">Hosur (33AAGCS8525B1ZL)</option>
+                <option value="WABRTK">Rohtak (06AAGCS8525B1ZI)</option>
+              </select>
+            </label>
+            <label class="field"><span class="field-label">Place of supply (as on the invoice)</span><input id="bill-inv-place" type="text" maxlength="20" autocomplete="off"></label>
+          </div>
+          <button id="btn-bill-prepare" class="btn btn-primary" type="button">
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label">Prepare bill</span>
+          </button>
+          <p class="field-hint">Reads IREPS and ECM only; nothing is created yet.</p>
+        </section>
 
-          <label class="field">
-            <span class="field-label">Document Type:</span>
-            <select id="upload-type"></select>
-          </label>
+        <section class="doc-results" id="bill-step-review" hidden>
+          <h3 class="section-heading">3. Check the bill header</h3>
+          <dl id="bill-review" class="bill-review"></dl>
+          <button id="btn-bill-apply" class="btn btn-link" type="button" hidden>Apply my changes and check again</button>
+          <ul id="bill-checks" class="bill-checks"></ul>
+          <label class="bill-confirm" id="bill-ack-row" hidden><input type="checkbox" id="bill-ack"> I have read the warnings above</label>
+          <label class="bill-confirm"><input type="checkbox" id="bill-confirm"> The values are right. Create the bill in IREPS - the header cannot be changed afterwards.</label>
+          <button id="btn-bill-create" class="btn btn-primary" type="button" disabled>
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label">Create draft bill in IREPS</span>
+          </button>
+        </section>
 
-          <button id="btn-upload-submit" class="btn btn-primary" type="submit">Upload</button>
-          <p id="upload-message" class="form-message" hidden></p>
-        </form>
-        <button id="btn-upload-back" class="btn btn-link" type="button">Back</button>
+        <section class="doc-results" id="bill-step-result" hidden>
+          <h3 class="section-heading">4. Bill in IREPS</h3>
+          <div id="bill-result" class="result">
+            <div class="result-title" id="bill-result-title"></div>
+            <p class="result-text" id="bill-result-text"></p>
+          </div>
+          <dl id="bill-item-review" class="bill-review"></dl>
+          <ul id="bill-item-checks" class="bill-checks"></ul>
+          <label class="bill-confirm" id="bill-item-ack-row" hidden><input type="checkbox" id="bill-item-ack"> I have read the warnings above</label>
+          <button id="btn-bill-save-item" class="btn btn-primary" type="button" hidden>
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label">Save item details in IREPS</span>
+          </button>
+        </section>
+
+        <section class="doc-results" id="bill-step-docs" hidden>
+          <h3 class="section-heading">5. Documents</h3>
+          <button id="btn-bill-docs" class="btn btn-secondary" type="button">
+            <span class="btn-spinner" aria-hidden="true"></span>
+            <span class="btn-label">Get documents from ECM</span>
+          </button>
+          <ul id="bill-docs" class="bill-list" hidden></ul>
+          <button id="btn-bill-docs-folder" class="btn btn-link" type="button" hidden>Show in folder</button>
+          <div id="bill-next" hidden>
+            <h3 class="section-heading">Finish in IREPS</h3>
+            <ol class="instructions" id="bill-next-steps"></ol>
+          </div>
+        </section>
+
+        <div id="bill-progress" class="progress" hidden>
+          <p class="progress-message" id="bill-progress-message"></p>
+        </div>
+        <div id="bill-error" class="result result-error" hidden>
+          <div class="result-title" id="bill-error-title"></div>
+          <p class="result-text" id="bill-error-message"></p>
+          <div class="result-actions">
+            <button id="btn-bill-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button>
+          </div>
+        </div>
+        <button id="btn-bill-reset" class="btn btn-link" type="button">Start over</button>
       </article>
     </section>
   </main>

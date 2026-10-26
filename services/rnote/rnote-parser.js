@@ -5,11 +5,14 @@
  *         searchCriteria=RNOTE (untrusted).
  * Output: one record per result row, plus pagination info.
  *
- * What is confirmed from the captured PO Search page: R-NOTE is
- * <option value="RNOTE">Receipt Note (R-NOTE)</option> of the same
- * searchPOForm, with the same railway / PO / date controls. What is NOT
- * captured yet is an R-NOTE result page, so this parser makes no assumption
- * about the column set or the document link path:
+ * R-NOTE is <option value="RNOTE">Receipt Note (R-NOTE)</option> of the same
+ * searchPOForm, with the same railway / PO / date controls. A real result page
+ * has since been captured (stock bill HAR #11, upload.md step 1: "RNOTE No.",
+ * "RNOTE Qty", "RO No.", "DRR No.", "Bill Claim", payment columns - fixture
+ * rnote-results-real.html); its labels are mapped below, and the Bill Claim
+ * link (rly, poKey) and a draft bill's reg no. are kept for the bill upload.
+ * The parser still makes no assumption about the column set or the document
+ * link path:
  *
  *   - the result table is located by its header row (a "R-Note No." style
  *     column must exist), never by position;
@@ -27,7 +30,7 @@
 import { stripDangerousNodes } from "../../utils/sanitizer.js";
 import { normalizeIrepsValue } from "../bill-parser.js";
 import { resolveIrepsUrl } from "../search-po/search-po-api.js";
-import { normaliseHeaderLabel, cellText, anchorsOf, isMarkupHeaderRow, locateResultTable, resultEnvelope } from "../search-po/search-po-table.js";
+import { normaliseHeaderLabel, cellText, anchorsOf, billClaimOf, billRegNoOf, isMarkupHeaderRow, locateResultTable, resultEnvelope } from "../search-po/search-po-table.js";
 
 /** Typed fields (mapped when the header is recognised); everything else stays in rawColumns. */
 export const RNOTE_FIELDS = [
@@ -42,7 +45,12 @@ export const RNOTE_FIELDS = [
   { key: "invoiceNo", label: "Invoice No." },
   { key: "invoiceDate", label: "Invoice Date" },
   { key: "quantity", label: "Quantity" },
-  { key: "status", label: "Status" }
+  { key: "status", label: "Status" },
+  { key: "roNo", label: "RO No." },
+  { key: "roDate", label: "RO Date" },
+  { key: "drrNo", label: "DRR No." },
+  { key: "billClaimStatus", label: "Bill Claim" },
+  { key: "billRegNo", label: "Bill Reg No." }
 ];
 
 const SERIAL = "_serial";
@@ -82,6 +90,13 @@ export const RNOTE_HEADER_MAP = Object.freeze({
   quantityreceived: "quantity",
   receivedqty: "quantity",
   acceptedqty: "quantity",
+  // captured R-NOTE result (stock bill HAR #11): "RNOTE Qty", "RO No.", "RO Date", "DRR No.", "Bill Claim", "Bill Reg No."
+  rnoteqty: "quantity",
+  rono: "roNo",
+  rodate: "roDate",
+  drrno: "drrNo",
+  billclaim: "billClaimStatus",
+  billregno: "billRegNo",
   status: "status",
   rnotestatus: "status",
   action: ACTION,
@@ -95,8 +110,10 @@ const UNRELATED_LINK = /manage|purchase order|bill|acknowledg|challan|invoice|in
 export function matchRnoteHeader(label) {
   const key = normaliseHeaderLabel(label);
   if (Object.prototype.hasOwnProperty.call(RNOTE_HEADER_MAP, key)) return RNOTE_HEADER_MAP[key];
-  // "R-Note No. / Date" style labels that contain the word but were not listed.
-  if (/r?note/.test(key) && /no|number/.test(key) && !/date/.test(key)) return "rnoteNo";
+  // "R-Note No. / Date" style labels that contain the word but were not listed. A quantity
+  // label ("RNOTE Qty") must never become the number: "no" is found inside "rnote" itself.
+  if (/qty|quantity/.test(key)) return null;
+  if (/r?note/.test(key) && /no|number/.test(key.replace(/r?note/, "")) && !/date/.test(key)) return "rnoteNo";
   if (/r?note/.test(key) && /date/.test(key)) return "rnoteDate";
   return null;
 }
@@ -107,6 +124,8 @@ export function createEmptyRnoteRecord() {
   for (const f of RNOTE_FIELDS) record[f.key] = null;
   record.documentUrl = null;
   record.documentLink = null;
+  /** { rly, poKey } from the Bill Claim link; null when the row cannot be billed (e.g. "Rnote Not Published"). */
+  record.billClaim = null;
   record.links = [];
   record.rawColumns = {};
   return record;
@@ -146,13 +165,19 @@ export function parseRnoteRow(row, header, ordinal = 1, options = {}) {
     const key = header.keys[i] !== undefined ? header.keys[i] : null;
     const text = cellText(cell);
     const value = normalizeIrepsValue(text);
-    for (const a of anchorsOf(cell)) {
+    const anchors = anchorsOf(cell);
+    for (const a of anchors) {
       const url = resolveIrepsUrl(a.href, options.baseUrl);
       record.links.push({ text: a.text, title: a.title, href: a.href, url, column: label, key });
     }
     if (key === ACTION) return;
     const rawLabel = label || "#";
     record.rawColumns[rawLabel in record.rawColumns ? `${rawLabel} (${i + 1})` : rawLabel] = value;
+    if (key === "billClaimStatus") record.billClaim = billClaimOf(anchors);
+    if (key === "billRegNo") {
+      record.billRegNo = billRegNoOf(anchors, text);
+      return;
+    }
     if (key && key !== SERIAL) record[key] = value;
   });
 

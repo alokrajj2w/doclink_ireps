@@ -53,8 +53,8 @@
  *                                   recordsPerPage, submit and the trailing empty
  *                                   searchCriteria; returns the CRN or R-NOTE
  *                                   results table (table#table_id > table#dTbl) in
- *                                   ONE response like the real portal (the R-NOTE
- *                                   layout is an assumption - no capture yet)
+ *                                   ONE response like the real portal (R-NOTE in
+ *                                   the captured layout, rnote-results-real.html)
  *   POST /epsn/searchPO.do          page-link body (rly, dateFrom, dateTo, pageNo,
  *                                   searchRange, poNo, count, recordsPerPage - no
  *                                   token) -> one result page (scenario crn-paged)
@@ -93,6 +93,11 @@
  *   GET /mock/scenario/ma-pdf-404     every MA/PO PDF URL answers HTTP 404
  *   GET /mock/status                  current scenario + live session count (JSON)
  *
+ * Bill upload ("Upload Bill to IREPS"): the supplier bill endpoints (/epsn/ct/*) and the
+ * ECM calls the bill upload makes (/nuxeo/...) are mocked in mock-bill-upload.mjs; the
+ * R-NOTE results use the captured layout (test/fixtures/rnote-results-real.html) with two
+ * billable receipts.
+ *
  * No real session cookie, token or business data is used anywhere here: the
  * JSESSIONID values are random and only mimic the real cookie's shape.
  */
@@ -102,6 +107,7 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { handleBillUpload, markDraftBills } from "./mock-bill-upload.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = join(here, "..", "fixtures");
@@ -117,7 +123,8 @@ const pages = {
   expired: readFileSync(join(fixtures, "session-expired.html"), "utf8"),
   crnSearch: readFileSync(join(fixtures, "crn-search-page.html"), "utf8"),
   crnResults: readFileSync(join(fixtures, "crn-results-page.html"), "utf8"),
-  rnoteResults: readFileSync(join(fixtures, "rnote-results-page.html"), "utf8"),
+  // the captured R-NOTE layout (Bill Claim links, RO / DRR, payment columns)
+  rnoteResults: readFileSync(join(fixtures, "rnote-results-real.html"), "utf8"),
   maResults: readFileSync(join(fixtures, "ma-results-page.html"), "utf8"),
   poResults: readFileSync(join(fixtures, "po-results-page.html"), "utf8"),
   icListPage: readFileSync(join(fixtures, "ic-list-page.html"), "utf8"),
@@ -574,9 +581,10 @@ const rnoteResultsTail = pages.rnoteResults.slice(pages.rnoteResults.indexOf(RNO
 const rnoteFixtureRows = pages.rnoteResults.slice(rnoteResultsHead.length, pages.rnoteResults.indexOf(RNOTE_ROWS_END));
 
 const RNOTE_FIXTURE_DATA = [
-  { poNo: "RR-PR-WC-1001-25-26-01", rly: "01", rnoteNo: "RN-013801-26-40001", crnDate: "10/09/2026" },
-  { poNo: "70220028100002", rly: "13", rnoteNo: "RN-013802-26-40002", crnDate: "11/09/2026" },
-  { poNo: "LR-SCR-2026-0003", rly: "07", rnoteNo: "RN-013803-26-40003", crnDate: "12/09/2026" }
+  { poNo: "11260000100001", rly: "11", rnoteNo: "4800000001", crnDate: "14/10/2026" },
+  { poNo: "22260000100002", rly: "09", rnoteNo: "0600000002", crnDate: "14/10/2026" },
+  { poNo: "21260000100003", rly: "06", rnoteNo: "1000000003", crnDate: "06/10/2026" },
+  { poNo: "05260000100004", rly: "05", rnoteNo: "4400000004", crnDate: "04/09/2026" }
 ];
 const RNOTE_STATUSES = ["Accepted", "Accepted", "Partially Accepted", "Rejected"];
 
@@ -606,35 +614,38 @@ function generatedRnotes(count) {
   return out;
 }
 
+/** A generated R-NOTE row in the captured layout; generated receipts are never billable (status text in Bill Claim). */
 function renderRnoteRow(r) {
+  const pay = Array.from({ length: 11 }, () => '<td class="payDtlCls"></td>').join("");
   return `
-									<tr>
-										<td>${r.serial}</td>
-										<td>${r.poNo}</td>
-										<td>${r.poDate}</td>
-										<td>${r.rlyShort}</td>
-										<td>${r.poSerial}</td>
-										<td><a href='/ireps/etender/ct/MOCK/RNOTE/2026/${r.rly}/${40000 + r.serial}/${r.rnoteNo}.pdf' target="_blank">${r.rnoteNo}</a></td>
-										<td>${r.crnDate}</td>
-										<td>${r.challanNo}</td>
-										<td>${r.challanDate}</td>
-										<td>${r.invoiceNo}</td>
-										<td>${r.invoiceDate}</td>
-										<td>${r.qty}</td>
-										<td>${r.status}</td>
-										<td>
-											<a title="Manage Your Purchase Order" class="linkStyle" href="#" onclick="postRequest('/epsn/dispatchParticulars/showDispatchParticular.do?rly=${r.rly}&poKey=${10000 + r.serial}&poNo=${r.poNo}')" >
-												<img src="/ireps/images/common/icon_view.gif" alt="Manage Your Purchase Order" height="15" width="15" border="0" class="linkStyle" />
-											</a>
-										</td>
-									</tr>
+								<tr style="line-height: 26px;" class="trPoRow">
+									<td class="searchDtlCls">${r.serial}</td>
+									<td class="searchDtlCls">${r.rlyShort}</td>
+									<td class="searchDtlCls"><a href="/ireps/etender/pdfdocs/MMIS/PO/2026/${r.rly}/${r.poNo}.pdf" title="Click to View/Download PO" target="_blank">${r.poNo}</a></td>
+									<td> ${r.poDate}</td>
+									<td class="searchDtlCls">${r.poSerial}</td>
+									<td class="searchDtlCls">${r.rnoteNo}</td>
+									<td class="searchDtlCls"> ${r.crnDate} </td>
+									<td class="searchDtlCls">${r.qty} Nos.</td>
+									<td class="searchDtlCls">${r.challanNo}</td>
+									<td class="searchDtlCls">${r.challanDate}</td>
+									<td class="searchDtlCls">R${String(r.serial).padStart(7, "0")}</td>
+									<td class="searchDtlCls">${r.status === "Rejected" ? "Rnote Not Published" : "Paid"}</td>
+									<td class="payDtlCls"><a href="#" onclick="postRequestNewWindow('/epsn/ct/generateBillPreview.do?billRegNo=')" title="Click Here to View / Sign & Submit Draft Supplier Bill" > </a></td>
+									${pay}
+									<td class="dataText">
+										<a title="View/Download RNOTE" class="linkStyle" href="/ireps/etender/pdfdocs/MMIS/RN/2026/${r.rly}/${r.rnoteNo}.pdf" target="_blank"><img src="/ireps/images/common/View Negotiattion Details.png" alt="View/Download" height="15" width="15" border="0" class="linkStyle" /></a>
+										<a title="Manage Your Purchase Order" class="linkStyle" href="#" onclick="postRequest('/epsn/dispatchParticulars/showDispatchParticular.do?rly=${r.rly}&poKey=${10000 + r.serial}&poNo=${r.poNo}')" ><img src="/ireps/images/common/icon_view.gif" alt="Manage Your Purchase Order" height="15" width="15" border="0" class="linkStyle" /></a>
+									</td>
+								</tr>
 `;
 }
 
 function rnoteFixtureRowsFor(form) {
   const keep = new Set(filterCrns(RNOTE_FIXTURE_DATA, form).map((r) => r.rnoteNo));
-  const rows = rnoteFixtureRows.split(/(?=\n\s*<tr>)/).filter((chunk) => /<tr>/.test(chunk));
-  return rows.filter((chunk) => Array.from(keep).some((no) => chunk.includes(no))).join("");
+  const rows = rnoteFixtureRows.split(/(?=<tr\b)/).filter((chunk) => /class="trPoRow"/.test(chunk));
+  // a receipt with a mock draft bill (mock-bill-upload.mjs) shows it, like the portal
+  return markDraftBills(rows.filter((chunk) => Array.from(keep).some((no) => chunk.includes(no))).join(""));
 }
 
 /** R-NOTE results page (assumed layout); same scenarios as CRN. */
@@ -1066,6 +1077,8 @@ const server = createServer(async (req, res) => {
   if (path === "/" || path === "/epsn/home/showHome.do") return html(res, 200, homePage(hasSession(req)));
   if (path === "/mock" || path === "/mock/") return html(res, 200, controlPanel(hasSession(req)));
   if (serveStatic(path, res)) return;
+  // supplier bill endpoints + the ECM calls of the bill upload (mock-bill-upload.mjs)
+  if (await handleBillUpload({ req, res, path, url, html, readBody, hasSession, pages, fixtures, tinyPdf, scenario: () => scenario })) return;
 
   if (path === "/login" && req.method === "POST") {
     const id = issueSession();
@@ -1288,7 +1301,7 @@ const server = createServer(async (req, res) => {
     return res.end(pdf);
   }
 
-  if (/^\/(ireps\/etender\/ct\/(MMIS\/CONS|MMIS\/CRC\/WAR|MOCK\/RNOTE|sbill)|ireps\/etender\/pdfdocs\/MMIS\/PO|mock\/ma|mock\/po)\/.+\.pdf$/.test(path)) {
+  if (/^\/(ireps\/etender\/ct\/(MMIS\/CONS|MMIS\/CRC\/WAR|MOCK\/RNOTE|sbill)|ireps\/etender\/pdfdocs\/MMIS\/(PO|RN)|mock\/ma|mock\/po)\/.+\.pdf$/.test(path)) {
     const file = decodeURIComponent(path.split("/").pop());
     const flavour = path.includes("/MMIS/CONS/") ? "CRN" : path.includes("/MMIS/CRC/") ? "WARRANTY CLAIM" : path.includes("/MOCK/RNOTE/") ? "RECEIPT NOTE (MOCK)" : path.includes("/mock/ma/") || /_\d+\.pdf$/.test(path) && path.includes("/pdfdocs/") ? "MODIFICATION ADVICE" : path.includes("/mock/po/") || path.includes("/pdfdocs/") ? "PURCHASE ORDER" : "SUPPLIER BILL";
     if (scenario === "ma-pdf-login") return html(res, 200, pages.login);

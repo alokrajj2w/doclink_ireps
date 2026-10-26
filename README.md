@@ -39,7 +39,13 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
   layer). The feature
   runs in the side panel only; it has its own node tests (section 10).
 
-The **Upload Document** card is present in the UI as a Phase 2 placeholder.
+* **Upload Bill to IREPS** (bill upload, started by hand): bills an ECM invoice
+  against an IREPS R-Note / CRN up to the digital signature - finds the
+  billable receipt, gets the invoice from the ECM (or as typed), reads and
+  checks everything, then (after the user confirms) saves the bill header and
+  item in IREPS and fetches the invoice's documents from the ECM. Attaching the
+  signed documents and Sign & Submit stay with the user in IREPS. See section 20
+  and `upload.md`.
 
 DocLink never asks for, reads, stores or forwards IREPS credentials, security
 keys or session cookies. It acts as an authenticated browser client, not as a
@@ -96,7 +102,7 @@ corrected, reconciled or inferred.
 | Bill Status export | `services/bill-status-export.js` | Bill Status columns (`BILL_FIELDS` order) handed to the shared table exporter → .xlsx |
 | PDF | `services/pdf-service.js` | Dependency-free PDF writer (Helvetica, wrapping, page breaks, headers/footers); used by the preview's "Download PDF" |
 | Download | `services/download-service.js` | `chrome.downloads` with `uniquify` conflict handling |
-| Upload | `services/upload-service.js` | Phase 2 placeholder, isolated from the download flow |
+| Bill upload | `services/bill-upload/`, `background/bill-upload-job.js`, `popup/popup-bill-upload.js` | ECM invoice -> IREPS supplier bill (section 20) |
 | PO Search API | `services/search-po/search-po-api.js` | `/epsn/searchPO.do` requests (showPage, `searchCriteria=<type>` search, page links), document types, error codes, URL resolution |
 | PO Search form | `services/search-po/search-po-form.js` | Extracts the Struts TOKEN, railway list, searchCriteria options and searchRange controls from the PO Search page |
 | PO Search table | `services/search-po/search-po-table.js` | Generic result-table mechanics: table location by header, cell text, anchors, pagination links, page message |
@@ -196,6 +202,7 @@ doclink-extension/
 | `tabs` | Open IREPS / the preview page in a new tab |
 | `offscreen` | Create an invisible offscreen document so the parser can use `DOMParser`; MV3 service workers have no DOM |
 | `identity` | Only for **Sign in with Okta** to the Recon Engine (section 17): `chrome.identity.launchWebAuthFlow` opens the Okta sign-in window and returns to `https://<extension id>.chromiumapp.org/okta` |
+| `scripting` | Only for **Upload Bill to IREPS**: the supplier bill calls (`/epsn/ct/*`) are sent from inside the user's IREPS tab (`services/bill-upload/tab-transport.js`), so they leave from the portal's own origin like the bill page's own requests. Nothing is injected into other sites |
 | `debugger` | Only for **published letters** (LOA, Negotiation, Counter Offer, Correspondence - in Download Tender Documents and Pending Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both declared permanently) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
 
@@ -582,16 +589,12 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
 * Save to ECM / S3 needs the Recon Engine sign-in (section 17). Okta sign-in
   works only once DocLink's redirect is registered in the Okta app.
 
-## 14. Future upload implementation (Phase 2)
+## 14. Upload (Phase 2)
 
-`services/upload-service.js` exposes `uploadDocument(request)` returning
-`{ ok, message }`. The popup's Upload view already collects Source
-(SharePoint / OneDrive / Local), Select Document and Document Type and posts
-`UPLOAD_DOCUMENT` to the service worker. Implementing SharePoint / OneDrive
-access and the IREPS upload workflow touches only that module (plus any new
-permissions it requires). Scheduled downloads and automatic login are explicitly out of scope. Saving
-IREPS exports to the Recon Engine (S3) is a download destination, not part of
-this upload view (section 15).
+The Phase 2 placeholder (`services/upload-service.js`, the Source / Document /
+Type form) is replaced by **Upload Bill to IREPS**, section 20. Scheduled runs
+and automatic login stay out of scope. Saving IREPS exports to the Recon Engine
+(S3) is a download destination, not part of the upload (section 15).
 
 ---
 
@@ -1341,3 +1344,65 @@ network / timeout / HTTP 5xx only. An expired session is never retried.
 * The inspection-call date window: the portal's own default is used first; if nothing matches, one wider retry
   (`dateFrom`/`dateFromIC` = 01/01/2015) is made. Whether IREPS accepts that early a date is unconfirmed.
 * Notifications beyond what `getMyActivitesData` returns (no other notification endpoint is called).
+
+---
+
+## 20. Upload Bill to IREPS (bill upload)
+
+Bills an ECM invoice against an IREPS receipt, up to the point where IREPS needs
+the user's digital signature. The study behind it - every call, field, source
+and open question - is `upload.md`; this section is how DocLink implements it.
+Started by hand from the side panel (**Upload Bill** on the main view).
+
+```
+1 Receipt    PO number -> R-NOTE + CRN search (searchPO.do, read-only)
+             -> receipts with a "Bill Claim" link (rly, poKey); others greyed out with the reason
+2 Invoice    ECM RetrieveInvoiceData {customerPO, customerPOSrNo, invoiceQuantity}
+             (exactly one match, not "Sent to Doculink") - or typed by hand
+3 Prepare    read-only IREPS calls in the IREPS tab: fetchPODetails.do (bill page), populatePayAuthList,
+             populatePOSrList, getAjaxData (GSTIN), populateROList, populateRODetails
+             -> every header value with its source + checks; the user may correct supplier GSTIN,
+                state / place of supply and bill description (re-checked)
+4 Create     only with no error, warnings read and the values confirmed:
+             saveBillHeader.do (creates the DRAFT bill - the header cannot be edited afterwards)
+             -> fetchPOItemDetails / populateROList / populateRODetails -> amounts computed like the
+                bill page -> item checks -> saveBillDetails.do
+5 Documents  the invoice's ECM documents (per-type NXQL by invoice no. / PO no., newest per type),
+             checked (PDF, < 8 MB) and saved to Downloads/DocLink/IREPS/BillUpload/<invoice>/,
+             each with the description to type in IREPS
+Then in IREPS (manual): open the draft bill, attach the documents (each signed in the IREPS
+signer), Generate Preview, Sign & Submit with DSC + PIN.
+```
+
+| File | Role |
+|---|---|
+| `services/bill-upload/bill-upload-api.js` | The `/epsn/ct/*` calls: request bodies in the captured field order (`orderedBody` refuses a missing or extra field), the bill page's AJAX headers, parsers for the `^^` / `@#$%` answers; anything not starting with `success` is IREPS refusing, its text kept as the reason |
+| `services/bill-upload/bill-form.js` | Reads the bill page (regex, no DOM): the `saveBillHeader()` script literals (`nitOid`, `poKey`, `unit`, ...), company, prefilled bank / IFSC, the supplier GSTIN / paying railway / railway GSTIN / state options, PO payment terms |
+| `services/bill-upload/bill-rules.js` | Pure rules: `buildHeader`, `buildItem`, `computeAmounts`, GST split (IGST vs CGST + SGST / UTGST from the header states), state codes, the supplier-GSTIN-by-division and state-of-supply derivations, every check |
+| `services/bill-upload/ecm-invoice.js` | `retrieveInvoice` (answer read defensively - its format is not documented yet), `manualInvoice`, the bill document types with their IREPS descriptions, document search and fetch |
+| `services/bill-upload/bill-upload-service.js` | The steps above (`findBillableReceipts`, `prepareBill`, `reviewBill`, `createDraftBill`, `saveItem`, `collectBillDocuments`) |
+| `services/bill-upload/bill-upload-store.js` | Per receipt, what DocLink already wrote (bill reg no., dispatch no.; identifiers only) in `chrome.storage.local`: a receipt is never billed twice, also after a restart |
+| `services/bill-upload/tab-transport.js` | A `fetch` that runs in the panel's IREPS tab (`chrome.scripting`) for the bill calls |
+| `background/bill-upload-job.js` | Service-worker job: `BILL_UPLOAD_*` messages, one step at a time, state in `chrome.storage.session`, `BILL_UPLOAD_UPDATE` to the panel |
+| `popup/popup-bill-upload.js` | The view |
+
+Safety rules: Prepare never writes. Create needs the confirmation tick, refuses
+while any check is an error, and needs the warnings ticked as read. A failure
+after the header was saved keeps the draft bill's number on screen (item can be
+retried, or finished / deleted in IREPS). A receipt with a DocLink bill, or one
+IREPS already shows a bill for, cannot be billed again.
+
+What DocLink derives because the ECM does not carry it yet (upload.md section 8,
+to be confirmed by the business): supplier GSTIN from ECM `division`
+(`WABHSR` -> 33AAGCS8525B1ZL, `WABRTK` -> 06AAGCS8525B1ZI), state of supply from
+ECM `gstinRecipient` (else the consignee address), place of supply from
+`supplyPlace`. All three are shown with their source and can be corrected.
+
+Not supported yet (stopped by a check): advance / part payment, PVC, POs with
+discount / packing / freight / other charges, several paying authorities,
+several receipts per PO Sr without a match, multi-invoice bills. Not verified on
+the live portal: the ECM `RetrieveInvoiceData` answer (no response captured) and
+re-opening a DocLink-created draft in IREPS to attach the documents (IREPS
+offers "View / Sign & Submit Draft Supplier Bill" from the R-NOTE / CRN row).
+The mock portal serves the whole flow, including the ECM calls (TESTING.md C9).
+

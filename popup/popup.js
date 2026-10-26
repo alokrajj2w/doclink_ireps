@@ -8,7 +8,6 @@
  */
 
 import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError } from "../utils/messages.js";
-import { UPLOAD_SOURCES, DOCUMENT_TYPES } from "../services/upload-service.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
 import { loadEcmConfig, isDirectEcm } from "../services/ecm-config.js";
 import { loadDownloadLogConfig, configureDownloadLog, describeSkip, DOWNLOAD_LOG_ERROR } from "../services/download-log.js";
@@ -21,6 +20,7 @@ import { initBatch, handleBatchMessage, restoreBatch, refreshBatchDestination } 
 import { initGate, currentPanelTabId } from "./popup-gate.js";
 import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser } from "./popup-recon-auth.js";
 import { initDownloads } from "./popup-downloads.js";
+import { initBillUpload, handleBillUploadMessage, restoreBillUpload } from "./popup-bill-upload.js";
 import { logger, mirrorLogToConsole, installConsoleHelpers } from "../utils/logger.js";
 
 const $ = (id) => document.getElementById(id);
@@ -64,17 +64,10 @@ const el = {
   btnErrorPreview: $("btn-error-preview"),
   btnErrorRetry: $("btn-error-retry"),
   btnErrorOpenRecon: $("btn-error-open-recon"),
-  btnUpload: $("btn-upload"),
   loginTitle: $("login-title"),
   loginText: $("login-text"),
   btnOpenIreps: $("btn-open-ireps"),
   btnLoginBack: $("btn-login-back"),
-  uploadForm: $("upload-form"),
-  uploadSource: $("upload-source"),
-  uploadFile: $("upload-file"),
-  uploadType: $("upload-type"),
-  uploadMessage: $("upload-message"),
-  btnUploadBack: $("btn-upload-back"),
   metaLastDownload: $("meta-last-download"),
   metaStatus: $("meta-status")
 };
@@ -99,7 +92,7 @@ let resultDownloadId = null;
 /* -------------------------------------------------------------------------- */
 
 /** Requests that only read state; logged at debug level, everything else is a user action. */
-const QUIET_TYPES = /^(GET_|CHECK_IREPS_SESSION|SEARCH_PO_LOAD_FORM)/;
+const QUIET_TYPES = /^(GET_|CHECK_IREPS_SESSION|SEARCH_PO_LOAD_FORM|BILL_UPLOAD_GET_STATE)/;
 
 /** Requests that start a download run; under Save to: ECM / S3 they need the Recon sign-in first. */
 const RUN_TYPES = new Set([
@@ -181,6 +174,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (handleMaMessage(message)) return false;
   if (handlePoIcMessage(message)) return false;
   if (handleBatchMessage(message)) return false;
+  if (handleBillUploadMessage(message)) return false;
   switch (message.type) {
     case MESSAGE_TYPES.IREPS_PROGRESS:
       renderProgress(message.stage, message.message);
@@ -542,25 +536,6 @@ async function restoreJobState() {
   return false;
 }
 
-function populateUploadForm() {
-  for (const source of UPLOAD_SOURCES) {
-    const option = document.createElement("option");
-    option.value = source.value;
-    option.textContent = source.label;
-    el.uploadSource.append(option);
-  }
-  const placeholder = document.createElement("option");
-  placeholder.value = "";
-  placeholder.textContent = "Select Type";
-  el.uploadType.append(placeholder);
-  for (const type of DOCUMENT_TYPES) {
-    const option = document.createElement("option");
-    option.value = type.value;
-    option.textContent = type.label;
-    el.uploadType.append(option);
-  }
-}
-
 /* -------------------------------------------------------------------------- */
 /* Wiring                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -586,25 +561,6 @@ el.optZone.addEventListener("change", updateOptionsSummary);
 el.optDateFrom.addEventListener("change", updateOptionsSummary);
 el.optDateTo.addEventListener("change", updateOptionsSummary);
 
-el.btnUpload.addEventListener("click", () => {
-  el.uploadMessage.hidden = true;
-  showView("upload");
-});
-el.btnUploadBack.addEventListener("click", () => showView("main"));
-el.uploadForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const file = el.uploadFile.files && el.uploadFile.files[0];
-  const response = await send(MESSAGE_TYPES.UPLOAD_DOCUMENT, {
-    request: {
-      source: el.uploadSource.value,
-      documentType: el.uploadType.value,
-      file: file ? { name: file.name, size: file.size, type: file.type } : null
-    }
-  });
-  el.uploadMessage.textContent = (response && response.message) || "Upload integration will be implemented in Phase 2.";
-  el.uploadMessage.hidden = false;
-});
-
 /**
  * First time the active tab is the configured IREPS portal: restore any job
  * state and check the session. Later returns to an IREPS tab only refresh
@@ -620,7 +576,8 @@ async function onIrepsTabActive() {
     const maRestored = restored || documentRestored ? false : await restoreMa();
     const poIcRestored = restored || documentRestored || maRestored ? false : await restorePoIc();
     const batchRestored = restored || documentRestored || maRestored || poIcRestored ? false : await restoreBatch();
-    if (!restored && !documentRestored && !maRestored && !poIcRestored && !batchRestored) showView("main");
+    const billRestored = restored || documentRestored || maRestored || poIcRestored || batchRestored ? false : await restoreBillUpload();
+    if (!restored && !documentRestored && !maRestored && !poIcRestored && !batchRestored && !billRestored) showView("main");
     const state = await send(MESSAGE_TYPES.GET_JOB_STATE);
     if (!state || state.status !== "running") {
       if (restored && state && state.status === "error" && state.error && state.error.loginRequired) {
@@ -642,7 +599,6 @@ async function onIrepsTabActive() {
   installConsoleHelpers();
   mirrorLogToConsole();
   logger.info("Side panel opened");
-  populateUploadForm();
   updateOptionsSummary();
   refreshMeta();
   initDocuments({ send, showView, setConnection, setConnectionForError, showLogin, showResult, hideResult, getDestination: selectedDestination });
@@ -658,6 +614,7 @@ async function onIrepsTabActive() {
   updateDestination(); // the MA / PO / IC labels, now that those cards are wired
   initBatch({ send, showView, setConnection, setConnectionForError, getDestination: selectedDestination });
   refreshBatchDestination();
+  initBillUpload({ send, showView, setConnection, setConnectionForError, currentPanelTabId });
   initDownloads({ showView, ensureSignedIn: () => ensureReconSignedIn({ always: true }), currentUser: currentReconUser, openSignIn: openReconSignIn });
   // Nothing talks to IREPS until the active tab is the configured portal.
   await initGate({ send, setConnection, onActive: onIrepsTabActive });

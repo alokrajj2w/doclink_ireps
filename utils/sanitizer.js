@@ -92,6 +92,9 @@ export function stripDangerousNodes(root) {
     for (const attr of Array.from(el.attributes || [])) {
       const name = attr.name.toLowerCase();
       if (name.startsWith("on")) {
+        // an onclick's text stays readable as inert data: IREPS puts link targets there
+        // (Bill Claim: postRequest('/epsn/ct/fetchPODetails.do?rly=..&poKey=..'))
+        if (name === "onclick") el.setAttribute("data-onclick", attr.value);
         el.removeAttribute(attr.name);
       } else if (URL_ATTRIBUTES.includes(name) && /^\s*(javascript|data|vbscript):/i.test(attr.value)) {
         el.removeAttribute(attr.name);

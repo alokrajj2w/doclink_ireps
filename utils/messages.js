@@ -11,7 +11,6 @@ export const MESSAGE_TYPES = Object.freeze({
   OPEN_IREPS: "OPEN_IREPS",
   GET_TAB_SCOPE: "GET_TAB_SCOPE",
   OPEN_PREVIEW: "OPEN_PREVIEW",
-  UPLOAD_DOCUMENT: "UPLOAD_DOCUMENT",
   // opens the Recon Engine (config.json reconAppUrl) so the user can sign in for "Save to: Recon Engine (S3)"
   OPEN_RECON: "OPEN_RECON",
 
@@ -37,6 +36,16 @@ export const MESSAGE_TYPES = Object.freeze({
   BATCH_RETRY: "BATCH_RETRY",
   BATCH_GET_STATE: "BATCH_GET_STATE",
 
+  // popup -> service worker: bill upload (ECM invoice -> IREPS supplier bill, services/bill-upload/)
+  BILL_UPLOAD_SEARCH: "BILL_UPLOAD_SEARCH",
+  BILL_UPLOAD_PREPARE: "BILL_UPLOAD_PREPARE",
+  BILL_UPLOAD_REVIEW: "BILL_UPLOAD_REVIEW",
+  BILL_UPLOAD_CREATE: "BILL_UPLOAD_CREATE",
+  BILL_UPLOAD_SAVE_ITEM: "BILL_UPLOAD_SAVE_ITEM",
+  BILL_UPLOAD_DOCUMENTS: "BILL_UPLOAD_DOCUMENTS",
+  BILL_UPLOAD_GET_STATE: "BILL_UPLOAD_GET_STATE",
+  BILL_UPLOAD_RESET: "BILL_UPLOAD_RESET",
+
   // service worker -> popup (broadcast)
   IREPS_PROGRESS: "IREPS_PROGRESS",
   IREPS_DOWNLOAD_COMPLETE: "IREPS_DOWNLOAD_COMPLETE",
@@ -57,6 +66,7 @@ export const MESSAGE_TYPES = Object.freeze({
   IC_DOWNLOAD_COMPLETE: "IC_DOWNLOAD_COMPLETE",
   IC_DOWNLOAD_ERROR: "IC_DOWNLOAD_ERROR",
   BATCH_UPDATE: "BATCH_UPDATE",
+  BILL_UPLOAD_UPDATE: "BILL_UPLOAD_UPDATE",
 
   // service worker -> popup (request / response): "these files are already downloaded /
   // in the ECM - download which again?" (services/download-log.js, popup/popup-redownload.js)
@@ -559,6 +569,92 @@ export const ERROR_CATALOG = Object.freeze({
     title: "IC Download Already Running",
     message: "Please wait for the current Inspection Certificate download to finish."
   },
+  /* --------------------------------------- Bill upload (services/bill-upload/) */
+  BILL_REQUEST_FAILED: {
+    title: "IREPS did not answer",
+    message: "DocLink could not complete the bill request to IREPS ({detail}). Check your network connection and try again.",
+    connection: "offline"
+  },
+  BILL_FORM_INVALID: {
+    title: "IREPS bill page not recognised",
+    message: "IREPS did not return the supplier bill page for this receipt ({detail}). Open the receipt's Bill Claim in IREPS to see why.",
+    connection: "connected"
+  },
+  BILL_IREPS_REJECTED: {
+    title: "IREPS refused the bill",
+    message: "IREPS answered: {detail}",
+    connection: "connected"
+  },
+  BILL_RESPONSE_INVALID: {
+    title: "Unexpected IREPS answer",
+    message: "IREPS answered in a form DocLink does not recognise ({detail}). Nothing further was sent.",
+    connection: "connected"
+  },
+  BILL_NO_RECEIPTS: {
+    title: "No receipts found",
+    message: "{detail}.",
+    notice: true,
+    connection: "connected"
+  },
+  BILL_NOT_BILLABLE: {
+    title: "This receipt cannot be billed",
+    message: "{detail}.",
+    notice: true,
+    connection: "connected"
+  },
+  BILL_DRAFT_EXISTS: {
+    title: "Bill already created",
+    message: "{detail}. DocLink does not create a second bill for the same receipt; finish or delete it in IREPS (Bills for Pay).",
+    connection: "connected"
+  },
+  BILL_CHECKS_FAILED: {
+    title: "Checks did not pass",
+    message: "Nothing was sent to IREPS: {detail}",
+    notice: true,
+    connection: "connected"
+  },
+  BILL_INVOICE_INVALID: {
+    title: "Invoice details incomplete",
+    message: "{detail}",
+    notice: true
+  },
+  BILL_ECM_NOT_FOUND: {
+    title: "Invoice not found in ECM",
+    message: "{detail}. ECM does not store the customer PO Sr no. yet, so the match can fail; you can enter the invoice details by hand.",
+    notice: true
+  },
+  BILL_ECM_AMBIGUOUS: {
+    title: "More than one ECM invoice",
+    message: "{detail}. The spec says to stop when several invoices match.",
+    notice: true
+  },
+  BILL_ECM_ALREADY_SENT: {
+    title: "Invoice already sent",
+    message: "{detail}.",
+    notice: true
+  },
+  BILL_ECM_UNAVAILABLE: {
+    title: "ECM not available",
+    message: "DocLink could not read the ECM ({detail})."
+  },
+  BILL_NO_DOCUMENTS: {
+    title: "No documents in ECM",
+    message: "{detail}",
+    notice: true
+  },
+  BILL_TAB_UNAVAILABLE: {
+    title: "IREPS tab needed",
+    message: "DocLink sends the bill from your IREPS tab: {detail}.",
+    connection: "connected"
+  },
+  BILL_BUSY: {
+    title: "Bill upload busy",
+    message: "Please wait for the current bill step to finish."
+  },
+  BILL_NOT_PREPARED: {
+    title: "Bill not prepared",
+    message: "{detail}. Start again from the receipt."
+  },
   NO_BACKGROUND_RESPONSE: {
     title: "DocLink Needs a Reload",
     message: "DocLink's background service did not answer ({detail}). Open chrome://extensions, click the reload icon on the DocLink card, then retry."
@@ -610,5 +706,6 @@ export const SESSION_KEYS = Object.freeze({
   MA_STATE: "doclink.maState",
   PO_STATE: "doclink.poState",
   IC_STATE: "doclink.icState",
-  BATCH_STATE: "doclink.batchState"
+  BATCH_STATE: "doclink.batchState",
+  BILL_UPLOAD_STATE: "doclink.billUploadState"
 });

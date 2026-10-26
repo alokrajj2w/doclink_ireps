@@ -49,7 +49,7 @@ import { extractBillStatusForm, publicFormInfo } from "../services/ireps-form.js
 import { fetchBillStatus } from "../services/bill-status-service.js";
 import { buildBillStatusExport } from "../services/bill-status-export.js";
 import { uploadToRecon, loadReconConfig, ReconError, RECON_CONFIG, RECON_DOC_TYPE, SAVE_DESTINATION } from "../services/recon-service.js";
-import { uploadDocument } from "../services/upload-service.js";
+import { createBillUploadJob } from "./bill-upload-job.js";
 import { searchIrepsDocuments, validateSearchPoSession, SEARCH_PO_FLOW_STAGES } from "../services/search-po/search-po-service.js";
 import { loadSearchPoPage, SEARCH_PO_ERROR, SEARCH_PO_CRITERIA, SEARCH_PO_DOCUMENT_TYPES } from "../services/search-po/search-po-api.js";
 import { extractSearchPoForm, publicSearchPoFormInfo } from "../services/search-po/search-po-form.js";
@@ -1413,7 +1413,14 @@ async function retryBatch(kind, rawDestination, panelTabId) {
 /* Message router                                                             */
 /* -------------------------------------------------------------------------- */
 
+/** Bill upload (ECM invoice -> IREPS supplier bill, started by hand): background/bill-upload-job.js */
+const billUploadJob = createBillUploadJob({
+  broadcast,
+  parseSearchPo: (html, options) => parseSearchPoInOffscreen(html, options)
+});
+
 const handlers = {
+  ...billUploadJob,
   [MESSAGE_TYPES.CHECK_IREPS_SESSION]: async (message) => {
     const result = await performSessionCheck({ useCache: !message.force });
     return publicSessionInfo(result);
@@ -1441,7 +1448,6 @@ const handlers = {
     await chrome.tabs.create({ url: PREVIEW_URL });
     return { ok: true };
   },
-  [MESSAGE_TYPES.UPLOAD_DOCUMENT]: (message) => uploadDocument(message.request || {}),
   // Sign-in for "Save to: Recon Engine (S3)": the Recon Engine opens in a new tab, IREPS stays put.
   [MESSAGE_TYPES.OPEN_RECON]: async () => {
     await loadReconConfig();
