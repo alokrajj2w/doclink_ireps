@@ -2,8 +2,9 @@
 // Every identifier (nitId, nitOid, tenderOID, letter ids, tokens, dates...) is read from the live
 // IREPS responses; nothing captured from a previous session is baked in.
 //
-// OUT OF SCOPE (never requested, enforced in tender-core.isExcludedUrl):
-//   Financial Tabulation (FIN-TAB), Commercial / Techno-Commercial Tabulation (TECH-TAB).
+// Financial and Commercial Tabulation are downloaded from the tender's row (or its row in IREPS "Closed
+// Tenders"); OUT OF SCOPE (never requested, enforced in tender-core.isExcludedUrl):
+//   Techno-Commercial Tabulation (TECH-TAB) and any other commTboPdfAction.do pdfType.
 
 import {
   TenderError, SESSION_MSG, log, norm,
@@ -11,6 +12,7 @@ import {
   elementActions, parseCalls, qparam, toRequest, requestKey, fetchDocument, createSaver, safeSegment,
 } from './tender-core.js';
 import { getActiveIrepsAccountContext, assertSameAccount, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
+import { printPageToPdf } from './tender-print.js';
 import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
 import { ecmDocumentFor, tenderEcmSink, ensureDownloadSignIn, CATEGORY_ECM_KIND } from './tender-ecm.js';
 import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
@@ -24,8 +26,8 @@ const MAX_INBOX_PAGES = 15;
 const INBOX_WINDOW_DAYS = 90;
 const INBOX_WINDOWS = 5;
 
-export const EXCLUSIONS = ['Financial Tabulation', 'Commercial/Techno-Commercial Tabulation'];
-export const CATEGORY_KEYS = ['tenderPdf', 'attachments', 'corrigenda', 'myOffer', 'negotiation', 'counterOffer', 'loa', 'correspondence'];
+export const EXCLUSIONS = ['Techno-Commercial Tabulation'];
+export const CATEGORY_KEYS = ['tenderPdf', 'attachments', 'corrigenda', 'myOffer', 'negotiation', 'counterOffer', 'loa', 'correspondence', 'financialTabulation', 'commercialTabulation'];
 const DATE_RE = /\b\d{1,2}[-/ ](?:\d{1,2}|[A-Za-z]{3})[-/ ]\d{2,4}\b/;
 const pad2 = (n) => String(n).padStart(2, '0');
 
@@ -68,16 +70,27 @@ export function dedupeItems(items) {
 /**
  * The single download path used by every category: issue the request exactly as the IREPS page
  * would, validate/resolve the response into a real document, save it, return the file record.
- *   action = { req, opts, subdir, fileName(ext) -> string, id, category, before?() }
+ *   action = { req, opts, subdir, fileName(ext) -> string, id, category, before?(), print? }
+ * `print`: a letter that IREPS only serves as a web page is printed by Chrome itself (Ctrl+P, see
+ * tender-print.js) instead of the text-only rendering; if Chrome cannot print, the text PDF is kept.
  * Under "Save to: ECM / S3" (run.ecm) a document whose category has an ECM kind goes to the ECM
  * folder of the account's unit; when the ECM does not take it, it is saved locally as before.
  * The file record then carries `ecm` (and no relPath unless a local copy was made).
  */
 export async function resolveAndDownloadIrepsDocument(action, run) {
   if (action.before) await action.before();
-  const doc = await fetchDocument(run.base, { ...action.req, relativeTo: action.req.relativeTo || run.ctx.searchUrl },
+  let doc = await fetchDocument(run.base, { ...action.req, relativeTo: action.req.relativeTo || run.ctx.searchUrl },
     { allowHtml: !!action.allowHtml, allowAnyFile: !!action.allowAnyFile, nameHint: action.nameHint || '' });
-  log('Download', `Validating document (${doc.kind}${doc.converted ? ', rendered from HTML' : ''})`);
+  let printError = '';
+  if (doc.kind === 'html' && action.print) {
+    try {
+      doc = { ...doc, bytes: await printPageToPdf(doc.page), converted: false, printed: true };
+    } catch (e) {
+      printError = e.message;
+      log('Download', `Chrome print failed, keeping the text rendering: ${e.message}`);
+    }
+  }
+  log('Download', `Validating document (${doc.kind}${doc.printed ? ', printed by Chrome' : doc.converted ? ', rendered from HTML' : ''})`);
   const fileName = action.fileName(doc.ext);
   const ecmDoc = run.ecm ? ecmDocumentFor(action.category, action, run.ctx) : null;
   let saved;
@@ -97,19 +110,21 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
     { filename: saved ? saved.relPath.split('/').pop() : fileName, ecm, account: run.account }
   ));
   const out = [{ fileName: saved ? saved.relPath.split('/').pop() : fileName, relPath: saved ? saved.relPath : null, status: 'DOWNLOADED', id: action.id || '', downloadId: saved ? saved.downloadId : null, size, converted: !!doc.converted,
+    ...(doc.printed ? { printed: true } : {}),
     title: action.meta?.title || '', docDate: action.meta?.docDate || '', downloadedAt: new Date().toISOString(),
     validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '', bytes: size },
     ...(ecm ? { ecm } : {}) }];
-  if (doc.kind === 'html') {
+  if (doc.kind === 'html' && !doc.printed) {
     // Keep the complete original page next to the text rendering: nothing from the letter is lost.
+    // (A page Chrome printed is already complete, as Ctrl+P would save it.)
     const htmlName = fileName.replace(/\.pdf$/i, '') + '.html';
     const savedHtml = await run.saver.save(action.subdir, htmlName, new TextEncoder().encode(doc.html), 'text/html');
     out.push({ fileName: savedHtml.relPath.split('/').pop(), relPath: savedHtml.relPath, status: 'DOWNLOADED', id: action.id || '', downloadId: savedHtml.downloadId, size: savedHtml.size, note: 'original HTML' });
   }
-  return { files: out, converted: doc.kind === 'html' };
+  return { files: out, converted: doc.kind === 'html' && !doc.printed, printError };
 }
 
-const LEDGER_BUCKET = { CORRIGENDA: 'corrigenda', NEGOTIATION: 'letters', COUNTER_OFFER: 'letters', LOA: 'letters', CORRESPONDENCE: 'letters' };
+const LEDGER_BUCKET = { CORRIGENDA: 'corrigenda', NEGOTIATION: 'letters', COUNTER_OFFER: 'letters', LOA: 'letters', CORRESPONDENCE: 'letters', FINANCIAL_TABULATION: 'letters', COMMERCIAL_TABULATION: 'letters' };
 
 const ITEM_CONCURRENCY = 3;
 
@@ -177,9 +192,9 @@ async function downloadItems(run, result, items, build) {
       const item = items[i];
       try {
         if (item.skip) throw new TenderError(item.skip.code, item.skip.message);
-        const { files, converted } = await resolveAndDownloadIrepsDocument({ category: result.category, ...build(item) }, run);
+        const { files, converted, printError } = await resolveAndDownloadIrepsDocument({ category: result.category, ...build(item) }, run);
         if (run.ledger && bucket) run.ledger.mark(bucket, ledgerKey(item));
-        outcomes[i] = { ok: true, files, converted };
+        outcomes[i] = { ok: true, files, converted, printError };
       } catch (e) {
         if (e.code === 'SESSION_EXPIRED' || e.code === 'EXCLUDED') { fatal = fatal || e; return; }
         outcomes[i] = { ok: false, item, error: e };
@@ -193,6 +208,7 @@ async function downloadItems(run, result, items, build) {
     if (o.ok) {
       result.downloaded++;
       result.files.push(...o.files);
+      if (o.printError) result.warnings.push(`Chrome could not print these letters as Ctrl+P would: ${o.printError}`);
       if (o.converted) {
         result.warnings.push('Some documents were printable web pages. A text-only PDF rendering and the complete original .html were saved; the PDF does not keep the page layout.');
       }
@@ -574,6 +590,167 @@ async function myOffer(run) {
   }));
 }
 
+// ---------------------------------------------------------------- D2. Financial / Commercial Tabulation
+
+/**
+ * The tabulations sit next to My Offer on commTboPdfAction.do (pdfType=...), on the tender's row in IREPS
+ * "Closed Tenders" (Vendor inbox, Tenders > Closed Tenders, filtered by closing date) once the bids are opened:
+ *   View Financial Tabulation   /epsn/tbo/commTboPdfAction.do?tenderOID=<oid>&pdfType=financialTabulation&accountID=<acct>
+ *   View Commercial Tabulation  /epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=<oid>&accountID=<acct>
+ * (01_api_data/finncial and commercial documentation response.har). Both open with postRequestNewWindow (POST).
+ */
+export const TABULATIONS = Object.freeze({
+  financialTabulation: { pdfType: 'financialTabulation', category: 'FINANCIAL_TABULATION', key: 'financialTabulation', label: 'Financial Tabulation', file: 'Financial_Tabulation' },
+  commercialTabulation: { pdfType: 'commercialTabulation', category: 'COMMERCIAL_TABULATION', key: 'commercialTabulation', label: 'Commercial Tabulation', file: 'Commercial_Tabulation' },
+});
+const CLOSED_STATUS = 'MyBidsClosed';
+const CLOSED_WINDOW_DAYS = 90; // the Closed Tenders page's own default range
+const CLOSING_RE = /^(\d{2}\/\d{2}\/\d{4})(?:\s+\d{1,2}:\d{2})?$/;
+/** "23/10/2026 11:30" or "23/10/2026" -> that day (local), or null. */
+const closingDay = (text) => {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(norm(text));
+  return m ? new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1])) : null;
+};
+
+const tabulationReq = (actions, pdfType) =>
+  allReqs(actions).find((x) => /commTboPdfAction\.do/i.test(pathOf(x.url)) && qparam(x.url, 'pdfType').toLowerCase() === pdfType.toLowerCase()) || null;
+
+/**
+ * The rows of a Closed Tenders page:
+ *   Dept/Rly. Unit | Tender No. (Bid Id) | Tender Title | Closing Date/Time | Actions
+ * -> [{ tenderNo, bidId, nitId, tenderOid, dept, title, closingDate, links: { financialTabulation, commercialTabulation } }]
+ * A link is the request ({ method, url }) or null when IREPS does not show it (yet).
+ */
+export function parseClosedTenders(doc) {
+  const rows = [];
+  for (const tr of doc.querySelectorAll('tr')) {
+    if (tr.querySelector('tr')) continue;
+    const nitLink = [...tr.querySelectorAll('a')].find((a) => /nitPublish\.do/i.test(`${a.getAttribute('onclick') || ''} ${a.getAttribute('href') || ''}`) && norm(a.textContent));
+    if (!nitLink) continue;
+    const cells = [...tr.children].filter((c) => /^td$/i.test(c.tagName));
+    const at = cells.indexOf(nitLink.closest('td'));
+    const text = (i) => (i >= 0 && i < cells.length ? norm(cells[i].textContent) : '');
+    const actions = elementActions(tr);
+    const reqs = allReqs(actions);
+    const closing = cells.map((c) => norm(c.textContent)).find((t) => CLOSING_RE.test(t)) || '';
+    rows.push({
+      tenderNo: norm(nitLink.textContent),
+      bidId: /\((\d+)\)/.exec(text(at))?.[1] || '',
+      nitId: reqs.map((x) => qparam(x.url, 'nitId')).find(Boolean) || '',
+      tenderOid: reqs.map((x) => qparam(x.url, 'tenderOID') || qparam(x.url, 'oid') || qparam(x.url, 'nitOid')).find(Boolean) || '',
+      dept: text(at - 1),
+      title: text(at + 1),
+      closingDate: closing,
+      links: Object.fromEntries(Object.keys(TABULATIONS).map((t) => [t, tabulationReq(actions, t)])),
+    });
+  }
+  return rows;
+}
+
+/** [from, to] (Dates, both included) in windows of at most CLOSED_WINDOW_DAYS days. */
+function closingWindows(from, to) {
+  const day = 86400000;
+  const out = [];
+  for (let start = new Date(from.getFullYear(), from.getMonth(), from.getDate()); start <= to; ) {
+    const end = new Date(Math.min(start.getTime() + (CLOSED_WINDOW_DAYS - 1) * day, to.getTime()));
+    out.push({ from: start, to: end });
+    start = new Date(end.getFullYear(), end.getMonth(), end.getDate() + 1);
+  }
+  return out;
+}
+
+/**
+ * Read IREPS Closed Tenders for tenders CLOSING between `from` and `to` (Dates), optionally one tender
+ * number, across windows and result pages. -> { rows (see parseClosedTenders), pages }
+ */
+export async function scanClosedTenders(run, { from, to, tenderNo = '' }) {
+  const form = await loadInboxForm(run, CLOSED_STATUS, 'Tenders');
+  const sample = form.defaults.get('startDate') || form.defaults.get('endDate') || '';
+  const rows = [];
+  const seen = new Set();
+  let pages = 0;
+  for (const win of closingWindows(from, to)) {
+    let prevSig = '';
+    for (let pageNo = 1; pageNo <= MAX_INBOX_PAGES; pageNo++) {
+      const p = new URLSearchParams(form.defaults);
+      Object.entries({ menuLink: 'Tenders', status: CLOSED_STATUS, listType: CLOSED_STATUS, tenderNo, startDate: fmtDate(win.from, sample), endDate: fmtDate(win.to, sample), pageNo: String(pageNo) })
+        .forEach(([k, v]) => p.set(k, v));
+      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined });
+      assertSession(res);
+      if (res.status !== 200) throw new TenderError('HTTP', `IREPS returned HTTP ${res.status} for the Closed Tenders list.`);
+      pages++;
+      const doc = parseHtml(res.text());
+      const found = parseClosedTenders(doc);
+      const sig = found.map((r) => `${r.tenderNo}|${r.bidId}`).join(',');
+      if (!found.length || sig === prevSig) break;
+      prevSig = sig;
+      for (const r of found) {
+        const k = `${r.tenderNo}|${r.bidId}`;
+        if (!seen.has(k)) { seen.add(k); rows.push({ ...r, pageUrl: res.url }); }
+      }
+      if (!hasMorePages(doc, pageNo)) break;
+    }
+  }
+  log('Closed', `${rows.length} closed tender(s) over ${pages} page(s), ${rows.filter((r) => r.links.financialTabulation || r.links.commercialTabulation).length} with a tabulation`);
+  return { rows, pages };
+}
+
+/** This tender's Closed Tenders row (one scan per run, shared by both tabulation steps), or null. */
+function closedTenderRow(run) {
+  if (!run.closedRowP) {
+    const day = 86400000;
+    const closing = closingDay(run.ctx.closingDate || '');
+    const now = new Date();
+    // around the known closing date, else the page's own last 90 days
+    const [from, to] = closing ? [new Date(closing.getTime() - day), new Date(closing.getTime() + day)] : [new Date(now.getTime() - (CLOSED_WINDOW_DAYS - 1) * day), now];
+    run.closedRowP = scanClosedTenders(run, { from, to, tenderNo: run.ctx.tenderNo }).then(({ rows }) => {
+      const want = norm(run.ctx.tenderNo).toLowerCase();
+      return rows.find((r) => norm(r.tenderNo).toLowerCase() === want) || null;
+    });
+  }
+  return run.closedRowP;
+}
+
+/** Download one tabulation from its request (a tender row or a Closed Tenders row): one category result. */
+export function downloadTabulation(run, pdfType, rq, { relativeTo = '' } = {}) {
+  const t = TABULATIONS[pdfType];
+  const r = newCategory(t.category);
+  const { ctx } = run;
+  const oid = qparam(rq.url, 'tenderOID');
+  setId(run, 'tenderOID', oid, 'row_action');
+  ctx.discoveredActions[t.key] = [{ method: rq.method, path: pathOf(rq.url) }];
+  const acct = qparam(rq.url, 'accountID');
+  const item = { id: oid || ctx.tenderNo, req: { ...toRequest(rq.url, rq.method), relativeTo: relativeTo || ctx.searchUrl } };
+  if (acct && acct !== run.account.irepsAccountId) {
+    item.skip = { code: 'ACCOUNT_MISMATCH', message: `Account mismatch: this ${t.label} belongs to account ${acct} but the active account is ${run.account.irepsAccountId}.` };
+  }
+  // a PDF is expected (as for My Offer); a web page answer is printed to PDF like the letters
+  return downloadItems(run, r, [item], (it) => ({
+    req: it.req, subdir: 'Tabulation', id: it.id, meta: { title: t.label }, allowHtml: true, print: true,
+    fileName: (ext) => `${t.file}_${safeSegment(ctx.tenderNo)}${ext}`,
+  }));
+}
+
+async function tabulation(run, pdfType) {
+  const t = TABULATIONS[pdfType];
+  let rq = tabulationReq(run.ctx.row.actions, pdfType);
+  let relativeTo = '';
+  if (!rq) {
+    const row = await closedTenderRow(run);
+    rq = row?.links[pdfType] || null;
+    relativeTo = row?.pageUrl || '';
+  }
+  log('Tabulation', `${t.label}: ${rq ? 'found' : 'not shown'}`);
+  if (!rq) {
+    const r = newCategory(t.category);
+    r.note = `IREPS shows no ${t.label} for this tender yet (it appears under Closed Tenders once the bids are opened).`;
+    return finalize(r);
+  }
+  return downloadTabulation(run, pdfType, rq, { relativeTo });
+}
+const financialTabulation = (run) => tabulation(run, 'financialTabulation');
+const commercialTabulation = (run) => tabulation(run, 'commercialTabulation');
+
 // ---------------------------------------------------------------- Post Tenders (inbox) lists
 
 function hasMorePages(doc, pageNo) {
@@ -596,9 +773,11 @@ function pageWait(run, status) {
   return { what: `${LETTER_KINDS[status].page} page`, onWait: (msg) => run.onProgress?.(msg) };
 }
 
-async function loadInboxForm(run, status) {
+async function loadInboxForm(run, status, menuLink = 'PostTenders') {
+  // Post Tenders lists open on menuLink + status; the Tenders lists (Closed Tenders) also name their listType
+  const first = menuLink === 'PostTenders' ? { menuLink, status } : { menuLink, status, listType: status };
   for (const method of ['POST', 'GET']) {
-    const g = await irepsFetch(run.base, INBOX_PATH, { method, form: { menuLink: 'PostTenders', status }, wait: pageWait(run, status) });
+    const g = await irepsFetch(run.base, INBOX_PATH, { method, form: first, wait: pageWait(run, status) });
     assertSession(g);
     if (g.status !== 200) continue;
     const gdoc = parseHtml(g.text());
@@ -805,8 +984,9 @@ export async function downloadLetterItems(run, status, items, scripts = '') {
     if (status !== 'MyNegotiation') it.skip = bidderMismatch(run, it.url);
     if (loaAck) it.docId = it.rq.args?.[1] || qparam(it.url, 'letterId');
   }
+  // print: IREPS builds every published letter as a web page on each view; Chrome prints it to PDF as Ctrl+P does
   return downloadItems(run, r, items, (it) => ({
-    req: it.req, subdir: kind.subdir, id: it.id, meta: { title: `${kind.tag} letter ${it.id}`, docDate: it.date || '' }, allowHtml: true, allowAnyFile: true,
+    req: it.req, subdir: kind.subdir, id: it.id, meta: { title: `${kind.tag} letter ${it.id}`, docDate: it.date || '' }, allowHtml: true, allowAnyFile: true, print: true,
     before: loaAck && (async () => {
       const ack = await irepsFetch(run.base, loaAck.path, { method: 'POST', form: { ajaxMode: loaAck.ajaxMode, docId: it.docId, docType: loaAck.docType } });
       assertSession(ack);
@@ -933,7 +1113,7 @@ async function correspondence(run) {
   log('Correspondence', `Found ${items.length} matching letters`);
   return downloadItems(run, r, items, (it) => ({
     // viewpubIndltr.do only - vendorCorresSubmitReply.do is for replying and is never requested
-    req: it.req, subdir: 'Correspondence', id: it.id, meta: { title: it.subject || `Correspondence ${it.letterNo}`, docDate: it.letterDate || '' }, allowHtml: true, allowAnyFile: true,
+    req: it.req, subdir: 'Correspondence', id: it.id, meta: { title: it.subject || `Correspondence ${it.letterNo}`, docDate: it.letterDate || '' }, allowHtml: true, allowAnyFile: true, print: true,
     fileName: (ext) => `Correspondence_${safeSegment(ctx.tenderNo)}_${safeSegment(it.letterId)}${ext}`,
   }));
 }
@@ -949,9 +1129,11 @@ const STEPS = [
   ['counterOffer', 'Checking Counter Offer Letters...', counterOffer],
   ['loa', 'Checking Advance Acceptance / LOA...', loa],
   ['correspondence', 'Checking Tender Correspondence...', correspondence],
+  ['financialTabulation', 'Checking Financial Tabulation...', financialTabulation],
+  ['commercialTabulation', 'Checking Commercial Tabulation...', commercialTabulation],
 ];
 
-const TYPE = { tenderPdf: 'TENDER_PDF', attachments: 'ATTACHMENTS', corrigenda: 'CORRIGENDA', myOffer: 'MY_OFFER', negotiation: 'NEGOTIATION', counterOffer: 'COUNTER_OFFER', loa: 'LOA', correspondence: 'CORRESPONDENCE' };
+const TYPE = { tenderPdf: 'TENDER_PDF', attachments: 'ATTACHMENTS', corrigenda: 'CORRIGENDA', myOffer: 'MY_OFFER', negotiation: 'NEGOTIATION', counterOffer: 'COUNTER_OFFER', loa: 'LOA', correspondence: 'CORRESPONDENCE', financialTabulation: 'FINANCIAL_TABULATION', commercialTabulation: 'COMMERCIAL_TABULATION' };
 
 export function summarize(categories) {
   const cats = CATEGORY_KEYS.filter((k) => categories[k]).map((k) => categories[k]);

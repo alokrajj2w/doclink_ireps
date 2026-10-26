@@ -68,7 +68,7 @@ export async function runEcmTests({ test, assert, eq }) {
     eq(init.body.get("kind"), "inspectionCertificate");
     eq(init.body.get("ireps_account_id"), "833", "routed by the IREPS account");
     eq(init.body.get("operating_unit"), "HOSUR", "unit sent too");
-    eq(init.body.get("title"), null, "no title: the gateway's template (IC number) applies");
+    eq(init.body.get("title"), null, "no title: the gateway's template (\"<IC number> - IC\") applies");
     eq(init.body.get("fields"), JSON.stringify({ ic_number: "3480517", customer_po_number: "27253922100240", ic_date: "2026-05-12" }), "fields as JSON, IREPS date as YYYY-MM-DD");
     eq(init.body.get("file").name, DOC.filename);
     eq(init.body.get("file").type, "application/pdf");

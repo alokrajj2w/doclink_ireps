@@ -2,12 +2,12 @@
 // message, takes the tender number from it, downloads the NIT + supporting documents, and collects the
 // other documents by DATE (corrigenda, negotiation, counter offer, LOA, correspondence, My Offer).
 // Only documents of the discovered tenders / the selected dates are fetched - nothing unrelated.
-// Financial and Commercial Tabulation are never part of this.
+// Financial and Commercial Tabulation are not part of this: they have their own run (runTabulations), by closing date.
 
 import { TenderError, log, norm } from './tender-core.js';
 import { searchTender } from './tender-search.js';
 import { runSteps, publicAccount, startTenderRun } from './tender-workflows.js';
-import { beginJob, dayRange, openTender, recordManifest, downloadLettersByDate, startLetterRun } from './tender-jobs.js';
+import { beginJob, dayRange, openTender, recordManifest, downloadLettersByDate, downloadTabulationsByDate, startLetterRun } from './tender-jobs.js';
 import { scanMessages, readMessageDetail, dmyOf } from './tender-messages.js';
 
 const DAY = 86400000;
@@ -168,4 +168,17 @@ export async function runLetterType({ status, from, to, tenderNo = '', onProgres
   const letters = await downloadLettersByDate({ job, dates, statuses: [status], tenderNo, onProgress });
   await job.ledger.save();
   return { range: { from: dates[0], to: dates[dates.length - 1] }, letters };
+}
+
+/**
+ * Financial or Commercial Tabulation of the tenders CLOSING on the selected dates (IREPS Closed Tenders),
+ * optionally for one Tender Number. Only the published tabulation is downloaded - nothing is changed.
+ * @param pdfType  'financialTabulation' | 'commercialTabulation'
+ */
+export async function runTabulations({ pdfType, from, to, tenderNo = '', onProgress = () => {}, onAccount = () => {} }) {
+  if (!(from instanceof Date) || !(to instanceof Date) || from > to) throw new TenderError('INPUT', 'Choose a valid From / To date.');
+  const job = await beginJob({ onProgress, onAccount });
+  const tabulations = await downloadTabulationsByDate({ job, from, to, pdfTypes: [pdfType], tenderNo, onProgress });
+  await job.ledger.save();
+  return { range: tabulations.range, tabulations };
 }

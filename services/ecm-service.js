@@ -48,7 +48,9 @@ export const ECM_KIND = Object.freeze({
   NBSP: "nbsp", //               Negotiation Bid Submission Pending
   EXTENSION: "extension", //     Tender extension / qty change (Corrigendum)
   CRP: "crp", //                 Correspondence Reply pending
-  COUNTER_OFFER: "co"
+  COUNTER_OFFER: "co",
+  FINANCIAL_TABULATION: "vft", // Financial Tabulation (IREPS "View Financial Tabulation")
+  COMMERCIAL_TABULATION: "vct" // Commercial Tabulation (IREPS "View Commercial Tabulation")
 });
 
 /** Error codes; each has an entry in utils/messages.js ERROR_CATALOG. */

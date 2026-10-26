@@ -16,7 +16,8 @@
     "tabs",
     "offscreen",
     "sidePanel",
-    "identity"
+    "identity",
+    "debugger"
   ],
   "host_permissions": [
     "http://localhost:8765/*",

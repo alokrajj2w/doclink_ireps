@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { PDF, homePage, loginPage } from './fake-ireps.js';
+import { PDF, homePage, loginPage, fakeChromeDebugger } from './fake-ireps.js';
 
 const req = createRequire((process.env.JSDOM_ROOT || process.cwd()) + '/');
 const { JSDOM } = req('jsdom');
@@ -260,6 +260,39 @@ test('T1/T2/T3/T6/T7/T9 full run: every pending record, every letter, attachment
   assert.doesNotMatch(blob, /JSESSIONID|password|cookie|TOKEN/i);
 });
 
+test('a letter IREPS serves as a web page is printed by Chrome (as Ctrl+P); PDF letters are not; no .html kept', async () => {
+  scenario();
+  const dbg = fakeChromeDebugger(chrome);
+  try {
+    const r = await go();
+    assert.equal(r.summary.lettersDownloaded, 3);
+    assert.equal(dbg.tabs.created, 1, 'only 9002 is a web page; 9001 is a PDF, 9003 embeds one');
+    const names = saved.map((s) => s.filename);
+    const printed = saved.find((s) => /Pending\/19264728\/Correspondence_502_.*\.pdf$/.test(s.filename));
+    assert.match(new TextDecoder().decode(printed.bytes), /chrome-print/);
+    assert.ok(!names.some((n) => n.endsWith('.html')), names.join('\n'));
+    assert.match(Buffer.from(dbg.cmd('Fetch.fulfillRequest').body, 'base64').toString(), /please confirm the offer validity/);
+    const v = stored().letters.find((x) => x.letterId === '9002').files.find((f) => f.role === 'letter').validation;
+    assert.deepEqual([v.kind, v.source, v.pdfSignature], ['pdf (printed by Chrome)', 'chrome_print', true]);
+  } finally {
+    delete chrome.debugger;
+    delete chrome.tabs;
+  }
+});
+test('when Chrome cannot print, the letter keeps the text rendering + original .html and records why', async () => {
+  scenario();
+  fakeChromeDebugger(chrome, { attachError: 'blocked by policy' });
+  try {
+    await go();
+    assert.ok(saved.some((s) => /Correspondence_502_.*\.html$/.test(s.filename)));
+    const v = stored().letters.find((x) => x.letterId === '9002').files.find((f) => f.role === 'letter').validation;
+    assert.equal(v.kind, 'pdf (rendered from HTML)');
+    assert.match(v.printError, /blocked by policy/);
+  } finally {
+    delete chrome.debugger;
+    delete chrome.tabs;
+  }
+});
 test('T4 empty pending table: finishes cleanly, only the list is requested', async () => {
   mk({ rows: [] });
   const r = await go();

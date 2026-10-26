@@ -101,25 +101,25 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     assert(fetch.calls.slice(1).every((c) => c.headers.Authorization === "Bearer tok-1"), "every API call carries the bearer token");
     assert(fetch.calls.every((c) => c.credentials === "omit"), "no cookies are sent to the ECM");
     eq(search.headers.Properties, "*");
-    eq(search.query, "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'inspectionCertificate' AND ecm:parentId = 'd440070d-3a60-4ad7-bf67-8efeb198e26b' AND dc:title = '3480517' AND file:content/name = 'IC_27253922100240_001_6038184070.pdf' AND InvoiceCertificateSchema:icNumber = '3480517' AND InvoiceCertificateSchema:customerPONumber = '27253922100240'", "dedup query: same kind, folder, title, file name and metadata, dates left out (the ECM answers 400 to icDate = '...')");
+    eq(search.query, "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'inspectionCertificate' AND ecm:parentId = 'd440070d-3a60-4ad7-bf67-8efeb198e26b' AND dc:title = '3480517 - IC' AND file:content/name = 'IC_27253922100240_001_6038184070.pdf' AND InvoiceCertificateSchema:icNumber = '3480517' AND InvoiceCertificateSchema:customerPONumber = '27253922100240'", "dedup query: same kind, folder, title, file name and metadata, dates left out (the ECM answers 400 to icDate = '...')");
     eq(file.headers["X-File-Name"], IC.filename);
     eq(file.headers["X-File-Type"], "application/pdf");
     eq(file.body, IC.bytes, "the PDF bytes as they are");
     eq(create.headers["Content-Type"], "application/json");
     eq(create.body, JSON.stringify({
       "entity-type": "document",
-      name: "3480517",
+      name: "3480517 - IC",
       type: "InvoiceCertificate",
       properties: {
-        "dc:title": "3480517",
+        "dc:title": "3480517 - IC",
         "InvoiceCertificateSchema:type": "inspectionCertificate",
         "InvoiceCertificateSchema:icNumber": "3480517",
         "InvoiceCertificateSchema:customerPONumber": "27253922100240",
         "InvoiceCertificateSchema:icDate": "2026-05-12",
         "file:content": { "upload-batch": "batch-1", "upload-fileId": "0" }
       }
-    }), "the spec's document JSON: title = IC number, metadata, file from the batch");
-    eq(JSON.stringify(result), JSON.stringify({ uid: "doc-1", path: "/x/3480517", title: "3480517", site: "hosur", deduplicated: false }), "same answer as the gateway");
+    }), "the spec's document JSON: title = \"<IC number> - IC\", metadata, file from the batch");
+    eq(JSON.stringify(result), JSON.stringify({ uid: "doc-1", path: "/x/3480517 - IC", title: "3480517 - IC", site: "hosur", deduplicated: false }), "same answer as the gateway");
   });
 
   await test("ECM direct: the token is reused, and a 401 fetches a new one and retries the call once", async () => {
@@ -163,7 +163,7 @@ export async function runEcmDirectTests({ test, assert, eq }) {
       modificationAdvise: { customer_po_number: "PO-1", modification_advise_number: "MA-1" },
       loi: { tender_number: "T-1", loi_number: "L-1", loi_date: "04/10/2026" }
     };
-    const TITLES = { inspectionCertificate: "1", poCopy: "PO-1", modificationAdvise: "MA-1" };
+    const TITLES = { inspectionCertificate: "1 - IC", poCopy: "PO-1 - PO", modificationAdvise: "MA-1 - MA", nit: "T-1 - NIT", nbsp: "T-1 - NBSP", extension: "T-1 - Extension", crp: "T-1 - CRP", co: "T-1 - CO", loi: "T-1 - LOI", vft: "T-1 - Financial Tabulation", vct: "T-1 - Commercial Tabulation" };
     eq(Object.keys(ECM_KINDS).sort().join(), Object.values(ECM_KIND).sort().join(), "the catalog covers every kind DocLink uploads");
     for (const [account, siteKey] of [[HOSUR, "hosur"], [ROHTAK, "rohtak"]]) {
       for (const kind of Object.values(ECM_KIND)) {
@@ -175,7 +175,7 @@ export async function runEcmDirectTests({ test, assert, eq }) {
         eq(create.path, `/nuxeo/api/v1/id/${ECM_SITES.TEST[siteKey].folderIds[location]}`, `${kind} -> ${siteKey} ${location}`);
         const props = JSON.parse(create.body).properties;
         eq(props["InvoiceCertificateSchema:type"], kind);
-        eq(props["dc:title"], TITLES[kind] || "T-1", `${kind} title template`);
+        eq(props["dc:title"], TITLES[kind], `${kind} title template`);
         eq(result.site, siteKey);
       }
     }

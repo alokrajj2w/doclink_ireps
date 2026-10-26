@@ -527,7 +527,7 @@
           <button id="btn-account-refresh" class="btn btn-link" type="button">Refresh account</button>
         </div>
 
-        <p class="card-text">DocLink reads your IREPS My Messages, takes each tender number from the NIT message itself, downloads the NIT and its supporting documents, then collects corrigenda, negotiation, counter offer, LOA, correspondence and My Offer for the selected dates. Financial and Commercial Tabulations are not downloaded.</p>
+        <p class="card-text">DocLink reads your IREPS My Messages, takes each tender number from the NIT message itself, downloads the NIT and its supporting documents, then collects corrigenda, negotiation, counter offer, LOA, correspondence and My Offer for the selected dates. Financial and Commercial Tabulations have their own buttons below (by the tender's Closing Date).</p>
         <div class="tender-dates">
           <label class="field"><span class="field-label">From</span><input id="auto-from" type="date"></label>
           <label class="field"><span class="field-label">To</span><input id="auto-to" type="date"></label>
@@ -542,6 +542,9 @@
           <button id="btn-letter-negotiation" class="btn btn-secondary" type="button" data-status="MyNegotiation"><span class="btn-label">Negotiation</span></button>
           <button id="btn-letter-counter" class="btn btn-secondary" type="button" data-status="MyCounterOffer"><span class="btn-label">Counter Offer</span></button>
           <button id="btn-letter-loa" class="btn btn-secondary" type="button" data-status="MyAdvanceAcceptanceLetter"><span class="btn-label">Advance Acceptance Letter</span></button>
+          <p class="card-text">Download the tabulations of tenders by their Closing Date (From / To above; IREPS Closed Tenders):</p>
+          <button id="btn-tab-financial" class="btn btn-secondary" type="button" data-tabulation="financialTabulation"><span class="btn-label">Financial Tabulation</span></button>
+          <button id="btn-tab-commercial" class="btn btn-secondary" type="button" data-tabulation="commercialTabulation"><span class="btn-label">Commercial Tabulation</span></button>
         </div>
         <button id="btn-auto-retry" class="btn btn-link" type="button" hidden>Retry failed</button>
         <button id="btn-copy-diag" class="btn btn-link" type="button">Copy diagnostics</button>

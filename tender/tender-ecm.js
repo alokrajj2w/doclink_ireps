@@ -9,6 +9,7 @@
 import { STORAGE_KEYS } from '../utils/messages.js';
 import { SAVE_DESTINATION } from '../services/recon-service.js';
 import { ECM_KIND, saveToEcmOrLocally } from '../services/ecm-service.js';
+import { ECM_KINDS } from '../services/ecm-catalog.js';
 import { confirmReconSignIn } from '../services/recon-auth.js';
 import { loadEcmConfig, isDirectEcm } from '../services/ecm-config.js';
 import { loadDownloadLogConfig } from '../services/download-log.js';
@@ -35,6 +36,8 @@ export const CATEGORY_ECM_KIND = Object.freeze({
   COUNTER_OFFER: ECM_KIND.COUNTER_OFFER,
   LOA: ECM_KIND.LOI, //                    Advance Acceptance Letter / LOI
   CORRESPONDENCE: ECM_KIND.CRP, //         Correspondence Reply pending
+  FINANCIAL_TABULATION: ECM_KIND.FINANCIAL_TABULATION, // vft
+  COMMERCIAL_TABULATION: ECM_KIND.COMMERCIAL_TABULATION, // vct
 });
 
 const TITLE_MAX = 200;
@@ -58,7 +61,10 @@ export async function savedDestination() {
 
 /**
  * How one tender document is filed in the ECM, or null when its category has no ECM kind.
- * Titles are explicit and unique within a tender (a tender holds several documents of a kind).
+ * The title is "<tender no> - <kind code>" as "ECM - Download speci-v1" names it
+ * ("29263265 - NIT", "29263265 - LOI"; codes in services/ecm-catalog.js). A tender can hold
+ * several documents of a kind (attachments, corrigenda, letters), so those add what tells
+ * them apart: "29263265 - NIT - Annexure - SPEC", "29263265 - NBSP - 1204920".
  *   action = the download action ({ id, meta: { title, docDate } }), ctx = run.ctx
  */
 export function ecmDocumentFor(category, action, ctx) {
@@ -67,18 +73,18 @@ export function ecmDocumentFor(category, action, ctx) {
   const tenderNo = ctx.tenderNo;
   const meta = action.meta || {};
   const id = action.id || '';
-  const label = {
-    TENDER_PDF: 'NIT',
-    ATTACHMENTS: `Attachment - ${meta.title || id}`,
-    CORRIGENDA: `Corrigendum ${meta.title || id}`,
-    NEGOTIATION: `Negotiation letter ${id}`,
-    COUNTER_OFFER: `Counter Offer ${id}`,
-    LOA: `LOA ${id}`,
-    CORRESPONDENCE: `Correspondence ${meta.title || id}`,
+  // TENDER_PDF, LOA and the tabulations need nothing more: one of each per tender (an LOA's number is its own field)
+  const detail = {
+    ATTACHMENTS: meta.title || id,
+    CORRIGENDA: meta.title || id,
+    NEGOTIATION: id,
+    COUNTER_OFFER: id,
+    CORRESPONDENCE: meta.title || id,
   }[category];
   const fields = { tender_number: tenderNo, tender_date: ctx.closingDate || localDay(ctx.dueDate) };
   if (category === 'LOA') Object.assign(fields, { loi_number: id, loi_date: meta.docDate || '' });
-  return { kind, title: `${tenderNo} - ${label}`.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX), fields };
+  const title = [tenderNo, ECM_KINDS[kind].code, detail].filter(Boolean).join(' - ');
+  return { kind, title: title.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX), fields };
 }
 
 /**

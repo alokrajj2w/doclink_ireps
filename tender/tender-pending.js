@@ -20,6 +20,7 @@ import { getActiveIrepsAccountContext, accountFolderLabel, assertSameAccount, AC
 import { openLedger } from './tender-ledger.js';
 import { inferRoute } from './tender-workflows.js';
 import { ensureDownloadSignIn } from './tender-ecm.js';
+import { printPageToPdf } from './tender-print.js';
 import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
 
 /** The download log of one saved file (letters keep their own "already saved" check: force / Download again). */
@@ -335,7 +336,8 @@ export function describeAction(req) {
  * Open a published letter and turn the response into a validated document.
  *   pdf   : IREPS returned the PDF itself (or an embedded PDF viewer pointing at it)
  *   file  : IREPS returned another real document type
- *   html  : a letter web page -> rendered to a PDF locally (+ the original page is kept)
+ *   html  : a letter web page -> rendered to a PDF locally (+ the original page is kept); `page` is the
+ *           response as received, which the caller has Chrome print (tender-print.js)
  * A login / error page is never returned as a document.
  */
 export async function openLetter(base, req, meta = {}) {
@@ -377,7 +379,8 @@ export async function openLetter(base, req, meta = {}) {
     meta.subject ? `Subject: ${meta.subject}` : '',
     '-'.repeat(60),
   ].filter(Boolean);
-  return { ...common, form: 'html', html, bytes: buildPdf(wrapLines([...preface, ...lines])), ext: '.pdf', via: 'html_render', attachments };
+  return { ...common, form: 'html', html, bytes: buildPdf(wrapLines([...preface, ...lines])), ext: '.pdf', via: 'html_render', attachments,
+    page: { url: res.url, bytes: res.bytes, contentType: res.contentType } };
 }
 
 // ---------------------------------------------------------------- Stage E (C): attachments
@@ -686,11 +689,21 @@ async function processLetter({ base, saver, state, rec, entry, letter, page, det
   onProgress(`${rec.tenderNo}: letter ${letter.letterNo || letter.letterId}`);
   await sleep(pace);
 
-  const opened = await withRetry(() => openLetter(base, req, { tenderNo: rec.tenderNo, letterNo: letter.letterNo, letterDate: letter.letterDate, subject: letter.subject }), { sleep, label: `letter ${letter.letterId}` });
+  let opened = await withRetry(() => openLetter(base, req, { tenderNo: rec.tenderNo, letterNo: letter.letterNo, letterDate: letter.letterDate, subject: letter.subject }), { sleep, label: `letter ${letter.letterId}` });
   const files = force ? [] : entry.files.filter((f) => f.status === 'DOWNLOADED').map((f) => ({ ...f, previous: true }));
 
   // ---- the letter itself
   if (!prevLetterFile) {
+    let printError = '';
+    if (opened.form === 'html') {
+      // as Ctrl+P would save it; if Chrome cannot print, the text rendering + original page are kept
+      try {
+        opened = { ...opened, form: 'printed', bytes: await printPageToPdf(opened.page), via: 'chrome_print' };
+      } catch (e) {
+        printError = e.message;
+        log('Pending', `letter ${letter.letterId}: Chrome print failed, keeping the text rendering: ${e.message}`);
+      }
+    }
     if (opened.form !== 'html' && opened.ext === '.pdf' && !isPdfBytes(opened.bytes)) throw new TenderError('NOT_PDF', 'The letter was not a valid PDF.');
     const taken = (name) => Object.values(state.letters).some((o) => o.key !== entry.key && o.tenderNo === rec.tenderNo && o.files.some((f) => lc(f.fileName) === lc(name) && f.role === 'letter'));
     let name = letterFileName(letter, opened.ext);
@@ -700,7 +713,7 @@ async function processLetter({ base, saver, state, rec, entry, letter, page, det
     logPending(entry, 'letter', saved);
     files.push({
       role: 'letter', fileName: saved.relPath, relPath: saved.relPath, status: 'DOWNLOADED', size: saved.size, downloadedAt: new Date().toISOString(), downloadId: saved.downloadId,
-      validation: { ok: true, kind: opened.form === 'html' ? 'pdf (rendered from HTML)' : opened.form, source: opened.via, extension: opened.ext, httpStatus: opened.httpStatus, contentType: opened.contentType, pdfSignature: opened.ext === '.pdf' ? isPdfBytes(opened.bytes) : null, ...check },
+      validation: { ok: true, kind: opened.form === 'html' ? 'pdf (rendered from HTML)' : opened.form === 'printed' ? 'pdf (printed by Chrome)' : opened.form, source: opened.via, ...(printError ? { printError } : {}), extension: opened.ext, httpStatus: opened.httpStatus, contentType: opened.contentType, pdfSignature: opened.ext === '.pdf' ? isPdfBytes(opened.bytes) : null, ...check },
     });
     if (opened.form === 'html') {
       const htmlName = saved.relPath.replace(/\.pdf$/i, '') + '.html';

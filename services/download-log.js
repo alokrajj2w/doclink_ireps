@@ -54,7 +54,9 @@ export const TENDER_DOC_TYPE = Object.freeze({
   COUNTER_OFFER: "counter_offer",
   LOA: "loa",
   CORRESPONDENCE: "correspondence",
-  PENDING_CORRESPONDENCE: "pending_correspondence"
+  PENDING_CORRESPONDENCE: "pending_correspondence",
+  FINANCIAL_TABULATION: "financial_tabulation",
+  COMMERCIAL_TABULATION: "commercial_tabulation"
 });
 
 /** Why a document was not downloaded. */
@@ -306,7 +308,9 @@ export const DOC_TYPE_LABEL = Object.freeze({
   counter_offer: "Counter offer",
   loa: "LOA",
   correspondence: "Correspondence",
-  pending_correspondence: "Pending correspondence"
+  pending_correspondence: "Pending correspondence",
+  financial_tabulation: "Financial tabulation",
+  commercial_tabulation: "Commercial tabulation"
 });
 
 /* -------------------------------------------------------------------------- */

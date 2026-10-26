@@ -33,8 +33,10 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
   corrigenda, My Offer, negotiation / counter offer / LOA letters and
   correspondence into `Downloads/DocLink/<unit>/Tender_<no>/`. A per-account
   ledger (`chrome.storage.local`) skips documents already downloaded, so
-  "Retry failed" is safe. Financial and Commercial / Techno-Commercial
-  Tabulations are never requested (blocked at the request layer). The feature
+  "Retry failed" is safe. Financial and Commercial Tabulations are downloaded
+  by the tenders' Closing Date from IREPS Closed Tenders (section 19); the
+  Techno-Commercial Tabulation is never requested (blocked at the request
+  layer). The feature
   runs in the side panel only; it has its own node tests (section 10).
 
 The **Upload Document** card is present in the UI as a Phase 2 placeholder.
@@ -194,12 +196,13 @@ doclink-extension/
 | `tabs` | Open IREPS / the preview page in a new tab |
 | `offscreen` | Create an invisible offscreen document so the parser can use `DOMParser`; MV3 service workers have no DOM |
 | `identity` | Only for **Sign in with Okta** to the Recon Engine (section 17): `chrome.identity.launchWebAuthFlow` opens the Okta sign-in window and returns to `https://<extension id>.chromiumapp.org/okta` |
+| `debugger` | Only for **published letters** (LOA, Negotiation, Counter Offer, Correspondence - in Download Tender Documents and Pending Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both declared permanently) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
 
 | host `http://localhost:8000/*` (the Recon Engine; replace/add the deployed Recon URL) | Only for **Save to: ECM / S3**: the Recon Engine sign-in (section 17) and the uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
 
-Not requested: `cookies`, `<all_urls>`, `history`, `bookmarks`, `webRequest`,
-`debugger`. The extension never reads cookie values.
+Not requested: `cookies`, `<all_urls>`, `history`, `bookmarks`, `webRequest`.
+The extension never reads cookie values.
 
 ---
 
@@ -990,17 +993,27 @@ settings, sign-in cookie and host permission as section 15:
 `operating_unit` (`services/ecm-service.js`; gateway: recon-engine
 `backend/ECM`, mounted at `/api/ecm`).
 
-| Document | `kind` | `fields` |
-|---|---|---|
-| Inspection Certificate | `inspectionCertificate` | `ic_number` (the IC PDF's file name, e.g. `3480517`), `customer_po_number`, `ic_date` |
-| PO | `poCopy` | `customer_po_number` |
-| Modification Advice | `modificationAdvise` | `customer_po_number`, `modification_advise_number` |
-| NIT + attached documents | `nit` | `tender_number`, `tender_date` (the tender's closing / "Due Date/Time"; letters found by date look it up once per tender, correspondence reads it from its page; blank when IREPS does not show it) |
-| Corrigendum | `extension` | same |
-| Negotiation letter | `nbsp` | same |
-| Counter offer | `co` | same |
-| LOA (Advance Acceptance Letter) | `loi` | same + `loi_number` (letter id), `loi_date` (published) |
-| Correspondence | `crp` | same |
+| Document | `kind` | `fields` | Title (`dc:title`) |
+|---|---|---|---|
+| Inspection Certificate | `inspectionCertificate` | `ic_number` (the IC PDF's file name, e.g. `3480517`), `customer_po_number`, `ic_date` | `3480517 - IC` |
+| PO | `poCopy` | `customer_po_number` | `<PO no> - PO` |
+| Modification Advice | `modificationAdvise` | `customer_po_number`, `modification_advise_number` | `<MA no> - MA` |
+| NIT + attached documents | `nit` | `tender_number`, `tender_date` (the tender's closing / "Due Date/Time"; letters found by date look it up once per tender, correspondence reads it from its page; blank when IREPS does not show it) | `<tender no> - NIT`; an attachment `<tender no> - NIT - <name>` |
+| Corrigendum | `extension` | same | `<tender no> - Extension - <corrigendum no>` |
+| Negotiation letter | `nbsp` | same | `<tender no> - NBSP - <letter id>` |
+| Counter offer | `co` | same | `<tender no> - CO - <letter id>` |
+| LOA (Advance Acceptance Letter) | `loi` | same + `loi_number` (letter id), `loi_date` (published) | `<tender no> - LOI` |
+| Correspondence | `crp` | same | `<tender no> - CRP - <subject>` |
+| Financial Tabulation | `vft` | `tender_number`, `tender_date` (the Closed Tenders row's Closing Date/Time; mandatory here) | `<tender no> - Financial Tabulation` |
+| Commercial Tabulation | `vct` | same | `<tender no> - Commercial Tabulation` |
+
+The title is `<document number> - <code>`, the codes of the spec's row 4
+(API: "Example Title - IC", "- PO", "- MA", "- NIT", "- LOI", ...) and the
+numbers of its row 8 (Title). It is also the ECM document's `name`. A tender
+holds several attachments, corrigenda and letters, so those add what tells
+them apart. IC, PO and MA titles come from the kind's template
+(`services/ecm-catalog.js`, and the gateway's `document_kinds.toml`, kept in
+step); tender titles are sent by DocLink (`tender/tender-ecm.js`).
 
 * **Which folder.** The IREPS account is read from the home page's welcome
   line (`utils/ireps-account.js`, parsed in the offscreen document for the
@@ -1226,6 +1239,45 @@ of `tender/tests/run-tests.mjs`, and `backend/tests/test_doclink_downloads.py`
 plus the `find_in_folder` tests in the recon-engine repo.
 
 ---
+
+## 19. Financial and Commercial Tabulation
+
+"ECM - Download speci-v1" columns L and M (ECM types `vft` / `vct`). IREPS
+shows both on a tender's row in **Closed Tenders** (Vendor inbox, Tenders ›
+Closed Tenders) once the bids are opened, next to My Offer
+(`01_api_data/finncial and commercial documentation response.har`):
+
+| Link | Request (POST, as `postRequestNewWindow` sends it) |
+|---|---|
+| View Financial Tabulation | `/epsn/tbo/commTboPdfAction.do?tenderOID=<oid>&pdfType=financialTabulation&accountID=<acct>` |
+| View Commercial Tabulation | `/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=<oid>&accountID=<acct>` |
+
+The list itself is `POST /epsn/vendorInboxLink.do` with `menuLink=Tenders`,
+`status` = `listType` = `MyBidsClosed`, `tenderNo`, `startDate` / `endDate`
+(the **Closing Date**, dd/mm/yyyy) and `pageNo`; each row gives Dept/Rly. Unit,
+Tender No. (Bid Id), Tender Title and Closing Date/Time
+(`parseClosedTenders`, `scanClosedTenders` in `tender/tender-workflows.js`).
+
+* **Panel.** "Download Tender Documents" › **Financial Tabulation** /
+  **Commercial Tabulation**: every tender that closed between From and To (the
+  optional Tender Number narrows it) and shows the link is downloaded to
+  `Downloads/DocLink/<unit>/Tender_<no>/Tabulation/`; a closed tender without
+  it reads "not available yet" (re-run the range later). A range longer than
+  90 days is read in 90-day windows (`downloadTabulationsByDate`,
+  `tender/tender-jobs.js`; `runTabulations`, `tender/tender-auto.js`).
+* **Single tender.** `downloadTenderDocuments` has the two categories
+  `financialTabulation` / `commercialTabulation`: from the tender's search row,
+  else from its Closed Tenders row (one scan, closing date ± 1 day).
+* **Checks.** The link's `accountID` must be the active IREPS account; what was
+  downloaded before is skipped (download log types `financial_tabulation` /
+  `commercial_tabulation`, else the ledger). A PDF is expected; a web page
+  answer is printed to PDF like the letters.
+* **ECM.** Under Save to: ECM / S3 they go to the unit's Tenders folder as
+  `vft` / `vct` with `tenderNumber` and `tenderDate` (section 16). The gateway's
+  `document_kinds.toml` has both kinds.
+* **Excluded.** `isExcludedUrl` (`tender/tender-core.js`) still refuses the
+  Techno-Commercial Tabulation and any other `pdfType`; it now reads `pdfType`
+  from a POST body too.
 
 ## Pending Correspondence Downloads (`tender/tender-pending.js`, `tender/pending-ui.js`)
 

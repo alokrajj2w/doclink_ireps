@@ -61,10 +61,21 @@ export function isPdfBytes(bytes) {
 }
 
 /**
- * Financial / Commercial / Techno-Commercial Tabulation are OUT OF SCOPE for the tender feature.
- * They live next to "My Offer" on commTboPdfAction.do (pdfType=...), so the guard sits at the
- * lowest request layer: nothing in this module can reach those endpoints, even by mistake.
+ * commTboPdfAction.do serves "My Offer" and the tender's tabulations (pdfType=...). DocLink fetches My Offer
+ * and the Financial and Commercial Tabulations ("ECM - Download speci-v1" types vft / vct); the
+ * Techno-Commercial Tabulation and any other pdfType stay OUT OF SCOPE. The guard sits at the lowest request
+ * layer: nothing in this module can reach those endpoints, even by mistake.
  */
+/** The URL as the server sees the request: a POST's form fields count too (postRequest.js moves the query into the body). */
+function withParams(url, params) {
+  if (!params) return url;
+  const u = new URL(url);
+  for (const [k, v] of params) if (!u.searchParams.has(k)) u.searchParams.append(k, v);
+  return u.toString();
+}
+
+export const ALLOWED_PDF_TYPES = Object.freeze(['offer', 'financialtabulation', 'commercialtabulation']);
+
 export function isExcludedUrl(url) {
   let u;
   try {
@@ -74,9 +85,12 @@ export function isExcludedUrl(url) {
   }
   if (/commTboPdfAction\.do/i.test(u.pathname)) {
     const t = [...u.searchParams].find(([k]) => k.toLowerCase() === 'pdftype')?.[1] || '';
-    return t.toLowerCase() !== 'offer';
+    return !ALLOWED_PDF_TYPES.includes(t.toLowerCase());
   }
-  return /tabulation|fin-?tab|tech-?tab/i.test(u.pathname + u.search);
+  // a tabulation file the page itself links to: Financial / Commercial pass, Techno-Commercial and unknown ones do not
+  const s = u.pathname + u.search;
+  if (/techno|tech-?tab/i.test(s)) return true;
+  return /tabulation/i.test(s) && !/financial|commercial/i.test(s);
 }
 
 /** Authenticated request. `form` is an object / URLSearchParams (body for POST, query for GET). */
@@ -121,10 +135,10 @@ export async function irepsFetch(base, ref, opts = {}) {
 
 async function irepsFetchOnce(base, ref, { method = 'GET', form = null, relativeTo, timeoutMs = fetchSettings.timeoutMs } = {}) {
   let url = absUrl(base, ref, relativeTo);
-  if (isExcludedUrl(url)) throw new TenderError('EXCLUDED', 'Financial/Commercial Tabulation downloads are excluded from DocLink tender downloads.');
+  const params = form ? (form instanceof URLSearchParams ? form : new URLSearchParams(form)) : null;
+  if (isExcludedUrl(withParams(url, params))) throw new TenderError('EXCLUDED', 'Techno-Commercial Tabulation and other tabulation downloads are excluded from DocLink tender downloads.');
   const init = { method, credentials: 'include', redirect: 'follow', headers: {} };
-  if (form) {
-    const params = form instanceof URLSearchParams ? form : new URLSearchParams(form);
+  if (params) {
     if (method === 'GET') {
       const u = new URL(url);
       for (const [k, v] of params) u.searchParams.set(k, v);
@@ -429,7 +443,8 @@ export function looksLikeErrorPage(doc) {
 /**
  * Turn an IREPS response into a validated document.
  *   -> { kind:'file', bytes, ext, converted:false }                 real PDF / document bytes
- *   -> { kind:'html', html, bytes, ext:'.pdf', converted:true }     print-ready HTML (+ locally rendered text PDF)
+ *   -> { kind:'html', html, bytes, ext:'.pdf', converted:true, page } print-ready HTML (+ locally rendered text PDF;
+ *                                                                    page = the response as received, for tender-print.js)
  * Throws SESSION_EXPIRED for login pages; NO_DOCUMENT when nothing usable is found.
  * A login / error page is never returned as a document.
  */
@@ -472,7 +487,7 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
   if (bad) throw new TenderError('NO_DOCUMENT', bad);
   const lines = htmlToLines(doc);
   if (!lines.length) throw new TenderError('NO_DOCUMENT', 'The IREPS page had no readable content.');
-  return { kind: 'html', html, bytes: buildPdf(wrapLines(lines)), ext: '.pdf', converted: true, ...meta };
+  return { kind: 'html', html, bytes: buildPdf(wrapLines(lines)), ext: '.pdf', converted: true, page: { url: res.url, bytes: res.bytes, contentType: res.contentType }, ...meta };
 }
 
 /**

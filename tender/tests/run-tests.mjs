@@ -3,7 +3,7 @@
 import { createRequire } from 'node:module';
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeIreps, PDF, corresPage } from './fake-ireps.js';
+import { FakeIreps, PDF, corresPage, fakeChromeDebugger } from './fake-ireps.js';
 
 const req = createRequire((process.env.JSDOM_ROOT || process.cwd()) + '/');
 const { JSDOM } = req('jsdom');
@@ -83,9 +83,12 @@ test('parseWelcomeText: account 60828 is always ROHTAK', () => {
   assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-HOSUR (IREPS ID- 60828)').operatingUnit, 'ROHTAK');
   assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-HOSUR (IREPS ID- 833)').operatingUnit, 'HOSUR');
 });
-test('isExcludedUrl blocks tabulation endpoints but not My Offer', () => {
-  assert.equal(core.isExcludedUrl('/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=1'), true);
-  assert.equal(core.isExcludedUrl('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=1'), true);
+test('isExcludedUrl blocks the Techno-Commercial Tabulation but not My Offer or the Financial / Commercial Tabulation', () => {
+  assert.equal(core.isExcludedUrl('/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=1'), false);
+  assert.equal(core.isExcludedUrl('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=1'), false);
+  assert.equal(core.isExcludedUrl('/ireps/upload/tbo/financialTabulation_107204732.pdf'), false, 'a file the tabulation page links to');
+  assert.equal(core.isExcludedUrl('/ireps/upload/tbo/technoCommercialTabulation_1.pdf'), true);
+  assert.equal(core.isExcludedUrl('/epsn/tbo/viewTabulation.do?id=1'), true, 'an unknown tabulation');
   assert.equal(core.isExcludedUrl('/epsn/tbo/commTboPdfAction.do?pdfType=technoCommercialTabulation&tenderOID=1'), true);
   assert.equal(core.isExcludedUrl('/epsn/tbo/commTboPdfAction.do?tenderOID=1'), true);
   assert.equal(core.isExcludedUrl('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=1&accountID=833'), false);
@@ -277,6 +280,7 @@ test('10-14,15-19 full run: every category, correct methods, no manifest file do
   assert.deepEqual([c.attachments.status, c.attachments.downloaded], ['DOWNLOADED', 4]);
   assert.deepEqual([c.corrigenda.status, c.corrigenda.downloaded], ['DOWNLOADED', 2]);
   assert.equal(c.myOffer.status, 'DOWNLOADED');
+  assert.deepEqual([c.financialTabulation.status, c.commercialTabulation.status], ['DOWNLOADED', 'DOWNLOADED'], 'both tabulations from the tender row');
   assert.deepEqual([c.negotiation.status, c.negotiation.downloaded], ['DOWNLOADED', 2]); // second letter is in an older window
   assert.deepEqual([c.counterOffer.status, c.counterOffer.downloaded], ['DOWNLOADED', 1]);
   assert.deepEqual([c.loa.status, c.loa.downloaded], ['DOWNLOADED', 1]);
@@ -285,13 +289,14 @@ test('10-14,15-19 full run: every category, correct methods, no manifest file do
   const n = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
   for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'My_Offer/My_Offer_29263265.pdf', 'NIT_and_Supporting_Documents/Attachment_01_Annexure.pdf', 'NIT_and_Supporting_Documents/Attachment_02_IRS_CONDITIONS_5595304.pdf', 'NIT_and_Supporting_Documents/Attachment_04_drawing.zip',
     'Corrigenda/Corrigendum_01_29263265.pdf', 'Corrigenda/Corrigendum_02_29263265.pdf', 'Corrigenda/Corrigendum_02_29263265.html', 'Negotiation/Negotiation_29263265_224222.pdf', 'Negotiation/Negotiation_29263265_224300.pdf',
-    'Counter_Offers/Counter_Offer_29263265_1461275.pdf', 'Advance_Acceptance_LOA/LOA_29263265_1461928.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(n.includes(want), `missing ${want}\n${n.join('\n')}`);
+    'Counter_Offers/Counter_Offer_29263265_1461275.pdf', 'Advance_Acceptance_LOA/LOA_29263265_1461928.pdf', 'Correspondence/Correspondence_29263265_306789.pdf',
+    'Tabulation/Financial_Tabulation_29263265.pdf', 'Tabulation/Commercial_Tabulation_29263265.pdf']) assert.ok(n.includes(want), `missing ${want}\n${n.join('\n')}`);
   // identifier discipline
   assert.equal(r.tender.nitId, '5569207'); assert.equal(r.tender.nitOid, '107200478'); assert.equal(r.context.tenderOID, '107200478');
   // no download_manifest.json in Downloads; the result still names the account and exclusions
   assert.ok(!n.some((x) => /manifest/i.test(x)), n.join('\n'));
   assert.deepEqual([r.account.irepsAccountId, r.account.operatingUnit, r.account.verified], ['833', 'HOSUR', true]);
-  assert.deepEqual(r.exclusions, ['Financial Tabulation', 'Commercial/Techno-Commercial Tabulation']);
+  assert.deepEqual(r.exclusions, ['Techno-Commercial Tabulation']);
 });
 test('10b. Tender PDF is validated: HTML/login response is never saved as .pdf (21)', async () => {
   mk({ tenders: [T({})], failPaths: [] });
@@ -367,14 +372,91 @@ test('20b. HTML wrapper with a PDF link resolves to the real PDF (Case B)', asyn
   assert.equal(r.categories.attachments.status, 'DOWNLOADED');
   assert.ok(saved.find((s) => s.filename.includes('NIT_and_Supporting_Documents'))?.bytes.slice(0, 4).join() === '37,80,68,70');
 });
-test('print-ready HTML letters: original .html + text PDF, flagged, never a fake pdf of HTML', async () => {
-  mk({ tenders: [T({})], inbox: letters('29263265') }); // letters default to HTML
+test('print-ready HTML letters without Chrome printing: original .html + text PDF, flagged, never a fake pdf of HTML', async () => {
+  mk({ tenders: [T({})], inbox: letters('29263265') }); // letters default to HTML; no chrome.debugger here
   const r = await run();
   assert.equal(r.categories.negotiation.status, 'DOWNLOADED');
   const pdfs = saved.filter((s) => s.filename.includes('Negotiation') && s.filename.endsWith('.pdf'));
   assert.ok(pdfs.length >= 1 && pdfs.every((s) => String.fromCharCode(...s.bytes.slice(0, 4)) === '%PDF'));
   assert.ok(saved.some((s) => s.filename.includes('Negotiation') && s.filename.endsWith('.html')));
-  assert.ok(r.categories.negotiation.warnings.length === 1);
+  const w = r.categories.negotiation.warnings;
+  assert.equal(w.length, 2, w.join('\n'));
+  assert.match(w[0], /could not print.*"debugger" permission/);
+  assert.match(w[1], /text-only PDF/);
+});
+// ---- letters printed by Chrome (tender-print.js)
+const fakeDebugger = (o) => fakeChromeDebugger(chrome, o);
+const withoutDebugger = () => { delete chrome.debugger; delete chrome.tabs; };
+const loaOnly = () => mk({ tenders: [T({})], inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [{ no: '29263265', oid: '107200478', letter: '1461928', date: daysAgo(5) }] } });
+
+test('LOA: Chrome prints the fetched letter like Ctrl+P (A4, background); IREPS is asked once; no .html; tab closed', async () => {
+  loaOnly();
+  const dbg = fakeDebugger();
+  try {
+    const r = await run('29263265', { only: ['loa'] });
+    const loa = r.categories.loa;
+    assert.deepEqual([loa.status, loa.downloaded, loa.warnings], ['DOWNLOADED', 1, []]);
+    const files = saved.filter((s) => s.filename.includes('Advance_Acceptance_LOA'));
+    assert.deepEqual(files.map((s) => s.filename.split('/').pop()), ['LOA_29263265_1461928.pdf']);
+    assert.match(new TextDecoder().decode(files[0].bytes), /chrome-print/);
+    assert.equal(loa.files[0].printed, true);
+    // the tab was given the letter IREPS returned, at the letter's own address
+    const served = dbg.cmd('Fetch.fulfillRequest');
+    assert.match(Buffer.from(served.body, 'base64').toString(), /Letter 1461928/);
+    assert.match(dbg.cmd('Page.navigate').url, /\/epsn\/supply\/tds\/publishLOALetter\.do$/);
+    assert.equal(paths().filter((p) => p.endsWith('publishLOALetter.do')).length, 1);
+    assert.deepEqual(dbg.cmd('Page.printToPDF'), { paperWidth: 8.27, paperHeight: 11.69, printBackground: true, displayHeaderFooter: false, preferCSSPageSize: true });
+    assert.deepEqual([dbg.tabs.created, dbg.tabs.removed], [1, [7]]);
+    assert.ok(dbg.calls.some((c) => c[0] === 'detach'));
+  } finally {
+    withoutDebugger();
+  }
+});
+test('LOA: when Chrome will not let DocLink print (policy), the text PDF + .html are kept and the run says why', async () => {
+  loaOnly();
+  const dbg = fakeDebugger({ attachError: 'Cannot access a chrome:// URL' });
+  try {
+    const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
+    assert.equal(loa.status, 'DOWNLOADED');
+    const names = saved.filter((s) => s.filename.includes('Advance_Acceptance_LOA')).map((s) => s.filename.split('/').pop());
+    assert.deepEqual(names.sort(), ['LOA_29263265_1461928.html', 'LOA_29263265_1461928.pdf']);
+    assert.ok(loa.warnings.some((w) => /could not print.*Cannot access/i.test(w)), loa.warnings.join('\n'));
+    assert.deepEqual(dbg.tabs.removed, [7]);
+  } finally {
+    withoutDebugger();
+  }
+});
+test('LOA: cancelling the "started debugging" bar falls back to the text PDF', async () => {
+  loaOnly();
+  fakeDebugger({ cancel: true });
+  try {
+    const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
+    assert.equal(loa.status, 'DOWNLOADED');
+    assert.ok(loa.warnings.some((w) => /bar was cancelled/.test(w)), loa.warnings.join('\n'));
+  } finally {
+    withoutDebugger();
+  }
+});
+test('Every published letter is printed by Chrome (negotiation, counter offer, LOA, correspondence); a corrigendum page keeps the text rendering', async () => {
+  mk({ tenders: [FULL()], inbox: letters('29263265'), corres: { 107200478: { nitOid: '107200478', tenderNo: '29263265', letters: [{ no: '306789', id: '306789', corresId: '225319', subject: 'Withdrawal' }] } } });
+  const dbg = fakeDebugger();
+  try {
+    const c = (await run()).categories;
+    const counts = {};
+    for (const k of ['negotiation', 'counterOffer', 'loa', 'correspondence']) {
+      assert.equal(c[k].status, 'DOWNLOADED', k);
+      assert.ok(c[k].files.every((f) => f.printed && f.fileName.endsWith('.pdf')), `${k}: ${JSON.stringify(c[k].files)}`);
+      assert.deepEqual(c[k].warnings, [], k);
+      counts[k] = c[k].files.length;
+    }
+    assert.deepEqual(counts, { negotiation: 2, counterOffer: 1, loa: 1, correspondence: 1 });
+    assert.equal(dbg.tabs.created, 5);
+    const names = savedNames();
+    assert.ok(!names.some((n) => /(Negotiation|Counter_Offers|Advance_Acceptance_LOA|Correspondence)\/.*\.html$/.test(n)), names.join('\n'));
+    assert.ok(names.some((n) => n.endsWith('Corrigenda/Corrigendum_02_29263265.html')), 'not a letter: unchanged');
+  } finally {
+    withoutDebugger();
+  }
 });
 test('21. Session expiry mid-run is reported and nothing HTML is saved as a document', async () => {
   mk({ tenders: [FULL()] });
@@ -733,23 +815,24 @@ test('E. Unauthenticated / expired session and unverified account stop the run',
   await assert.rejects(() => autoRun(), (e) => e.code === 'ACCOUNT');
   assert.ok(!server.log.some((l) => l.path.includes('vendorInboxLink')));
 });
-test('F. Financial / Commercial Tabulation are never requested in automatic mode', async () => {
+test('F. Financial / Commercial Tabulation are not part of automatic mode (they have their own run)', async () => {
   mk({ tenders: [futureT({ no: 'X1', nitId: '1', oid: '10', offer: true })], messages: [nitMsg('X1')] });
   await autoRun();
   assert.ok(!server.excludedHit);
-  assert.ok(server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do').every((l) => l.query.pdfType === 'offer'));
+  assert.ok(server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do').every((l) => (l.query.pdfType || l.body.pdfType) === 'offer'));
+  assert.ok(!server.log.some((l) => l.body.status === 'MyBidsClosed'), 'Closed Tenders is not read');
 });
 
 // =========================== exclusions (24-26) =============================================
-test('24-26. FIN-TAB / COM-TAB / TECH-TAB endpoints are never invoked, even when listed on the row', async () => {
+test('24-26. FIN-TAB / COM-TAB are fetched from the row; TECH-TAB is never invoked, even when listed on the row', async () => {
   mk({ tenders: [FULL()], inbox: letters('29263265') });
   const r = await run();
   assert.ok(!server.excludedHit);
-  assert.ok(server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do').every((l) => l.query.pdfType === 'offer'));
-  assert.ok(!paths().some((p) => /tabulation/i.test(p)));
+  const types = server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do').map((l) => l.query.pdfType || l.body.pdfType).sort();
+  assert.deepEqual(types, ['commercialTabulation', 'financialTabulation', 'offer']);
   assert.equal(r.categories.myOffer.status, 'DOWNLOADED');
-  assert.deepEqual(r.exclusions, ['Financial Tabulation', 'Commercial/Techno-Commercial Tabulation']);
-  await assert.rejects(() => core.irepsFetch('https://www.ireps.gov.in', '/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=1'), (e) => e.code === 'EXCLUDED');
+  assert.deepEqual(r.exclusions, ['Techno-Commercial Tabulation']);
+  await assert.rejects(() => core.irepsFetch('https://www.ireps.gov.in', '/epsn/tbo/commTboPdfAction.do?pdfType=technoCommercialTabulation&tenderOID=1'), (e) => e.code === 'EXCLUDED');
 });
 test('no password / cookie / token is stored by the extension code', async () => {
   const fs = await import('node:fs');
@@ -833,10 +916,11 @@ test('ECM: each tender category maps to its ECM kind, with tender number, date a
   const ctx = { tenderNo: '29263265', closingDate: '09/11/2026 15:00' };
   const doc = (category, action) => tecm.ecmDocumentFor(category, action, ctx);
   assert.deepEqual(doc('TENDER_PDF', { id: '5569207', meta: { title: 'NIT / Tender document' } }), { kind: 'nit', title: '29263265 - NIT', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00' } });
-  assert.equal(doc('ATTACHMENTS', { id: 'Annexure', meta: { title: 'Annexure - SPEC' } }).title, '29263265 - Attachment - Annexure - SPEC');
+  assert.equal(doc('ATTACHMENTS', { id: 'Annexure', meta: { title: 'Annexure - SPEC' } }).title, '29263265 - NIT - Annexure - SPEC');
+  assert.deepEqual([doc('CORRIGENDA', { id: '1204920', meta: { title: '1' } }).title, doc('NEGOTIATION', { id: '77' }).title, doc('COUNTER_OFFER', { id: '78' }).title, doc('CORRESPONDENCE', { id: '9', meta: { title: 'Withdrawal' } }).title], ['29263265 - Extension - 1', '29263265 - NBSP - 77', '29263265 - CO - 78', '29263265 - CRP - Withdrawal'], 'titles: <tender no> - <spec code> - what tells them apart');
   assert.equal(doc('ATTACHMENTS', { id: 'x', meta: {} }).kind, 'nit');
   assert.deepEqual([doc('CORRIGENDA', { id: '1204920', meta: { title: '1' } }).kind, doc('NEGOTIATION', { id: '1' }).kind, doc('COUNTER_OFFER', { id: '1' }).kind, doc('CORRESPONDENCE', { id: '1', meta: { title: 'Withdrawal' } }).kind], ['extension', 'nbsp', 'co', 'crp']);
-  assert.deepEqual(doc('LOA', { id: '1461928', meta: { docDate: '04/10/2026' } }), { kind: 'loi', title: '29263265 - LOA 1461928', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00', loi_number: '1461928', loi_date: '04/10/2026' } });
+  assert.deepEqual(doc('LOA', { id: '1461928', meta: { docDate: '04/10/2026' } }), { kind: 'loi', title: '29263265 - LOI', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00', loi_number: '1461928', loi_date: '04/10/2026' } });
   assert.equal(doc('MY_OFFER', { id: '1' }), null);
   assert.equal(tecm.ecmDocumentFor('NIT', {}, { tenderNo: 'T', dueDate: '' }), null);
   assert.equal(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T', dueDate: new Date(2026, 10, 9).toISOString() }).fields.tender_date, '2026-11-09', 'an automatic-mode due date is its local day');
@@ -857,11 +941,12 @@ test('ECM: Save to ECM / S3 files every tender document in the Hosur folder; My 
     const c = r.categories;
     assert.equal(r.summary.failed, 0);
     const kinds = posts.reduce((m, p) => ({ ...m, [p.kind]: (m[p.kind] || 0) + 1 }), {});
-    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2 });
+    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2, vft: 1, vct: 1 });
+    assert.deepEqual(posts.filter((p) => /^v[fc]t$/.test(p.kind)).map((p) => p.title).sort(), ['29263265 - Commercial Tabulation', '29263265 - Financial Tabulation']);
     assert.ok(posts.every((p) => p.account === '833' && p.unit === 'HOSUR' && p.fields.tender_number === '29263265' && p.credentials === 'include'));
     assert.ok(posts.every((p) => !p.fields.tender_date || /^\d{4}-\d{2}-\d{2}$/.test(p.fields.tender_date)), 'tender date, when known, as YYYY-MM-DD');
     const loi = posts.find((p) => p.kind === 'loi');
-    assert.deepEqual([loi.title, loi.fields.loi_number], ['29263265 - LOA 1461928', '1461928']);
+    assert.deepEqual([loi.title, loi.fields.loi_number], ['29263265 - LOI', '1461928']);
     assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(loi.fields.loi_date), 'LOI date from the published stamp');
     assert.equal(new Set(posts.map((p) => p.title)).size, posts.length, 'every title is unique within the tender');
     // nothing that went to the ECM is in Downloads; My Offer (no ECM kind) is, and no manifest file is
@@ -881,7 +966,7 @@ test('ECM: when the ECM refuses or is down, each document is saved locally inste
   await withEcm((p, n) => (n === 1 ? [400, { detail: { error: 'INVALID_INPUT', detail: 'nit requires tender_number' } }] : [502, { detail: { error: 'ECM_UPSTREAM_ERROR', detail: 'HTTP 500' } }]), async (posts) => {
     const r = await run();
     assert.equal(r.summary.failed, 0, 'nothing is lost');
-    assert.equal(posts.length, 13);
+    assert.equal(posts.length, 15);
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
     for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265_1461928.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(local.includes(want), `missing ${want}`);
     const nit = r.categories.tenderPdf.files[0];
@@ -897,10 +982,10 @@ test('ECM direct: with ecmBackendAws false every tender document goes straight t
     assert.equal(r.summary.failed, 0);
     assert.equal(gateway.length, 0, 'the Recon Engine gateway is not called');
     const kinds = creates.reduce((m, p) => ({ ...m, [p['InvoiceCertificateSchema:type']]: (m[p['InvoiceCertificateSchema:type']] || 0) + 1 }), {});
-    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2 });
+    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2, vft: 1, vct: 1 });
     assert.ok(creates.every((p) => p.folder === 'aa28acbe-add1-49d3-b0ab-16ab1263996c' && p['InvoiceCertificateSchema:tenderNumber'] === '29263265'));
     const loi = creates.find((p) => p['InvoiceCertificateSchema:type'] === 'loi');
-    assert.deepEqual([loi['dc:title'], loi['InvoiceCertificateSchema:loiNumber']], ['29263265 - LOA 1461928', '1461928']);
+    assert.deepEqual([loi['dc:title'], loi['InvoiceCertificateSchema:loiNumber']], ['29263265 - LOI', '1461928']);
     assert.equal(r.categories.tenderPdf.files[0].ecm.status, 'stored');
     assert.equal(r.categories.tenderPdf.files[0].ecm.uid.startsWith('n-'), true);
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
@@ -1109,7 +1194,7 @@ test('Download log: documents this user already downloaded are skipped after one
     assert.equal(c.attachments.downloaded, 4);
     await dlog.flushDownloadLog();
     const types = seen.logged.reduce((m, x) => ({ ...m, [x.doc_type]: (m[x.doc_type] || 0) + 1 }), {});
-    assert.deepEqual(types, { tender_attachment: 4, my_offer: 1 });
+    assert.deepEqual(types, { tender_attachment: 4, my_offer: 1, financial_tabulation: 1, commercial_tabulation: 1 });
     assert.ok(seen.logged.every((x) => x.destination === 'local' && x.ireps_account_id === '833' && x.doc_key.startsWith('tender:') && x.filename));
   });
 });
@@ -1145,5 +1230,96 @@ test('Download log: cancelling the Recon sign-in stops the run before anything i
     globalThis.document.dispatchEvent = (event) => { event.detail.resolve(false); return false; };
     await assert.rejects(run(), (e) => e.code === 'SIGN_IN_REQUIRED');
     assert.equal(server.log.length, 0, 'IREPS was not called');
+  });
+});
+
+// =========================== Financial / Commercial Tabulation ===============================
+const { readFileSync } = await import('node:fs');
+const CLOSED_FIXTURE = readFileSync(new URL('./fixtures/closed-tenders.html', import.meta.url), 'utf8');
+const closed = (no, o = {}) => ({ no, nitId: `55${no.slice(-5)}`, oid: `107${no.slice(-6)}`, bidId: `208${no.slice(-5)}`, title: `Item ${no}`, closing: new Date(2026, 9, 20), tab: true, ...o });
+const tabPosts = () => server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do');
+const closedPosts = () => server.log.filter((l) => l.path === '/epsn/vendorInboxLink.do' && l.body.status === 'MyBidsClosed' && l.body.startDate);
+
+test('Tabulation: parseClosedTenders reads every row of the captured Closed Tenders page (HAR entry 82)', () => {
+  const rows = wf.parseClosedTenders(core.parseHtml(CLOSED_FIXTURE));
+  assert.equal(rows.length, 10);
+  const withTab = rows.filter((r) => r.links.financialTabulation);
+  assert.deepEqual(withTab.map((r) => r.tenderNo), ['42263731', '69261051', '04241210', '03263926B', 'NB265748']);
+  assert.ok(withTab.every((r) => r.links.commercialTabulation), 'Financial and Commercial come together');
+  const r = rows.find((x) => x.tenderNo === '42263731');
+  assert.deepEqual([r.bidId, r.nitId, r.tenderOid, r.dept, r.title, r.closingDate], ['20874501', '5574420', '107204732', 'STORES / CENTRAL RLY', 'WHEEL MOUNTED BRAKE', '23/10/2026 11:30']);
+  assert.equal(r.links.financialTabulation.method, 'POST', 'postRequestNewWindow posts');
+  assert.equal(r.links.financialTabulation.url, '/epsn/tbo/commTboPdfAction.do?tenderOID=107204732&pdfType=financialTabulation&accountID=833');
+  assert.equal(r.links.commercialTabulation.url, '/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=107204732&accountID=833');
+  assert.deepEqual([rows[0].tenderNo, rows[0].links.financialTabulation], ['36265202', null], 'a tender whose bids are not opened has no link');
+  assert.equal(rows.find((x) => x.tenderNo === 'RS11031149').closingDate, '22/10/2026 15:00');
+});
+test('Tabulation: a POSTed commTboPdfAction.do is checked on its body - My Offer and the tabulations pass, Techno-Commercial does not', async () => {
+  const post = (pdfType) => core.irepsFetch('https://www.ireps.gov.in', '/epsn/tbo/commTboPdfAction.do', { method: 'POST', form: { tenderOID: '1', pdfType, accountID: '833' } });
+  for (const t of ['offer', 'financialTabulation', 'commercialTabulation']) assert.equal((await post(t)).status, 200, t);
+  await assert.rejects(() => post('technoCommercialTabulation'), (e) => e.code === 'EXCLUDED');
+  await assert.rejects(() => core.irepsFetch('https://www.ireps.gov.in', '/epsn/tbo/commTboPdfAction.do', { method: 'POST', form: { tenderOID: '1' } }), (e) => e.code === 'EXCLUDED');
+  assert.ok(!server.excludedHit);
+});
+test('Tabulation by closing date: every closed tender with the link is downloaded across pages, one without is "not available yet", another account is refused', async () => {
+  mk({ closed: [closed('42263731'), closed('24261658', { tab: false }), closed('69261051', { page: 2 }), closed('03263926B', { tabAcct: '60828' }), closed('11111111', { closing: new Date(2026, 8, 1) })] });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  const t = r.tabulations;
+  assert.deepEqual([r.range, t.listed, t.summary], [{ from: '15/10/2026', to: '23/10/2026' }, 4, { downloaded: 2, withTabulation: 3, notAvailable: 1 }]);
+  const by = Object.fromEntries(t.tenders.map((x) => [x.tenderNo, x]));
+  assert.equal(by['24261658'].notAvailable, true);
+  assert.equal(by['42263731'].categories.financialTabulation.status, 'DOWNLOADED');
+  assert.equal(by['69261051'].categories.financialTabulation.status, 'DOWNLOADED', 'page 2 is read');
+  assert.match(by['03263926B'].categories.financialTabulation.files[0].error, /Account mismatch: .*60828/);
+  assert.deepEqual(savedNames().sort(), ['DocLink/HOSUR/Tender_42263731/Tabulation/Financial_Tabulation_42263731.pdf', 'DocLink/HOSUR/Tender_69261051/Tabulation/Financial_Tabulation_69261051.pdf']);
+  assert.ok(tabPosts().every((l) => l.method === 'POST' && l.body.pdfType === 'financialTabulation'), 'only the chosen tabulation, POSTed as IREPS does');
+  assert.ok(closedPosts().every((l) => l.body.menuLink === 'Tenders' && l.body.listType === 'MyBidsClosed' && l.body.startDate === '15/10/2026' && l.body.endDate === '23/10/2026'));
+  // the same range again: the ledger skips what was downloaded
+  saved.length = 0;
+  const again = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  assert.equal(again.tabulations.summary.downloaded, 0);
+  assert.equal(again.tabulations.tenders.find((x) => x.tenderNo === '42263731').categories.financialTabulation.alreadyDownloaded, 1);
+  assert.equal(saved.length, 0);
+});
+test('Tabulation by closing date: a range longer than 90 days is read in windows; the Tender Number narrows it', async () => {
+  mk({ closed: [closed('42263731', { closing: new Date(2026, 5, 10) }), closed('69261051', { closing: new Date(2026, 9, 20) })] });
+  const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 5, 1), to: new Date(2026, 9, 23) });
+  assert.equal(r.tabulations.summary.downloaded, 2);
+  assert.deepEqual(closedPosts().map((l) => [l.body.startDate, l.body.endDate]), [['01/06/2026', '29/08/2026'], ['30/08/2026', '23/10/2026']]);
+  assert.ok(savedNames().includes('DocLink/HOSUR/Tender_42263731/Tabulation/Commercial_Tabulation_42263731.pdf'));
+  mk({ closed: [closed('42263731'), closed('69261051')] });
+  const one = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23), tenderNo: ' 69261051 ' });
+  assert.deepEqual([one.tabulations.listed, one.tabulations.summary.downloaded], [1, 1]);
+  assert.ok(closedPosts().every((l) => l.body.tenderNo === '69261051'));
+});
+test('Tabulation: a single tender whose row has no tabulation link finds it in Closed Tenders around its closing date (one scan for both)', async () => {
+  const closing = new Date(2026, 10, 9);
+  mk({ tenders: [T({ offer: false, closing })], closed: [closed('29263265', { nitId: '5569207', oid: '107200478', closing })] });
+  const r = await run('29263265', { only: ['financialTabulation', 'commercialTabulation'] });
+  assert.deepEqual([r.categories.financialTabulation.status, r.categories.commercialTabulation.status], ['DOWNLOADED', 'DOWNLOADED']);
+  assert.equal(closedPosts().length, 1, 'both steps share one Closed Tenders scan');
+  assert.deepEqual([closedPosts()[0].body.startDate, closedPosts()[0].body.endDate, closedPosts()[0].body.tenderNo], ['08/11/2026', '10/11/2026', '29263265']);
+  mk({ tenders: [T({ offer: false })], closed: [] });
+  const none = await run('29263265', { only: ['financialTabulation'] });
+  assert.equal(none.categories.financialTabulation.status, 'NOT_AVAILABLE');
+  assert.match(none.categories.financialTabulation.note, /no Financial Tabulation for this tender yet/);
+});
+test('Tabulation: a web page answer is still saved as a PDF (with its original HTML)', async () => {
+  mk({ closed: [closed('42263731')], tabulationAsHtml: true });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  assert.equal(r.tabulations.summary.downloaded, 1);
+  assert.ok(savedNames().some((n) => n.endsWith('Tabulation/Financial_Tabulation_42263731.pdf')), savedNames().join('\n'));
+});
+test('Tabulation: Save to ECM files them as vft / vct with "<tender no> - <type>" and the closing date as the tender date', async () => {
+  mk({ closed: [closed('42263731', { closing: new Date(2026, 9, 23) })] });
+  store['doclink.saveDestination'] = 'recon';
+  await withEcm((p, n) => [201, { uid: `u-${n}`, path: `/FT/x/${n}`, title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
+    await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+    await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+    assert.deepEqual(posts.map((p) => [p.kind, p.title, p.fields.tender_number, p.fields.tender_date, p.account]), [
+      ['vft', '42263731 - Financial Tabulation', '42263731', '2026-10-23', '833'],
+      ['vct', '42263731 - Commercial Tabulation', '42263731', '2026-10-23', '833'],
+    ]);
+    assert.equal(saved.length, 0, 'nothing that went to the ECM is in Downloads');
   });
 });

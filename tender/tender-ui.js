@@ -1,5 +1,5 @@
 // "Download Tender Documents" view: account panel + automatic discovery from My Messages.
-import { runAutomatic, runLetterType } from './tender-auto.js';
+import { runAutomatic, runLetterType, runTabulations } from './tender-auto.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { SESSION_MSG, getLogTail } from './tender-core.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
@@ -29,7 +29,7 @@ function setBusy(busy) {
   running = busy;
   $('btn-auto-run').disabled = busy;
   $('btn-auto-retry').disabled = busy;
-  document.querySelectorAll('[data-status]').forEach((b) => { b.disabled = busy; });
+  document.querySelectorAll('[data-status],[data-tabulation]').forEach((b) => { b.disabled = busy; });
   $('btn-account-refresh').disabled = busy;
   $('btn-auto-run').classList.toggle('is-busy', busy);
 }
@@ -92,7 +92,8 @@ const catText = (c) => {
 };
 // download-log skips say when / where, the ledger's only that they were skipped
 const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : '')), ...(c.skippedFiles || []).map((f) => `${f.title || f.id}: ${describeSkip(f.skip)}`), ...(c.warnings || []).filter((w) => /download log|ECM could not be checked/i.test(w))].filter(Boolean).join('\n');
-const LABEL = { tenderPdf: 'NIT', attachments: 'Attachments', myOffer: 'My Offer', corrigenda: 'Corrigenda', negotiation: 'Negotiation', counterOffer: 'Counter offer', loa: 'LOA', correspondence: 'Correspondence' };
+const LABEL = { tenderPdf: 'NIT', attachments: 'Attachments', myOffer: 'My Offer', corrigenda: 'Corrigenda', negotiation: 'Negotiation', counterOffer: 'Counter offer', loa: 'LOA', correspondence: 'Correspondence', financialTabulation: 'Financial Tabulation', commercialTabulation: 'Commercial Tabulation' };
+const TABULATION_NAME = { financialTabulation: 'Financial Tabulation', commercialTabulation: 'Commercial Tabulation' };
 
 const LETTER_PAGE = { MyNegotiation: 'Negotiation', MyCounterOffer: 'Counter Offer', MyAdvanceAcceptanceLetter: 'Advance Acceptance Letter' };
 
@@ -177,7 +178,37 @@ function renderLetterResult(status, r) {
   }
 }
 
-async function runLetters(status) {
+// ---------------------------------------------------------------- one tabulation type (by closing date)
+
+function renderTabulationResult(pdfType, r) {
+  const name = TABULATION_NAME[pdfType];
+  const body = $('tender-result-rows');
+  body.replaceChildren();
+  const t = r.tabulations;
+  const n = t.summary.downloaded;
+  body.append(li(`${name} (by Closing Date)`, n ? `${n} downloaded` : t.summary.withTabulation ? 'nothing new' : 'none for these dates', n ? 'tender-ok' : 'tender-muted'));
+  for (const x of t.tenders) {
+    if (x.notAvailable) {
+      body.append(li(`  ${x.tenderNo}`, 'not available yet', 'tender-muted', '', `${x.title || ''}${x.closingDate ? ` · closed ${x.closingDate}` : ''} · IREPS shows no ${name} yet`));
+      continue;
+    }
+    const parts = Object.entries(x.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
+    body.append(li(`  ${x.tenderNo}`, x.error ? 'failed' : parts.join(' · '), x.error ? 'tender-bad' : 'tender-ok', '', x.error || Object.values(x.categories).map(reasons).filter(Boolean).join('\n')));
+  }
+  $('tender-result-tender').textContent = `${name} of tenders closing ${r.range.from} - ${r.range.to}: ${t.listed} closed tender(s), ${t.summary.withTabulation} with a ${name}`;
+  $('tender-result-totals').textContent = `Downloaded: ${n}   Not available yet: ${t.summary.notAvailable}`;
+  $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/Tabulation/';
+  $('btn-tender-show').hidden = true;
+  $('tender-result').hidden = false;
+  $('btn-auto-retry').hidden = true;
+  if (t.aborted) {
+    $('tender-error-message').textContent = `Stopped early: ${t.aborted.message}`;
+    $('tender-error').hidden = false;
+  }
+}
+
+/** A run over the From / To dates (and the optional Tender Number): `task({ from, to, tenderNo, onProgress, onAccount })`. */
+async function runByDate(what, task, render) {
   if (running) return;
   $('tender-error').hidden = true;
   $('tender-result').hidden = true;
@@ -197,21 +228,24 @@ async function runLetters(status) {
   $('tender-progress').hidden = false;
   const stopGuard = guardTabs();
   try {
-    renderLetterResult(status, await runLetterType({
-      status, from, to, tenderNo: $('letter-tender-no').value,
+    render(await task({
+      from, to, tenderNo: $('letter-tender-no').value,
       onProgress: (m) => ($('tender-progress-message').textContent = m),
       onAccount: renderAccount,
     }));
   } catch (e) {
     $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('tender-error').hidden = false;
-    console.error('[DocLink][Tender] letters failed:', e.code || '', e.message);
+    console.error(`[DocLink][Tender] ${what} failed:`, e.code || '', e.message);
   } finally {
     stopGuard();
     $('tender-progress').hidden = true;
     setBusy(false);
   }
 }
+
+const runLetters = (status) => runByDate('letters', (o) => runLetterType({ status, ...o }), (r) => renderLetterResult(status, r));
+const runTabulationType = (pdfType) => runByDate('tabulations', (o) => runTabulations({ pdfType, ...o }), (r) => renderTabulationResult(pdfType, r));
 
 // ---------------------------------------------------------------- keep the user on the IREPS tab while downloading
 
@@ -288,6 +322,7 @@ $('btn-tender-open').addEventListener('click', () => show(true));
 $('btn-tender-back').addEventListener('click', () => show(false));
 $('btn-auto-run').addEventListener('click', run);
 document.querySelectorAll('[data-status]').forEach((b) => b.addEventListener('click', () => runLetters(b.dataset.status)));
+document.querySelectorAll('[data-tabulation]').forEach((b) => b.addEventListener('click', () => runTabulationType(b.dataset.tabulation)));
 $('btn-auto-retry').addEventListener('click', run); // already-downloaded documents are skipped via the ledger
 $('btn-account-refresh').addEventListener('click', refreshAccount);
 $('btn-copy-diag').addEventListener('click', async () => {

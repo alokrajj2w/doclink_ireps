@@ -33,26 +33,34 @@ export const ECM_FIELDS = Object.freeze({
   loi_date: "InvoiceCertificateSchema:loiDate"
 });
 
-const TENDER_KIND = Object.freeze({ fields: ["tender_number", "tender_date"], required: ["tender_number"], location: "tenders", title: "{tender_number}" });
+const TENDER_FIELDS = Object.freeze({ fields: ["tender_number", "tender_date"], required: ["tender_number"], location: "tenders" });
+const tenderKind = (code, extra = {}) => Object.freeze({ ...TENDER_FIELDS, code, title: `{tender_number} - ${code}`, ...extra });
 
 /**
  * Keyed by ECM_KIND values (services/ecm-service.js; written out here so this module
  * does not import ecm-service.js, which imports the direct upload that imports this).
  * Per kind: fields it may carry, fields an upload must supply, the site location new
- * documents go to, and the dc:title template used when the upload gives no title.
+ * documents go to, and the dc:title: "<document number> - <code>", as the sheet's row 4
+ * (API) names them ("Example Title - IC", "- PO", "- MA", "- NIT", "- LOI", "- NBSP",
+ * "- Extension", "- CRP", "- CO", "- Financial Tabulation", "- Commercial Tabulation") with row 8 (Title) giving the number: IC, PO or MA
+ * number, else the tender number. `title` is the template used when the upload gives no
+ * title; tender uploads give their own (tender/tender-ecm.js), which starts the same way.
  * "ECM - Download speci-v1" marks more fields mandatory than IREPS supplies, so
  * `required` is what DocLink always has; the rest is sent whenever it is known.
  */
 export const ECM_KINDS = Object.freeze({
-  inspectionCertificate: { fields: ["invoice_number", "customer_po_number", "ic_number", "ic_date", "co_number"], required: ["ic_number", "customer_po_number"], location: "inputs", title: "{ic_number}" },
-  poCopy: { fields: ["customer_po_number"], required: ["customer_po_number"], location: "inputs", title: "{customer_po_number}" },
-  modificationAdvise: { fields: ["customer_po_number", "modification_advise_number", "tender_number", "tender_date"], required: ["customer_po_number", "modification_advise_number"], location: "inputs", title: "{modification_advise_number}" },
-  nit: TENDER_KIND,
-  nbsp: TENDER_KIND,
-  extension: TENDER_KIND,
-  crp: TENDER_KIND,
-  co: TENDER_KIND,
-  loi: { ...TENDER_KIND, fields: ["tender_number", "tender_date", "loi_number", "loi_date"] }
+  inspectionCertificate: { fields: ["invoice_number", "customer_po_number", "ic_number", "ic_date", "co_number"], required: ["ic_number", "customer_po_number"], location: "inputs", code: "IC", title: "{ic_number} - IC" },
+  poCopy: { fields: ["customer_po_number"], required: ["customer_po_number"], location: "inputs", code: "PO", title: "{customer_po_number} - PO" },
+  modificationAdvise: { fields: ["customer_po_number", "modification_advise_number", "tender_number", "tender_date"], required: ["customer_po_number", "modification_advise_number"], location: "inputs", code: "MA", title: "{modification_advise_number} - MA" },
+  nit: tenderKind("NIT"),
+  nbsp: tenderKind("NBSP"),
+  extension: tenderKind("Extension"),
+  crp: tenderKind("CRP"),
+  co: tenderKind("CO"),
+  loi: tenderKind("LOI", { fields: ["tender_number", "tender_date", "loi_number", "loi_date"] }),
+  // the spec makes the tender date mandatory for these; the Closed Tenders row always shows the closing date
+  vft: tenderKind("Financial Tabulation", { required: ["tender_number", "tender_date"] }),
+  vct: tenderKind("Commercial Tabulation", { required: ["tender_number", "tender_date"] })
 });
 
 /**

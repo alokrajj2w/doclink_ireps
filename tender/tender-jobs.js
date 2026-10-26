@@ -5,8 +5,8 @@
 //   downloadTodaysCorrigenda() once a day   - corrigendum published today (only that document)
 //   downloadLettersByDate()    3-4x a day   - negotiation / counter offer / LOA letters published on a date
 //                                            (alias: checkNewLetters)
-//
-// Financial and Commercial Tabulation are not part of any job.
+//   downloadTabulationsByDate()                - Financial / Commercial Tabulation of tenders CLOSING on the dates
+//                                            (IREPS Closed Tenders); a tabulation shows up some days after closing
 
 import { TenderError, SESSION_MSG, IREPS_DOWN_CODES, log, norm, getBaseUrl } from './tender-core.js';
 import { assertSameAccount } from './tender-account.js';
@@ -15,6 +15,7 @@ import { searchTender, fmtDate } from './tender-search.js';
 import { openLedger } from './tender-ledger.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
+  scanClosedTenders, downloadTabulation, TABULATIONS,
 } from './tender-workflows.js';
 import { tenderEcmSink, ensureDownloadSignIn } from './tender-ecm.js';
 
@@ -265,6 +266,60 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
 
 /** The 3-4x-a-day check: letters dated since the last run (normally just today). */
 export const checkNewLetters = downloadLettersByDate;
+
+/**
+ * Financial / Commercial Tabulations of the tenders that CLOSED between `from` and `to` (Dates, both included),
+ * optionally of one Tender Number. IREPS Closed Tenders is read once; each row that shows a wanted
+ * tabulation is downloaded straight from it, with the row's closing date as the ECM tender date. A row
+ * without the link is reported as "not available yet" (IREPS adds it once the bids are opened), and what
+ * was downloaded before is skipped (download log, or the ledger), so the same range can be re-run.
+ * @param pdfTypes  keys of TABULATIONS (default both)
+ */
+export async function downloadTabulationsByDate({ from, to, pdfTypes = Object.keys(TABULATIONS), tenderNo: onlyTender = '', onProgress = () => {}, onAccount = () => {}, job: sharedJob = null } = {}) {
+  const job = sharedJob || (await beginJob({ onProgress, onAccount }));
+  const range = { from: ddmmyyyy(from), to: ddmmyyyy(to) };
+  const probe = { base: job.base, ctx: { tenderNo: '' }, inboxCache: new Map(), onProgress };
+  const wantTender = norm(onlyTender);
+  onProgress(`Reading Closed Tenders (closing date ${range.from} - ${range.to})...`);
+  const { rows, pages } = await scanClosedTenders(probe, { from, to, tenderNo: wantTender });
+  const listed = rows.filter((r) => !wantTender || norm(r.tenderNo).toLowerCase() === wantTender.toLowerCase());
+
+  let ecm;
+  const ecmSink = async () => (ecm === undefined ? (ecm = await tenderEcmSink(job.account)) : ecm);
+  const tenders = [];
+  let aborted = null;
+  let downloaded = 0;
+  for (const row of listed) {
+    const rec = { tenderNo: row.tenderNo, title: row.title, closingDate: row.closingDate, categories: {}, folder: '' };
+    tenders.push(rec);
+    const wanted = pdfTypes.filter((t) => row.links[t]);
+    if (!wanted.length) { rec.notAvailable = true; continue; }
+    if (aborted) { rec.error = `Skipped: ${aborted.message}`; continue; }
+    onProgress(`Tabulation for ${row.tenderNo}...`);
+    try {
+      const run = startLetterRun(job, row.tenderNo);
+      run.onProgress = onProgress;
+      Object.assign(run.ctx, { closingDate: row.closingDate, tenderTitle: row.title, railwayUnit: row.dept });
+      await assertSameAccount(job.account, { base: job.base });
+      run.ecm = await ecmSink();
+      for (const t of wanted) {
+        const r = await downloadTabulation(run, t, row.links[t], { relativeTo: row.pageUrl });
+        rec.categories[TABULATIONS[t].key] = r;
+        downloaded += r.downloaded;
+      }
+      await recordManifest(job, run, rec.categories, { range });
+      rec.folder = `Downloads/${run.saver.root}/`;
+    } catch (e) {
+      if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
+      rec.error = e.message;
+    }
+  }
+  if (!sharedJob) await job.ledger.save();
+  return {
+    account: publicAccount(job.account), range, pages, listed: listed.length, tenders, aborted,
+    summary: { downloaded, withTabulation: tenders.filter((t) => !t.notAvailable).length, notAvailable: tenders.filter((t) => t.notAvailable).length },
+  };
+}
 
 export function startLetterRun(job, tenderNo) {
   const found = { tenderNo, tenderTitle: '', railwayUnit: '', department: '', tenderStatus: '', searchUrl: '', row: { actions: [] } };
