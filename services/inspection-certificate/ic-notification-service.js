@@ -26,9 +26,8 @@ import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { fetchNotifications, selectIcNotifications, NOTIFICATION_ERROR } from "../notifications/notification-service.js";
 import { withRetry } from "../batch-utils.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
-import { loadIcListPage, submitIcSearch, buildIcSearchRequest, buildIcPageRequest, extractIcPageCount, IC_ERROR } from "./ic-api.js";
-import { extractIcForm } from "./ic-form.js";
-import { validateIcSession } from "./ic-service.js";
+import { buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
+import { runIcSearch } from "./ic-search.js";
 import { parseIcSearchResults, icNumberFromUrl } from "./ic-parser.js";
 import { ECM_KIND } from "../ecm-service.js";
 
@@ -79,38 +78,21 @@ export function matchIcRows(records, { poNo, poSerial, refId }) {
 export async function findIcRows(target, deps = {}) {
   const parseHtml = deps.parseHtml || ((html, options) => parseIcSearchResults(html, target.poNo, options));
   const retry = (task) => withRetry(task, { attempts: 3, sleep: deps.sleep, delayMs: deps.retryDelayMs });
-  const requestDeps = { fetch: deps.fetch };
 
   const attempt = async (widen) => {
-    const listPage = await retry(() => loadIcListPage(requestDeps));
-    const listVerdict = validateIcSession(listPage.html, listPage);
-    if (!listVerdict.authenticated) throw new IrepsError(listVerdict.code, listVerdict.reason || "IREPS session is not active", { status: listVerdict.status });
-    const form = extractIcForm(listPage.html);
-    if (!form.token) throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "Struts token not found on the Inspection Call List page");
-
-    let request = buildIcSearchRequest(form, target.poNo, { poSerial: target.poSerial, ...(widen ? { dateFrom: IC_WIDE_FROM, dateFromIC: IC_WIDE_FROM } : {}) });
     const records = [];
-    let pages = 0;
-    let pageNo = 1;
-    for (;;) {
-      const results = await retry(() => submitIcSearch(request, requestDeps));
-      const verdict = validateIcSession(results.html, results, IC_ERROR.RESULTS_INVALID);
-      if (!verdict.authenticated) throw new IrepsError(verdict.code, verdict.reason || "IREPS response not recognised", { status: verdict.status });
-      let parsed;
-      try {
-        parsed = await parseHtml(results.html, { sourceUrl: results.url || null, poNo: target.poNo });
-      } catch (error) {
-        throw new IrepsError(IC_ERROR.PARSE_FAILED, "IC results HTML could not be parsed", { cause: error });
-      }
-      if (!parsed || !Array.isArray(parsed.records)) throw new IrepsError(IC_ERROR.PARSE_FAILED, "Parser returned no result");
-      records.push(...parsed.records);
-      pages++;
-      // Re-read the page count each time: the portal only prints ~10 page links at once.
-      if (pageNo >= extractIcPageCount(results.html) || pages >= MAX_PAGES) break;
-      pageNo++;
-      const next = extractIcForm(results.html);
-      request = buildIcPageRequest(request, next.token, pageNo);
-    }
+    const { pages } = await runIcSearch(
+      {
+        buildRequest: (form) => buildIcSearchRequest(form, target.poNo, { poSerial: target.poSerial, ...(widen ? { dateFrom: IC_WIDE_FROM, dateFromIC: IC_WIDE_FROM } : {}) }),
+        parseHtml,
+        parseOptions: { poNo: target.poNo },
+        maxPages: MAX_PAGES,
+        onPage: (parsed) => {
+          records.push(...parsed.records);
+        }
+      },
+      { fetch: deps.fetch, retry }
+    );
     return { records, pages };
   };
 

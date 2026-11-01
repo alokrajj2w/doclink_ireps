@@ -239,6 +239,27 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
     await rejects(searchInspectionCertificates("27253922100240", { fetch: noTokenIreps.fetchImpl, parseHtml }), IC_ERROR.TOKEN_NOT_FOUND);
   });
 
+  await test("searchInspectionCertificates: a consumed Struts token (IREPS 'Invalid Token' page) is retried once with a fresh page and token", async () => {
+    const invalidToken = "<html><head><title>Error</title></head><body><h2>Invalid Token</h2><p>The form was already submitted.</p></body></html>";
+    let searches = 0;
+    const { fetchImpl, calls } = fakeIc({ listPage, onSearch: (b, t, respond) => respond(++searches === 1 ? invalidToken : resultsPage) });
+    const found = await searchInspectionCertificates("27253922100240", { fetch: fetchImpl, parseHtml });
+    eq(found.count, 4, "the retry finds the ICs");
+    eq(calls.length, 4, "list page, search, fresh list page, search");
+    eq(calls[1].body, EXPECTED_IC_BODY("TOKEN-1"));
+    eq(calls[3].body, EXPECTED_IC_BODY("TOKEN-2"), "the retry uses the fresh token, never the consumed one");
+  });
+
+  await test("searchInspectionCertificates: the token retry happens once only, and never after a session expiry", async () => {
+    const invalidToken = "<html><body><h2>Invalid Token</h2></body></html>";
+    const always = fakeIc({ listPage, onSearch: (b, t, respond) => respond(invalidToken) });
+    await rejects(searchInspectionCertificates("27253922100240", { fetch: always.fetchImpl, parseHtml }), IC_ERROR.RESULTS_INVALID);
+    eq(always.calls.length, 4, "one retry, then the failure is reported");
+    const expired = fakeIc({ listPage, onSearch: (b, t, respond) => respond(loginPage) });
+    await rejects(searchInspectionCertificates("27253922100240", { fetch: expired.fetchImpl, parseHtml }), IC_ERROR.SESSION_EXPIRED);
+    eq(expired.calls.length, 2, "an expired session is not retried");
+  });
+
   await test("IC file names: IC_<PO>_<POSR>_<CALLID>.pdf grouped under Downloads/DocLink/IREPS/IC/<PO>/", () => {
     eq(buildIcFilename("27253922100240", "001", "6038184070"), "IC_27253922100240_001_6038184070.pdf");
     eq(buildIcFilename("27253922100240", null, "6038184070"), "IC_27253922100240_6038184070.pdf", "no PO Sr. -> shorter name");

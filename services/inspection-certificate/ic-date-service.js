@@ -28,9 +28,8 @@ import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/d
 import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { withRetry } from "../batch-utils.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
-import { loadIcListPage, submitIcSearch, buildIcDateSearchRequest, buildIcPageRequest, extractIcPageCount, IC_ERROR } from "./ic-api.js";
-import { extractIcForm } from "./ic-form.js";
-import { validateIcSession } from "./ic-service.js";
+import { buildIcDateSearchRequest, IC_ERROR } from "./ic-api.js";
+import { runIcSearch } from "./ic-search.js";
 import { parseIcSearchResults, icNumberFromUrl } from "./ic-parser.js";
 import { ECM_KIND } from "../ecm-service.js";
 
@@ -78,68 +77,54 @@ export async function searchIcsByDate(options, deps = {}) {
   const sel = validateIcDateSelection(options.dateFrom, options.dateTo);
   const parseHtml = deps.parseHtml || ((html, opts) => parseIcSearchResults(html, null, opts));
   const retry = (task) => withRetry(task, { attempts: 3, sleep: deps.sleep, delayMs: deps.retryDelayMs });
-  const requestDeps = { fetch: deps.fetch };
   const stats = { pages: 0, scanned: 0, outOfRange: 0, notIssued: 0, duplicates: 0, stoppedEarly: false, pageLimit: false };
-
-  const listPage = await retry(() => loadIcListPage(requestDeps));
-  const listVerdict = validateIcSession(listPage.html, listPage);
-  if (!listVerdict.authenticated) throw new IrepsError(listVerdict.code, listVerdict.reason || "IREPS session is not active", { status: listVerdict.status });
-  const form = extractIcForm(listPage.html);
-  if (!form.token) throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "Struts token not found on the Inspection Call List page");
-
-  let request = buildIcDateSearchRequest(form, { dateFromIC: sel.dateFrom, dateToIC: sel.dateTo });
   const seen = new Set();
   const records = [];
-  let pageNo = 1;
   let oldPages = 0;
-  for (;;) {
-    const results = await retry(() => submitIcSearch(request, requestDeps));
-    const verdict = validateIcSession(results.html, results, IC_ERROR.RESULTS_INVALID);
-    if (!verdict.authenticated) throw new IrepsError(verdict.code, verdict.reason || "IREPS response not recognised", { status: verdict.status });
-    let parsed;
-    try {
-      parsed = await parseHtml(results.html, { sourceUrl: results.url || null, poNo: null });
-    } catch (error) {
-      throw new IrepsError(IC_ERROR.PARSE_FAILED, "IC results HTML could not be parsed", { cause: error });
-    }
-    if (!parsed || !Array.isArray(parsed.records)) throw new IrepsError(IC_ERROR.PARSE_FAILED, "Parser returned no result");
-    stats.pages++;
-    stats.scanned += parsed.records.length;
-    let reachedRange = false;
-    for (const r of parsed.records) {
-      const d = parseIrepsDate(r.icDate);
-      if (d && d.getTime() >= sel.from) reachedRange = true;
-      if (!d || d.getTime() < sel.from || d.getTime() > sel.to) {
-        stats.outOfRange++;
-        continue;
+
+  await runIcSearch(
+    {
+      buildRequest: (form) => buildIcDateSearchRequest(form, { dateFromIC: sel.dateFrom, dateToIC: sel.dateTo }),
+      parseHtml,
+      parseOptions: { poNo: null },
+      maxPages: MAX_IC_DATE_PAGES,
+      onPageLimit: () => {
+        stats.pageLimit = true;
+      },
+      onPage: (parsed, { pageNo, pageCount }) => {
+        stats.pages++;
+        stats.scanned += parsed.records.length;
+        let reachedRange = false;
+        for (const r of parsed.records) {
+          const d = parseIrepsDate(r.icDate);
+          if (d && d.getTime() >= sel.from) reachedRange = true;
+          if (!d || d.getTime() < sel.from || d.getTime() > sel.to) {
+            stats.outOfRange++;
+            continue;
+          }
+          if (!IC_ISSUED_STATUS_RE.test(r.callStatus || "")) {
+            stats.notIssued++;
+            continue;
+          }
+          const key = r.icPdfUrl || `${r.poNo}|${r.poSerial}|${r.callId}`;
+          if (seen.has(key)) {
+            stats.duplicates++;
+            continue;
+          }
+          seen.add(key);
+          records.push(r);
+        }
+        if (typeof deps.onPage === "function") deps.onPage({ pageNo, pages: pageCount, found: records.length });
+        oldPages = parsed.records.length && !reachedRange ? oldPages + 1 : 0;
+        if (oldPages >= OLD_PAGES_TO_STOP) {
+          stats.stoppedEarly = true;
+          return false;
+        }
+        return true;
       }
-      if (!IC_ISSUED_STATUS_RE.test(r.callStatus || "")) {
-        stats.notIssued++;
-        continue;
-      }
-      const key = r.icPdfUrl || `${r.poNo}|${r.poSerial}|${r.callId}`;
-      if (seen.has(key)) {
-        stats.duplicates++;
-        continue;
-      }
-      seen.add(key);
-      records.push(r);
-    }
-    if (typeof deps.onPage === "function") deps.onPage({ pageNo, pages: extractIcPageCount(results.html), found: records.length });
-    oldPages = parsed.records.length && !reachedRange ? oldPages + 1 : 0;
-    if (oldPages >= OLD_PAGES_TO_STOP) {
-      stats.stoppedEarly = true;
-      break;
-    }
-    // Re-read the page count each time: the portal only prints ~10 page links at once.
-    if (pageNo >= extractIcPageCount(results.html)) break;
-    if (stats.pages >= MAX_IC_DATE_PAGES) {
-      stats.pageLimit = true;
-      break;
-    }
-    pageNo++;
-    request = buildIcPageRequest(request, extractIcForm(results.html).token, pageNo);
-  }
+    },
+    { fetch: deps.fetch, retry }
+  );
   return { dateFrom: sel.dateFrom, dateTo: sel.dateTo, records, stats };
 }
 

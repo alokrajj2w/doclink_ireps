@@ -21,16 +21,15 @@
  */
 
 import { IrepsError } from "../ireps-api.js";
-import { isIrepsLoginPage } from "../session-service.js";
 import { downloadIrepsDocuments } from "../search-po/document-downloader.js";
 import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
-import { loadIcListPage, submitIcSearch, buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
-import { extractIcForm, hasIcForm } from "./ic-form.js";
+import { buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
+import { runIcSearch, validateIcSession } from "./ic-search.js";
 import { parseIcSearchResults } from "./ic-parser.js";
 import { ECM_KIND } from "../ecm-service.js";
 
-export { IC_ERROR };
+export { IC_ERROR, validateIcSession };
 
 /** Progress stage ids emitted through deps.onProgress. */
 export const IC_FLOW_STAGES = Object.freeze({
@@ -46,21 +45,6 @@ const DOWNLOAD_CODES = Object.freeze({
   INVALID_PDF: IC_ERROR.INVALID_PDF,
   SESSION_EXPIRED: IC_ERROR.SESSION_EXPIRED
 });
-
-/** Validate a vendorInspectionCallList.do response and decide whether the user is authenticated. */
-export function validateIcSession(html, response = {}, notRecognisedCode = IC_ERROR.LIST_PAGE_FAILED) {
-  if (response.status !== undefined && response.ok === false) {
-    return { authenticated: false, reason: `IREPS returned HTTP ${response.status}`, code: notRecognisedCode, status: response.status };
-  }
-  if (!html || html.trim().length === 0) {
-    return { authenticated: false, reason: "IREPS returned an empty response", code: notRecognisedCode };
-  }
-  if (isIrepsLoginPage(html, response)) {
-    return { authenticated: false, reason: "IREPS session expired", code: IC_ERROR.SESSION_EXPIRED };
-  }
-  if (hasIcForm(html)) return { authenticated: true, reason: null, code: "OK" };
-  return { authenticated: false, reason: "IREPS response was not recognised as the Inspection Call List page", code: notRecognisedCode };
-}
 
 /** Trim and validate a PO number; throws IrepsError(IREPS_INVALID_REQUEST) when empty. */
 export function normalisePoNumber(poNumber) {
@@ -92,35 +76,22 @@ export async function searchInspectionCertificates(poNumber, deps = {}) {
   const poNo = normalisePoNumber(poNumber);
   const progress = typeof deps.onProgress === "function" ? deps.onProgress : () => {};
   const parseHtml = deps.parseHtml || ((html, options) => parseIcSearchResults(html, poNo, options));
-  const requestDeps = { fetch: deps.fetch };
 
   progress(IC_FLOW_STAGES.CHECKING_SESSION);
-  const listPage = await loadIcListPage(requestDeps);
-  const listVerdict = validateIcSession(listPage.html, listPage);
-  if (!listVerdict.authenticated) {
-    throw new IrepsError(listVerdict.code, listVerdict.reason || "IREPS session is not active", { status: listVerdict.status });
-  }
-  progress(IC_FLOW_STAGES.CONNECTED);
-
-  const formState = extractIcForm(listPage.html);
-  if (!formState.token) throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "Struts token not found on the Inspection Call List page");
-
-  progress(IC_FLOW_STAGES.SEARCHING);
-  const request = buildIcSearchRequest(formState, poNo);
-  const results = await submitIcSearch(request, requestDeps);
-  const verdict = validateIcSession(results.html, results, IC_ERROR.RESULTS_INVALID);
-  if (!verdict.authenticated) {
-    throw new IrepsError(verdict.code, verdict.reason || "IREPS response not recognised", { status: verdict.status });
-  }
-
-  progress(IC_FLOW_STAGES.PARSING);
-  let parsed;
-  try {
-    parsed = await parseHtml(results.html, { sourceUrl: results.url || null });
-  } catch (error) {
-    throw new IrepsError(IC_ERROR.PARSE_FAILED, "IC results HTML could not be parsed", { cause: error });
-  }
-  if (!parsed || !Array.isArray(parsed.records)) throw new IrepsError(IC_ERROR.PARSE_FAILED, "Parser returned no result");
+  let parsed = null;
+  await runIcSearch(
+    {
+      buildRequest: (form) => buildIcSearchRequest(form, poNo),
+      parseHtml,
+      onStage: progress,
+      // one PO: the first result page, as IREPS lists it
+      onPage: (page) => {
+        parsed = page;
+        return false;
+      }
+    },
+    { fetch: deps.fetch }
+  );
 
   return {
     success: true,
