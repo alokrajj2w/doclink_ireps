@@ -30,7 +30,7 @@
  * mock/real switch (test/mock/switch-target.mjs) applies here as well.
  */
 
-import { IREPS_CONFIG, IREPS_ERROR, IrepsError, requestIreps, validateDateRange } from "../ireps-api.js";
+import { IREPS_CONFIG, IREPS_ERROR, IrepsError, requestIreps, validateDateRange, rewrapTransportError } from "../ireps-api.js";
 import { SEARCH_PO_FORM_FIELDS, ALL_RAILWAYS_VALUE } from "./search-po-form.js";
 
 /** Shared configuration. Keep every PO Search URL / constant here. */
@@ -210,29 +210,9 @@ export function resolveIrepsUrl(href, baseUrl = IREPS_CONFIG.baseUrl) {
   return url.href;
 }
 
-/**
- * Is this absolute URL on the configured IREPS origin?
- * @param {string} url
- */
-export function isIrepsOriginUrl(url, baseUrl = IREPS_CONFIG.baseUrl) {
-  try {
-    return new URL(url).origin === new URL(baseUrl).origin;
-  } catch {
-    return false;
-  }
-}
-
 /* -------------------------------------------------------------------------- */
 /* Errors                                                                     */
 /* -------------------------------------------------------------------------- */
-
-/** Re-label a transport failure (IREPS_REQUEST_FAILED) with a step code. */
-function rewrapTransportError(error, code, message) {
-  if (error instanceof IrepsError && error.code === IREPS_ERROR.REQUEST_FAILED) {
-    return new IrepsError(code, message, { status: error.status, reason: error.reason, detail: error.detail, cause: error });
-  }
-  return error;
-}
 
 /* -------------------------------------------------------------------------- */
 /* Step 1 - load the PO Search page (form + fresh token)                      */

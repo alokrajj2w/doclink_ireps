@@ -154,7 +154,6 @@ function cellValue(text) {
 }
 
 /** Kept for callers/tests that used the CRN-named helpers. */
-export const normaliseCrnLabel = normaliseHeaderLabel;
 export const extractCrnPagination = extractSearchPoPagination;
 export const extractCrnPageMessage = extractSearchPoPageMessage;
 

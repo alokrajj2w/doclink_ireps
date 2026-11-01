@@ -26,9 +26,9 @@ import {
   describeSearchPoFilter,
   inferSearchPoMode,
   loadSearchPoPage,
-  resolveIrepsUrl,
-  isIrepsOriginUrl
+  resolveIrepsUrl
 } from "../services/search-po/search-po-api.js";
+import { isIrepsOriginUrl } from "../services/ireps-api.js";
 import { parseCrnSearchResults, extractCrnPagination, extractCrnPageMessage, matchCrnHeader, CRN_FIELDS, CRN_LINK_FIELDS } from "../services/crn/crn-parser.js";
 import { searchCrn, validateCrnSession, CRN_ERROR } from "../services/crn/crn-service.js";
 

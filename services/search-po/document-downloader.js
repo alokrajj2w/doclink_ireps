@@ -25,7 +25,7 @@ import { isIrepsLoginPage } from "../session-service.js";
 import { downloadBytes } from "../download-service.js";
 import { logger } from "../../utils/logger.js";
 import { withRetry } from "../batch-utils.js";
-import { isIrepsOriginUrl } from "./search-po-api.js";
+import { isIrepsOriginUrl } from "../ireps-api.js";
 
 export const DOCUMENT_DOWNLOAD_CONCURRENCY = 3;
 

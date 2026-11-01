@@ -22,7 +22,7 @@
 
 import { IrepsError } from "../ireps-api.js";
 import { isIrepsLoginPage } from "../session-service.js";
-import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
+import { downloadIrepsDocuments } from "../search-po/document-downloader.js";
 import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
 import { loadIcListPage, submitIcSearch, buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
@@ -31,7 +31,6 @@ import { parseIcSearchResults } from "./ic-parser.js";
 import { ECM_KIND } from "../ecm-service.js";
 
 export { IC_ERROR };
-export const IC_DOWNLOAD_STATUS = DOCUMENT_DOWNLOAD_STATUS;
 
 /** Progress stage ids emitted through deps.onProgress. */
 export const IC_FLOW_STAGES = Object.freeze({

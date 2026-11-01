@@ -173,6 +173,23 @@ export class IrepsError extends Error {
   }
 }
 
+/** Is this absolute URL on the configured IREPS origin? */
+export function isIrepsOriginUrl(url, baseUrl = IREPS_CONFIG.baseUrl) {
+  try {
+    return new URL(url).origin === new URL(baseUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
+/** Re-label a transport failure (IREPS_REQUEST_FAILED) with a step code. */
+export function rewrapTransportError(error, code, message) {
+  if (error instanceof IrepsError && error.code === IREPS_ERROR.REQUEST_FAILED) {
+    return new IrepsError(code, message, { status: error.status, reason: error.reason, detail: error.detail, cause: error });
+  }
+  return error;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Low level request                                                          */
 /* -------------------------------------------------------------------------- */

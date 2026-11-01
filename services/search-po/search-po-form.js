@@ -30,7 +30,7 @@
  */
 
 import { normaliseText } from "../../utils/sanitizer.js";
-import { STRUTS_TOKEN_FIELD, parseTagAttributes, decodeEntities } from "../ireps-form.js";
+import { STRUTS_TOKEN_FIELD, parseTagAttributes, decodeEntities, stripComments, findAllTags, locateFormIn } from "../ireps-form.js";
 
 export const SEARCH_PO_FORM_NAME = "searchPOForm";
 export const SEARCH_PO_FORM_ACTION = "/epsn/searchPO.do";
@@ -83,26 +83,6 @@ function emptyForm() {
 /* Regex path (service worker, no DOM)                                        */
 /* -------------------------------------------------------------------------- */
 
-function stripComments(html) {
-  return String(html || "").replace(/<!--[\s\S]*?-->/g, "");
-}
-
-function findAllTags(html, tagName) {
-  const re = new RegExp(`<${tagName}\\b[^>]*>`, "gi");
-  const out = [];
-  let m;
-  while ((m = re.exec(html))) out.push({ index: m.index, tag: m[0], attrs: parseTagAttributes(m[0]) });
-  return out;
-}
-
-function locateForm(html) {
-  const forms = findAllTags(html, "form");
-  const form = forms.find((f) => f.attrs.name === SEARCH_PO_FORM_NAME || (f.attrs.action || "").includes(SEARCH_PO_FORM_ACTION));
-  if (!form) return null;
-  const close = html.indexOf("</form", form.index);
-  return { action: form.attrs.action || null, inner: html.slice(form.index, close === -1 ? html.length : close) };
-}
-
 function optionsOfSelect(scopeHtml, name) {
   const selectRe = /<select\b[^>]*>([\s\S]*?)<\/select>/gi;
   let sm;
@@ -124,7 +104,7 @@ function optionsOfSelect(scopeHtml, name) {
 
 function extractWithRegex(html) {
   const clean = stripComments(html);
-  const form = locateForm(clean);
+  const form = locateFormIn(clean, SEARCH_PO_FORM_NAME, SEARCH_PO_FORM_ACTION);
   const scope = form ? form.inner : clean;
   const result = emptyForm();
   result.present = !!form;

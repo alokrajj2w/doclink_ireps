@@ -1090,8 +1090,8 @@ async function resetMaState() {
   maState = emptyMaState();
   try {
     await chrome.storage.session.remove(SESSION_KEYS.MA_STATE);
-  } catch {
-    /* ignore */
+  } catch (error) {
+    logger.debug("Could not clear the MA state", error);
   }
   return { ok: true };
 }
@@ -1292,7 +1292,7 @@ function pushBatchState(kind, { immediately = false } = {}) {
     batchTimers[kind] = null;
     const snapshot = publicBatchState(kind);
     broadcast(MESSAGE_TYPES.BATCH_UPDATE, { kind, state: snapshot });
-    chrome.storage.session.set({ [`${SESSION_KEYS.BATCH_STATE}.${kind}`]: snapshot }).catch(() => {});
+    chrome.storage.session.set({ [`${SESSION_KEYS.BATCH_STATE}.${kind}`]: snapshot }).catch((error) => logger.debug("Could not persist batch state", error));
   };
   if (immediately) {
     if (batchTimers[kind]) clearTimeout(batchTimers[kind]);
@@ -1330,7 +1330,7 @@ function batchErrorState(kind, previous, error) {
   const described = error instanceof IrepsError ? describeError(error.code, { status: error.status, detail: error.detail }) : describeError("UNKNOWN", { detail: errorDetail(error) });
   if (!(error instanceof IrepsError)) logger.error(`${kind} batch failed`, error);
   else logger.warn(`${kind} batch stopped: ${described.title}`, { code: error.code, status: error.status ?? null });
-  if (described.code === "IREPS_SESSION_EXPIRED") lastSessionCheck = null;
+  if (described.code === IREPS_ERROR.SESSION_EXPIRED) lastSessionCheck = null;
   return { ...(previous || { kind }), kind, phase: "error", error: described, finishedAt: new Date().toISOString() };
 }
 
@@ -1361,7 +1361,7 @@ async function runBatch(kind, work) {
     batch[kind] = finalState;
     if (kind === "ic-notif") await saveIcManifest(finalState);
     if (finalState.sessionExpired) lastSessionCheck = null;
-    await chrome.storage.local.set({ [`doclink.last.${kind}`]: { at: new Date().toISOString(), counts: finalState.counts } }).catch(() => {});
+    await chrome.storage.local.set({ [`doclink.last.${kind}`]: { at: new Date().toISOString(), counts: finalState.counts } }).catch((error) => logger.debug("Could not record the batch summary", error));
   } catch (error) {
     batch[kind] = batchErrorState(kind, batch[kind], error);
   } finally {
