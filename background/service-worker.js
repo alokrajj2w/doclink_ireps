@@ -71,7 +71,7 @@ import { IC_DOWNLOAD_SUBFOLDER } from "../utils/filename.js";
 import { buildDocumentExportDownloadPath, buildDocumentExportFilename, buildBillStatusExportDownloadPath, buildBillStatusExportFilename } from "../utils/filename.js";
 import { MESSAGE_TYPES, TARGETS, STAGES, DOCUMENT_STAGES, MA_STAGES, PO_STAGES, IC_STAGES, documentStageLabel, describeError, STORAGE_KEYS, SESSION_KEYS } from "../utils/messages.js";
 import { logger, installLogCollector, installConsoleHelpers } from "../utils/logger.js";
-import { classifyTabUrl } from "../utils/url-scope.js";
+import { classifyTabUrl, compileMatchPatterns } from "../utils/url-scope.js";
 
 // One stored DocLink log for all contexts (see utils/logger.js). Registered
 // first so entries sent by the panel / parser are never missed.
@@ -1491,6 +1491,36 @@ const handlers = {
   }
 };
 
+/** Jobs that send requests to IREPS: refused up front when the IREPS origin is not in host_permissions. */
+const IREPS_JOB_TYPES = new Set([
+  MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS,
+  MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS,
+  MESSAGE_TYPES.MA_SEARCH,
+  MESSAGE_TYPES.MA_DOWNLOAD,
+  MESSAGE_TYPES.PO_DOWNLOAD,
+  MESSAGE_TYPES.IC_DOWNLOAD,
+  MESSAGE_TYPES.BATCH_START,
+  MESSAGE_TYPES.BATCH_RETRY
+]);
+
+/** The configured IREPS origin when host_permissions do not cover it (so nothing may be sent), else null. */
+function irepsOriginNotPermitted() {
+  if (compileMatchPatterns(chrome.runtime.getManifest().host_permissions || [])(IREPS_CONFIG.baseUrl)) return null;
+  try {
+    return new URL(IREPS_CONFIG.baseUrl).origin;
+  } catch {
+    return String(IREPS_CONFIG.baseUrl || "(no IREPS URL)");
+  }
+}
+
+function guardIrepsJob(message) {
+  if (!IREPS_JOB_TYPES.has(message.type)) return null;
+  const origin = irepsOriginNotPermitted();
+  if (!origin) return null;
+  logger.warn(`Refused ${message.type}: ${origin} is not in host_permissions`);
+  return { ok: false, started: false, error: describeError("IREPS_NOT_CONFIGURED", { detail: origin }) };
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return false;
   if (message.target && message.target !== TARGETS.SERVICE_WORKER) return false;
@@ -1501,7 +1531,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // lifetime, before the first request it can affect; the listener itself
   // stays registered synchronously above so no wake-up event is missed.
   loadIrepsConfig()
-    .then(() => handler(message))
+    .then(() => guardIrepsJob(message) || handler(message))
     .then((response) => sendResponse(response ?? { ok: true }))
     .catch((error) => {
       logger.error(`Handler ${message.type} failed`, error);

@@ -157,6 +157,11 @@ export function documentStageLabel(stage, typeLabel) {
  * "IREPS returned HTTP 500"). `connection` drives the header indicator.
  */
 export const ERROR_CATALOG = Object.freeze({
+  IREPS_NOT_CONFIGURED: {
+    title: "IREPS not configured",
+    message: "DocLink is not allowed to contact {detail}. Add it to host_permissions in manifest.json (or fix the target in config.json), then reload DocLink. Nothing was sent.",
+    connection: "connected"
+  },
   IREPS_SESSION_EXPIRED: {
     title: "IREPS login required",
     message: "IREPS session expired. Please log in to IREPS and try again.",
