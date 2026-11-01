@@ -30,7 +30,7 @@ cd "/Users/I36260027/Desktop/DocLink Download/doclink-extension"
 Expected output:
 
 ```
-DOCLINK_TESTS 100/100 passed
+DOCLINK_TESTS <n>/<n> passed
 ```
 
 These tests cover the real `viewBills.do` flow with a fake IREPS (empty POST →
@@ -674,7 +674,7 @@ Manual check against the mock (`node test/mock/mock-ireps-server.mjs`): under
 Download ICs by IC Date, 27/10/2026 - 28/10/2026 gives 2 ICs of PO
 05220028100004; 01/05/2026 - 31/10/2026 gives 6 ICs of 2 POs.
 
-`DOCLINK_TESTS 168/168 passed` is the expected line after these were added.
+The summary line must show every test passing (`DOCLINK_TESTS <n>/<n> passed`).
 Not covered by any automatic test: the live portal itself (see README,
 "Batch downloads - what is not verified").
 

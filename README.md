@@ -201,13 +201,13 @@ doclink-extension/
 |---|---|
 | `downloads` | Save the Bill Status workbook (.xlsx) into `Downloads/DocLink/IREPS/`, the CRN / R-NOTE exports (.xlsx/.csv) into `Downloads/DocLink/IREPS/CRN/` and `.../RNOTE/`, and the MA copies into `.../MA/<date>/`, and open the folder |
 | `storage` | `chrome.storage.local` for non-sensitive metadata (last download time, filename, record count); `chrome.storage.session` (memory only) for job state and the last parsed result used by the preview |
-| `tabs` | Open IREPS / the preview page in a new tab |
+| `tabs` | Read the active tab's URL so the side panel can tell IREPS (mock or real) from any other site and show the right view (`popup/popup-gate.js`); opening IREPS / the preview page itself needs no permission |
 | `offscreen` | Create an invisible offscreen document so the parser can use `DOMParser`; MV3 service workers have no DOM |
 | `identity` | Only for **Sign in with Okta** to the Recon Engine (section 17): `chrome.identity.launchWebAuthFlow` opens the Okta sign-in window and returns to `https://<extension id>.chromiumapp.org/okta` |
 | `debugger` | Only for **published letters and corrigenda** (LOA, Negotiation, Counter Offer, Correspondence, Corrigendum - in Download Tender Documents and Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both declared permanently) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
-
-| host `http://localhost:8000/*` (the Recon Engine; replace/add the deployed Recon URL) | Only for **Save to: ECM / S3**: the Recon Engine sign-in (section 17) and the uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
+| host `http://localhost:8000/*` and `https://wabtec.reconalpha-staging.joulestowatts.com/*` (the Recon Engine, local and staging; add the deployed Recon URL) | Only for **Save to: ECM / S3**: the Recon Engine sign-in (section 17) and the uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
+| host `http://wctsrvecmtstsn1.wabtec.com:8080/*` (the ECM test server) | Only for **Save to: ECM / S3** with `"ecmBackendAws": false`: DocLink calls the ECM (Nuxeo) directly. Must match `config.json` `ecm.domain` |
 
 Not requested: `cookies`, `<all_urls>`, `history`, `bookmarks`, `webRequest`.
 The extension never reads cookie values.
@@ -427,11 +427,21 @@ Requires Chrome 116 or newer (offscreen documents + `chrome.runtime.getContexts`
 
 `scripts/build.mjs` produces a protected copy of the extension for sharing.
 Each JS entry point (`background/service-worker.js`, `background/offscreen.js`,
-`popup/popup.js`, `pages/preview.js`, `tender/tender-ui.js`) is bundled with
-its imports, minified and obfuscated; HTML, CSS, `assets/`, `manifest.json`
-and `config.json are copied as-is. Tests, `scripts/` and the readable
+`pages/preview.js`) is bundled with its imports, minified and obfuscated. The
+three side-panel scripts (`popup/popup.js`, `tender/tender-ui.js`,
+`tender/pending-ui.js`) load into the same page, so they are bundled together
+with code splitting: the modules they share (download log, print queue,
+diagnostics log) are emitted once under `chunks/`, exactly as when DocLink is
+loaded unpacked. HTML, CSS, `assets/`, `manifest.json` and `config.json` are
+copied as-is. Tests, `scripts/`, `config.local.json` and the readable
 `services/` / `utils/` sources are not included. The source tree is never
 modified.
+
+The build checks `config.json` first: it stops unless `"target"` is `"real"`
+(`npm run build -- --allow-mock` builds against the mock portal on purpose),
+and warns when ECM documents would go straight to the ECM
+(`"ecmBackendAws": false`) with placeholder client credentials, since
+`config.local.json` is never packaged.
 
 Requirements: Node.js 18+, and the `zip` command (preinstalled on macOS).
 
@@ -451,12 +461,12 @@ npm run build
 Output:
 
 ```
-dist/doclink/                  unpacked build (load this in Chrome to check it)
-dist/doclink-<version>.zip     the file to share, named from manifest.json "version"
+dist/doclink/                                unpacked build (load this in Chrome to check it)
+dist/doclink-<version>-<YYYYMMDD-HHMMSS>.zip  the file to share ("version" from manifest.json)
 ```
 
-`npm run build` deletes and recreates `dist/` every run; `dist/` is
-git-ignored and should not be edited by hand.
+`npm run build` deletes and recreates `dist/doclink/` every run; earlier zips
+in `dist/` are kept. `dist/` is git-ignored and should not be edited by hand.
 
 The recipient unzips the file, opens `chrome://extensions`, enables
 **Developer mode**, clicks **Load unpacked** and selects the unzipped
@@ -474,7 +484,7 @@ click the reload icon on the DocLink card.
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --headless=new --allow-file-access-from-files --virtual-time-budget=20000 \
   --dump-dom "file://$PWD/test/run-tests.html" | grep -o 'DOCLINK_TESTS[^<]*'
-# → DOCLINK_TESTS 43/43 passed
+# → DOCLINK_TESTS <n>/<n> passed (every test passing; the count grows with the suites)
 
 # Sample PDF for visual inspection
 node test/make-sample-pdf.mjs /tmp/sample.pdf
@@ -482,6 +492,8 @@ node test/make-sample-pdf.mjs /tmp/sample.pdf
 # Tender documents (node:test + a fake IREPS; needs jsdom, which is not a
 # dependency of the extension - point JSDOM_ROOT at any folder with it installed)
 JSDOM_ROOT=/path/to/dir-with-node_modules node --test tender/tests/run-tests.mjs
+# Correspondence (pending letters), same setup
+JSDOM_ROOT=/path/to/dir-with-node_modules node --test tender/tests/pending-tests.mjs
 ```
 
 You can also open `test/run-tests.html` in Chrome started with

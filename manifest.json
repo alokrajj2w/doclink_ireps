@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "DocLink",
   "version": "1.3.7",
-  "description": "Download IREPS Bill Status, CRN and R-NOTE reports to this computer or to the Recon Engine (S3); upload business documents.",
+  "description": "Download IREPS Bill Status, CRN, R-NOTE, MA, PO, Inspection Certificate and tender documents to this computer, the Recon Engine (S3) or the ECM.",
   "minimum_chrome_version": "116",
   "icons": {
     "16": "assets/icon16.png",
