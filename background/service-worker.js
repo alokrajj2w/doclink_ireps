@@ -48,7 +48,7 @@ import { checkIrepsSession } from "../services/session-service.js";
 import { extractBillStatusForm, publicFormInfo } from "../services/ireps-form.js";
 import { fetchBillStatus } from "../services/bill-status-service.js";
 import { buildBillStatusExport } from "../services/bill-status-export.js";
-import { uploadToRecon, loadReconConfig, ReconError, RECON_CONFIG, RECON_DOC_TYPE, SAVE_DESTINATION } from "../services/recon-service.js";
+import { loadReconConfig, RECON_CONFIG, RECON_DOC_TYPE, SAVE_DESTINATION } from "../services/recon-service.js";
 import { uploadDocument } from "../services/upload-service.js";
 import { searchIrepsDocuments, validateSearchPoSession, SEARCH_PO_FLOW_STAGES } from "../services/search-po/search-po-service.js";
 import { loadSearchPoPage, SEARCH_PO_ERROR, SEARCH_PO_CRITERIA, SEARCH_PO_DOCUMENT_TYPES } from "../services/search-po/search-po-api.js";
@@ -58,11 +58,12 @@ import { buildCrnExport } from "../services/crn/crn-export.js";
 import { buildRnoteExport } from "../services/rnote/rnote-export.js";
 import { searchMa, downloadMaPdfs, MA_ERROR, MA_FLOW_STAGES } from "../services/ma/ma-service.js";
 import { downloadBytes } from "../services/download-service.js";
+import { WorkflowError, saveExportFile, sanitiseDestination, savedSummary, lastDownloadEntry } from "../services/export-save-service.js";
 import { saveToEcmOrLocally, canReplaceInEcm } from "../services/ecm-service.js";
-import { loadDownloadLogConfig, preflightDownloads, logDownload, flushDownloadLog, downloadRecord, downloadKey, exportFingerprint, runDestination, LOG_DESTINATION } from "../services/download-log.js";
+import { loadDownloadLogConfig, preflightDownloads, logDownload, flushDownloadLog, downloadRecord, runDestination } from "../services/download-log.js";
 import { HOME_PATH } from "../utils/ireps-account.js";
-import { downloadPo, PO_ERROR, PO_FLOW_STAGES } from "../services/po/po-service.js";
-import { downloadInspectionCertificates, IC_ERROR, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
+import { downloadPo, PO_FLOW_STAGES } from "../services/po/po-service.js";
+import { downloadInspectionCertificates, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
 import { runPoDateDownload, retryPoDateFailures } from "../services/po/po-date-service.js";
 import { runIcNotificationDownload, retryIcNotificationFailures, publicIcState } from "../services/inspection-certificate/ic-notification-service.js";
 import { runIcDateDownload, retryIcDateFailures } from "../services/inspection-certificate/ic-date-service.js";
@@ -97,13 +98,23 @@ let jobRunning = false;
  */
 let lastSessionCheck = null;
 
+/**
+ * Keep a job's state in chrome.storage.session (memory only) so a reopened panel can
+ * restore it. Never fails the job; returns whether it was stored.
+ */
+async function persistSession(key, value, what) {
+  try {
+    await chrome.storage.session.set({ [key]: value });
+    return true;
+  } catch (error) {
+    logger.debug(`Could not persist ${what}`, error);
+    return false;
+  }
+}
+
 async function setJobState(patch) {
   jobState = { ...jobState, ...patch, updatedAt: Date.now() };
-  try {
-    await chrome.storage.session.set({ [SESSION_KEYS.JOB_STATE]: jobState });
-  } catch (error) {
-    logger.debug("Could not persist job state", error);
-  }
+  await persistSession(SESSION_KEYS.JOB_STATE, jobState, "job state");
 }
 
 function broadcast(type, payload = {}) {
@@ -392,78 +403,12 @@ function takeCachedPage() {
 /* Download workflow                                                          */
 /* -------------------------------------------------------------------------- */
 
-class WorkflowError extends Error {
-  constructor(code, details = {}) {
-    super(code);
-    this.name = "WorkflowError";
-    this.code = code;
-    this.details = details;
-  }
-}
-
 const STAGE_FOR_PROGRESS = {
   CHECKING_SESSION: STAGES.CHECKING_SESSION,
   CONNECTED: STAGES.CONNECTED,
   FETCHING: STAGES.FETCHING,
   PROCESSING: STAGES.PROCESSING
 };
-
-/**
- * Save an export file where the user chose: the Downloads folder, or the
- * Recon Engine (S3). Failures surface as WorkflowError with the code the
- * caller passes for a local failure, or the Recon error's own code.
- *
- * @param {import("../services/search-po/search-po-export.js").ExportFile} file
- * @param {{ destination: string, docType: string, localPath: string, filename: string, localErrorCode: string }} target
- * @returns {Promise<{ destination: string, downloadId: number|null, filename: string, storedPath: string|null, deduplicated: boolean, ingestStats: object|null }>}
- */
-async function saveExportFile(file, target) {
-  // The download log: an export is "the same" when it has the same rows in the same format
-  // (its file name and bytes carry the run's time). Asked before saving; logged after.
-  const log = (await loadDownloadLogConfig()) ? { docType: target.docType, key: downloadKey.export(target.docType, await exportFingerprint(file.format || file.extension, target.records)) } : null;
-  const destination = target.destination === SAVE_DESTINATION.RECON ? LOG_DESTINATION.S3 : LOG_DESTINATION.LOCAL;
-  let warnings = [];
-  if (log) {
-    const n = (target.records || []).length;
-    const checked = await preflightDownloads([{ id: "export", label: `${target.label} export: the same ${n} record${n === 1 ? "" : "s"}`, log }], { destination, ask: askPanel(target.panelTabId) });
-    warnings = checked.warnings;
-    const skip = checked.skip.get("export");
-    if (skip) {
-      logger.info(`${target.label}: identical export already downloaded; not saved again`, { date: skip.date, time: skip.time, count: skip.count });
-      return { destination: target.destination, downloadId: null, filename: null, storedPath: null, deduplicated: false, ingestStats: null, skipped: true, skip, warnings };
-    }
-  }
-  const saved = await saveExportFileTo(file, target);
-  if (log) {
-    await logDownload(downloadRecord(log, { filename: saved.filename, destination }));
-    flushDownloadLog();
-  }
-  return { ...saved, warnings };
-}
-
-async function saveExportFileTo(file, target) {
-  if (target.destination === SAVE_DESTINATION.RECON) {
-    try {
-      const stored = await uploadToRecon({ docType: target.docType, bytes: file.bytes, filename: target.filename, mimeType: file.mimeType });
-      return { destination: SAVE_DESTINATION.RECON, downloadId: null, filename: target.filename, storedPath: stored.storedPath, deduplicated: stored.deduplicated, ingestStats: stored.stats };
-    } catch (error) {
-      if (error instanceof ReconError) throw new WorkflowError(error.code, { status: error.status, detail: error.detail });
-      throw error;
-    }
-  }
-  try {
-    const download = await downloadBytes(file.bytes, { path: target.localPath, mimeType: file.mimeType });
-    return { destination: SAVE_DESTINATION.LOCAL, downloadId: download.downloadId, filename: download.filename, storedPath: null, deduplicated: false, ingestStats: null };
-  } catch (error) {
-    logger.error("Download failed", error);
-    throw new WorkflowError(target.localErrorCode);
-  }
-}
-
-/** A user-chosen destination, defaulting to the Downloads folder. */
-function sanitiseDestination(value) {
-  return value === SAVE_DESTINATION.RECON ? SAVE_DESTINATION.RECON : SAVE_DESTINATION.LOCAL;
-}
 
 /**
  * @param {{ mode?: string, zone?: string, dateFrom?: string, dateTo?: string, destination?: string }} options
@@ -524,19 +469,11 @@ async function runDownloadWorkflow(options, panelTabId) {
     localErrorCode: "DOWNLOAD_ERROR",
     records: result.records,
     label: "Bill Status",
-    panelTabId
+    ask: askPanel(panelTabId)
   });
 
   const summary = {
-    destination: saved.destination,
-    downloadId: saved.downloadId,
-    filename: saved.filename,
-    storedPath: saved.storedPath,
-    deduplicated: saved.deduplicated,
-    ingestStats: saved.ingestStats,
-    skipped: saved.skipped === true,
-    skip: saved.skip || null,
-    warnings: saved.warnings || [],
+    ...savedSummary(saved),
     recordCount: result.recordCount,
     skippedCount: result.skippedCount || 0,
     warningCount: (result.warnings || []).length,
@@ -545,15 +482,7 @@ async function runDownloadWorkflow(options, panelTabId) {
     fetchedAt: fetched.fetchedAt,
     downloadedAt: new Date().toISOString()
   };
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.LAST_DOWNLOAD]: {
-      lastDownloadAt: summary.downloadedAt,
-      lastDownloadFilename: summary.storedPath || summary.filename,
-      lastRecordCount: summary.recordCount,
-      lastFilter: summary.filter,
-      lastStatus: saved.skipped ? "Not saved again: identical export already downloaded" : toRecon ? "Saved to Recon Engine (S3)" : "Downloaded successfully"
-    }
-  });
+  await chrome.storage.local.set({ [STORAGE_KEYS.LAST_DOWNLOAD]: lastDownloadEntry(summary) });
   return summary;
 }
 
@@ -651,11 +580,7 @@ function typeLabel(criteria) {
 
 async function setDocumentJob(criteria, patch) {
   documentJobs[criteria] = { ...documentJob(criteria), ...patch, criteria, updatedAt: Date.now() };
-  try {
-    await chrome.storage.session.set({ [SESSION_KEYS.DOCUMENT_JOBS]: documentJobs });
-  } catch (error) {
-    logger.debug("Could not persist document job state", error);
-  }
+  await persistSession(SESSION_KEYS.DOCUMENT_JOBS, documentJobs, "document job state");
 }
 
 async function documentProgress(criteria, stage, message, detail) {
@@ -770,21 +695,13 @@ async function runDocumentDownloadWorkflow(criteria, options, panelTabId) {
     localErrorCode: "DOCUMENT_DOWNLOAD_ERROR",
     records: result.records,
     label,
-    panelTabId
+    ask: askPanel(panelTabId)
   });
 
   const summary = {
     criteria,
     typeLabel: label,
-    destination: saved.destination,
-    downloadId: saved.downloadId,
-    filename: saved.filename,
-    storedPath: saved.storedPath,
-    deduplicated: saved.deduplicated,
-    ingestStats: saved.ingestStats,
-    skipped: saved.skipped === true,
-    skip: saved.skip || null,
-    warnings: saved.warnings || [],
+    ...savedSummary(saved),
     format: file.format,
     recordCount: result.recordCount,
     columnCount: file.columnCount,
@@ -797,17 +714,7 @@ async function runDocumentDownloadWorkflow(criteria, options, panelTabId) {
     downloadedAt: new Date().toISOString()
   };
   const key = LAST_DOWNLOAD_KEYS[criteria];
-  if (key) {
-    await chrome.storage.local.set({
-      [key]: {
-        lastDownloadAt: summary.downloadedAt,
-        lastDownloadFilename: summary.storedPath || summary.filename,
-        lastRecordCount: summary.recordCount,
-        lastFilter: summary.filter,
-        lastStatus: saved.skipped ? "Not saved again: identical export already downloaded" : toRecon ? "Saved to Recon Engine (S3)" : "Downloaded successfully"
-      }
-    });
-  }
+  if (key) await chrome.storage.local.set({ [key]: lastDownloadEntry(summary) });
   return summary;
 }
 
@@ -884,15 +791,9 @@ function emptyMaState() {
 
 async function setMaState(patch) {
   maState = { ...maState, ...patch, updatedAt: Date.now() };
-  try {
-    await chrome.storage.session.set({ [SESSION_KEYS.MA_STATE]: maState });
-  } catch (error) {
-    logger.debug("Could not persist MA state with records; storing without them", error);
-    try {
-      await chrome.storage.session.set({ [SESSION_KEYS.MA_STATE]: { ...maState, records: [], recordsDropped: true } });
-    } catch (inner) {
-      logger.debug("Could not persist MA state", inner);
-    }
+  // a long MA list can exceed the session quota: then keep the state without its records
+  if (!(await persistSession(SESSION_KEYS.MA_STATE, maState, "MA state with records; storing without them"))) {
+    await persistSession(SESSION_KEYS.MA_STATE, { ...maState, records: [], recordsDropped: true }, "MA state");
   }
 }
 
@@ -951,10 +852,20 @@ function errorDetail(error) {
   return text.replace(/\s+/g, " ").trim().slice(0, 160) || "unexpected error";
 }
 
-function maErrorFrom(error) {
-  if (error instanceof IrepsError) return describeError(error.code, { status: error.status, detail: error.detail });
-  logger.error("MA workflow failed", error);
-  return describeError("UNKNOWN", { detail: errorDetail(error) });
+/**
+ * A job failure as the panel shows it: an IREPS error by its code, anything else as
+ * UNKNOWN (and logged as an error). An expired session also drops the cached session check.
+ */
+function describeJobError(error, what) {
+  let described;
+  if (error instanceof IrepsError) {
+    described = describeError(error.code, { status: error.status, detail: error.detail });
+  } else {
+    logger.error(`${what} failed`, error);
+    described = describeError("UNKNOWN", { detail: errorDetail(error) });
+  }
+  if (described.code === IREPS_ERROR.SESSION_EXPIRED) lastSessionCheck = null;
+  return described;
 }
 
 async function startMaSearch(rawOptions) {
@@ -1001,11 +912,8 @@ async function startMaSearch(rawOptions) {
       broadcast(MESSAGE_TYPES.MA_SEARCH_COMPLETE, publicMaState());
       logger.info("MA search complete", { matched: result.recordCount, total: result.allRecordCount, pages: result.pagination.pagesFetched, filter: result.filter });
     } catch (error) {
-      const described = maErrorFrom(error);
-      if (described.code === MA_ERROR.SESSION_EXPIRED) {
-        lastSessionCheck = null;
-        lastSearchPoFormCheck = null;
-      }
+      const described = describeJobError(error, "MA search");
+      if (described.code === MA_ERROR.SESSION_EXPIRED) lastSearchPoFormCheck = null;
       logger.warn(`MA search stopped: ${described.title}`, { code: described.code, message: described.message, status: (error && error.status) ?? null });
       await setMaState({ status: "error", stage: MA_STAGES.ERROR.id, message: described.title, error: described, records: [], recordCount: 0, downloads: null });
       broadcast(MESSAGE_TYPES.MA_ERROR, { ...described, phase: "search" });
@@ -1068,7 +976,7 @@ async function startMaDownload(selection, destination, panelTabId) {
       logger.info("MA download finished", { completed: summary.completed, failed: summary.failed, skipped: summary.skipped, sessionExpired: summary.sessionExpired });
       flushDownloadLog();
     } catch (error) {
-      const described = maErrorFrom(error);
+      const described = describeJobError(error, "MA download");
       logger.warn(`MA download stopped: ${described.title}`, { code: described.code, message: described.message, status: (error && error.status) ?? null });
       await setMaState({ status: "ready", stage: MA_STAGES.READY.id, message: described.title, error: described });
       broadcast(MESSAGE_TYPES.MA_ERROR, { ...described, phase: "download" });
@@ -1113,20 +1021,12 @@ let icRunning = false;
 
 async function setPoState(patch) {
   poState = { ...poState, ...patch, updatedAt: Date.now() };
-  try {
-    await chrome.storage.session.set({ [SESSION_KEYS.PO_STATE]: poState });
-  } catch (error) {
-    logger.debug("Could not persist PO state", error);
-  }
+  await persistSession(SESSION_KEYS.PO_STATE, poState, "PO state");
 }
 
 async function setIcState(patch) {
   icState = { ...icState, ...patch, updatedAt: Date.now() };
-  try {
-    await chrome.storage.session.set({ [SESSION_KEYS.IC_STATE]: icState });
-  } catch (error) {
-    logger.debug("Could not persist IC state", error);
-  }
+  await persistSession(SESSION_KEYS.IC_STATE, icState, "IC state");
 }
 
 const PO_STAGE_FOR_PROGRESS = {
@@ -1180,10 +1080,8 @@ async function startPoDownload(rawPoNo, destination, panelTabId) {
       logger.info(result.skipped ? "PO download skipped: already downloaded" : "PO download complete", { poNo, filename: result.filename, skip: result.skip ? result.skip.reason : null });
       flushDownloadLog();
     } catch (error) {
-      const described = error instanceof IrepsError ? describeError(error.code, { status: error.status, detail: error.detail }) : describeError("UNKNOWN", { detail: errorDetail(error) });
-      if (!(error instanceof IrepsError)) logger.error("PO download failed", error);
-      else logger.warn(`PO download stopped: ${described.title}`, { poNo, code: error.code, message: described.message, status: error.status ?? null });
-      if (described.code === PO_ERROR.SESSION_EXPIRED) lastSessionCheck = null;
+      const described = describeJobError(error, "PO download");
+      if (error instanceof IrepsError) logger.warn(`PO download stopped: ${described.title}`, { poNo, code: error.code, message: described.message, status: error.status ?? null });
       await setPoState({ status: "error", stage: PO_STAGES.ERROR.id, message: described.title, error: described, result: undefined });
       broadcast(MESSAGE_TYPES.PO_DOWNLOAD_ERROR, { poNumber: poNo, ...described });
     } finally {
@@ -1249,10 +1147,8 @@ async function startIcDownload(rawPoNo, destination, panelTabId) {
       logger.info("IC download finished", { poNo, count: result.count, completed: result.downloads.completed, failed: result.downloads.failed, skipped: result.downloads.skipped });
       flushDownloadLog();
     } catch (error) {
-      const described = error instanceof IrepsError ? describeError(error.code, { status: error.status, detail: error.detail }) : describeError("UNKNOWN", { detail: errorDetail(error) });
-      if (!(error instanceof IrepsError)) logger.error("IC download failed", error);
-      else logger.warn(`IC download stopped: ${described.title}`, { poNo, code: error.code, message: described.message, status: error.status ?? null });
-      if (described.code === IC_ERROR.SESSION_EXPIRED) lastSessionCheck = null;
+      const described = describeJobError(error, "IC download");
+      if (error instanceof IrepsError) logger.warn(`IC download stopped: ${described.title}`, { poNo, code: error.code, message: described.message, status: error.status ?? null });
       await setIcState({ status: "error", stage: IC_STAGES.ERROR.id, message: described.title, error: described });
       broadcast(MESSAGE_TYPES.IC_DOWNLOAD_ERROR, { poNumber: poNo, ...described });
     } finally {
@@ -1327,10 +1223,8 @@ function ensureIcIndexes(state) {
 }
 
 function batchErrorState(kind, previous, error) {
-  const described = error instanceof IrepsError ? describeError(error.code, { status: error.status, detail: error.detail }) : describeError("UNKNOWN", { detail: errorDetail(error) });
-  if (!(error instanceof IrepsError)) logger.error(`${kind} batch failed`, error);
-  else logger.warn(`${kind} batch stopped: ${described.title}`, { code: error.code, status: error.status ?? null });
-  if (described.code === IREPS_ERROR.SESSION_EXPIRED) lastSessionCheck = null;
+  const described = describeJobError(error, `${kind} batch`);
+  if (error instanceof IrepsError) logger.warn(`${kind} batch stopped: ${described.title}`, { code: error.code, status: error.status ?? null });
   return { ...(previous || { kind }), kind, phase: "error", error: described, finishedAt: new Date().toISOString() };
 }
 

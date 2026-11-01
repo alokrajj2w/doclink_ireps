@@ -41,6 +41,7 @@ import { runReconTests } from "./recon-tests.js";
 import { runEcmTests } from "./ecm-tests.js";
 import { runEcmDirectTests } from "./ecm-direct-tests.js";
 import { runDownloadLogTests } from "./download-log-tests.js";
+import { runExportSaveTests } from "./export-save-tests.js";
 import { runReconAuthTests } from "./recon-auth-tests.js";
 import { compileMatchPatterns, compileMatchPattern, classifyTabUrl, TAB_SCOPE } from "../utils/url-scope.js";
 
@@ -947,6 +948,7 @@ await runReconTests({ test, assert, eq });
 await runEcmTests({ test, assert, eq });
 await runEcmDirectTests({ test, assert, eq });
 await runDownloadLogTests({ test, assert, eq });
+await runExportSaveTests({ test, assert, eq });
 await runReconAuthTests({ test, assert, eq });
 await runBatchTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
 
