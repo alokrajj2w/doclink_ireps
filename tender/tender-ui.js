@@ -1,7 +1,8 @@
 // "Download Tender Documents" view: account panel + automatic discovery from My Messages.
 import { runAutomatic, runLetterType, runTabulations } from './tender-auto.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
-import { SESSION_MSG, getLogTail } from './tender-core.js';
+import { SESSION_MSG, log } from './tender-core.js';
+import { renderAccountPanel, refreshAccountPanel, wireCopyDiagnostics, wireViewLifecycle } from './view-common.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
 import { describeSkip } from '../services/download-log.js';
 import { claimPanelRun, releasePanelRun, isPanelBusy, PANEL_BUSY_MSG } from './run-lock.js';
@@ -40,29 +41,10 @@ function setBusy(busy, button) {
 // ---------------------------------------------------------------- account panel
 
 /** Render a detected (or failed) account context. Nothing here is assumed: every value is from IREPS. */
-export function renderAccount(a) {
-  const ok = !!(a && a.authenticated && a.verified);
-  $('acc-connection').textContent = a ? (a.authenticated ? 'Connected' : 'Not connected') : 'Not connected';
-  $('acc-company').textContent = ok || a?.companyName ? a.companyName : '—';
-  $('acc-unit').textContent = ok ? a.operatingUnit || 'Not stated' : '—';
-  $('acc-id').textContent = ok || a?.irepsAccountId ? a.irepsAccountId : '—';
-  $('acc-status').textContent = ok ? 'Verified' : 'Account not verified';
-  $('acc-status').className = ok ? 'tender-ok' : 'tender-bad';
-  const w = $('acc-warning');
-  w.textContent = ok ? '' : a && !a.authenticated ? SESSION_MSG : ACCOUNT_UNVERIFIED_MSG;
-  w.hidden = ok;
-}
+const renderAccount = (a) => renderAccountPanel('', a);
 
 async function refreshAccount() {
-  if (running) return;
-  $('acc-connection').textContent = 'Checking…';
-  $('acc-status').textContent = 'Checking…';
-  try {
-    renderAccount(await getActiveIrepsAccountContext());
-  } catch (e) {
-    console.error('[DocLink][Account] check failed:', e.message);
-    renderAccount(null);
-  }
+  if (!running) await refreshAccountPanel('');
 }
 
 // ---------------------------------------------------------------- rendering
@@ -234,7 +216,7 @@ async function runByDate(what, task, render, button) {
   } catch (e) {
     $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('tender-error').hidden = false;
-    console.error(`[DocLink][Tender] ${what} failed:`, e.code || '', e.message);
+    log('Tender', `${what} failed: ${e.code || ''} ${e.message}`, 'error');
   } finally {
     stopGuard();
     $('tender-progress').hidden = true;
@@ -313,7 +295,7 @@ async function run() {
     $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('tender-error').hidden = false;
     if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') renderAccount(await getActiveIrepsAccountContext().catch(() => null));
-    console.error('[DocLink][Tender] run failed:', e.code || '', e.message);
+    log('Tender', `run failed: ${e.code || ''} ${e.message}`, 'error');
   } finally {
     stopGuard();
     $('tender-progress').hidden = true;
@@ -328,22 +310,7 @@ document.querySelectorAll('[data-status]').forEach((b) => b.addEventListener('cl
 document.querySelectorAll('[data-tabulation]').forEach((b) => b.addEventListener('click', () => runTabulationType(b.dataset.tabulation, b)));
 $('btn-auto-retry').addEventListener('click', run); // already-downloaded documents are skipped via the ledger
 $('btn-account-refresh').addEventListener('click', refreshAccount);
-$('btn-copy-diag').addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(getLogTail() || '(no log yet)');
-    $('btn-copy-diag').textContent = 'Copied';
-  } catch {
-    $('btn-copy-diag').textContent = 'Copy failed';
-  }
-  setTimeout(() => ($('btn-copy-diag').textContent = 'Copy diagnostics'), 1500);
-});
+wireCopyDiagnostics($('btn-copy-diag'));
 
-// The user may switch IREPS accounts in another tab: re-detect whenever the panel regains focus.
-const refreshIfVisible = () => !view.hidden && !running && refreshAccount();
-window.addEventListener('focus', refreshIfVisible);
-document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && refreshIfVisible());
-
-// If DocLink's "go to IREPS" gate takes over, keep this view out of the way.
-new MutationObserver(() => {
-  if (!gate.hidden) view.hidden = true;
-}).observe(gate, { attributes: true, attributeFilter: ['hidden'] });
+// Re-detect the account when the panel comes back into view; step aside for the "go to IREPS" gate.
+wireViewLifecycle({ view, gate, isRunning: () => running, refresh: refreshAccount });

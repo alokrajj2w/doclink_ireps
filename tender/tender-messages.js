@@ -4,14 +4,14 @@
 // Read-only: nothing is deleted, replied to or archived. (Opening a message does mark it "read" in IREPS,
 // exactly as opening it by hand would.)
 
-import { TenderError, log, norm, irepsFetch, assertSession, parseHtml, parseCalls } from './tender-core.js';
+import { TenderError, log, norm, irepsFetch, assertSession, parseHtml, parseCalls, INBOX_PATH, dmyOf } from './tender-core.js';
 
-export const INBOX_PATH = '/epsn/vendorInboxLink.do';
+export { INBOX_PATH, dmyOf };
+
 export const MESSAGE_DETAIL_PATH = '/epsn/admin/myMessages/ViewMessageDetailAction.do';
 const MAX_PAGES = 60;
 
 const key = (dmy) => dmy.split('/').reverse().join(''); // dd/mm/yyyy -> yyyymmdd (sortable)
-export const dmyOf = (d) => `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
 
 /** 'NIT' | 'CORRIGENDUM' | 'OTHER' - from the (full) subject. */
 export function classifyMessage(subject) {

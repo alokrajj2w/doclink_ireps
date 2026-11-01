@@ -981,7 +981,7 @@ test('24-26. FIN-TAB / COM-TAB are fetched from the row; TECH-TAB is never invok
 });
 test('no password / cookie / token is stored by the extension code', async () => {
   const fs = await import('node:fs');
-  const src = ['tender-core.js', 'tender-account.js', 'tender-search.js', 'tender-workflows.js', 'tender-ui.js'].map((f) => fs.readFileSync(new URL('../' + f, import.meta.url), 'utf8')).join('\n');
+  const src = ['tender-core.js', 'tender-account.js', 'tender-search.js', 'tender-workflows.js', 'tender-ui.js', 'view-common.js', 'run-lock.js'].map((f) => fs.readFileSync(new URL('../' + f, import.meta.url), 'utf8')).join('\n');
   assert.ok(!/chrome\.storage|localStorage|sessionStorage|document\.cookie/.test(src));
 });
 

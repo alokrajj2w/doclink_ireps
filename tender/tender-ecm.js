@@ -6,17 +6,17 @@
 //
 // This module only READS the panel's Save to preference from chrome.storage.local; it stores nothing.
 
-import { STORAGE_KEYS } from '../utils/messages.js';
+import { STORAGE_KEYS, describeError } from '../utils/messages.js';
 import { SAVE_DESTINATION } from '../services/recon-service.js';
 import { ECM_KIND, saveToEcmOrLocally } from '../services/ecm-service.js';
 import { ECM_KINDS } from '../services/ecm-catalog.js';
 import { confirmReconSignIn } from '../services/recon-auth.js';
 import { loadEcmConfig, isDirectEcm } from '../services/ecm-config.js';
-import { loadDownloadLogConfig } from '../services/download-log.js';
+import { loadDownloadLogConfig, DOWNLOAD_LOG_ERROR } from '../services/download-log.js';
 import { TenderError } from './tender-core.js';
 import { localIsoDate } from '../utils/dates.js';
 
-export const SIGN_IN_REQUIRED_MSG = 'Sign in to the Recon Engine to download: DocLink records every download for the signed-in user. Nothing was downloaded.';
+export const SIGN_IN_REQUIRED_MSG = describeError(DOWNLOAD_LOG_ERROR.SIGN_IN_REQUIRED).message;
 
 /**
  * Before any tender download: with the download log on (config.json "downloadLog") the user

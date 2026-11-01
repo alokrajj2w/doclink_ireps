@@ -12,15 +12,15 @@
 // Under "Save to: ECM / S3" the letters and attachments go to the unit's ECM folder as crp (storeFile).
 
 import {
-  TenderError, SESSION_MSG, log, norm, getBaseUrl, absUrl, irepsFetch, assertSession, parseHtml,
+  TenderError, SESSION_MSG, log, norm, absUrl, irepsFetch, assertSession, parseHtml,
   elementActions, parseCalls, qparam, toRequest, requestKey, sniffKind, extensionFor,
   resolveIrepsDocument, looksLikeErrorPage, htmlToLines, wrapLines, buildPdf, isPdfBytes,
-  createSaver, safeSegment,
+  createSaver, safeSegment, CORRES_LIST_PATH, CORRES_REPLY_PATH, CORRES_VIEW_FALLBACK_PATH, inlineScripts,
 } from './tender-core.js';
-import { getActiveIrepsAccountContext, accountFolderLabel, assertSameAccount, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
+import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { openLedger } from './tender-ledger.js';
-import { inferRoute } from './tender-workflows.js';
-import { ensureDownloadSignIn, tenderEcmSink, ecmDocumentFor } from './tender-ecm.js';
+import { inferRoute, publicAccount } from './tender-workflows.js';
+import { tenderEcmSink, ecmDocumentFor } from './tender-ecm.js';
 import { printPageToPdf } from './tender-print.js';
 import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE } from '../services/download-log.js';
 
@@ -28,9 +28,9 @@ import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_
 const logPending = (entry, role, { filename, ecm }) =>
   logDownload(downloadRecord({ docType: TENDER_DOC_TYPE.PENDING_CORRESPONDENCE, key: downloadKey.pending(entry.key, role) }, { filename, ecm }));
 
-export const LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
-export const REPLY_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
-export const VIEW_FALLBACK_PATH = '/epsn/corres/rly/viewpubIndltr.do';
+export const LIST_PATH = CORRES_LIST_PATH;
+export const REPLY_PATH = CORRES_REPLY_PATH;
+export const VIEW_FALLBACK_PATH = CORRES_VIEW_FALLBACK_PATH;
 const MANIFEST_KEY = 'pending-correspondence';
 
 export const STATUS = {
@@ -179,7 +179,6 @@ function labelValue(doc, re) {
   return { text: '', title: '' };
 }
 
-const inlineScripts = (doc) => [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join('\n');
 
 /**
  * Parse a pending-replies page. Only the table under the heading "Pending Replies" is read (Lapsed and
@@ -486,7 +485,6 @@ function summarize(state, run) {
 }
 
 const publicLetter = ({ key, req, ...l }) => ({ ...l, key: undefined, files: l.files.map(({ downloadId, ...f }) => f) });
-const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, companyName: a.companyName, operatingUnit: a.operatingUnit });
 
 /**
  * Download every letter currently shown as pending.
@@ -496,14 +494,7 @@ const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, companyName: a
  * Callbacks: onProgress(text), onAccount(account), onEvent({type:'records'|'record'|'letter'|'summary', ...}).
  */
 export async function downloadPendingCorrespondence({ mode = 'all', force = false, onProgress = () => {}, onAccount = () => {}, onEvent = () => {}, sleep = defaultSleep, pace = 200 } = {}) {
-  await ensureDownloadSignIn(); // Recon sign-in: every download is logged for the signed-in user
-  const base = await getBaseUrl();
-  onProgress('Verifying IREPS account...');
-  const account = await getActiveIrepsAccountContext({ base });
-  onAccount(account);
-  if (!account.authenticated) throw new TenderError('SESSION_EXPIRED', SESSION_MSG);
-  if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
-  const folderLabel = accountFolderLabel(account);
+  const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
   const ledger = await openLedger(account.irepsAccountId);
   const state = ledger.manifest(MANIFEST_KEY) || blank();
   state.records ||= {};

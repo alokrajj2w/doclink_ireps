@@ -2,7 +2,8 @@
 // live progress table, counts, retry. All values shown come from IREPS responses; text is set via textContent only.
 import { downloadPendingCorrespondence } from './tender-pending.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
-import { SESSION_MSG, getLogTail } from './tender-core.js';
+import { SESSION_MSG, log } from './tender-core.js';
+import { renderAccountPanel, refreshAccountPanel, wireCopyDiagnostics, wireViewLifecycle } from './view-common.js';
 import { describeEcmOutcome } from '../services/ecm-service.js';
 import { claimPanelRun, releasePanelRun, isPanelBusy, PANEL_BUSY_MSG } from './run-lock.js';
 
@@ -29,29 +30,10 @@ function setBusy(busy) {
   $('btn-pc-run').classList.toggle('is-busy', busy);
 }
 
-function renderAccount(a) {
-  const ok = !!(a && a.authenticated && a.verified);
-  $('pc-acc-connection').textContent = a?.authenticated ? 'Connected' : 'Not connected';
-  $('pc-acc-company').textContent = ok || a?.companyName ? a.companyName : '—';
-  $('pc-acc-unit').textContent = ok ? a.operatingUnit || 'Not stated' : '—';
-  $('pc-acc-id').textContent = ok || a?.irepsAccountId ? a.irepsAccountId : '—';
-  $('pc-acc-status').textContent = ok ? 'Verified' : 'Account not verified';
-  $('pc-acc-status').className = ok ? 'tender-ok' : 'tender-bad';
-  const w = $('pc-acc-warning');
-  w.textContent = ok ? '' : a && !a.authenticated ? SESSION_MSG : ACCOUNT_UNVERIFIED_MSG;
-  w.hidden = ok;
-}
+const renderAccount = (a) => renderAccountPanel('pc-', a);
 
 async function refreshAccount() {
-  if (running) return;
-  $('pc-acc-connection').textContent = 'Checking…';
-  $('pc-acc-status').textContent = 'Checking…';
-  try {
-    renderAccount(await getActiveIrepsAccountContext());
-  } catch (e) {
-    console.error('[DocLink][Account] check failed:', e.message);
-    renderAccount(null);
-  }
+  if (!running) await refreshAccountPanel('pc-');
 }
 
 function cell(tr, text, small) {
@@ -157,7 +139,7 @@ async function run(mode) {
     $('pc-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('pc-error').hidden = false;
     if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') renderAccount(await getActiveIrepsAccountContext().catch(() => null));
-    console.error('[DocLink][Pending] run failed:', e.code || '', e.message);
+    log('Pending', `run failed: ${e.code || ''} ${e.message}`, 'error');
   } finally {
     $('pc-progress').hidden = true;
     setBusy(false);
@@ -169,21 +151,5 @@ $('btn-pc-back').addEventListener('click', () => show(false));
 $('btn-pc-run').addEventListener('click', () => run('all'));
 $('btn-pc-retry').addEventListener('click', () => run('retry')); // saved letters are skipped, so nothing is duplicated
 $('btn-pc-account-refresh').addEventListener('click', refreshAccount);
-$('btn-pc-diag').addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(getLogTail() || '(no log yet)');
-    $('btn-pc-diag').textContent = 'Copied';
-  } catch {
-    $('btn-pc-diag').textContent = 'Copy failed';
-  }
-  setTimeout(() => ($('btn-pc-diag').textContent = 'Copy diagnostics'), 1500);
-});
-
-const refreshIfVisible = () => !view.hidden && !running && refreshAccount();
-window.addEventListener('focus', refreshIfVisible);
-document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && refreshIfVisible());
-
-// If DocLink's "go to IREPS" gate takes over, keep this view out of the way.
-new MutationObserver(() => {
-  if (!gate.hidden) view.hidden = true;
-}).observe(gate, { attributes: true, attributeFilter: ['hidden'] });
+wireCopyDiagnostics($('btn-pc-diag'));
+wireViewLifecycle({ view, gate, isRunning: () => running, refresh: refreshAccount });

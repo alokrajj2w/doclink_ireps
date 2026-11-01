@@ -8,20 +8,17 @@
 
 import {
   TenderError, SESSION_MSG, log, norm,
-  getBaseUrl, irepsFetch, assertSession, parseHtml, formParams, findForm,
+  irepsFetch, assertSession, parseHtml, formParams, findForm,
   elementActions, parseCalls, qparam, toRequest, requestKey, fetchDocument, fetchLinkedDocument, createSaver, safeSegment,
+  INBOX_PATH, CORRES_LIST_PATH, CORRES_REPLY_PATH, CORRES_VIEW_FALLBACK_PATH, dmyOf, inlineScripts,
 } from './tender-core.js';
-import { getActiveIrepsAccountContext, assertSameAccount, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
+import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { printPageToPdf } from './tender-print.js';
 import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
-import { ecmDocumentFor, tenderEcmSink, ensureDownloadSignIn, CATEGORY_ECM_KIND } from './tender-ecm.js';
+import { ecmDocumentFor, tenderEcmSink, CATEGORY_ECM_KIND } from './tender-ecm.js';
 import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
 
-const INBOX_PATH = '/epsn/vendorInboxLink.do';
 const DEFAULT_AJAX_PATH = '/epsn/supply/tds/ajxdata.do';
-const CORRES_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
-const CORRES_LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
-const CORRES_VIEW_FALLBACK = '/epsn/corres/rly/viewpubIndltr.do';
 const MAX_INBOX_PAGES = 15;
 /** A list scanned by date (letters, Closed Tenders) normally stops long before this (see OLD_PAGES_TO_STOP). */
 const MAX_LIST_PAGES = 60;
@@ -358,7 +355,6 @@ export function inferRoute(scriptText, fnName, argValues) {
   return { method, url };
 }
 
-const inlineScripts = (doc) => [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join('\n');
 
 // ---------------------------------------------------------------- NIT page (shared)
 
@@ -487,7 +483,8 @@ export function parseCorrigendumList(doc) {
 
 // ---------------------------------------------------------------- corrigendum notices in the message inbox
 
-export const todayStr = (d = new Date()) => `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}`;
+/** Today (or `d`) as dd/mm/yyyy. */
+export const todayStr = (d = new Date()) => dmyOf(d);
 
 /**
  * "Issue of Corrigendum towards <unit>, Tender no: <no>" messages in My Messages > Inbox sent on `dateStr`
@@ -970,7 +967,6 @@ export const LETTER_SPECS = {
 
 /** "10/09/2026 17:40 (224222)" - the letter's published date/time and id, as shown in the Post Tenders rows. */
 const LETTER_STAMP_RE = /(\d{2}\/\d{2}\/\d{4})\s+\d{1,2}:\d{2}\s*\((\d+)\)/;
-const LETTER_STAMP = /(\d{2}\/\d{2}\/\d{4})\s+\d{1,2}:\d{2}\s*\((\d+)\)/;
 
 const stampDay = (s) => { const [d, m, y] = s.split('/').map(Number); return new Date(y, m - 1, d); };
 
@@ -1028,7 +1024,7 @@ export async function scanPostTenderList(run, status, { windows = null, stopBefo
         const letters = allReqs(elementActions(tr)).filter((x) => spec.re.test(pathOf(x.url)) && spec.accept(x));
         if (!letters.length) continue;
         const tenderNo = norm(tr.querySelector('a[title*="NIT" i]')?.textContent) || norm(tr.querySelector('a')?.textContent);
-        const stamp = LETTER_STAMP.exec(norm(tr.textContent));
+        const stamp = LETTER_STAMP_RE.exec(norm(tr.textContent));
         if (!tenderNo || !stamp) { unparsed++; continue; }
         pageDays.push(stampDay(stamp[1]));
         for (const rq of letters) {
@@ -1193,8 +1189,8 @@ async function correspondence(run) {
     r.note = 'No nitOid could be discovered for this tender, so the correspondence page could not be opened.';
     return finalize(r);
   }
-  ctx.discoveredActions.correspondence = [{ method: 'POST', path: CORRES_PATH }];
-  const res = await irepsFetch(run.base, CORRES_PATH, { method: 'POST', form: { nitOid } });
+  ctx.discoveredActions.correspondence = [{ method: 'POST', path: CORRES_REPLY_PATH }];
+  const res = await irepsFetch(run.base, CORRES_REPLY_PATH, { method: 'POST', form: { nitOid } });
   assertSession(res);
   const doc = parseHtml(res.text());
   const onPage = pageTenderNo(doc);
@@ -1218,7 +1214,7 @@ async function correspondence(run) {
     seen.add(`${corresId}|${letterId}`);
     const cells = [...(el.closest('tr')?.children || [])].map((c) => norm(c.textContent)).filter(Boolean);
     const route = inferRoute(scripts, 'viewPublishedLtr', call.args);
-    const target = route || { method: 'POST', url: `${CORRES_VIEW_FALLBACK}?nitOid=${oid}&letterID=${letterId}&corresId=${corresId}` };
+    const target = route || { method: 'POST', url: `${CORRES_VIEW_FALLBACK_PATH}?nitOid=${oid}&letterID=${letterId}&corresId=${corresId}` };
     if (!route) log('Correspondence', 'Route not readable from the page; using the documented viewpubIndltr.do route');
     items.push({
       id: letterId, corresId, letterId, nitOid: oid || nitOid, letterNo: cells[0] || '', subject: cells[1] || '',
@@ -1319,15 +1315,7 @@ export function startTenderRun(base, account, found, folderLabel) {
 export async function downloadTenderDocuments(rawTenderNo, { onProgress = () => {}, onAccount = () => {}, only = CATEGORY_KEYS } = {}) {
   const tenderNo = norm(rawTenderNo);
   if (!tenderNo) throw new TenderError('INPUT', 'Enter a Tender Number.');
-  await ensureDownloadSignIn();
-
-  const base = await getBaseUrl();
-  onProgress('Verifying IREPS account...');
-  const account = await getActiveIrepsAccountContext({ base });
-  onAccount(account);
-  if (!account.authenticated) throw new TenderError('SESSION_EXPIRED', SESSION_MSG);
-  if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
-  const folderLabel = accountFolderLabel(account);
+  const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
 
   onProgress('Finding Tender...');
   const found = await searchTender(base, tenderNo, { onProgress });

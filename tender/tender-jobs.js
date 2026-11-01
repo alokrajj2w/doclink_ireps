@@ -7,29 +7,21 @@
 //   downloadTabulationsByDate()                - Financial / Commercial Tabulation of tenders CLOSING on the dates
 //                                            (IREPS Closed Tenders); a tabulation shows up some days after closing
 
-import { TenderError, SESSION_MSG, IREPS_DOWN_CODES, log, norm, getBaseUrl } from './tender-core.js';
-import { assertSameAccount } from './tender-account.js';
-import { getActiveIrepsAccountContext, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
+import { IREPS_DOWN_CODES, log, norm } from './tender-core.js';
+import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { searchTender, fmtDate } from './tender-search.js';
 import { openLedger } from './tender-ledger.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
   scanClosedTenders, downloadTabulation, TABULATIONS,
 } from './tender-workflows.js';
-import { tenderEcmSink, ensureDownloadSignIn, ECM_TAKES_TENDER_DATE } from './tender-ecm.js';
+import { tenderEcmSink, ECM_TAKES_TENDER_DATE } from './tender-ecm.js';
 
 const DAY = 86400000;
 const ddmmyyyy = (d) => fmtDate(d);
 
 export async function beginJob({ onProgress, onAccount }) {
-  await ensureDownloadSignIn(); // Recon sign-in: every download is logged for the signed-in user
-  const base = await getBaseUrl();
-  onProgress('Verifying IREPS account...');
-  const account = await getActiveIrepsAccountContext({ base });
-  onAccount(account);
-  if (!account.authenticated) throw new TenderError('SESSION_EXPIRED', SESSION_MSG);
-  if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
-  const folderLabel = accountFolderLabel(account);
+  const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
   const ledger = await openLedger(account.irepsAccountId);
   // "same answer for the rest of this run" of the download-again prompt, shared by its tenders
   return { base, account, folderLabel, ledger, redownloadMemo: {} };

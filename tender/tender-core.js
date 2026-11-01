@@ -4,8 +4,11 @@
 // reuse the user's existing IREPS browser session - no credentials are read or stored).
 
 import { IREPS_CONFIG, loadIrepsConfig } from '../services/ireps-api.js';
+import { logger } from '../utils/logger.js';
+import { describeError } from '../utils/messages.js';
 
-export const SESSION_MSG = 'IREPS session expired. Please log in to IREPS and try again.';
+/** The panel-wide session-expired text (utils/messages.js), so every view says the same. */
+export const SESSION_MSG = describeError('IREPS_SESSION_EXPIRED').message;
 
 /** Error codes meaning "IREPS itself did not answer" (as opposed to a rejected or invalid document). */
 export const IREPS_DOWN_CODES = new Set(['TIMEOUT', 'UNREACHABLE']);
@@ -25,10 +28,15 @@ export function redact(msg) {
 }
 
 const LOG_TAIL = [];
-export function log(tag, msg) {
-  const line = `[DocLink][${tag}] ${redact(msg)}`;
-  console.log(line);
-  LOG_TAIL.push(`${new Date().toISOString().slice(11, 19)} ${line}`);
+/**
+ * Log a tender / correspondence line: through utils/logger.js (console + DocLink's stored
+ * log, doclinkLog.dump()) and into the panel's own tail for "Copy diagnostics".
+ * `level` is "info" (default), "warn" or "error".
+ */
+export function log(tag, msg, level = 'info') {
+  const text = `[${tag}] ${redact(msg)}`;
+  (logger[level] || logger.info)(text);
+  LOG_TAIL.push(`${new Date().toISOString().slice(11, 19)} [DocLink]${text}`);
   if (LOG_TAIL.length > 400) LOG_TAIL.shift();
 }
 
@@ -36,6 +44,19 @@ export function log(tag, msg) {
 export const getLogTail = () => LOG_TAIL.join('\n');
 
 export const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
+/** IREPS pages the tender and correspondence flows read (read-only). */
+export const INBOX_PATH = '/epsn/vendorInboxLink.do';
+export const CORRES_LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
+export const CORRES_REPLY_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
+/** A published correspondence letter, when the page names no route of its own. */
+export const CORRES_VIEW_FALLBACK_PATH = '/epsn/corres/rly/viewpubIndltr.do';
+
+/** A Date as IREPS writes it: dd/mm/yyyy (local time). */
+export const dmyOf = (d = new Date()) => `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+
+/** The text of a page's inline <script> blocks (where IREPS keeps its routes). */
+export const inlineScripts = (doc) => [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join('\n');
+
 export const fileSafe = (s) => String(s ?? '').trim().replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_') || 'NA';
 
 /** The IREPS origin, from the same loader the service worker uses (config.json + config.local.json). */

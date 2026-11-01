@@ -3,6 +3,8 @@
 // Stored per IREPS account in chrome.storage.local. Holds tender numbers / letter ids / dates only -
 // never cookies, tokens, passwords or document content.
 
+import { log } from './tender-core.js';
+
 const KEY = (accountId) => `doclink.tender.ledger.${accountId}`;
 const KEEP_MS = 400 * 86400000;
 
@@ -30,7 +32,7 @@ export async function openLedger(accountId, storage = globalThis.chrome?.storage
       try {
         await storage.set({ [KEY(accountId)]: data });
       } catch (e) {
-        console.warn('[DocLink][Ledger] not saved:', e.message);
+        log('Ledger', `not saved: ${e.message}`, 'warn');
       }
     },
   };
