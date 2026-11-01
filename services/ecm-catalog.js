@@ -19,7 +19,14 @@ import { ECM_ENV } from "./ecm-config.js";
 export const DOC_TYPE = "InvoiceCertificate";
 export const TYPE_PROPERTY = "InvoiceCertificateSchema:type";
 
-/** Field key (what DocLink sends) -> Nuxeo property. Values are strings; *_date as YYYY-MM-DD. */
+/**
+ * Field key (what DocLink sends) -> Nuxeo property. Values are strings; *_date as YYYY-MM-DD.
+ * Only properties the ECM's InvoiceCertificateSchema has: a search or create naming any other
+ * answers HTTP 400 "No such property". The spec also lists tenderDate, loiNumber and loiDate,
+ * but the TEST ECM does not have them (GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema,
+ * 26/10/2026), so tender documents carry the tender number only. When the ECM team adds them,
+ * map them here (tender_date, loi_number, loi_date) and list them in the kinds below.
+ */
 export const ECM_FIELDS = Object.freeze({
   invoice_number: "InvoiceCertificateSchema:invoiceNumber",
   customer_po_number: "InvoiceCertificateSchema:customerPONumber",
@@ -27,13 +34,10 @@ export const ECM_FIELDS = Object.freeze({
   ic_date: "InvoiceCertificateSchema:icDate",
   co_number: "InvoiceCertificateSchema:coNumber",
   modification_advise_number: "InvoiceCertificateSchema:modificationAdviseNumber",
-  tender_number: "InvoiceCertificateSchema:tenderNumber",
-  tender_date: "InvoiceCertificateSchema:tenderDate",
-  loi_number: "InvoiceCertificateSchema:loiNumber",
-  loi_date: "InvoiceCertificateSchema:loiDate"
+  tender_number: "InvoiceCertificateSchema:tenderNumber"
 });
 
-const TENDER_FIELDS = Object.freeze({ fields: ["tender_number", "tender_date"], required: ["tender_number"], location: "tenders" });
+const TENDER_FIELDS = Object.freeze({ fields: ["tender_number"], required: ["tender_number"], location: "tenders" });
 const tenderKind = (code, extra = {}) => Object.freeze({ ...TENDER_FIELDS, code, title: `{tender_number} - ${code}`, ...extra });
 
 /**
@@ -45,22 +49,22 @@ const tenderKind = (code, extra = {}) => Object.freeze({ ...TENDER_FIELDS, code,
  * "- Extension", "- CRP", "- CO", "- Financial Tabulation", "- Commercial Tabulation") with row 8 (Title) giving the number: IC, PO or MA
  * number, else the tender number. `title` is the template used when the upload gives no
  * title; tender uploads give their own (tender/tender-ecm.js), which starts the same way.
- * "ECM - Download speci-v1" marks more fields mandatory than IREPS supplies, so
- * `required` is what DocLink always has; the rest is sent whenever it is known.
+ * "ECM - Download speci-v1" marks more fields mandatory than IREPS supplies (or the ECM
+ * has, see ECM_FIELDS), so `required` is what DocLink always has; the rest is sent
+ * whenever it is known.
  */
 export const ECM_KINDS = Object.freeze({
   inspectionCertificate: { fields: ["invoice_number", "customer_po_number", "ic_number", "ic_date", "co_number"], required: ["ic_number", "customer_po_number"], location: "inputs", code: "IC", title: "{ic_number} - IC" },
   poCopy: { fields: ["customer_po_number"], required: ["customer_po_number"], location: "inputs", code: "PO", title: "{customer_po_number} - PO" },
-  modificationAdvise: { fields: ["customer_po_number", "modification_advise_number", "tender_number", "tender_date"], required: ["customer_po_number", "modification_advise_number"], location: "inputs", code: "MA", title: "{modification_advise_number} - MA" },
+  modificationAdvise: { fields: ["customer_po_number", "modification_advise_number", "tender_number"], required: ["customer_po_number", "modification_advise_number"], location: "inputs", code: "MA", title: "{modification_advise_number} - MA" },
   nit: tenderKind("NIT"),
   nbsp: tenderKind("NBSP"),
   extension: tenderKind("Extension"),
   crp: tenderKind("CRP"),
   co: tenderKind("CO"),
-  loi: tenderKind("LOI", { fields: ["tender_number", "tender_date", "loi_number", "loi_date"] }),
-  // the spec makes the tender date mandatory for these; the Closed Tenders row always shows the closing date
-  vft: tenderKind("Financial Tabulation", { required: ["tender_number", "tender_date"] }),
-  vct: tenderKind("Commercial Tabulation", { required: ["tender_number", "tender_date"] })
+  loi: tenderKind("LOI"),
+  vft: tenderKind("Financial Tabulation"),
+  vct: tenderKind("Commercial Tabulation")
 });
 
 /**

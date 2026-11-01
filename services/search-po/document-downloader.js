@@ -157,9 +157,10 @@ export async function fetchIrepsDocument(url, deps = {}) {
  * @property {string} path          Downloads-relative target path (…/name.pdf)
  * @property {string} [label]       shown in progress / logs (e.g. "MA 007327")
  * @property {object} [meta]        anything the caller wants echoed back
- * @property {{ kind: string, fields: object, title?: string }} [ecm]
+ * @property {{ kind: string, fields: object, title?: string, replace?: string[] }} [ecm]
  *                                  how the document is filed in the ECM under "ECM / S3"
- *                                  (services/ecm-service.js)
+ *                                  (services/ecm-service.js); `replace` is set by the run from
+ *                                  preflight: the ECM copies found (the first gets the new PDF)
  */
 
 /**
@@ -212,11 +213,12 @@ function describeFailure(error, CODES) {
  *
  * @param {DownloadItem[]} items
  * `preflight` (before anything is fetched) answers which items not to download, with why:
- * they are reported as skipped, with that reason as `skip`.
+ * they are reported as skipped, with that reason as `skip`. Its `replace` (id -> ECM uids)
+ * goes to the saver as item.ecm.replace: the new PDF goes into the first of those ECM copies.
  *
  * @param {{ concurrency?: number, fetch?: typeof fetch, saveFile?: Function, codes?: object,
  *          retries?: number, retryDelayMs?: number, onSaved?: Function,
- *          preflight?: (items: DownloadItem[]) => Promise<{ skip: Map<string, object> }>,
+ *          preflight?: (items: DownloadItem[]) => Promise<{ skip: Map<string, object>, replace?: Map<string, string[]> }>,
  *          onProgress?: (snapshot: DocumentBatchSnapshot) => void }} [options]
  * @returns {Promise<DocumentBatchSnapshot & { startedAt: string, finishedAt: string }>}
  */
@@ -241,6 +243,7 @@ export async function downloadIrepsDocuments(items, options = {}) {
   let sessionExpired = false;
   let cursor = 0;
   let warnings = [];
+  let replace = new Map();
 
   const snapshot = () => ({
     total: states.length,
@@ -277,7 +280,8 @@ export async function downloadIrepsDocuments(items, options = {}) {
       state.status = DOCUMENT_DOWNLOAD_STATUS.DOWNLOADING;
       notify();
       try {
-        const attempt = () => downloadIrepsDocument(item, { fetch: options.fetch, saveFile: options.saveFile, onSaved: options.onSaved, codes: CODES });
+        const target = item.ecm && replace.has(item.id) ? { ...item, ecm: { ...item.ecm, replace: replace.get(item.id) } } : item;
+        const attempt = () => downloadIrepsDocument(target, { fetch: options.fetch, saveFile: options.saveFile, onSaved: options.onSaved, codes: CODES });
         // Transient failures only (network / timeout / HTTP 5xx); never an expired session or a non-PDF.
         const done = options.retries > 0 ? await withRetry(attempt, { attempts: options.retries + 1, delayMs: options.retryDelayMs }) : await attempt();
         state.status = DOCUMENT_DOWNLOAD_STATUS.COMPLETED;
@@ -298,6 +302,7 @@ export async function downloadIrepsDocuments(items, options = {}) {
     try {
       const checked = await options.preflight(list);
       warnings = (checked && checked.warnings) || [];
+      replace = (checked && checked.replace) || new Map();
       for (const [i, item] of list.entries()) {
         const skip = checked && checked.skip && checked.skip.get(item.id);
         if (skip) Object.assign(states[i], { status: DOCUMENT_DOWNLOAD_STATUS.SKIPPED, skip });

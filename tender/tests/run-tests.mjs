@@ -289,7 +289,7 @@ test('10-14,15-19 full run: every category, correct methods, no manifest file do
   const n = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
   for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'My_Offer/My_Offer_29263265.pdf', 'NIT_and_Supporting_Documents/Attachment_01_Annexure.pdf', 'NIT_and_Supporting_Documents/Attachment_02_IRS_CONDITIONS_5595304.pdf', 'NIT_and_Supporting_Documents/Attachment_04_drawing.zip',
     'Corrigenda/Corrigendum_01_29263265.pdf', 'Corrigenda/Corrigendum_02_29263265.pdf', 'Corrigenda/Corrigendum_02_29263265.html', 'Negotiation/Negotiation_29263265_224222.pdf', 'Negotiation/Negotiation_29263265_224300.pdf',
-    'Counter_Offers/Counter_Offer_29263265_1461275.pdf', 'Advance_Acceptance_LOA/LOA_29263265_1461928.pdf', 'Correspondence/Correspondence_29263265_306789.pdf',
+    'Counter_Offers/Counter_Offer_29263265_1461275.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf', 'Correspondence/Correspondence_29263265_306789.pdf',
     'Tabulation/Financial_Tabulation_29263265.pdf', 'Tabulation/Commercial_Tabulation_29263265.pdf']) assert.ok(n.includes(want), `missing ${want}\n${n.join('\n')}`);
   // identifier discipline
   assert.equal(r.tender.nitId, '5569207'); assert.equal(r.tender.nitOid, '107200478'); assert.equal(r.context.tenderOID, '107200478');
@@ -397,7 +397,7 @@ test('LOA: Chrome prints the fetched letter like Ctrl+P (A4, background); IREPS 
     const loa = r.categories.loa;
     assert.deepEqual([loa.status, loa.downloaded, loa.warnings], ['DOWNLOADED', 1, []]);
     const files = saved.filter((s) => s.filename.includes('Advance_Acceptance_LOA'));
-    assert.deepEqual(files.map((s) => s.filename.split('/').pop()), ['LOA_29263265_1461928.pdf']);
+    assert.deepEqual(files.map((s) => s.filename.split('/').pop()), ['LOA_29263265.pdf']);
     assert.match(new TextDecoder().decode(files[0].bytes), /chrome-print/);
     assert.equal(loa.files[0].printed, true);
     // the tab was given the letter IREPS returned, at the letter's own address
@@ -412,19 +412,73 @@ test('LOA: Chrome prints the fetched letter like Ctrl+P (A4, background); IREPS 
     withoutDebugger();
   }
 });
-test('LOA: when Chrome will not let DocLink print (policy), the text PDF + .html are kept and the run says why', async () => {
+test('LOA: when Chrome will not let DocLink print (policy), the one text PDF is kept (no .html) and the run says why', async () => {
   loaOnly();
   const dbg = fakeDebugger({ attachError: 'Cannot access a chrome:// URL' });
   try {
     const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
     assert.equal(loa.status, 'DOWNLOADED');
     const names = saved.filter((s) => s.filename.includes('Advance_Acceptance_LOA')).map((s) => s.filename.split('/').pop());
-    assert.deepEqual(names.sort(), ['LOA_29263265_1461928.html', 'LOA_29263265_1461928.pdf']);
+    assert.deepEqual(names, ['LOA_29263265.pdf']);
     assert.ok(loa.warnings.some((w) => /could not print.*Cannot access/i.test(w)), loa.warnings.join('\n'));
     assert.deepEqual(dbg.tabs.removed, [7]);
   } finally {
     withoutDebugger();
   }
+});
+test('LOA: only the letter page is saved, printed by Chrome - nothing it links, embeds or redirects to is downloaded', async () => {
+  loaOnly();
+  server.s.loaExtra = '<p>Annexure: <a href="/ireps/upload/loa/Annexure_A.pdf" target="_blank">Annexure_A.pdf</a></p><iframe src="/ireps/upload/loa/viewer.do?id=1"></iframe>' +
+    '<embed src="/ireps/upload/loa/Terms.pdf"><a href="#" onclick="window.open(\'/ireps/upload/loa/Sign.docx\')">sign</a><script>if(0){window.location=\'/ireps/upload/loa/next.pdf\'}</script>';
+  const dbg = fakeDebugger();
+  try {
+    const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
+    assert.deepEqual([loa.status, loa.downloaded], ['DOWNLOADED', 1]);
+    const files = saved.filter((s) => s.filename.includes('Advance_Acceptance_LOA'));
+    assert.deepEqual(files.map((s) => s.filename.split('/').pop()), ['LOA_29263265.pdf']);
+    assert.match(new TextDecoder().decode(files[0].bytes), /chrome-print/);
+    assert.ok(!server.loaAttachmentHit, `a file inside the letter was fetched: ${paths().filter((p) => p.includes('/loa/')).join(', ')}`);
+    assert.match(Buffer.from(dbg.cmd('Fetch.fulfillRequest').body, 'base64').toString(), /Letter 1461928/);
+  } finally {
+    withoutDebugger();
+  }
+});
+const coOnly = () => mk({ tenders: [T({})], inbox: { MyNegotiation: [], MyCounterOffer: [{ no: '29263265', oid: '107200478', letter: '1461275', date: daysAgo(12) }], MyAdvanceAcceptanceLetter: [] } });
+test('Counter Offer: a letter with a document attached saves the letter page printed by Chrome, never the attachment', async () => {
+  coOnly();
+  server.s.coExtra = '<p>Attached document: <a href="/ireps/upload/co/CounterOffer_Annexure.pdf" target="_blank">CounterOffer_Annexure.pdf</a></p>' +
+    '<iframe src="/ireps/upload/co/viewer.do?id=1"></iframe><embed src="/ireps/upload/co/Rates.pdf"><a href="#" onclick="window.open(\'/ireps/upload/co/Sheet.xlsx\')">rates</a>';
+  const dbg = fakeDebugger();
+  try {
+    const co = (await run('29263265', { only: ['counterOffer'] })).categories.counterOffer;
+    assert.deepEqual([co.status, co.downloaded, co.warnings], ['DOWNLOADED', 1, []]);
+    const files = saved.filter((s) => s.filename.includes('Counter_Offers'));
+    assert.deepEqual(files.map((s) => s.filename.split('/').pop()), ['Counter_Offer_29263265_1461275.pdf']);
+    assert.match(new TextDecoder().decode(files[0].bytes), /chrome-print/);
+    assert.ok(!server.coAttachmentHit, `a file attached to the letter was fetched: ${paths().filter((p) => p.includes('/co/')).join(', ')}`);
+    assert.match(Buffer.from(dbg.cmd('Fetch.fulfillRequest').body, 'base64').toString(), /Letter 1461275/);
+    assert.match(dbg.cmd('Page.navigate').url, /\/epsn\/supply\/tds\/publishCounterOfferLetter\.do$/);
+    assert.equal(paths().filter((p) => p.endsWith('publishCounterOfferLetter.do')).length, 1);
+  } finally {
+    withoutDebugger();
+  }
+});
+test('Counter Offer: when Chrome cannot print, the one text PDF of the letter is kept (no .html, no attachment)', async () => {
+  coOnly();
+  server.s.coExtra = '<a href="/ireps/upload/co/CounterOffer_Annexure.pdf">CounterOffer_Annexure.pdf</a>';
+  const co = (await run('29263265', { only: ['counterOffer'] })).categories.counterOffer;
+  assert.equal(co.status, 'DOWNLOADED');
+  assert.deepEqual(saved.filter((s) => s.filename.includes('Counter_Offers')).map((s) => s.filename.split('/').pop()), ['Counter_Offer_29263265_1461275.pdf']);
+  assert.ok(!server.coAttachmentHit);
+});
+test('LOA: a letter IREPS serves as a PDF file is kept as it is (one PDF, no print)', async () => {
+  loaOnly();
+  server.s.letterAsPdf = true;
+  const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
+  assert.equal(loa.status, 'DOWNLOADED');
+  const files = saved.filter((s) => s.filename.includes('Advance_Acceptance_LOA'));
+  assert.deepEqual(files.map((s) => s.filename.split('/').pop()), ['LOA_29263265.pdf']);
+  assert.match(new TextDecoder().decode(files[0].bytes), /letter1461928/);
 });
 test('LOA: cancelling the "started debugging" bar falls back to the text PDF', async () => {
   loaOnly();
@@ -437,7 +491,7 @@ test('LOA: cancelling the "started debugging" bar falls back to the text PDF', a
     withoutDebugger();
   }
 });
-test('Every published letter is printed by Chrome (negotiation, counter offer, LOA, correspondence); a corrigendum page keeps the text rendering', async () => {
+test('Every published letter and corrigendum page is printed by Chrome (negotiation, counter offer, LOA, correspondence, corrigendum); a corrigendum file is saved as is', async () => {
   mk({ tenders: [FULL()], inbox: letters('29263265'), corres: { 107200478: { nitOid: '107200478', tenderNo: '29263265', letters: [{ no: '306789', id: '306789', corresId: '225319', subject: 'Withdrawal' }] } } });
   const dbg = fakeDebugger();
   try {
@@ -450,13 +504,72 @@ test('Every published letter is printed by Chrome (negotiation, counter offer, L
       counts[k] = c[k].files.length;
     }
     assert.deepEqual(counts, { negotiation: 2, counterOffer: 1, loa: 1, correspondence: 1 });
-    assert.equal(dbg.tabs.created, 5);
+    // corrigendum 02 is a web page (POST supply/viewCorrigendum.do): printed like the letters; 01 is a PDF file: saved as is
+    const corr = Object.fromEntries(c.corrigenda.files.map((f) => [f.fileName, f]));
+    assert.deepEqual(Object.keys(corr).sort(), ['Corrigendum_01_29263265.pdf', 'Corrigendum_02_29263265.pdf']);
+    assert.equal(corr['Corrigendum_02_29263265.pdf'].printed, true);
+    assert.equal(corr['Corrigendum_01_29263265.pdf'].printed, undefined);
+    assert.deepEqual(c.corrigenda.warnings, []);
+    assert.equal(dbg.tabs.created, 6);
     const names = savedNames();
-    assert.ok(!names.some((n) => /(Negotiation|Counter_Offers|Advance_Acceptance_LOA|Correspondence)\/.*\.html$/.test(n)), names.join('\n'));
-    assert.ok(names.some((n) => n.endsWith('Corrigenda/Corrigendum_02_29263265.html')), 'not a letter: unchanged');
+    assert.ok(!names.some((n) => /(Negotiation|Counter_Offers|Advance_Acceptance_LOA|Correspondence|Corrigenda)\/.*\.html$/.test(n)), names.join('\n'));
+    // the corrigendum page is asked for as its view icon does: POST with activity=displayPubCorri, nitId, cn, corrigendumId
+    const asked = server.log.filter((l) => l.path === '/epsn/supply/viewCorrigendum.do');
+    assert.equal(asked.length, 2);
+    assert.ok(asked.every((l) => l.method === 'POST' && l.body.activity === 'displayPubCorri' && l.body.nitId === '5569207' && l.body.cn && l.body.corrigendumId), JSON.stringify(asked));
   } finally {
     withoutDebugger();
   }
+});
+const ATT_CORR = (attached) => T({ corrigenda: [{ id: '1204999', cn: '2', date: '07/10/2026 10:00', attached }] });
+const savedText = (suffix) => new TextDecoder().decode(saved.find((x) => x.filename.endsWith(suffix))?.bytes || new Uint8Array());
+test('Corrigendum with an attached document: the corrigendum page (printed) AND the attached file are saved, never the file alone', async () => {
+  mk({ tenders: [ATT_CORR(['Revised_Spec.pdf'])] });
+  const dbg = fakeDebugger();
+  try {
+    const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
+    assert.equal(c.status, 'DOWNLOADED');
+    assert.equal(c.downloaded, 1, 'one corrigendum (its attachment is not counted as another)');
+    const files = Object.fromEntries(c.files.map((f) => [f.fileName, f]));
+    assert.deepEqual(Object.keys(files).sort(), ['Corrigendum_02_29263265.pdf', 'Corrigendum_02_29263265_Attachment_1.pdf']);
+    assert.equal(files['Corrigendum_02_29263265.pdf'].printed, true, 'the page itself is printed by Chrome');
+    assert.equal(files['Corrigendum_02_29263265_Attachment_1.pdf'].role, 'attachment');
+    assert.equal(files['Corrigendum_02_29263265_Attachment_1.pdf'].attachmentOf, 'Corrigendum_02_29263265.pdf');
+    assert.match(savedText('Corrigendum_02_29263265_Attachment_1.pdf'), /corratt\/ireps\/upload\/corrigendum\/1204999\/Revised_Spec\.pdf/, 'the attachment is the linked file');
+    assert.doesNotMatch(savedText('Corrigendum_02_29263265.pdf'), /corratt/, 'the corrigendum is the page, not the attachment');
+    assert.equal(dbg.tabs.created, 1);
+    assert.deepEqual(c.warnings, []);
+    assert.ok(savedNames().every((n) => n.includes('/Corrigenda/')), savedNames().join('\n'));
+  } finally {
+    withoutDebugger();
+  }
+});
+test('Corrigendum attachments: several are numbered in page order; one that fails is a warning and the rest are kept', async () => {
+  mk({ tenders: [ATT_CORR(['Revised_Spec.pdf', 'missing.pdf', 'Annexure.pdf'])] });
+  fakeDebugger();
+  try {
+    const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
+    assert.equal(c.status, 'DOWNLOADED', 'the corrigendum is saved even when an attachment fails');
+    assert.deepEqual(c.files.map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Corrigendum_02_29263265_Attachment_1.pdf', 'Corrigendum_02_29263265_Attachment_2.pdf']);
+    assert.match(savedText('_Attachment_2.pdf'), /Annexure\.pdf/);
+    assert.equal(c.warnings.length, 1);
+    assert.match(c.warnings[0], /Corrigendum_02_29263265\.pdf: an attached document could not be downloaded/);
+  } finally {
+    withoutDebugger();
+  }
+});
+test('Corrigendum attachments without Chrome printing: text PDF + original HTML + the attached file', async () => {
+  mk({ tenders: [ATT_CORR(['Revised_Spec.pdf'])] });
+  const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
+  assert.deepEqual(c.files.map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Corrigendum_02_29263265.html', 'Corrigendum_02_29263265_Attachment_1.pdf']);
+  assert.match(savedText('Corrigendum_02_29263265.pdf'), /%PDF/);
+});
+test('A NIT viewer page still gives the NIT PDF only (keepPage is for corrigenda alone)', async () => {
+  mk({ tenders: [T({ attachments: [{ name: 'Spec.pdf', desc: 'SPEC', href: '/ireps/upload/att/Spec.pdf', asHtml: true }] })] });
+  const c = (await run('29263265', { only: ['attachments'] })).categories.attachments;
+  assert.equal(c.status, 'DOWNLOADED');
+  assert.ok(c.files.every((f) => !f.role && f.fileName.endsWith('.pdf')), JSON.stringify(c.files));
+  assert.ok(!savedNames().some((n) => /\.html$|_Attachment_/.test(n)), savedNames().join('\n'));
 });
 test('21. Session expiry mid-run is reported and nothing HTML is saved as a document', async () => {
   mk({ tenders: [FULL()] });
@@ -646,7 +759,7 @@ test('Letters job is by DATE: only letters published today, no tender number, no
   const r1 = await jobs.downloadLettersByDate();
   assert.equal(r1.summary.newLetters, 3);
   const names = savedNames().map((n) => n.split('/').slice(-3).join('/'));
-  for (const w of ['Tender_NEG1/Negotiation/Negotiation_NEG1_11.pdf', 'Tender_CO7/Counter_Offers/Counter_Offer_CO7_21.pdf', 'Tender_LOA3/Advance_Acceptance_LOA/LOA_LOA3_31.pdf']) assert.ok(names.includes(w), w);
+  for (const w of ['Tender_NEG1/Negotiation/Negotiation_NEG1_11.pdf', 'Tender_CO7/Counter_Offers/Counter_Offer_CO7_21.pdf', 'Tender_LOA3/Advance_Acceptance_LOA/LOA_LOA3.pdf']) assert.ok(names.includes(w), w);
   assert.ok(!names.some((n) => n.includes('OLD9')));
   // fast: three list reads (+form loads), no tender search, no per-tender re-query by tender number
   assert.ok(!server.log.some((l) => l.path === '/epsn/search/advancedSearch.do'));
@@ -675,6 +788,36 @@ test('Letters job: LOA letter needs the OK acknowledgement; not-OK is reported w
   const r = await jobs.downloadLettersByDate();
   assert.equal(r.tenders[0].categories.loa.status, 'FAILED');
   assert.match(r.tenders[0].categories.loa.files[0].error, /did not confirm/);
+});
+// IREPS ignores startDate/endDate on these lists and returns them newest first (the fake does the same)
+const longList = (extra = []) => [...Array.from({ length: 60 }, (_, i) => ({ no: `T${i}`, oid: `6${i}`, letter: `40${i}`, date: new Date(NOW() - (1 + i) * D) })), ...extra];
+const negoPages = () => server.listPages.filter((l) => l.status === 'MyNegotiation');
+test('Letters job reads the list once and stops after 2 pages older than From (not the whole list, twice)', async () => {
+  mk({ inbox: { MyNegotiation: longList([{ no: 'NEW1', oid: '71', letter: '901', date: new Date(NOW()) }, { no: 'NEW2', oid: '72', letter: '902', date: new Date(NOW()) }]), MyCounterOffer: [], MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
+  const r = await jobs.downloadLettersByDate({ dates: [dmy(NOW())], statuses: ['MyNegotiation'] });
+  assert.deepEqual(r.tenders.map((t) => t.tenderNo).sort(), ['NEW1', 'NEW2']);
+  assert.deepEqual(negoPages().map((l) => l.pageNo), ['1', '2', '3'], '62 rows = 5 pages; page 1 has today, pages 2-3 are older, 4-5 never read');
+  assert.equal(new Set(negoPages().map((l) => `${l.startDate}..${l.endDate}`)).size, 1, 'one date window');
+  assert.match(core.getLogTail(), /MyNegotiation: pages 2-3 are all older than \d{2}\/\d{2}\/\d{4}; stopping/);
+});
+test('Letters job: a letter dated today behind a full page of older live-bid rows is still found', async () => {
+  const live = Array.from({ length: 14 }, (_, i) => ({ no: `LIVE${i}`, oid: `8${i}`, letter: `50${i}`, date: new Date(NOW() - (3 + i) * D), live: true }));
+  mk({ inbox: { MyNegotiation: longList([...live, { no: 'LAPSED_TODAY', oid: '79', letter: '909', date: new Date(NOW()) }]), MyCounterOffer: [], MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
+  const r = await jobs.downloadLettersByDate({ dates: [dmy(NOW())], statuses: ['MyNegotiation'] });
+  assert.deepEqual(r.tenders.map((t) => t.tenderNo), ['LAPSED_TODAY']);
+  assert.deepEqual(negoPages().map((l) => l.pageNo), ['1', '2', '3', '4']);
+});
+test('Letters job: a From date far back reads the list to its end and finds every letter in range', async () => {
+  mk({ inbox: { MyNegotiation: longList(), MyCounterOffer: [], MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
+  const r = await jobs.downloadLettersByDate({ dates: jobs.dayRange(new Date(NOW() - 70 * D), new Date(NOW())), statuses: ['MyNegotiation'] });
+  assert.equal(r.summary.newLetters, 60);
+  assert.deepEqual(negoPages().map((l) => l.pageNo), ['1', '2', '3', '4', '5']);
+});
+test('Download by tender number: the date ranges stop once IREPS returns the same list for a second range', async () => {
+  mk({ tenders: [T({})], inbox: letters('29263265'), letterAsPdf: true });
+  await run('29263265', { only: ['negotiation'] });
+  assert.equal(negoPages().length, 2, JSON.stringify(negoPages()));
+  assert.equal(new Set(negoPages().map((l) => l.startDate)).size, 2);
 });
 test('Jobs never request tabulation endpoints', () => {
   assert.ok(!server.log.some((l) => /tabulation/i.test(JSON.stringify(l))));
@@ -765,7 +908,7 @@ test('B4. An invalid PDF response is not saved; the message is retried on the ne
   assert.ok(!r2.tenders.some((t) => t.tenderNo === 'G1')); // already handled: its message is not even re-opened
   assert.equal(saved.filter((s) => /NIT_G1/.test(s.filename)).length, before);
 });
-test('C. Date-based: corrigendum dated in range only, letters by date, correspondence dated in range; nothing unrelated', async () => {
+test('C. NIT Documents: corrigendum dated in range only; letters and correspondence are left to their own buttons; nothing unrelated', async () => {
   const today = dmy(NOW());
   mk({
     tenders: [futureT({ no: 'C1', nitId: '1', oid: '10', corrigenda: [{ id: '1', cn: '1', date: '01/09/2026 10:00' }, { id: '2', cn: '2', date: `${today} 10:00` }] }), futureT({ no: 'U1', nitId: '9', oid: '90', corrigenda: [{ id: '9', cn: '1', date: `${today} 09:00` }] })],
@@ -783,9 +926,11 @@ test('C. Date-based: corrigendum dated in range only, letters by date, correspon
   assert.ok(n.includes('Tender_C1/Corrigenda/Corrigendum_02_C1.pdf'));
   assert.ok(!n.some((x) => /Corrigendum_01_C1/.test(x))); // older corrigendum is not in the range
   assert.ok(!n.some((x) => x.includes('Tender_U1')));      // a tender with no message is unrelated
-  assert.ok(n.includes('Tender_N7/Negotiation/Negotiation_N7_71.pdf') && n.includes('Tender_K7/Counter_Offers/Counter_Offer_K7_61.pdf') && n.includes('Tender_L7/Advance_Acceptance_LOA/LOA_L7_51.pdf'));
-  assert.ok(!n.some((x) => x.includes('N8')));             // letter dated outside the range
-  assert.ok(n.includes('Tender_N7/Correspondence/Correspondence_N7_11.pdf') && !n.some((x) => /Correspondence_N7_12/.test(x)));
+  // Negotiation / Counter Offer / LOA have their own buttons, correspondence its own view: none of it is read here
+  assert.ok(!n.some((x) => /^Tender_(N7|N8|K7|L7)\/|\/(Negotiation|Counter_Offers|Advance_Acceptance_LOA|Correspondence)\//.test(x)), n.join('\n'));
+  assert.ok(!server.log.some((l) => /MyNegotiation|MyCounterOffer|MyAdvanceAcceptanceLetter/.test(JSON.stringify(l.body) + JSON.stringify(l.query))), 'no Post Tenders letter list is read');
+  assert.ok(!server.log.some((l) => l.path.startsWith('/epsn/corres/')), 'no correspondence page is read');
+  assert.deepEqual(Object.keys(r).filter((k) => k === 'letters' || k === 'correspondence'), []);
   assert.ok(!server.log.some((l) => /vendorCorresSubmitReply|coResponse|negoBid|tabulation/i.test(JSON.stringify(l))));
 });
 test('C. No matching documents for the dates => nothing downloaded', async () => {
@@ -884,6 +1029,8 @@ async function withDirectEcm(fn) {
   // the panel's Recon sign-in page answers this event; count whether it is asked at all
   globalThis.document = { dispatchEvent: () => { seen.asked += 1; return true; } };
   const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  const stored = new Map(); // created uid -> file length
+  let uploaded = 0;
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url);
     if (u === ECM_URL) seen.gateway.push(u);
@@ -892,9 +1039,19 @@ async function withDirectEcm(fn) {
     if (path === '/nuxeo/oauth2/token') return json(200, { access_token: 'tok', expires_in: 3600 });
     if (path === '/nuxeo/api/v1/search/lang/NXQL/execute') return json(200, { entries: [], isNextPageAvailable: false });
     if (path === '/nuxeo/api/v1/upload') return json(201, { batchId: 'b' });
-    if (path.startsWith('/nuxeo/api/v1/upload/')) return json(201, { uploaded: 'true' });
+    if (path.startsWith('/nuxeo/api/v1/upload/')) {
+      uploaded = init.body.length;
+      return json(201, { uploaded: 'true' });
+    }
+    if ((init.method || 'GET') === 'GET') {
+      const [uid, blob] = decodeURIComponent(path.replace('/nuxeo/api/v1/id/', '')).split('/@blob/');
+      // the read-back after a create: the document, then the last byte of its file
+      if (stored.has(uid)) return blob ? new Response(new Uint8Array(1), { status: 200 }) : json(200, { uid, properties: { 'file:content': { length: String(stored.get(uid)) } } });
+      return json(200, { uid, path: '/FT/folder' }); // the folder check
+    }
     const body = JSON.parse(init.body);
     seen.creates.push({ folder: path.replace('/nuxeo/api/v1/id/', ''), ...body.properties });
+    stored.set(`n-${seen.creates.length}`, uploaded);
     return json(201, { uid: `n-${seen.creates.length}`, path: `/x/${body.name}`, title: body.properties['dc:title'] });
   };
   try {
@@ -912,18 +1069,19 @@ test('ECM: account 833 is always HOSUR', () => {
   assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-UNIT 1 (IREPS ID- 833)').operatingUnit, 'HOSUR');
   assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED (IREPS ID- 833)').operatingUnit, 'HOSUR');
 });
-test('ECM: each tender category maps to its ECM kind, with tender number, date and LOI details; My Offer stays local', () => {
+test('ECM: each tender category maps to its ECM kind with the tender number (the only tender property the ECM has); My Offer stays local', () => {
   const ctx = { tenderNo: '29263265', closingDate: '09/11/2026 15:00' };
   const doc = (category, action) => tecm.ecmDocumentFor(category, action, ctx);
-  assert.deepEqual(doc('TENDER_PDF', { id: '5569207', meta: { title: 'NIT / Tender document' } }), { kind: 'nit', title: '29263265 - NIT', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00' } });
+  assert.deepEqual(doc('TENDER_PDF', { id: '5569207', meta: { title: 'NIT / Tender document' } }), { kind: 'nit', title: '29263265 - NIT', fields: { tender_number: '29263265' } });
   assert.equal(doc('ATTACHMENTS', { id: 'Annexure', meta: { title: 'Annexure - SPEC' } }).title, '29263265 - NIT - Annexure - SPEC');
   assert.deepEqual([doc('CORRIGENDA', { id: '1204920', meta: { title: '1' } }).title, doc('NEGOTIATION', { id: '77' }).title, doc('COUNTER_OFFER', { id: '78' }).title, doc('CORRESPONDENCE', { id: '9', meta: { title: 'Withdrawal' } }).title], ['29263265 - Extension - 1', '29263265 - NBSP - 77', '29263265 - CO - 78', '29263265 - CRP - Withdrawal'], 'titles: <tender no> - <spec code> - what tells them apart');
   assert.equal(doc('ATTACHMENTS', { id: 'x', meta: {} }).kind, 'nit');
   assert.deepEqual([doc('CORRIGENDA', { id: '1204920', meta: { title: '1' } }).kind, doc('NEGOTIATION', { id: '1' }).kind, doc('COUNTER_OFFER', { id: '1' }).kind, doc('CORRESPONDENCE', { id: '1', meta: { title: 'Withdrawal' } }).kind], ['extension', 'nbsp', 'co', 'crp']);
-  assert.deepEqual(doc('LOA', { id: '1461928', meta: { docDate: '04/10/2026' } }), { kind: 'loi', title: '29263265 - LOI', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00', loi_number: '1461928', loi_date: '04/10/2026' } });
+  assert.deepEqual(doc('LOA', { id: '1461928', meta: { docDate: '04/10/2026' } }), { kind: 'loi', title: '29263265 - LOI - 1461928', fields: { tender_number: '29263265' } }, 'no loiNumber / loiDate on the ECM: the letter id goes in the title');
   assert.equal(doc('MY_OFFER', { id: '1' }), null);
   assert.equal(tecm.ecmDocumentFor('NIT', {}, { tenderNo: 'T', dueDate: '' }), null);
-  assert.equal(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T', dueDate: new Date(2026, 10, 9).toISOString() }).fields.tender_date, '2026-11-09', 'an automatic-mode due date is its local day');
+  assert.deepEqual(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T', dueDate: new Date(2026, 10, 9).toISOString() }).fields, { tender_number: 'T' }, 'no tenderDate on the ECM: the due date is not sent');
+  assert.equal(tecm.ECM_TAKES_TENDER_DATE, false);
 });
 test('ECM: Save to Local (the default) never calls the ECM', async () => {
   mk({ tenders: [FULL()] });
@@ -944,21 +1102,38 @@ test('ECM: Save to ECM / S3 files every tender document in the Hosur folder; My 
     assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2, vft: 1, vct: 1 });
     assert.deepEqual(posts.filter((p) => /^v[fc]t$/.test(p.kind)).map((p) => p.title).sort(), ['29263265 - Commercial Tabulation', '29263265 - Financial Tabulation']);
     assert.ok(posts.every((p) => p.account === '833' && p.unit === 'HOSUR' && p.fields.tender_number === '29263265' && p.credentials === 'include'));
-    assert.ok(posts.every((p) => !p.fields.tender_date || /^\d{4}-\d{2}-\d{2}$/.test(p.fields.tender_date)), 'tender date, when known, as YYYY-MM-DD');
+    assert.ok(posts.every((p) => Object.keys(p.fields).join() === 'tender_number'), 'only the tender number: the ECM has no tenderDate / loiNumber / loiDate');
     const loi = posts.find((p) => p.kind === 'loi');
-    assert.deepEqual([loi.title, loi.fields.loi_number], ['29263265 - LOI', '1461928']);
-    assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(loi.fields.loi_date), 'LOI date from the published stamp');
+    assert.equal(loi.title, '29263265 - LOI - 1461928');
     assert.equal(new Set(posts.map((p) => p.title)).size, posts.length, 'every title is unique within the tender');
     // nothing that went to the ECM is in Downloads; My Offer (no ECM kind) is, and no manifest file is
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
     assert.ok(local.includes('My_Offer/My_Offer_29263265.pdf') && !local.some((n) => /manifest/i.test(n)));
     assert.ok(!local.some((n) => /^(NIT_and_Supporting_Documents|Negotiation|Counter_Offers|Advance_Acceptance_LOA|Correspondence)\//.test(n)), local.join('\n'));
-    assert.ok(local.includes('Corrigenda/Corrigendum_02_29263265.html'), 'a print-ready letter keeps its original HTML locally');
+    assert.ok(local.includes('Corrigenda/Corrigendum_02_29263265.html'), 'without Chrome printing, a corrigendum page keeps its original HTML locally');
     assert.equal(c.tenderPdf.files[0].ecm.status, 'stored');
     assert.equal(c.tenderPdf.files[0].relPath, null);
     assert.equal(c.myOffer.files[0].ecm, undefined);
     assert.equal(c.loa.files[0].ecm.uid, `u-${posts.indexOf(loi) + 1}`, 'the result records where each document went');
   });
+});
+test('ECM: a corrigendum\'s attached document is filed next to it as "<tender> - Extension - <corrigendum> - Attachment N"', async () => {
+  mk({ tenders: [ATT_CORR(['Revised_Spec.pdf'])] });
+  store['doclink.saveDestination'] = 'recon';
+  fakeDebugger();
+  try {
+    await withEcm((p, n) => [201, { uid: `u-${n}`, path: `/FT/x/${n}`, title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
+      const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
+      assert.deepEqual(posts.map((p) => [p.kind, p.title, p.file]), [
+        ['extension', '29263265 - Extension - Corrigendum - 2', 'Corrigendum_02_29263265.pdf'],
+        ['extension', '29263265 - Extension - Corrigendum - 2 - Attachment 1', 'Corrigendum_02_29263265_Attachment_1.pdf'],
+      ]);
+      assert.ok(c.files.every((f) => f.ecm?.status === 'stored'));
+      assert.equal(saved.length, 0, 'nothing local');
+    });
+  } finally {
+    withoutDebugger();
+  }
 });
 test('ECM: when the ECM refuses or is down, each document is saved locally instead and the reason is kept', async () => {
   mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: CORRES });
@@ -968,7 +1143,7 @@ test('ECM: when the ECM refuses or is down, each document is saved locally inste
     assert.equal(r.summary.failed, 0, 'nothing is lost');
     assert.equal(posts.length, 15);
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
-    for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265_1461928.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(local.includes(want), `missing ${want}`);
+    for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(local.includes(want), `missing ${want}`);
     const nit = r.categories.tenderPdf.files[0];
     assert.deepEqual([nit.ecm.status, nit.ecm.code, nit.ecm.detail], ['failed', 'ECM_REJECTED', 'nit requires tender_number']);
     assert.equal(r.categories.loa.files[0].ecm.code, 'ECM_UNAVAILABLE');
@@ -985,7 +1160,10 @@ test('ECM direct: with ecmBackendAws false every tender document goes straight t
     assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2, vft: 1, vct: 1 });
     assert.ok(creates.every((p) => p.folder === 'aa28acbe-add1-49d3-b0ab-16ab1263996c' && p['InvoiceCertificateSchema:tenderNumber'] === '29263265'));
     const loi = creates.find((p) => p['InvoiceCertificateSchema:type'] === 'loi');
-    assert.deepEqual([loi['dc:title'], loi['InvoiceCertificateSchema:loiNumber']], ['29263265 - LOI', '1461928']);
+    assert.equal(loi['dc:title'], '29263265 - LOI - 1461928');
+    // the properties the TEST ECM's InvoiceCertificateSchema has (anything else: HTTP 400 "No such property")
+    const props = new Set(['dc:title', 'file:content', 'InvoiceCertificateSchema:type', 'InvoiceCertificateSchema:tenderNumber']);
+    assert.ok(creates.every((p) => Object.keys(p).filter((k) => k !== 'folder').every((k) => props.has(k))), JSON.stringify(creates[0]));
     assert.equal(r.categories.tenderPdf.files[0].ecm.status, 'stored');
     assert.equal(r.categories.tenderPdf.files[0].ecm.uid.startsWith('n-'), true);
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
@@ -995,7 +1173,7 @@ test('ECM direct: with ecmBackendAws false every tender document goes straight t
   const asked = await withDirectEcm(async (seen) => seen.asked);
   assert.equal(asked, 0, 'no Recon sign-in asked in direct mode');
 });
-test('ECM: letters by date go to the ECM with the tender date looked up once per tender (a Local run never searches)', async () => {
+test('ECM: letters by date go to the ECM with the tender number only, without searching IREPS for the tender date', async () => {
   const at = (n) => new Date(NOW() - n * D);
   const closing = new Date(NOW() - 3 * D);
   mk({
@@ -1012,13 +1190,11 @@ test('ECM: letters by date go to the ECM with the tender date looked up once per
     const r = await jobs.downloadLettersByDate();
     assert.equal(r.summary.newLetters, 4);
     assert.deepEqual(posts.map((p) => p.kind).sort(), ['co', 'loi', 'nbsp', 'nbsp']);
-    const day = `${closing.getFullYear()}-${String(closing.getMonth() + 1).padStart(2, '0')}-${String(closing.getDate()).padStart(2, '0')}`;
     const loi = posts.find((p) => p.kind === 'loi');
-    assert.deepEqual(loi.fields, { tender_number: 'LOA3', tender_date: day, loi_number: '31', loi_date: dmy(NOW()).split('/').reverse().join('-') });
-    assert.ok(posts.filter((p) => p.kind === 'nbsp').every((p) => p.fields.tender_date === day));
-    assert.equal(posts.find((p) => p.kind === 'co').fields.tender_date, undefined, 'a tender IREPS cannot find: tender date left blank');
+    assert.deepEqual([loi.title, loi.fields], ['LOA3 - LOI - 31', { tender_number: 'LOA3' }]);
+    assert.ok(posts.every((p) => Object.keys(p.fields).join() === 'tender_number'));
     assert.ok(posts.every((p) => p.account === '833' && p.unit === 'HOSUR'));
-    assert.equal(server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do' && l.body.advancedSearch === 'NEG1').length, 1, 'searched once for two letters');
+    assert.equal(server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do').length, 0, 'no tender search: the ECM has no tenderDate to fill');
     assert.ok(!savedNames().some((n) => /\/(Negotiation|Counter_Offers|Advance_Acceptance_LOA)\//.test(n)), 'nothing that went to the ECM is in Downloads');
   });
 });
@@ -1292,6 +1468,24 @@ test('Tabulation by closing date: a range longer than 90 days is read in windows
   assert.deepEqual([one.tabulations.listed, one.tabulations.summary.downloaded], [1, 1]);
   assert.ok(closedPosts().every((l) => l.body.tenderNo === '69261051'));
 });
+// 40 closed tenders, one a day back from 23/10/2026, for an IREPS that returns the whole list whatever the dates
+const closedDaily = () => Array.from({ length: 40 }, (_, i) => closed(`4226${String(i).padStart(4, '0')}`, { closing: new Date(2026, 9, 23 - i) }));
+test('Tabulation by closing date: when IREPS ignores the dates, only tenders whose own Closing Date is in the range are downloaded, and paging stops', async () => {
+  mk({ closed: closedDaily(), closedIgnoresDates: true });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 16) });
+  assert.deepEqual(r.tabulations.tenders.map((t) => [t.tenderNo, t.closingDate]), [['42260007', '16/10/2026 11:30'], ['42260008', '15/10/2026 11:30']]);
+  assert.equal(r.tabulations.summary.downloaded, 2);
+  assert.deepEqual(savedNames().sort(), ['DocLink/HOSUR/Tender_42260007/Tabulation/Financial_Tabulation_42260007.pdf', 'DocLink/HOSUR/Tender_42260008/Tabulation/Financial_Tabulation_42260008.pdf']);
+  assert.deepEqual(server.listPages.map((l) => l.pageNo), ['1', '2', '3'], 'page 1 has the range, pages 2-3 closed earlier, page 4 is never read');
+  assert.match(core.getLogTail(), /Pages 2-3 all closed before 15\/10\/2026; stopping/);
+  assert.match(core.getLogTail(), /2 closed tender\(s\) closing 15\/10\/2026\.\.16\/10\/2026 .*; 28 outside the dates skipped/);
+});
+test('Tabulation by closing date: a range over 90 days does not re-read the same list when IREPS ignores the dates', async () => {
+  mk({ closed: closedDaily(), closedIgnoresDates: true });
+  const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 5, 1), to: new Date(2026, 9, 23) });
+  assert.equal(r.tabulations.summary.downloaded, 40);
+  assert.deepEqual(closedPosts().map((l) => `${l.body.startDate}..${l.body.endDate} p${l.body.pageNo}`), ['01/06/2026..29/08/2026 p1', '01/06/2026..29/08/2026 p2', '01/06/2026..29/08/2026 p3', '01/06/2026..29/08/2026 p4', '30/08/2026..23/10/2026 p1']);
+});
 test('Tabulation: a single tender whose row has no tabulation link finds it in Closed Tenders around its closing date (one scan for both)', async () => {
   const closing = new Date(2026, 10, 9);
   mk({ tenders: [T({ offer: false, closing })], closed: [closed('29263265', { nitId: '5569207', oid: '107200478', closing })] });
@@ -1304,21 +1498,42 @@ test('Tabulation: a single tender whose row has no tabulation link finds it in C
   assert.equal(none.categories.financialTabulation.status, 'NOT_AVAILABLE');
   assert.match(none.categories.financialTabulation.note, /no Financial Tabulation for this tender yet/);
 });
-test('Tabulation: a web page answer is still saved as a PDF (with its original HTML)', async () => {
+test('Tabulation: a web page with no PDF behind it fails with what IREPS showed; nothing is saved as the tabulation', async () => {
   mk({ closed: [closed('42263731')], tabulationAsHtml: true });
   const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
-  assert.equal(r.tabulations.summary.downloaded, 1);
-  assert.ok(savedNames().some((n) => n.endsWith('Tabulation/Financial_Tabulation_42263731.pdf')), savedNames().join('\n'));
+  assert.equal(r.tabulations.summary.downloaded, 0);
+  const cat = r.tabulations.tenders[0].categories.financialTabulation;
+  assert.equal(cat.status, 'FAILED');
+  assert.match(cat.files[0].error, /only a web page: "financialTabulation 107263731/);
+  assert.deepEqual(savedNames(), []);
 });
-test('Tabulation: Save to ECM files them as vft / vct with "<tender no> - <type>" and the closing date as the tender date', async () => {
+for (const [mode, file] of [['iframe', '/ireps/upload/tbo/Tabulation_'], ['form', '/epsn/tbo/showTabulation.do'], ['open', '/ireps/upload/tbo/view']]) {
+  test(`Tabulation: the PDF behind a viewer page (${mode}) is downloaded; Techno-Commercial links in it are never requested`, async () => {
+    mk({ closed: [closed('42263731')], tabulationAs: mode });
+    const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+    assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
+    const f = saved.find((x) => x.filename.endsWith('Tabulation/Commercial_Tabulation_42263731.pdf'));
+    assert.match(new TextDecoder().decode(f.bytes), /^%PDF/);
+    assert.ok(paths().some((x) => x.startsWith(file)), paths().join('\n'));
+    assert.ok(!server.excludedHit, 'a Techno-Commercial link was requested');
+  });
+}
+test('Tabulation: the 29 Oct capture of Closed Tenders lists the seven tenders with both tabulations', () => {
+  const rows = wf.parseClosedTenders(core.parseHtml(readFileSync(new URL('./fixtures/closed-tenders-29oct.html', import.meta.url), 'utf8')));
+  assert.equal(rows.length, 10);
+  const withTab = rows.filter((r) => r.links.financialTabulation && r.links.commercialTabulation);
+  assert.deepEqual(withTab.map((r) => r.tenderNo), ['24260725', '61266411', '61262196', '82261482', '26261089', 'LN265570', 'LF265194']);
+  assert.deepEqual([withTab[0].closingDate, withTab[0].tenderOid, withTab[0].links.financialTabulation.method], ['29/10/2026 11:30', '107120554', 'POST']);
+});
+test('Tabulation: Save to ECM files them as vft / vct with "<tender no> - <type>" and the tender number', async () => {
   mk({ closed: [closed('42263731', { closing: new Date(2026, 9, 23) })] });
   store['doclink.saveDestination'] = 'recon';
   await withEcm((p, n) => [201, { uid: `u-${n}`, path: `/FT/x/${n}`, title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
     await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
     await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
     assert.deepEqual(posts.map((p) => [p.kind, p.title, p.fields.tender_number, p.fields.tender_date, p.account]), [
-      ['vft', '42263731 - Financial Tabulation', '42263731', '2026-10-23', '833'],
-      ['vct', '42263731 - Commercial Tabulation', '42263731', '2026-10-23', '833'],
+      ['vft', '42263731 - Financial Tabulation', '42263731', undefined, '833'],
+      ['vct', '42263731 - Commercial Tabulation', '42263731', undefined, '833'],
     ]);
     assert.equal(saved.length, 0, 'nothing that went to the ECM is in Downloads');
   });

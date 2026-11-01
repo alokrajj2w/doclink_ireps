@@ -51,6 +51,7 @@ function render(question) {
   const lines = [];
   if (done) lines.push(`${plural(done, "file was", "files were")} already downloaded by you to ${destinationText(question.destination)}.`);
   if (inEcm) lines.push(`${plural(inEcm, "file is", "files are")} already in the ECM folder they would go to.`);
+  if (inEcm && question.replacesEcm) lines.push("Downloading one of those again puts the new PDF in that ECM document; the old PDF stays in it, renamed _old (a damaged one is removed).");
   el.summary.textContent = `${lines.join(" ")} Tick the ones to download again; the others are skipped.`;
   el.list.replaceChildren(
     ...list.map((row) => {

@@ -250,7 +250,7 @@ function setConnectionForError(described) {
 function setButtonBusy(busy, label) {
   el.btnDownload.disabled = busy;
   el.btnDownload.classList.toggle("is-busy", busy);
-  el.btnLabel.textContent = label || (selectedDestination() === SAVE_DESTINATION.RECON ? "Download Bill Status to S3" : "Download Bill Status");
+  el.btnLabel.textContent = label || "Bill Status";
 }
 
 /* ------------------------------------------------ shared bottom result panel */
@@ -386,21 +386,12 @@ function toIrepsDate(isoDate) {
 
 function selectedDestination() {
   const checked = el.optDestination.find((r) => r.checked);
-  return checked ? checked.value : SAVE_DESTINATION.LOCAL;
+  return checked ? checked.value : SAVE_DESTINATION.RECON;
 }
 
-/** Buttons of the ECM documents (MA, PO / IC, tenders): under ECM / S3 they read "... to ECM". */
-const ECM_BUTTONS = [
-  ["#btn-ma-open", "Download MA"],
-  ["#btn-po-ic-open", "Download PO / IC"],
-  ["#btn-tender-open", "Download Tender Documents"],
-  ["#btn-auto-run .btn-label", "Scan My Messages & Download"]
-];
-
 /**
- * Button and progress-step labels follow the Save to choice (only while idle), on every card:
- * ECM / S3 reads "Download ... to S3" for Bill Status, CRN and R-NOTE and "Download ... to ECM"
- * for MA, PO / IC and tender documents.
+ * The Save to choice changed: progress steps read "Uploading to S3" under ECM / S3, and CRN /
+ * R-NOTE lock their format to Excel. Button labels name the file type only, whatever Save to says.
  */
 function updateDestination() {
   const toRecon = selectedDestination() === SAVE_DESTINATION.RECON;
@@ -410,20 +401,20 @@ function updateDestination() {
   refreshMaDestination();
   refreshPoIcDestination();
   refreshBatchDestination();
-  for (const [selector, label] of ECM_BUTTONS) {
-    const button = document.querySelector(selector);
-    if (button) button.textContent = toRecon ? `${label} to ECM` : label;
-  }
 }
 
-/** The Save to switch is one panel-wide preference, remembered across panel openings. */
+/**
+ * The Save to switch is one panel-wide preference, remembered across panel openings.
+ * ECM / S3 until the user picks Local; the default is stored too, as the tender runs read it from storage.
+ */
 async function restoreDestination() {
   try {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.SAVE_DESTINATION);
-    const value = stored[STORAGE_KEYS.SAVE_DESTINATION];
-    for (const radio of el.optDestination) radio.checked = radio.value === (value === SAVE_DESTINATION.RECON ? SAVE_DESTINATION.RECON : SAVE_DESTINATION.LOCAL);
+    const value = stored[STORAGE_KEYS.SAVE_DESTINATION] === SAVE_DESTINATION.LOCAL ? SAVE_DESTINATION.LOCAL : SAVE_DESTINATION.RECON;
+    for (const radio of el.optDestination) radio.checked = radio.value === value;
+    if (stored[STORAGE_KEYS.SAVE_DESTINATION] !== value) await chrome.storage.local.set({ [STORAGE_KEYS.SAVE_DESTINATION]: value });
   } catch {
-    /* keep the default (Local) */
+    /* keep the default (ECM / S3) */
   }
   updateDestination();
 }

@@ -147,15 +147,21 @@ function splitPoNoDate(text) {
  * @param {{ baseUrl?: string }} [options]
  * @returns {{ record: object, warnings: string[] }}
  */
+/** A row's cells as the user sees them: a cell hidden with display: none is not a column. */
+export function visibleCells(row) {
+  return Array.from(row.cells).filter((cell) => !/display\s*:\s*none/i.test(cell.getAttribute("style") || ""));
+}
+
 export function parseIcRow(row, header, group, ordinal = 1, options = {}) {
   const record = createEmptyIcRecord();
   record.index = ordinal;
   const warnings = [];
-  const cells = Array.from(row.cells);
-  // The live page prints one more data cell than it has headers, between IC Date and
-  // Passed Qty. (a second date); parseIcSearchResults() measures that surplus once per
-  // table as header.extra. A positional mapping would shift Passed Qty. / Call Status /
-  // Actions by one, so the columns after IC Date are aligned from the right instead and
+  const cells = visibleCells(row);
+  // The live page prints one more data cell than it has headers: a hidden one
+  // (display: none) right after Offer Qty., which visibleCells() leaves out. Should a
+  // surplus cell still remain, parseIcSearchResults() measures it once per table as
+  // header.extra, and the columns after IC Date are aligned from the right instead
+  // (a positional mapping would shift Passed Qty. / Call Status / Actions by one) and
   // the surplus cell(s) are left unmapped.
   const extra = Math.max(Number(header.extra) || 0, 0);
   const fullWidth = header.keys.length + extra;
@@ -255,12 +261,11 @@ export function parseIcSearchResults(html, expectedPoNumber = null, options = {}
     const { table, headerRow, keys, labels } = located;
     const group = { values: {} };
     let ordinal = startIndex;
-    const widest = Math.max(0, ...Array.from(table.rows).filter((r) => r !== headerRow && !isMarkupHeaderRow(r)).map((r) => r.cells.length));
+    const widest = Math.max(0, ...Array.from(table.rows).filter((r) => r !== headerRow && !isMarkupHeaderRow(r)).map((r) => visibleCells(r).length));
     const extra = widest > keys.length ? widest - keys.length : 0;
     for (const row of Array.from(table.rows)) {
       if (row === headerRow || isMarkupHeaderRow(row)) continue;
-      const cells = Array.from(row.cells);
-      if (cells.length < 6) continue; // spacer / message rows
+      if (visibleCells(row).length < 6) continue; // spacer / message rows
       rowCount++;
       const { record, warnings: rowWarnings } = parseIcRow(row, { labels, keys, extra }, group, ordinal, { baseUrl: options.baseUrl });
       warnings.push(...rowWarnings);

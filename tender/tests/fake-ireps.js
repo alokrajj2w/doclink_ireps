@@ -193,7 +193,23 @@ ${rows.map(row).join('\n')}
 }
 
 /** Letter responses: print-ready HTML wrapper (default) or a direct PDF. */
-export const letterHtml = (label) => html(`<div><h2>${label}</h2><table><tr><td>Letter No</td><td>306789</td></tr><tr><td>Date</td><td>11/09/2026</td></tr></table><p>Please note the revised terms and conditions apply to the above tender in all respects.</p></div>`, label);
+export const letterHtml = (label, extra = '') => html(`<div><h2>${label}</h2><table><tr><td>Letter No</td><td>306789</td></tr><tr><td>Date</td><td>11/09/2026</td></tr></table><p>Please note the revised terms and conditions apply to the above tender in all respects.</p>${extra}</div>`, label);
+/** A corrigendum page with its attached documents linked (c.attached = ['Revised_Spec.pdf', ...]). */
+export const corrigendumPage = (c) => letterHtml(`Corrigendum ${c.cn}`, (c.attached || []).map((f) => `<p>Attached Document: <a href="/ireps/upload/corrigendum/${c.id}/${f}" target="_blank">${f}</a></p>`).join(''));
+
+/**
+ * Tabulation answers that are not the PDF itself (commTboPdfAction.do opens in a popup, so no HAR has the real one):
+ *   iframe  a viewer embedding /ireps/upload/tbo/Tabulation_<oid>.pdf (no "financial"/"commercial" in the name),
+ *           next to a Techno-Commercial link that must never be requested
+ *   form    a page that posts itself on to the file (showTabulation.do), as postRequest.js does
+ *   open    a page whose script opens a servlet URL with no extension
+ */
+export function tabulationViewer(mode, type, oid) {
+  if (mode === 'iframe') return html(`<a href="/ireps/upload/tbo/TechnoCommercial_Tabulation_${oid}.pdf">TCT</a><a href="#" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=technoCommercialTabulation&tenderOID=${oid}')">t</a><iframe src="/ireps/upload/tbo/Tabulation_${oid}.pdf" width="100%"></iframe>`, 'Tabulation');
+  if (mode === 'form') return html(`<form action="/epsn/tbo/showTabulation.do" method="post"><input type="hidden" name="oid" value="${oid}"><input type="hidden" name="pdfType" value="${type}"></form><script>document.forms[0].submit();</script>`, 'Please wait');
+  if (mode === 'open') return html(`<p>Opening...</p><script>window.open('/ireps/upload/tbo/view?oid=${oid}&t=${type}', '_self');</script>`, 'Tabulation');
+  return html('<h1>Error</h1> unknown mode');
+}
 
 export class FakeIreps {
   constructor(state) {
@@ -207,11 +223,13 @@ export class FakeIreps {
       loaAck: 'OK',
       rejectAllDepts: false,
       inboxPages: {},
+      inboxPageSize: 14, // rows per Post Tenders list page, as on IREPS
       letterAsPdf: false,
       failPaths: [],
       ...state,
     };
     this.log = [];
+    this.listPages = []; // every Post Tenders list page requested: { status, startDate, endDate, pageNo }
   }
 
   tenderBy(f, v) { return this.s.tenders.find((t) => String(t[f]) === String(v)); }
@@ -259,7 +277,11 @@ export class FakeIreps {
       const t = this.tenderBy('nitId', body.get('nitId'));
       const c = t?.corrigenda?.find((x) => x.id === body.get('corrigendumId'));
       if (!c) return ok(html('<h1>Error</h1>'));
-      return c.asHtml ? ok(letterHtml(`Corrigendum ${c.cn}`)) : pdf('corr' + c.id);
+      return c.asHtml || c.attached ? ok(corrigendumPage(c)) : pdf('corr' + c.id);
+    }
+    if (p.startsWith('/ireps/upload/corrigendum/')) {
+      if (p.includes('missing')) return { status: 404, type: 'text/html', bytes: html('not found') };
+      return pdf('corratt' + p);
     }
     if (p === '/epsn/works/rfq/viewCorrigendumDetail.do') return { status: 404, type: 'text/html', bytes: html('wrong route') };
 
@@ -269,8 +291,16 @@ export class FakeIreps {
       const type = arg('pdfType');
       if (!['offer', 'financialTabulation', 'commercialTabulation'].includes(type)) { this.excludedHit = true; return pdf('FORBIDDEN'); }
       if (type !== 'offer' && this.s.tabulationAsHtml) return ok(letterHtml(`${type} ${arg('tenderOID')}`));
+      if (type !== 'offer' && this.s.tabulationAs) return ok(tabulationViewer(this.s.tabulationAs, type, arg('tenderOID')));
       return pdf(type + arg('tenderOID'));
     }
+    if (p.startsWith('/ireps/upload/tbo/')) {
+      if (/techno/i.test(p)) { this.excludedHit = true; return pdf('FORBIDDEN'); }
+      return pdf('tabfile' + p);
+    }
+    if (p === '/epsn/tbo/showTabulation.do') return method === 'POST' && body.get('oid') ? pdf('tabform' + body.get('oid')) : ok(html('<h1>Error</h1> missing'));
+    if (p.startsWith('/ireps/upload/loa/')) { this.loaAttachmentHit = true; return pdf('loa-attachment'); }
+    if (p.startsWith('/ireps/upload/co/')) { this.coAttachmentHit = true; return pdf('co-attachment'); }
 
     if (p === '/epsn/vendorInboxLink.do') {
       const status = body.get('status') || q.get('status');
@@ -283,19 +313,27 @@ export class FakeIreps {
         if ((to - from) / DAY > 90) return ok(html('<form>Date range should be within 90 days</form>'));
         const pageNo = Number(body.get('pageNo') || 1);
         const want = body.get('tenderNo');
+        this.listPages.push({ status: 'MyBidsClosed', startDate: body.get('startDate'), endDate: body.get('endDate'), pageNo: body.get('pageNo') });
+        if (this.s.closedIgnoresDates) {
+          // whole list whatever the dates, newest closing first, 10 rows a page (as the captured page)
+          const list = all.filter((t) => !want || t.no === want).sort((a, b) => b.closing - a.closing);
+          return ok(closedTendersPage(list.slice((pageNo - 1) * 10, pageNo * 10), { more: pageNo * 10 < list.length, pageNo }));
+        }
         const hits = all.filter((t) => (!want || t.no === want) && t.closing >= from && t.closing <= to);
         const pages = Math.max(1, ...hits.map((t) => t.page || 1));
         return ok(closedTendersPage(hits.filter((t) => (t.page || 1) === pageNo), { more: pageNo < pages, pageNo }));
       }
       if (!body.get('startDate')) return ok(inboxForm());
-      const from = parseD(body.get('startDate'));
-      const to = parseD(body.get('endDate'));
+      this.listPages.push({ status, startDate: body.get('startDate'), endDate: body.get('endDate'), pageNo: body.get('pageNo') });
       const pageNo = Number(body.get('pageNo') || 1);
       const want = body.get('tenderNo');
-      const rows = (this.s.inbox[status] || []).filter((r) => (!want || r.no === want) && r.date >= from && r.date <= to);
+      // like IREPS: startDate/endDate are ignored on Post Tenders lists; newest Letter Date first, live bids before lapsed
+      const rows = (this.s.inbox[status] || []).filter((r) => !want || r.no === want)
+        .sort((a, b) => (a.live ? 0 : 1) - (b.live ? 0 : 1) || b.date - a.date);
       const pages = this.s.inboxPages[status];
-      if (pages) return ok(inboxRows(status, body.get('tenderNo'), rows.filter((r) => (r.page || 1) === pageNo), { more: pageNo < pages }));
-      return ok(inboxRows(status, body.get('tenderNo'), rows));
+      if (pages) return ok(inboxRows(status, want, rows.filter((r) => (r.page || 1) === pageNo), { more: pageNo < pages }));
+      const per = this.s.inboxPageSize;
+      return ok(inboxRows(status, want, rows.slice((pageNo - 1) * per, pageNo * per), { more: pageNo * per < rows.length }));
     }
 
     const letterPaths = ['/epsn/supply/tds/publishIndiNegotiationLetter.do', '/epsn/supply/tds/publishCounterOfferLetter.do', '/epsn/supply/tds/publishLOALetter.do', '/epsn/corres/rly/viewpubIndltr.do'];
@@ -303,7 +341,8 @@ export class FakeIreps {
       if (method !== 'POST') return { status: 405, type: 'text/html', bytes: html('POST only') };
       if (p.endsWith('publishLOALetter.do') && !this.loaAcked) return ok(html('<h1>Not viewed</h1> You have not acknowledged the letter first, error occurred'));
       const id = body.get('negoLetterId') || body.get('letterId') || body.get('letterID');
-      return this.s.letterAsPdf ? pdf('letter' + id) : ok(letterHtml('Letter ' + id));
+      const extra = p.endsWith('publishLOALetter.do') ? this.s.loaExtra : p.endsWith('publishCounterOfferLetter.do') ? this.s.coExtra : '';
+      return this.s.letterAsPdf ? pdf('letter' + id) : ok(letterHtml('Letter ' + id, extra || ''));
     }
     if (p === '/epsn/supply/tds/ajxdata.do') {
       this.loaAcked = this.s.loaAck === 'OK';

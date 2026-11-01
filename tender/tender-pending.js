@@ -1,4 +1,4 @@
-// "Download All Pending Correspondence": IREPS Tender Related Correspondence -> every row of
+// "Download All Correspondence": IREPS Tender Related Correspondence -> every row of
 // "Correspondence - Pending" -> every letter of that row's "Pending Replies" -> letter + attachments.
 //
 // STRICTLY READ / DOWNLOAD ONLY. The only requests this module can issue are:
@@ -9,6 +9,7 @@
 // vendorCorresSubmitReply.do (and anything that looks like a write action) is refused in pcFetch().
 //
 // Every identifier is read from the live responses; nothing from a captured session is baked in.
+// Under "Save to: ECM / S3" the letters and attachments go to the unit's ECM folder as crp (storeFile).
 
 import {
   TenderError, SESSION_MSG, log, norm, getBaseUrl, absUrl, irepsFetch, assertSession, parseHtml,
@@ -19,13 +20,13 @@ import {
 import { getActiveIrepsAccountContext, accountFolderLabel, assertSameAccount, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { openLedger } from './tender-ledger.js';
 import { inferRoute } from './tender-workflows.js';
-import { ensureDownloadSignIn } from './tender-ecm.js';
+import { ensureDownloadSignIn, tenderEcmSink, ecmDocumentFor } from './tender-ecm.js';
 import { printPageToPdf } from './tender-print.js';
-import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
+import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE } from '../services/download-log.js';
 
 /** The download log of one saved file (letters keep their own "already saved" check: force / Download again). */
-const logPending = (entry, role, saved) =>
-  logDownload(downloadRecord({ docType: TENDER_DOC_TYPE.PENDING_CORRESPONDENCE, key: downloadKey.pending(entry.key, role) }, { filename: saved.relPath, destination: LOG_DESTINATION.LOCAL }));
+const logPending = (entry, role, { filename, ecm }) =>
+  logDownload(downloadRecord({ docType: TENDER_DOC_TYPE.PENDING_CORRESPONDENCE, key: downloadKey.pending(entry.key, role) }, { filename, ecm }));
 
 export const LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
 export const REPLY_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
@@ -420,6 +421,28 @@ export function letterFileName(letter, ext, { withId = false } = {}) {
 
 export const letterKey = (accountId, l) => `${accountId}|${l.nitOid}|${l.corresId}|${l.letterId}`;
 
+// ---------------------------------------------------------------- saving (Downloads or ECM)
+
+/**
+ * Save one file of a letter. Under "Save to: ECM / S3" (ecm = tenderEcmSink) it goes to the unit's ECM
+ * Tenders folder as "Correspondence Reply pending" (crp), titled "<tender no> - CRP - <title>"; when the
+ * ECM does not take it, it is saved to Downloads as before. -> { saved (local save or null), ecm }
+ */
+async function storeFile({ saver, ecm, rec, letter }, name, bytes, title, contentType = '') {
+  const doc = ecm && ecmDocumentFor('CORRESPONDENCE', { id: letter.letterId, meta: { title } }, { tenderNo: rec.tenderNo });
+  if (!doc) return { saved: await saver.save('', name, bytes), ecm: null };
+  const mimeType = /\.pdf$/i.test(name) ? 'application/pdf' : contentType || 'application/octet-stream';
+  const r = await ecm.save({ ...doc, bytes, filename: name, mimeType }, () => saver.save('', name, bytes));
+  log('Pending', `ECM ${r.ecm.status}${r.ecm.site ? ` (${r.ecm.site})` : ''}: ${name}`);
+  return { saved: r.local, ecm: r.ecm };
+}
+
+/** The file entry of a stored file: where it went (relPath when saved locally, ecm when the ECM took it). */
+const storedEntry = (name, bytes, { saved, ecm }) => ({
+  fileName: saved ? saved.relPath : name, relPath: saved ? saved.relPath : null, size: saved ? saved.size : bytes.length,
+  downloadId: saved ? saved.downloadId : null, ...(ecm ? { ecm } : {}),
+});
+
 // ---------------------------------------------------------------- saved-file validation
 
 async function verifySaved(saved, bytes, role) {
@@ -487,6 +510,9 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   state.letters ||= {};
   const run = new Set(); // keys / nitOids touched by THIS run
   const jobSaver = createSaver({ accountLabel: folderLabel, subPath: ['Correspondence', 'Pending'], conflict: 'overwrite' });
+  // Save to: ECM / S3 -> the unit's ECM folder (Recon sign-in when through the gateway); Local -> null
+  const ecm = await tenderEcmSink(account);
+  const folder = ecm ? `ECM (${account.operatingUnit || 'IREPS unit'}); a file the ECM does not take: Downloads/${jobSaver.root}/` : `Downloads/${jobSaver.root}/`;
   let aborted = null;
   let skipped = [];
 
@@ -530,10 +556,10 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   onEvent({ type: 'records', records: records.map((r) => ({ ...r, letterKeys: undefined })), skipped, pendingSectionFound: list.pendingSectionFound });
 
   if (!records.length) {
-    onProgress('No pending correspondence found');
+    onProgress('No correspondence found');
     await persist();
     emitSummary();
-    return { account: publicAccount(account), empty: true, summary: summarize(state, run), skipped, aborted, folder: `Downloads/${jobSaver.root}/` };
+    return { account: publicAccount(account), empty: true, summary: summarize(state, run), skipped, aborted, folder, toEcm: !!ecm };
   }
 
   // ---- Stage C..E per record (sequential: conservative towards IREPS)
@@ -621,7 +647,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
           continue;
         }
         try {
-          await processLetter({ base, saver, state, rec, entry, letter, page, detailUrl: detail.url, force, sleep, pace, onProgress });
+          await processLetter({ base, saver, ecm, state, rec, entry, letter, page, detailUrl: detail.url, force, sleep, pace, onProgress });
         } catch (e) {
           if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') {
             entry.status = STATUS.SESSION_EXPIRED;
@@ -668,11 +694,11 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   await persist();
   emitSummary();
   flushDownloadLog();
-  onProgress(aborted ? 'Stopped: ' + aborted.message : 'Pending correspondence download complete.');
-  return { account: publicAccount(account), empty: false, summary: summarize(state, run), skipped, aborted, folder: `Downloads/${jobSaver.root}/` };
+  onProgress(aborted ? 'Stopped: ' + aborted.message : 'Correspondence download complete.');
+  return { account: publicAccount(account), empty: false, summary: summarize(state, run), skipped, aborted, folder, toEcm: !!ecm };
 }
 
-async function processLetter({ base, saver, state, rec, entry, letter, page, detailUrl, force, sleep, pace, onProgress }) {
+async function processLetter({ base, saver, ecm, state, rec, entry, letter, page, detailUrl, force, sleep, pace, onProgress }) {
   const prevLetterFile = !force && entry.files.find((f) => f.role === 'letter' && f.status === 'DOWNLOADED');
   if (!force && entry.attachmentsComplete && prevLetterFile) {
     entry.status = STATUS.DOWNLOADED;
@@ -708,15 +734,18 @@ async function processLetter({ base, saver, state, rec, entry, letter, page, det
     const taken = (name) => Object.values(state.letters).some((o) => o.key !== entry.key && o.tenderNo === rec.tenderNo && o.files.some((f) => lc(f.fileName) === lc(name) && f.role === 'letter'));
     let name = letterFileName(letter, opened.ext);
     if (taken(name)) name = letterFileName(letter, opened.ext, { withId: true });
-    const saved = await saver.save('', name, opened.bytes);
-    const check = await verifySaved(saved, opened.bytes, 'letter');
-    logPending(entry, 'letter', saved);
+    if (sniffKind(opened.bytes) === 'html') throw new TenderError('NOT_DOCUMENT', 'A web page was about to be saved as the letter.');
+    const letterNo = letter.letterNo || letter.letterId;
+    const stored = await storeFile({ saver, ecm, rec, letter }, name, opened.bytes, [letterNo, letter.subject].filter(Boolean).join(' - '), opened.contentType);
+    const check = stored.saved ? await verifySaved(stored.saved, opened.bytes, 'letter') : {};
+    logPending(entry, 'letter', { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm });
     files.push({
-      role: 'letter', fileName: saved.relPath, relPath: saved.relPath, status: 'DOWNLOADED', size: saved.size, downloadedAt: new Date().toISOString(), downloadId: saved.downloadId,
+      role: 'letter', ...storedEntry(name, opened.bytes, stored), status: 'DOWNLOADED', downloadedAt: new Date().toISOString(),
       validation: { ok: true, kind: opened.form === 'html' ? 'pdf (rendered from HTML)' : opened.form === 'printed' ? 'pdf (printed by Chrome)' : opened.form, source: opened.via, ...(printError ? { printError } : {}), extension: opened.ext, httpStatus: opened.httpStatus, contentType: opened.contentType, pdfSignature: opened.ext === '.pdf' ? isPdfBytes(opened.bytes) : null, ...check },
     });
     if (opened.form === 'html') {
-      const htmlName = saved.relPath.replace(/\.pdf$/i, '') + '.html';
+      // the original page stays in Downloads, also when the letter went to the ECM (as for tender letters)
+      const htmlName = (stored.saved ? stored.saved.relPath : name).replace(/\.pdf$/i, '') + '.html';
       const s2 = await saver.save('', htmlName, new TextEncoder().encode(opened.html), 'text/html');
       files.push({ role: 'letter_source_html', fileName: s2.relPath, relPath: s2.relPath, status: 'DOWNLOADED', size: s2.size, downloadedAt: new Date().toISOString(), downloadId: s2.downloadId, note: 'original IREPS letter page' });
     }
@@ -733,11 +762,11 @@ async function processLetter({ base, saver, state, rec, entry, letter, page, det
       await sleep(pace);
       const got = await withRetry(() => fetchAttachment(base, att), { sleep, label: `attachment ${att.id}` });
       const name = `Attachment_${safeSegment(letter.letterNo || letter.letterId, 40)}_${got.fileName}`;
-      const saved = await saver.save('', name, got.bytes);
-      const check = await verifySaved(saved, got.bytes, 'attachment');
-      logPending(entry, `attachment:${att.id}`, saved);
+      const stored = await storeFile({ saver, ecm, rec, letter }, name, got.bytes, [letter.letterNo || letter.letterId, 'Attachment', got.fileName].join(' - '), got.contentType);
+      const check = stored.saved ? await verifySaved(stored.saved, got.bytes, 'attachment') : {};
+      logPending(entry, `attachment:${att.id}`, { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm });
       files.push({
-        role: 'attachment', attId: att.id, fileName: saved.relPath, relPath: saved.relPath, originalName: got.fileName, status: 'DOWNLOADED', size: saved.size, downloadedAt: new Date().toISOString(), downloadId: saved.downloadId,
+        role: 'attachment', attId: att.id, ...storedEntry(name, got.bytes, stored), originalName: got.fileName, status: 'DOWNLOADED', downloadedAt: new Date().toISOString(),
         validation: { ok: true, kind: got.kind, extension: got.ext, httpStatus: got.httpStatus, contentType: got.contentType, ...check },
       });
     } catch (e) {

@@ -13,7 +13,6 @@
 
 import { MESSAGE_TYPES, MA_STAGES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
-import { SAVE_DESTINATION } from "../services/recon-service.js";
 import { describeSkip, skipChipText } from "../services/download-log.js";
 
 const $ = (id) => document.getElementById(id);
@@ -292,9 +291,8 @@ function applyFilter() {
 function updateSelectionUi() {
   const n = selected.size;
   const busy = currentState && (currentState.status === "downloading" || currentState.status === "searching");
-  const to = ctx && ctx.getDestination && ctx.getDestination() === SAVE_DESTINATION.RECON ? " to ECM" : "";
-  el.btnDownloadSelected.textContent = n ? `Download Selected (${n})${to}` : `Download Selected${to}`;
-  el.btnDownloadAll.textContent = `Download All${to}`;
+  el.btnDownloadSelected.textContent = n ? `Download Selected (${n})` : "Download Selected";
+  el.btnDownloadAll.textContent = "Download All";
   el.btnDownloadSelected.disabled = busy || n === 0;
   el.btnDownloadAll.disabled = busy || renderedIds.length === 0;
   const visible = visibleIds();
@@ -472,7 +470,7 @@ async function newSearch() {
 /* Public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
-/** Save to changed: the download buttons say where the MAs go. */
+/** Save to changed: refresh the download buttons (their labels do not name the destination). */
 export function refreshMaDestination() {
   if (ctx) updateSelectionUi();
 }

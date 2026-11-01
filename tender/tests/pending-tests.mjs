@@ -1,4 +1,4 @@
-// Tests for "Download All Pending Correspondence" (tender/tender-pending.js).
+// Tests for "Download All Correspondence" (tender/tender-pending.js).
 // Run:  JSDOM_ROOT=/path/to/dir-containing-node_modules node --test tender/tests/pending-tests.mjs
 // The fixtures in tender/tests/fixtures are the real IREPS pages from the supplied HAR (names redacted);
 // the fake server below rewrites their rows so the tests can vary how many records / letters exist.
@@ -293,6 +293,94 @@ test('when Chrome cannot print, the letter keeps the text rendering + original .
     delete chrome.tabs;
   }
 });
+// ---- Save to: ECM / S3 (straight to a fake ECM, "ecmBackendAws": false: no Recon sign-in)
+const ecmCfg = await import('../../services/ecm-config.js');
+const NUXEO = 'http://ecm.test:8080';
+async function withDirectEcm(fn, { refuse = false } = {}) {
+  ecmCfg.applyEcmConfig({ ecmBackendAws: false, ecm: { env: 'TEST', domain: NUXEO, clientId: 'id', clientSecret: 'secret' } });
+  chrome.runtime.getManifest = () => ({ host_permissions: [`${NUXEO}/*`] });
+  const prev = globalThis.fetch;
+  const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  const seen = { creates: [] };
+  const sizes = new Map();
+  let uploaded = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (!u.startsWith(NUXEO)) return prev(url, init);
+    const path = new URL(u).pathname;
+    if (path === '/nuxeo/oauth2/token') return json(200, { access_token: 'tok', expires_in: 3600 });
+    if (path === '/nuxeo/api/v1/search/lang/NXQL/execute') return json(200, { entries: [], isNextPageAvailable: false });
+    if (path === '/nuxeo/api/v1/upload') return json(201, { batchId: 'b' });
+    if (path.startsWith('/nuxeo/api/v1/upload/')) { uploaded = init.body.length; return json(201, { uploaded: 'true' }); }
+    if ((init.method || 'GET') === 'GET') {
+      const [uid, blob] = decodeURIComponent(path.replace('/nuxeo/api/v1/id/', '')).split('/@blob/');
+      if (sizes.has(uid)) return blob ? new Response(new Uint8Array(1), { status: 200 }) : json(200, { uid, properties: { 'file:content': { length: String(sizes.get(uid)) } } });
+      return json(200, { uid, path: '/FT/folder' }); // the folder check
+    }
+    if (refuse) return json(500, { message: 'ECM down' });
+    const body = JSON.parse(init.body);
+    seen.creates.push({ folder: path.replace('/nuxeo/api/v1/id/', ''), ...body.properties });
+    sizes.set(`n-${seen.creates.length}`, uploaded);
+    return json(201, { uid: `n-${seen.creates.length}`, path: `/x/${body.name}`, title: body.properties['dc:title'] });
+  };
+  try {
+    return await fn(seen);
+  } finally {
+    globalThis.fetch = prev;
+    delete chrome.runtime.getManifest;
+    ecmCfg.applyEcmConfig({ ecmBackendAws: true });
+  }
+}
+
+test('Save to ECM / S3: every pending letter and attachment goes to the unit\'s ECM Tenders folder as crp, not to Downloads', async () => {
+  scenario();
+  store['doclink.saveDestination'] = 'recon';
+  await withDirectEcm(async ({ creates }) => {
+    const r = await go();
+    assert.equal(r.toEcm, true);
+    assert.match(r.folder, /^ECM \(/);
+    assert.equal(r.summary.lettersDownloaded, 3);
+    assert.equal(r.summary.attachmentsDownloaded, 2);
+    assert.ok(creates.every((p) => p['InvoiceCertificateSchema:type'] === 'crp' && p.folder === 'aa28acbe-add1-49d3-b0ab-16ab1263996c'), JSON.stringify(creates));
+    assert.deepEqual(creates.map((p) => p['dc:title']).sort(), [
+      '19264728 - CRP - 501 - Confirmation;', '19264728 - CRP - 502 - Confirmation;',
+      'L1265428 - CRP - 777/B - Attachment - Annexure 1.pdf', 'L1265428 - CRP - 777/B - Attachment - drawing.pdf', 'L1265428 - CRP - 777/B - Clarification / price',
+    ]);
+    assert.deepEqual(creates.map((p) => p['InvoiceCertificateSchema:tenderNumber']).sort(), ['19264728', '19264728', 'L1265428', 'L1265428', 'L1265428']);
+    // nothing that went to the ECM is in Downloads (only the original page of the letter Chrome could not print)
+    assert.deepEqual(saved.map((s) => s.filename.split('/').pop()), ['Correspondence_502_11-10-2026_Confirmation;.html']);
+    const l3 = stored().letters.find((x) => x.letterId === '9003');
+    const letter = l3.files.find((f) => f.role === 'letter');
+    assert.deepEqual([letter.ecm.status, letter.relPath, letter.fileName], ['stored', null, 'Correspondence_777_B_11-10-2026_Clarification _ price.pdf']);
+    assert.ok(l3.files.filter((f) => f.role === 'attachment').every((f) => f.ecm.status === 'stored' && f.relPath === null));
+  });
+});
+test('Save to ECM / S3: a letter the ECM does not take is saved to Downloads instead, with the reason', async () => {
+  scenario();
+  store['doclink.saveDestination'] = 'recon';
+  await withDirectEcm(async ({ creates }) => {
+    const r = await go();
+    assert.equal(creates.length, 0);
+    assert.equal(r.summary.lettersDownloaded, 3);
+    const names = saved.map((s) => s.filename);
+    assert.ok(names.includes('DocLink/HOSUR/Correspondence/Pending/19264728/Correspondence_501_11-10-2026_Confirmation;.pdf'), names.join('\n'));
+    assert.ok(names.some((n) => /Pending\/L1265428\/Attachment_777_B_Annexure 1\.pdf$/.test(n)));
+    const letter = stored().letters.find((x) => x.letterId === '9001').files.find((f) => f.role === 'letter');
+    assert.equal(letter.ecm.status, 'failed');
+    assert.match(letter.relPath, /Correspondence_501/);
+  }, { refuse: true });
+});
+test('Save to Local: nothing is sent to the ECM', async () => {
+  scenario();
+  store['doclink.saveDestination'] = 'local';
+  await withDirectEcm(async ({ creates }) => {
+    const r = await go();
+    assert.equal(r.toEcm, false);
+    assert.equal(creates.length, 0);
+    assert.ok(stored().letters.every((l) => l.files.every((f) => !f.ecm)));
+  });
+});
+
 test('T4 empty pending table: finishes cleanly, only the list is requested', async () => {
   mk({ rows: [] });
   const r = await go();
@@ -415,15 +503,15 @@ test('two tenders sharing a number get separate folders; a filename collision ac
 });
 
 // =========================== UI (real popup.html in jsdom) ==============================
-test('UI: clicking "Download All Pending Correspondence" fills the progress table and counts; empty state shown when nothing pending', async () => {
+test('UI: clicking "Download All Correspondence" fills the progress table and counts; empty state shown when nothing pending', async () => {
   const dom = new JSDOM(readFileSync(new URL('../../popup/popup.html', import.meta.url), 'utf8').replace(/<script[^>]*><\/script>/g, ''), { pretendToBeVisual: true });
   Object.assign(globalThis, { document: dom.window.document, window: dom.window, MutationObserver: dom.window.MutationObserver });
   Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
   const $ = (id) => document.getElementById(id);
   scenario();
   await import('../pending-ui.js');
-  assert.match($('card-pending').textContent, /Pending Correspondence Downloads/);
-  assert.match($('btn-pc-run').textContent, /Download All Pending Correspondence/);
+  assert.equal($('btn-pending-open').textContent, 'Correspondence');
+  assert.match($('btn-pc-run').textContent, /Download All Correspondence/);
   const finished = async () => { for (let i = 0; i < 400 && ($('pc-progress').hidden === true ? i < 3 : true); i++) await new Promise((r) => setTimeout(r, 25)); await new Promise((r) => setTimeout(r, 400)); };
   $('btn-pc-run').click();
   await finished();
@@ -439,5 +527,5 @@ test('UI: clicking "Download All Pending Correspondence" fills the progress tabl
   $('btn-pc-run').click();
   await finished();
   assert.equal($('pc-empty').hidden, false);
-  assert.equal($('pc-empty').textContent, 'No pending correspondence found');
+  assert.equal($('pc-empty').textContent, 'No correspondence found');
 });

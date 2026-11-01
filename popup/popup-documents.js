@@ -136,7 +136,7 @@ class DocumentCard {
     return (ctx && ctx.getDestination && ctx.getDestination()) || SAVE_DESTINATION.LOCAL;
   }
 
-  /** Recon uploads are always Excel: lock the format; relabel the button and the last step (only while idle). */
+  /** Recon uploads are always Excel: lock the format; relabel the last step. */
   updateDestination() {
     const el = this.el;
     const toRecon = this.selectedDestination() === SAVE_DESTINATION.RECON;
@@ -191,7 +191,7 @@ class DocumentCard {
   setBusy(busy, text) {
     this.el.btnDownload.disabled = busy;
     this.el.btnDownload.classList.toggle("is-busy", busy);
-    this.el.btnLabel.textContent = text || (this.selectedDestination() === SAVE_DESTINATION.RECON ? `Download ${this.label} to S3` : `Download ${this.label}`);
+    this.el.btnLabel.textContent = text || this.label;
   }
 
   clearError() {

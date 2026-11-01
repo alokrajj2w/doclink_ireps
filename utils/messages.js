@@ -443,6 +443,12 @@ export const ERROR_CATALOG = Object.freeze({
     notice: true,
     connection: "connected"
   },
+  ECM_FILE_DAMAGED: {
+    title: "ECM copy is damaged",
+    message: "The ECM holds this document but cannot serve its file in full ({detail}). It was saved locally; ask the ECM team to remove the damaged copy.",
+    notice: true,
+    connection: "connected"
+  },
   DOWNLOAD_LOG_SIGN_IN_REQUIRED: {
     title: "Recon Engine sign-in required",
     message: "Sign in to the Recon Engine to download: DocLink records every download for the signed-in user, and checks what you already downloaded. Nothing was downloaded.",

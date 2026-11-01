@@ -19,7 +19,6 @@
 
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
-import { SAVE_DESTINATION } from "../services/recon-service.js";
 import { describeSkip } from "../services/download-log.js";
 
 const $ = (id) => document.getElementById(id);
@@ -79,7 +78,7 @@ let icFolderDownloadId = null;
 function setPoBusy(busy, label) {
   el.btnPoDownload.disabled = busy;
   el.btnPoDownload.classList.toggle("is-busy", busy);
-  el.poDownloadLabel.textContent = label || `Download PO${toEcm()}`;
+  el.poDownloadLabel.textContent = label || "Download PO";
 }
 
 function resetPoResults() {
@@ -165,7 +164,7 @@ async function refreshPoState() {
 function setIcBusy(busy, label) {
   el.btnIcDownload.disabled = busy;
   el.btnIcDownload.classList.toggle("is-busy", busy);
-  el.icDownloadLabel.textContent = label || `Download Inspection Certificate${toEcm()}`;
+  el.icDownloadLabel.textContent = label || "Download Inspection Certificate";
 }
 
 function resetIcResults() {
@@ -276,12 +275,7 @@ async function openView() {
 /**
  * @param {{ send: Function, showView: Function, setConnection: Function, setConnectionForError: Function }} context
  */
-/** " to ECM" while Save to is ECM / S3. */
-function toEcm() {
-  return ctx && ctx.getDestination && ctx.getDestination() === SAVE_DESTINATION.RECON ? " to ECM" : "";
-}
-
-/** Save to changed: the idle download buttons say where the PO and ICs go. */
+/** Reset the idle download buttons' labels (the labels name the file type only, whatever Save to says). */
 export function refreshPoIcDestination() {
   if (!ctx) return;
   if (!el.btnPoDownload.classList.contains("is-busy")) setPoBusy(false);

@@ -1,8 +1,9 @@
-// "Pending Correspondence Downloads" view: account panel, one-click download of every pending letter,
+// "Correspondence Downloads" view: account panel, one-click download of every pending letter,
 // live progress table, counts, retry. All values shown come from IREPS responses; text is set via textContent only.
 import { downloadPendingCorrespondence } from './tender-pending.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { SESSION_MSG, getLogTail } from './tender-core.js';
+import { describeEcmOutcome } from '../services/ecm-service.js';
 
 const $ = (id) => document.getElementById(id);
 const main = $('view-main');
@@ -100,7 +101,8 @@ function onEvent(ev) {
     const rec = rows.get(`r:${l.nitOid}`);
     if (rec) { rec.remove(); rows.delete(`r:${l.nitOid}`); }
     const att = l.files.filter((f) => f.role === 'attachment' && f.status === 'DOWNLOADED').length;
-    const note = [l.alreadyDownloaded ? 'already downloaded' : '', att ? `${att} attachment(s)` : '', l.status === 'FAILED' || l.status === 'NEEDS_REVIEW' ? l.error : ''].filter(Boolean).join(' · ');
+    const letterEcm = l.files.find((f) => f.role === 'letter' && !f.previous)?.ecm;
+    const note = [l.alreadyDownloaded ? 'already downloaded' : '', describeEcmOutcome(letterEcm), att ? `${att} attachment(s)` : '', l.status === 'FAILED' || l.status === 'NEEDS_REVIEW' ? l.error : ''].filter(Boolean).join(' · ');
     upsert(`l:${ev.key}`, { tenderNo: l.tenderNo, letterNo: l.letterNo, letterDate: l.letterDate, subject: l.subject, deadline: l.replyDeadline, status: l.status, note });
   } else if (ev.type === 'summary') {
     renderSummary(ev.summary);

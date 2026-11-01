@@ -225,7 +225,7 @@ body {
   width: 100%;
   border: 1px solid transparent;
   border-radius: 8px;
-  padding: 10px 14px;
+  padding: 6px 12px;
   font: inherit;
   font-weight: 600;
   cursor: pointer;
@@ -280,6 +280,50 @@ body {
 
 .btn.is-busy .btn-spinner {
   display: inline-block;
+}
+
+/* on an outlined button the spinner is teal, not white */
+.btn-secondary .btn-spinner {
+  border-color: rgba(56, 152, 144, 0.3);
+  border-top-color: var(--primary);
+}
+
+/* Buttons side by side: one column in a narrow panel, more as the panel is widened */
+.btn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+/* Small uppercase title over a group of buttons or fields */
+.group-title {
+  margin: 4px 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+/* Main view, Download: Bill Status, CRN and R-NOTE each with their search options */
+.dl-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  align-items: start;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.dl-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.dl-item .options {
+  margin: 0;
+}
+.dl-item .progress {
+  margin-top: 0;
 }
 
 @keyframes spin {
@@ -1209,5 +1253,3 @@ body[data-gate="on"] #view-redownload {
   margin: 4px 0;
   color: var(--text);
 }
-
-.tender-letters { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }

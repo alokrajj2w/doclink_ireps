@@ -8,8 +8,8 @@
  * APIs are used. Invoked from run-tests.js.
  */
 
-import { uploadToEcm, saveToEcmOrLocally, EcmError, ECM_ERROR, ECM_KIND, ECM_OUTCOME } from "../services/ecm-service.js";
-import { uploadToNuxeo, buildEcmQuery, existingDocumentQuery, nxqlLiteral, searchEcm, resetEcmDirectState } from "../services/ecm-direct.js";
+import { uploadToEcm, saveToEcmOrLocally, describeEcmOutcome, EcmError, ECM_ERROR, ECM_KIND, ECM_OUTCOME } from "../services/ecm-service.js";
+import { uploadToNuxeo, buildEcmQuery, existingDocumentQuery, nxqlLiteral, searchEcm, resetEcmDirectState, oldFileName } from "../services/ecm-direct.js";
 import { applyEcmConfig, mergeConfig, ECM_CONFIG, isDirectEcm } from "../services/ecm-config.js";
 import { ECM_KINDS, ECM_SITES, routeSite } from "../services/ecm-catalog.js";
 import { applyReconConfig } from "../services/recon-service.js";
@@ -34,14 +34,34 @@ function jsonResponse(status, body) {
 
 /**
  * A fake Nuxeo. Records every call as { method, url, path, query, headers, body }.
- *   existing      entries the dedup search finds
+ *   existing      entries the dedup search finds; each is also a stored document whose main
+ *                 file is `file` (default "f.pdf", 5 bytes) with attachments `files`
+ *                 (names, or { name, damaged: true })
  *   folders       path -> uid for `ecm:path = ` lookups
  *   respond(call) optional override: return a Response to answer a call yourself
+ *   damaged       uid -> how many bytes of that document's main file the ECM can really serve
+ *                 (the record keeps the uploaded length, as on the TEST ECM); for an existing
+ *                 document or one created here
+ *   damagedOnPut  uid -> the same for the main file a PUT stores
+ *   trashFails    uids whose Document.Trash the ECM refuses (fn.trashed lists the ones trashed)
+ * GET /id/{uid} opens a catalog folder (ECM_SITES) or a stored document (its file:content and
+ * files:files); /@blob/<xpath> serves one of its files; PUT /id/{uid} sets them from the batch.
  */
-function fakeNuxeo({ existing = [], folders = {}, respond } = {}) {
+const FOLDER_PATHS = Object.fromEntries(Object.values(ECM_SITES).flatMap((sites) => Object.values(sites).flatMap((site) => Object.entries(site.folderIds).map(([location, uid]) => [uid, site.locations[location]]))));
+function fakeNuxeo({ existing = [], folders = {}, respond, damaged = {}, damagedOnPut = {}, trashFails = [] } = {}) {
   const calls = [];
+  const trashed = [];
   let tokens = 0;
   let docs = 0;
+  const batch = {}; // upload-fileId -> { name, length }
+  const record = (name, length, served) => ({ name, length, served: served ?? length });
+  // uid -> { main: record, files: record[] }
+  const stored = new Map(existing.map((e) => [e.uid, {
+    main: record(e.file || "f.pdf", 5, damaged[e.uid]),
+    files: (e.files || []).map((f) => (typeof f === "string" ? record(f, 4) : record(f.name, 4, f.damaged ? 1 : undefined)))
+  }]));
+  const fromBatch = (ref) => ({ ...batch[ref["upload-fileId"]] });
+  const json = (r) => ({ name: r.name, "mime-type": "application/pdf", length: String(r.length) });
   const fn = async (url, init = {}) => {
     const u = new URL(url);
     const call = { method: init.method || "GET", url: String(url), path: u.pathname, query: u.searchParams.get("query"), headers: init.headers || {}, body: init.body, credentials: init.credentials };
@@ -55,16 +75,61 @@ function fakeNuxeo({ existing = [], folders = {}, respond } = {}) {
       return jsonResponse(200, { entries: existing, isNextPageAvailable: false });
     }
     if (call.path === "/nuxeo/api/v1/upload") return jsonResponse(201, { batchId: "batch-1" });
-    if (call.path.startsWith("/nuxeo/api/v1/upload/")) return jsonResponse(201, { uploaded: "true", fileIdx: "0" });
+    if (call.path.startsWith("/nuxeo/api/v1/upload/")) {
+      const fileId = call.path.split("/").pop();
+      batch[fileId] = { name: decodeURIComponent(call.headers["X-File-Name"] || ""), length: call.body ? call.body.length : 0 };
+      return jsonResponse(201, { uploaded: "true", fileIdx: fileId });
+    }
+    if (call.path.startsWith("/nuxeo/api/v1/id/") && call.method === "GET") {
+      const [uid, xpath] = decodeURIComponent(call.path.slice("/nuxeo/api/v1/id/".length)).split("/@blob/");
+      const doc = stored.get(uid);
+      if (doc && xpath) {
+        const index = /^files:files\/(\d+)\/file$/.exec(xpath);
+        const file = xpath === "file:content" ? doc.main : index ? doc.files[Number(index[1])] : null;
+        if (!file) return jsonResponse(404, { "entity-type": "exception", status: 404, message: xpath });
+        const start = Number((/^bytes=(\d+)-$/.exec(call.headers.Range || "") || [])[1] ?? 0);
+        // past the real end the ECM answers its error page ("Failed to skip in stream")
+        if (start >= file.served) return new Response("<html><title>An error occurred.</title></html>", { status: 500, headers: { "Content-Type": "text/html" } });
+        // the TEST ECM answers a range with 200 (not 206) and just the bytes asked for; a whole
+        // damaged file breaks off at its real end
+        return new Response(new Uint8Array(file.served - start), { status: 200, headers: { "Content-Type": "application/pdf" } });
+      }
+      if (doc) return jsonResponse(200, { "entity-type": "document", uid, path: `/x/${uid}`, title: `T ${uid}`, properties: { "file:content": json(doc.main), "files:files": doc.files.map((f) => ({ file: json(f) })) } });
+      if (FOLDER_PATHS[uid]) return jsonResponse(200, { "entity-type": "document", uid, path: FOLDER_PATHS[uid], type: "Folder" });
+      return jsonResponse(404, { "entity-type": "exception", status: 404, message: uid });
+    }
+    if (call.method === "POST" && call.path.endsWith("/@op/Document.Trash")) {
+      const uid = decodeURIComponent(call.path.slice("/nuxeo/api/v1/id/".length, -"/@op/Document.Trash".length));
+      if (trashFails.includes(uid)) return jsonResponse(500, { "entity-type": "exception", status: 500, message: "trash failed" });
+      trashed.push(uid);
+      return jsonResponse(200, { "entity-type": "document", uid, isTrashed: true });
+    }
+    if (call.method === "PUT" && call.path.startsWith("/nuxeo/api/v1/id/")) {
+      const uid = decodeURIComponent(call.path.slice("/nuxeo/api/v1/id/".length));
+      const doc = stored.get(uid);
+      if (!doc) return jsonResponse(404, { "entity-type": "exception", status: 404, message: uid });
+      const props = JSON.parse(call.body).properties;
+      if (props["file:content"]) {
+        const main = fromBatch(props["file:content"]);
+        doc.main = record(main.name, main.length, damagedOnPut[uid]);
+      }
+      if (props["files:files"]) doc.files = props["files:files"].map((e) => { const f = fromBatch(e.file); return record(f.name, f.length); });
+      return jsonResponse(200, { "entity-type": "document", uid, path: `/x/${uid}`, title: `T ${uid}` });
+    }
     if (call.path.startsWith("/nuxeo/api/v1/id/")) {
       const body = JSON.parse(call.body);
       docs += 1;
+      const main = fromBatch(body.properties["file:content"]);
+      stored.set(`doc-${docs}`, { main: record(main.name, main.length, damaged[`doc-${docs}`]), files: [] });
       return jsonResponse(201, { "entity-type": "document", uid: `doc-${docs}`, path: `/x/${body.name}`, title: body.properties["dc:title"], type: body.type });
     }
     return jsonResponse(404, { "entity-type": "exception", status: 404, message: `no route ${call.path}` });
   };
   fn.calls = calls;
+  fn.trashed = trashed;
+  fn.stored = stored;
   fn.of = (pathStart) => calls.filter((c) => c.path.startsWith(pathStart));
+  fn.creates = () => calls.filter((c) => c.method === "POST" && c.path.startsWith("/nuxeo/api/v1/id/") && !c.path.includes("/@op/"));
   return fn;
 }
 
@@ -90,13 +155,16 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     const result = await uploadToNuxeo(IC, { fetch, hostPermissions: HOSTS });
     eq(fetch.calls.map((c) => `${c.method} ${c.path}`).join(" | "), [
       "POST /nuxeo/oauth2/token",
+      "GET /nuxeo/api/v1/id/d440070d-3a60-4ad7-bf67-8efeb198e26b",
       "GET /nuxeo/api/v1/search/lang/NXQL/execute",
       "POST /nuxeo/api/v1/upload",
       "POST /nuxeo/api/v1/upload/batch-1/0",
-      "POST /nuxeo/api/v1/id/d440070d-3a60-4ad7-bf67-8efeb198e26b"
-    ].join(" | "), "the ECM_API_DOC flow, straight to the Inputs folder id");
+      "POST /nuxeo/api/v1/id/d440070d-3a60-4ad7-bf67-8efeb198e26b",
+      "GET /nuxeo/api/v1/id/doc-1",
+      "GET /nuxeo/api/v1/id/doc-1/@blob/file:content"
+    ].join(" | "), "the ECM_API_DOC flow, straight to the Inputs folder id (opened first), then the stored file read back");
 
-    const [token, search, , file, create] = fetch.calls;
+    const [token, , search, , file, create, , readBack] = fetch.calls;
     eq(token.url, `${DOMAIN}/nuxeo/oauth2/token?grant_type=client_credentials&client_id=id-1&client_secret=s3cret`, "client credentials grant");
     assert(fetch.calls.slice(1).every((c) => c.headers.Authorization === "Bearer tok-1"), "every API call carries the bearer token");
     assert(fetch.calls.every((c) => c.credentials === "omit"), "no cookies are sent to the ECM");
@@ -119,7 +187,141 @@ export async function runEcmDirectTests({ test, assert, eq }) {
         "file:content": { "upload-batch": "batch-1", "upload-fileId": "0" }
       }
     }), "the spec's document JSON: title = \"<IC number> - IC\", metadata, file from the batch");
+    eq(readBack.headers.Range, `bytes=${IC.bytes.length - 1}-`, "only the last byte is read back");
     eq(JSON.stringify(result), JSON.stringify({ uid: "doc-1", path: "/x/3480517 - IC", title: "3480517 - IC", site: "hosur", deduplicated: false }), "same answer as the gateway");
+  });
+
+  await test("ECM direct: a document the ECM cannot serve in full is ECM_FILE_DAMAGED (new or found by dedup) and saved locally", async () => {
+    // TEST ECM, 30/10/2026: IC 6709630 recorded as 63238 bytes, file readable only to byte 61980
+    fresh();
+    const fresh1 = fakeNuxeo({ damaged: { "doc-1": 3 } });
+    const error = await rejectsEcm(uploadToNuxeo(IC, { fetch: fresh1, hostPermissions: HOSTS }), ECM_ERROR.DAMAGED);
+    eq(error.detail, "document doc-1: the record says 5 bytes but the file cannot be read to its end (HTTP 500)");
+    eq(fresh1.trashed.join(), "doc-1", "DocLink's own damaged copy is moved to the trash, not left in the folder");
+
+    fresh();
+    const old = fakeNuxeo({ existing: [{ uid: "old-1", path: "/FT/x/3480517", title: "3480517" }], damaged: { "old-1": 0 } });
+    await rejectsEcm(uploadToNuxeo(IC, { fetch: old, hostPermissions: HOSTS }), ECM_ERROR.DAMAGED, "a damaged earlier copy is not reported as already stored");
+    eq(old.creates().length, 0, "nor replaced");
+    eq(old.trashed.length, 0, "and not trashed: only a download again replaces a copy");
+
+    fresh();
+    let localSaves = 0;
+    const result = await saveToEcmOrLocally(IC, async () => ({ downloadId: ++localSaves, filename: "x.pdf" }), { fetch: fakeNuxeo({ damaged: { "doc-1": 3 } }), hostPermissions: HOSTS });
+    eq(result.ecm.status, ECM_OUTCOME.FAILED);
+    eq(result.ecm.code, ECM_ERROR.DAMAGED);
+    eq(localSaves, 1, "saved locally instead");
+  });
+
+  await test("ECM direct: download again puts the new PDF in the existing document; the healthy old one stays in it as _old", async () => {
+    fresh();
+    const MAIN = "PO1_MODIFICATIONADVISE.pdf";
+    const fetch = fakeNuxeo({ existing: [{ uid: "old-1", file: MAIN }, { uid: "old-2" }, { uid: "old-3" }], damaged: { "old-3": 2 } });
+    const result = await uploadToNuxeo({ ...IC, replace: ["old-1", "old-2", "old-3", "old-1"] }, { fetch, hostPermissions: HOSTS });
+    eq(fetch.calls.map((c) => `${c.method} ${c.path.replace("/nuxeo/api/v1", "")}${c.headers.Range ? " (last byte)" : ""}`).join(" | "), [
+      "POST /nuxeo/oauth2/token",
+      "GET /id/d440070d-3a60-4ad7-bf67-8efeb198e26b",
+      "GET /id/old-1",
+      "GET /id/old-1/@blob/file:content",
+      "POST /upload",
+      "POST /upload/batch-1/0",
+      "POST /upload/batch-1/1",
+      "PUT /id/old-1",
+      "GET /id/old-1",
+      "GET /id/old-1/@blob/file:content (last byte)",
+      "GET /id/old-1",
+      "GET /id/old-1/@blob/files:files/0/file (last byte)",
+      "GET /id/old-2",
+      "GET /id/old-2/@blob/file:content (last byte)",
+      "GET /id/old-3",
+      "GET /id/old-3/@blob/file:content (last byte)",
+      "POST /id/old-3/@op/Document.Trash"
+    ].join(" | "), "old PDF read, both files uploaded, one update, both read back; a further damaged copy to the trash, a healthy one left");
+    eq(fetch.creates().length, 0, "no new document");
+    eq(fetch.of("/nuxeo/api/v1/search/").length, 0, "no duplicate check");
+    const [newFile, oldFile] = fetch.of("/nuxeo/api/v1/upload/");
+    eq(newFile.headers["X-File-Name"], MAIN, "the new PDF keeps the document's file name");
+    eq(newFile.body, IC.bytes);
+    eq(oldFile.headers["X-File-Name"], "PO1_MODIFICATIONADVISE_old.pdf");
+    eq(oldFile.body.length, 5, "the old PDF as the ECM served it");
+    const put = fetch.calls.find((c) => c.method === "PUT");
+    eq(put.body, JSON.stringify({ "entity-type": "document", properties: { "file:content": { "upload-batch": "batch-1", "upload-fileId": "0" }, "files:files": [{ file: { "upload-batch": "batch-1", "upload-fileId": "1" } }] } }), "only the files change: no title or metadata");
+    eq(fetch.stored.get("old-1").files.map((f) => f.name).join(), "PO1_MODIFICATIONADVISE_old.pdf");
+    eq(fetch.trashed.join(), "old-3");
+    eq(JSON.stringify(result), JSON.stringify({ uid: "old-1", path: "/x/old-1", title: "T old-1", site: "hosur", deduplicated: false, replaced: { oldFile: "PO1_MODIFICATIONADVISE_old.pdf", oldDamaged: false, oldFileReadable: true, trashed: ["old-3"] } }));
+
+    fresh();
+    const saved = await saveToEcmOrLocally({ ...IC, replace: ["old-1"] }, async () => { throw new Error("no local save"); }, { fetch: fakeNuxeo({ existing: [{ uid: "old-1", file: MAIN }] }), hostPermissions: HOSTS });
+    eq(saved.ecm.status, ECM_OUTCOME.STORED);
+    eq(saved.ecm.uid, "old-1", "the same document");
+    eq(describeEcmOutcome(saved.ecm), "Saved to ECM (Hosur): new PDF in the existing document; the old one is kept in it as PO1_MODIFICATIONADVISE_old.pdf");
+  });
+
+  await test("ECM direct: download again over a damaged PDF drops it; attachments already there are kept and _old is not reused", async () => {
+    fresh();
+    const broken = fakeNuxeo({ existing: [{ uid: "old-1", file: "MA_X_000379.pdf" }], damaged: { "old-1": 2 } });
+    const result = await saveToEcmOrLocally({ ...IC, replace: ["old-1"] }, async () => { throw new Error("no local save"); }, { fetch: broken, hostPermissions: HOSTS });
+    eq(broken.of("/nuxeo/api/v1/upload/").length, 1, "only the new PDF is uploaded");
+    eq(JSON.parse(broken.calls.find((c) => c.method === "PUT").body).properties["files:files"], undefined, "no attachment added");
+    eq(broken.stored.get("old-1").main.served, IC.bytes.length, "the document now serves the new PDF in full");
+    eq(broken.trashed.length, 0, "the document itself stays");
+    eq(describeEcmOutcome(result.ecm), "Saved to ECM (Hosur): new PDF in the existing document (the damaged one was removed)");
+
+    fresh();
+    const twice = fakeNuxeo({ existing: [{ uid: "old-1", file: "A.pdf", files: ["A_old.pdf", "note.txt"] }] });
+    const again = await uploadToNuxeo({ ...IC, replace: ["old-1"] }, { fetch: twice, hostPermissions: HOSTS });
+    eq(twice.of("/nuxeo/api/v1/upload/").map((c) => c.headers["X-File-Name"]).join(), "A.pdf,A_old.pdf,note.txt,A_old_2.pdf", "attachments sent again (a list is replaced whole), the old PDF last");
+    eq(twice.stored.get("old-1").files.map((f) => f.name).join(), "A_old.pdf,note.txt,A_old_2.pdf");
+    eq(again.replaced.oldFile, "A_old_2.pdf");
+  });
+
+  await test("ECM direct: download again changes nothing when the document's files cannot all be read (not damaged: just unreadable now)", async () => {
+    fresh();
+    const attachment = fakeNuxeo({ existing: [{ uid: "old-1", files: [{ name: "x.pdf", damaged: true }] }] });
+    const e1 = await rejectsEcm(uploadToNuxeo({ ...IC, replace: ["old-1"] }, { fetch: attachment, hostPermissions: HOSTS }), ECM_ERROR.UNAVAILABLE);
+    eq(e1.detail, "document old-1: its attachment x.pdf could not be read; the document was not changed");
+
+    fresh();
+    // the whole file breaks off once, yet its last byte reads: not damaged, so it is not dropped
+    const flaky = fakeNuxeo({ existing: [{ uid: "old-1" }], respond: (c) => (c.method === "GET" && c.path.endsWith("/@blob/file:content") && !c.headers.Range ? jsonResponse(503, { message: "busy" }) : null) });
+    const e2 = await rejectsEcm(uploadToNuxeo({ ...IC, replace: ["old-1"] }, { fetch: flaky, hostPermissions: HOSTS }), ECM_ERROR.UNAVAILABLE);
+    eq(e2.detail, "document old-1: its current file f.pdf could not be read; the document was not changed");
+    eq(attachment.calls.concat(flaky.calls).filter((c) => c.method === "PUT" || c.path.startsWith("/nuxeo/api/v1/upload")).length, 0, "nothing uploaded, nothing updated");
+
+    fresh();
+    const bad = fakeNuxeo({ existing: [{ uid: "old-1" }], damagedOnPut: { "old-1": 1 } });
+    const local = await saveToEcmOrLocally({ ...IC, replace: ["old-1"] }, async () => ({ downloadId: 7, filename: "x.pdf" }), { fetch: bad, hostPermissions: HOSTS });
+    eq(local.ecm.code, ECM_ERROR.DAMAGED, "a new PDF the ECM damaged: saved locally");
+    eq(bad.stored.get("old-1").files.map((f) => f.name).join(), "f_old.pdf", "the old PDF is still in the document");
+    eq(oldFileName("LC1_MODIFICATIONADVISE.pdf"), "LC1_MODIFICATIONADVISE_old.pdf");
+    eq(oldFileName("noext", ["noext_old"]), "noext_old_2");
+  });
+
+  await test("ECM switch: uploads run one at a time even when the caller starts several together", async () => {
+    fresh();
+    let open = 0;
+    let most = 0;
+    const base = fakeNuxeo();
+    const fetch = async (url, init) => {
+      open += 1;
+      most = Math.max(most, open);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      try {
+        return await base(url, init);
+      } finally {
+        open -= 1;
+      }
+    };
+    fetch.calls = base.calls;
+    const results = await Promise.allSettled([
+      uploadToEcm(IC, { fetch, hostPermissions: HOSTS }),
+      uploadToEcm({ ...IC, account: {} }, { fetch, hostPermissions: HOSTS }),
+      uploadToEcm({ ...IC, filename: "b.pdf" }, { fetch, hostPermissions: HOSTS }),
+      uploadToEcm({ ...IC, filename: "c.pdf" }, { fetch, hostPermissions: HOSTS })
+    ]);
+    eq(results.map((r) => r.status).join(), "fulfilled,rejected,fulfilled,fulfilled", "a failed upload does not stop the ones after it");
+    eq(most, 1, "never two ECM requests at once");
+    eq(base.creates().length, 3);
   });
 
   await test("ECM direct: the token is reused, and a 401 fetches a new one and retries the call once", async () => {
@@ -153,7 +355,23 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     const result = await uploadToNuxeo(IC, { fetch, hostPermissions: HOSTS });
     eq(JSON.stringify(result), JSON.stringify({ uid: "old-1", path: "/FT/x/3480517", title: "3480517", site: "hosur", deduplicated: true }));
     eq(fetch.of("/nuxeo/api/v1/upload").length, 0, "nothing uploaded");
-    eq(fetch.of("/nuxeo/api/v1/id/").length, 0, "nothing created");
+    eq(fetch.creates().length, 0, "nothing created");
+  });
+
+  await test("ECM direct: a supplied folder is opened once; one the ECM cannot open is refused by name before any search", async () => {
+    fresh();
+    const fetch = fakeNuxeo();
+    await uploadToNuxeo(IC, { fetch, hostPermissions: HOSTS });
+    await uploadToNuxeo({ ...IC, filename: "other.pdf" }, { fetch, hostPermissions: HOSTS });
+    eq(fetch.calls.filter((c) => c.method === "GET" && c.path === "/nuxeo/api/v1/id/d440070d-3a60-4ad7-bf67-8efeb198e26b").length, 1, "the folder is opened once");
+
+    fresh();
+    const tenders = ECM_SITES.TEST.hosur.folderIds.tenders;
+    // the TEST ECM's answer on 26/10/2026: the Tenders folder's type is no longer deployed
+    const gone = fakeNuxeo({ respond: (c) => (c.method === "GET" && c.path === `/nuxeo/api/v1/id/${tenders}` ? jsonResponse(404, { "entity-type": "exception", status: 404, message: tenders }) : null) });
+    const error = await rejectsEcm(uploadToNuxeo({ ...IC, kind: ECM_KIND.LOI, fields: { tender_number: "T-1" } }, { fetch: gone, hostPermissions: HOSTS }), ECM_ERROR.REJECTED);
+    eq(error.detail, `the Hosur tenders folder /FT/workspaces/Sites/HSR/Invoice Certificate - TS/Tenders (uid ${tenders}) cannot be opened on the ECM: HTTP 404 - ${tenders}`);
+    eq(gone.of("/nuxeo/api/v1/search/").length + gone.of("/nuxeo/api/v1/upload").length + gone.creates().length, 0, "nothing searched, uploaded or created");
   });
 
   await test("ECM direct: every DocLink kind goes to its TEST folder in Hosur and Rohtak, with the right type and title", async () => {
@@ -161,7 +379,6 @@ export async function runEcmDirectTests({ test, assert, eq }) {
       inspectionCertificate: { ic_number: "1", customer_po_number: "PO-1" },
       poCopy: { customer_po_number: "PO-1" },
       modificationAdvise: { customer_po_number: "PO-1", modification_advise_number: "MA-1" },
-      loi: { tender_number: "T-1", loi_number: "L-1", loi_date: "04/10/2026" }
     };
     const TITLES = { inspectionCertificate: "1 - IC", poCopy: "PO-1 - PO", modificationAdvise: "MA-1 - MA", nit: "T-1 - NIT", nbsp: "T-1 - NBSP", extension: "T-1 - Extension", crp: "T-1 - CRP", co: "T-1 - CO", loi: "T-1 - LOI", vft: "T-1 - Financial Tabulation", vct: "T-1 - Commercial Tabulation" };
     eq(Object.keys(ECM_KINDS).sort().join(), Object.values(ECM_KIND).sort().join(), "the catalog covers every kind DocLink uploads");
@@ -169,9 +386,9 @@ export async function runEcmDirectTests({ test, assert, eq }) {
       for (const kind of Object.values(ECM_KIND)) {
         fresh();
         const fetch = fakeNuxeo();
-        const result = await uploadToNuxeo({ ...IC, kind, account, fields: FIELDS[kind] || { tender_number: "T-1", tender_date: "09/11/2026" } }, { fetch, hostPermissions: HOSTS });
+        const result = await uploadToNuxeo({ ...IC, kind, account, fields: FIELDS[kind] || { tender_number: "T-1" } }, { fetch, hostPermissions: HOSTS });
         const location = ECM_KINDS[kind].location;
-        const [create] = fetch.of("/nuxeo/api/v1/id/");
+        const [create] = fetch.creates();
         eq(create.path, `/nuxeo/api/v1/id/${ECM_SITES.TEST[siteKey].folderIds[location]}`, `${kind} -> ${siteKey} ${location}`);
         const props = JSON.parse(create.body).properties;
         eq(props["InvoiceCertificateSchema:type"], kind);
@@ -190,7 +407,7 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     const lookups = fetch.calls.filter((c) => c.query && c.query.includes("ecm:path ="));
     eq(lookups.length, 1, "the folder uid is cached");
     eq(lookups[0].query, `SELECT * FROM Document WHERE ecm:path = '${inputs}'`);
-    eq(fetch.of("/nuxeo/api/v1/id/")[0].path, "/nuxeo/api/v1/id/prod-rohtak-inputs");
+    eq(fetch.creates()[0].path, "/nuxeo/api/v1/id/prod-rohtak-inputs");
 
     const untouched = fakeNuxeo();
     const error = await rejectsEcm(uploadToNuxeo({ ...IC, kind: ECM_KIND.NIT, fields: { tender_number: "T-1" } }, { fetch: untouched, hostPermissions: HOSTS }), ECM_ERROR.REJECTED, "no PROD tenders folder");
@@ -207,6 +424,7 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     const deps = { fetch: untouched, hostPermissions: HOSTS };
     eq((await rejectsEcm(uploadToNuxeo({ ...IC, fields: { ic_number: "1" } }, deps), ECM_ERROR.REJECTED)).detail, "inspectionCertificate requires customer_po_number");
     eq((await rejectsEcm(uploadToNuxeo({ ...IC, fields: { ...IC.fields, tender_number: "T" } }, deps), ECM_ERROR.REJECTED)).detail, "inspectionCertificate has no field tender_number");
+    eq((await rejectsEcm(uploadToNuxeo({ ...IC, kind: ECM_KIND.LOI, fields: { tender_number: "T", loi_number: "1" } }, deps), ECM_ERROR.REJECTED)).detail, "loi has no field loi_number", "the ECM has no loiNumber property (it answers 400 to a query naming it)");
     eq((await rejectsEcm(uploadToNuxeo({ ...IC, account: { irepsAccountId: "999" } }, deps), ECM_ERROR.REJECTED)).detail, "no ECM site for IREPS account 999");
     await rejectsEcm(uploadToNuxeo({ ...IC, account: { irepsAccountId: "833", operatingUnit: "ROHTAK" } }, deps), ECM_ERROR.REJECTED, "account and unit disagree");
     await rejectsEcm(uploadToNuxeo({ ...IC, account: {} }, deps), ECM_ERROR.ACCOUNT_UNKNOWN, "no account -> no guess");
@@ -232,7 +450,7 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     await rejectsEcm(uploadToNuxeo(IC, { fetch: async () => { throw new TypeError("Failed to fetch"); }, hostPermissions: HOSTS }), ECM_ERROR.UNAVAILABLE, "network error");
 
     fresh();
-    const denied = fakeNuxeo({ respond: (c) => (c.path.startsWith("/nuxeo/api/v1/id/") ? jsonResponse(403, { message: "Privilege 'AddChildren' is not granted" }) : null) });
+    const denied = fakeNuxeo({ respond: (c) => (c.method === "POST" && c.path.startsWith("/nuxeo/api/v1/id/") ? jsonResponse(403, { message: "Privilege 'AddChildren' is not granted" }) : null) });
     eq((await rejectsEcm(uploadToNuxeo(IC, { fetch: denied, hostPermissions: HOSTS }), ECM_ERROR.REJECTED)).detail, "the ECM denied access (HTTP 403): Privilege 'AddChildren' is not granted");
 
     fresh();
@@ -250,7 +468,7 @@ export async function runEcmDirectTests({ test, assert, eq }) {
       "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'nit' AND ecm:ancestorId = '34a61f51-10fe-44ce-a669-2ea14dc86ff4' ORDER BY dc:created DESC");
     eq(buildEcmQuery({ env: "PROD", site: "hosur", kind: "poCopy", filters: { customer_po_number: "PO-1", ic_number: "" } }),
       "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'poCopy' AND ecm:ancestorId = '7dfe3fc0-3157-489d-826a-9435e65631fc' AND InvoiceCertificateSchema:customerPONumber = 'PO-1' ORDER BY dc:created DESC");
-    eq(buildEcmQuery({ site: "hosur", kind: "nit", filters: { tender_date: "09/11/2026" } }).includes("(InvoiceCertificateSchema:tenderDate >= TIMESTAMP '2026-11-08T18:30:00.000Z' AND InvoiceCertificateSchema:tenderDate < TIMESTAMP '2026-11-09T18:30:00.000Z')"), true, "a date filter is the IST day as a timestamp range (a plain string is an invalid query)");
+    eq(buildEcmQuery({ site: "hosur", kind: "inspectionCertificate", filters: { ic_date: "09/11/2026" } }).includes("(InvoiceCertificateSchema:icDate >= TIMESTAMP '2026-11-08T18:30:00.000Z' AND InvoiceCertificateSchema:icDate < TIMESTAMP '2026-11-09T18:30:00.000Z')"), true, "a date filter is the IST day as a timestamp range (a plain string is an invalid query)");
     eq(buildEcmQuery({ env: "PROD", site: "rohtak", kind: "modificationAdvise" }).includes("ecm:ancestorId = 'f2a5bf87-877b-4e4c-b4fc-7301cabfd236'"), true);
     eq(nxqlLiteral("O'Brien \\ x"), "'O\\'Brien \\\\ x'", "quotes and backslashes escaped");
     eq(nxqlLiteral(true), "1");

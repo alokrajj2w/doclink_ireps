@@ -17,7 +17,7 @@ import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
   scanClosedTenders, downloadTabulation, TABULATIONS,
 } from './tender-workflows.js';
-import { tenderEcmSink, ensureDownloadSignIn } from './tender-ecm.js';
+import { tenderEcmSink, ensureDownloadSignIn, ECM_TAKES_TENDER_DATE } from './tender-ecm.js';
 
 const DAY = 86400000;
 const ddmmyyyy = (d) => fmtDate(d);
@@ -47,7 +47,8 @@ const parseDmy = (s) => { const [d, m, y] = s.split('/').map(Number); return new
 /**
  * The tender's closing date (IREPS "Due Date/Time"), searched once per job; '' when IREPS does not
  * find the tender. Only for ECM uploads (their tender date): the Post Tenders letter lists do not
- * show it, and a Local run never pays for this search.
+ * show it, and a Local run - or an ECM without a tenderDate property (ECM_TAKES_TENDER_DATE) -
+ * never pays for this search.
  */
 export async function closingDateFor(job, tenderNo, onProgress = () => {}) {
   job.closingDates = job.closingDates || new Map();
@@ -210,8 +211,10 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
   const statuses = onlyStatuses || Object.keys(LETTER_SPECS);
   const wantTender = norm(onlyTender).toLowerCase(); // optional exact (normalized) Tender Number filter
   onProgress(`Reading ${statuses.map((st) => LETTER_KINDS[st].page).join(', ')} list(s) for ${dates[0]}${dates.length > 1 ? ` - ${dates[dates.length - 1]}` : ''}...`);
+  // the lists are newest first: none is read past the earliest wanted Letter Date
+  const stopBefore = dates.length ? new Date(Math.min(...dates.map((d) => parseDmy(d).getTime()))) : null;
   // independent lists, read together; one that IREPS fails to open is reported on its own and never blocks the others
-  const settled = await Promise.allSettled(statuses.map((st) => scanPostTenderList(probe, st)));
+  const settled = await Promise.allSettled(statuses.map((st) => scanPostTenderList(probe, st, { stopBefore })));
   const listErrors = {};
   const scans = settled.map((s, i) => {
     if (s.status === 'fulfilled') return s.value;
@@ -245,7 +248,7 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
         run.onProgress = onProgress;
         await assertSameAccount(job.account, { base: job.base });
         run.ecm = await ecmSink();
-        if (run.ecm) run.ctx.closingDate = await closingDateFor(job, tenderNo, onProgress);
+        if (run.ecm && ECM_TAKES_TENDER_DATE) run.ctx.closingDate = await closingDateFor(job, tenderNo, onProgress);
         const items = todays.filter((e) => e.tenderNo === tenderNo).map(({ id, rq, url, date }) => ({ id, rq, url, date }));
         const r = await downloadLetterItems(run, status, items, scripts);
         rec.categories[LETTER_SPECS[status].key] = r;

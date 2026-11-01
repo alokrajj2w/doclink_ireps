@@ -59,7 +59,8 @@ export const ECM_ERROR = Object.freeze({
   ACCOUNT_UNKNOWN: "ECM_ACCOUNT_UNKNOWN",
   AUTH_REQUIRED: "ECM_AUTH_REQUIRED",
   REJECTED: "ECM_REJECTED",
-  UNAVAILABLE: "ECM_UNAVAILABLE"
+  UNAVAILABLE: "ECM_UNAVAILABLE",
+  DAMAGED: "ECM_FILE_DAMAGED" // stored, but the ECM cannot serve the file back in full (ecm-direct.js)
 });
 
 /** What happened to one document under "ECM / S3". */
@@ -138,18 +139,41 @@ export function ecmFields(fields) {
  * @property {boolean} deduplicated        already in the ECM; nothing new was stored
  */
 
+let uploadQueue = Promise.resolve(); // the tail of the one-at-a-time upload chain
+
+/**
+ * Can "download again" replace a copy already in the ECM? Only in direct mode: DocLink then
+ * puts the new PDF in that document itself (ecm-direct.js uploadToNuxeo `replace`); the
+ * Recon gateway has no such call.
+ */
+export async function canReplaceInEcm() {
+  await loadEcmConfig();
+  return isDirectEcm();
+}
+
 /**
  * Upload one document to the ECM folder of the account's unit: through the Recon Engine's
  * ECM gateway ("ecmBackendAws": true) or straight to the ECM (false, services/ecm-direct.js).
+ *
+ * Uploads run one at a time (per JS context), whatever the caller's download concurrency:
+ * the ECM re-saves IC / PO / MA PDFs while it creates them, and documents created within
+ * milliseconds of each other came out damaged (record and stored file disagree) or with
+ * another document's PDF (TEST ECM, 23-30/10/2026). Uploads made alone were always intact.
  *
  * @param {{ kind: string, bytes: Uint8Array, filename: string, title?: string, fields?: object,
  *           account: EcmAccount, mimeType?: string }} doc
  * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
  * @returns {Promise<EcmUploadResult>}
  */
-export async function uploadToEcm(doc, deps = {}) {
-  await loadEcmConfig();
-  return isDirectEcm() ? uploadToNuxeo(doc, deps) : uploadViaGateway(doc, deps);
+export function uploadToEcm(doc, deps = {}) {
+  const run = uploadQueue.then(async () => {
+    await loadEcmConfig();
+    if (isDirectEcm()) return uploadToNuxeo(doc, deps);
+    if (doc.replace && doc.replace.length) logger.warn(`ECM gateway: ${doc.filename} cannot replace the copy already in the ECM; uploaded as usual`);
+    return uploadViaGateway(doc, deps);
+  });
+  uploadQueue = run.catch(() => {});
+  return run;
 }
 
 /** POST {reconBaseUrl}/api/ecm/documents (see the top of this file). */
@@ -286,15 +310,19 @@ async function findViaGateway({ kind, account, candidates }, deps) {
  * @param {{ kind: string, bytes: Uint8Array, filename: string, title?: string, fields?: object, account: EcmAccount, mimeType?: string }} doc
  * @param {() => Promise<object>} saveLocally   the usual local save (its result is returned as `local`)
  * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
- * @returns {Promise<{ ecm: { status: string, site?: string|null, uid?: string, path?: string|null, code?: string, detail?: string }, local: object|null }>}
+ * @returns {Promise<{ ecm: { status: string, site?: string|null, uid?: string, path?: string|null, code?: string, detail?: string,
+ *          replaced?: { oldFile: string|null, oldDamaged: boolean, oldFileReadable: boolean|null, trashed: number } }, local: object|null }>}
  */
 export async function saveToEcmOrLocally(doc, saveLocally, deps = {}) {
   try {
     const stored = await uploadToEcm(doc, deps);
-    return {
-      ecm: { status: stored.deduplicated ? ECM_OUTCOME.ALREADY_STORED : ECM_OUTCOME.STORED, site: stored.site, uid: stored.uid, path: stored.path },
-      local: null
-    };
+    const ecm = { status: stored.deduplicated ? ECM_OUTCOME.ALREADY_STORED : ECM_OUTCOME.STORED, site: stored.site, uid: stored.uid, path: stored.path };
+    // download again into the existing document: where the old PDF went (ecm-direct.js replaceInDocument)
+    if (stored.replaced) {
+      const r = stored.replaced;
+      ecm.replaced = { oldFile: r.oldFile || null, oldDamaged: Boolean(r.oldDamaged), oldFileReadable: r.oldFileReadable ?? null, trashed: (r.trashed || []).length };
+    }
+    return { ecm, local: null };
   } catch (error) {
     if (!(error instanceof EcmError)) throw error;
     logger.warn(`ECM upload failed (${error.code}); saving ${doc.filename} locally`, { status: error.status, detail: error.detail });
@@ -309,6 +337,14 @@ const siteName = (site) => `${site.charAt(0).toUpperCase()}${site.slice(1)}`;
 export function describeEcmOutcome(ecm) {
   if (!ecm) return "";
   const site = ecm.site ? ` (${siteName(ecm.site)})` : "";
+  if (ecm.status === ECM_OUTCOME.STORED && ecm.replaced) {
+    const r = ecm.replaced;
+    const old = r.oldFile
+      ? `; the old one is kept in it as ${r.oldFile}${r.oldFileReadable === false ? " (but the ECM cannot serve that file in full)" : ""}`
+      : r.oldDamaged ? " (the damaged one was removed)" : "";
+    const trashed = r.trashed ? `; ${r.trashed === 1 ? "1 other damaged copy" : `${r.trashed} other damaged copies`} moved to the ECM trash` : "";
+    return `Saved to ECM${site}: new PDF in the existing document${old}${trashed}`;
+  }
   if (ecm.status === ECM_OUTCOME.STORED) return `Saved to ECM${site}`;
   if (ecm.status === ECM_OUTCOME.ALREADY_STORED) return `Already in ECM${site}`;
   if (ecm.status === ECM_OUTCOME.FAILED) return `ECM upload failed, saved locally: ${ECM_FAILURE_TEXT[ecm.code] || ecm.code}${ecm.detail ? ` (${ecm.detail})` : ""}`;
@@ -338,5 +374,6 @@ const ECM_FAILURE_TEXT = Object.freeze({
   [ECM_ERROR.ACCOUNT_UNKNOWN]: "IREPS account not verified",
   [ECM_ERROR.AUTH_REQUIRED]: "sign in to the Recon Engine",
   [ECM_ERROR.REJECTED]: "ECM refused the document",
-  [ECM_ERROR.UNAVAILABLE]: "ECM unavailable"
+  [ECM_ERROR.UNAVAILABLE]: "ECM unavailable",
+  [ECM_ERROR.DAMAGED]: "the ECM's copy is damaged"
 });

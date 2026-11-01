@@ -1,5 +1,6 @@
 // Chrome's own "Print -> Save as PDF" (Ctrl+P) for IREPS letters that exist only as web pages.
-// IREPS does not keep published letters (LOA, Negotiation, Counter Offer, Correspondence) as files: every
+// IREPS does not keep published letters (LOA, Negotiation, Counter Offer, Correspondence) or published
+// corrigenda (supply/viewCorrigendum.do) as files: every
 // view builds them as HTML. DocLink has already fetched that HTML (for the LOA after the "viewed" call,
 // always with the user's session). Here it is opened in a background tab at its
 // real IREPS address - the tab's request for the page is answered with those bytes, so IREPS is not asked

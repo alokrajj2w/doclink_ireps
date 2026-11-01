@@ -34,7 +34,7 @@
  * (test/mock/switch-target.mjs) applies here as well.
  */
 
-import { IREPS_CONFIG, IREPS_ERROR, IrepsError, requestIreps } from "../ireps-api.js";
+import { IREPS_CONFIG, IREPS_ERROR, IrepsError, requestIreps, parseIrepsDate } from "../ireps-api.js";
 import { IC_FORM_FIELDS, IC_CALL_TYPE, IC_STATUS, IC_STATUS_SELECTED_LABEL, ALL_INSPECTION_AGENCIES, ALL_STAGES } from "./ic-form.js";
 
 /** Shared configuration. Keep every Inspection Call List URL / constant here. */
@@ -138,6 +138,49 @@ export function buildIcSearchRequest(formState, poNumber, options = {}) {
   body.set(IC_FORM_FIELDS.STATUS_SELECTED, IC_STATUS_SELECTED_LABEL);
 
   return { poNo, body: body.toString() };
+}
+
+/**
+ * Build the "Show Results" request for every IC issued in a date range, any PO:
+ * the same form with PO No. left empty and the IC Date From / To fields set,
+ * as a user filling in only the IC dates on the portal would. The Call Date
+ * fields keep the portal's own defaults; only a From date earlier than the
+ * default Call Date From pulls that field back (a call always precedes its IC).
+ *
+ * @param {IcFormState} formState  from extractIcForm() on loadIcListPage()'s HTML
+ * @param {{ dateFromIC: string, dateToIC: string }} range  DD/MM/YYYY
+ * @returns {{ poNo: string, body: string }}
+ */
+export function buildIcDateSearchRequest(formState, range) {
+  if (!formState || typeof formState.token !== "string" || formState.token.trim() === "") {
+    throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "A Struts token is required to build the request");
+  }
+  const from = String(range?.dateFromIC || "").trim();
+  const to = String(range?.dateToIC || "").trim();
+  const dFrom = parseIrepsDate(from);
+  const dTo = parseIrepsDate(to);
+  if (!dFrom || !dTo) throw new IrepsError(IC_ERROR.INVALID_REQUEST, "IC date range missing", { detail: "Please select both From Date and To Date." });
+  if (dFrom > dTo) throw new IrepsError(IC_ERROR.INVALID_REQUEST, "IC date range reversed", { detail: "From Date must not be later than To Date." });
+  const callFrom = parseIrepsDate(formState.dateFrom || "");
+  const body = new URLSearchParams();
+  body.set(IC_FORM_FIELDS.TOKEN, formState.token);
+  body.set(IC_FORM_FIELDS.PAGE_NO, "1");
+  body.set(IC_FORM_FIELDS.TOTAL_RECORDS, formState.totalRecords ?? "0");
+  body.set(IC_FORM_FIELDS.CALL_TYPE, IC_CALL_TYPE);
+  body.set(IC_FORM_FIELDS.STATUS, IC_STATUS);
+  body.set(IC_FORM_FIELDS.PO_NO, "");
+  body.set(IC_FORM_FIELDS.INSP_AGENCY, ALL_INSPECTION_AGENCIES);
+  body.set(IC_FORM_FIELDS.PL_NO, "");
+  body.set(IC_FORM_FIELDS.INSP_OFFICIAL, "");
+  body.set(IC_FORM_FIELDS.PO_SR, "");
+  body.set(IC_FORM_FIELDS.DATE_FROM, !callFrom || dFrom < callFrom ? from : formState.dateFrom);
+  body.set(IC_FORM_FIELDS.DATE_TO, formState.dateTo ?? to);
+  body.set(IC_FORM_FIELDS.DATE_FROM_IC, from);
+  body.set(IC_FORM_FIELDS.DATE_TO_IC, to);
+  body.set(IC_FORM_FIELDS.STAGE, ALL_STAGES);
+  body.set(IC_FORM_FIELDS.ACTIVITY, IC_CONFIG.activityValue);
+  body.set(IC_FORM_FIELDS.STATUS_SELECTED, IC_STATUS_SELECTED_LABEL);
+  return { poNo: "", body: body.toString() };
 }
 
 /**

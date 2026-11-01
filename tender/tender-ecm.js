@@ -64,7 +64,9 @@ export async function savedDestination() {
  * The title is "<tender no> - <kind code>" as "ECM - Download speci-v1" names it
  * ("29263265 - NIT", "29263265 - LOI"; codes in services/ecm-catalog.js). A tender can hold
  * several documents of a kind (attachments, corrigenda, letters), so those add what tells
- * them apart: "29263265 - NIT - Annexure - SPEC", "29263265 - NBSP - 1204920".
+ * them apart: "29263265 - NIT - Annexure - SPEC", "29263265 - NBSP - 1204920", "29263265 - LOI - 1461928".
+ * Only the fields the ECM has for the kind are sent (services/ecm-catalog.js): today the
+ * tender number; the tender date once the ECM has tenderDate.
  *   action = the download action ({ id, meta: { title, docDate } }), ctx = run.ctx
  */
 export function ecmDocumentFor(category, action, ctx) {
@@ -73,19 +75,23 @@ export function ecmDocumentFor(category, action, ctx) {
   const tenderNo = ctx.tenderNo;
   const meta = action.meta || {};
   const id = action.id || '';
-  // TENDER_PDF, LOA and the tabulations need nothing more: one of each per tender (an LOA's number is its own field)
+  // TENDER_PDF and the tabulations need nothing more: one of each per tender
   const detail = {
     ATTACHMENTS: meta.title || id,
     CORRIGENDA: meta.title || id,
     NEGOTIATION: id,
     COUNTER_OFFER: id,
+    LOA: id, //                the letter id: the ECM has no loiNumber property
     CORRESPONDENCE: meta.title || id,
   }[category];
-  const fields = { tender_number: tenderNo, tender_date: ctx.closingDate || localDay(ctx.dueDate) };
-  if (category === 'LOA') Object.assign(fields, { loi_number: id, loi_date: meta.docDate || '' });
+  const known = { tender_number: tenderNo, tender_date: ctx.closingDate || localDay(ctx.dueDate) };
+  const fields = Object.fromEntries(ECM_KINDS[kind].fields.filter((key) => key in known).map((key) => [key, known[key]]));
   const title = [tenderNo, ECM_KINDS[kind].code, detail].filter(Boolean).join(' - ');
   return { kind, title: title.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX), fields };
 }
+
+/** Whether a tender document's ECM record holds the tender date (false until the ECM has tenderDate). */
+export const ECM_TAKES_TENDER_DATE = Object.values(CATEGORY_ECM_KIND).some((kind) => ECM_KINDS[kind].fields.includes('tender_date'));
 
 /**
  * The run's ECM sink, or null when the Save to choice is Local (or the user chose Local

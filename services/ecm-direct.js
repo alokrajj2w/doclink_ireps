@@ -5,10 +5,15 @@
  * "ECM_API_DOC" and "TSG India Doculink ECM specifications.xlsx":
  *
  *   POST {domain}/nuxeo/oauth2/token?grant_type=client_credentials&...   bearer token
+ *   GET  {domain}/nuxeo/api/v1/id/{folderUid}                             the folder exists (once)
  *   GET  {domain}/nuxeo/api/v1/search/lang/NXQL/execute?query=...         search (NXQL)
  *   POST {domain}/nuxeo/api/v1/upload                                     open a batch
  *   POST {domain}/nuxeo/api/v1/upload/{batchId}/0                         the file
  *   POST {domain}/nuxeo/api/v1/id/{folderUid}                             create the document
+ *   GET  {domain}/nuxeo/api/v1/id/{uid} + /@blob/file:content (last byte) its file reads back in full
+ *   PUT  {domain}/nuxeo/api/v1/id/{uid}                                   download again: the new PDF in the
+ *                                                                          same document (old one kept as _old)
+ *   POST {domain}/nuxeo/api/v1/id/{uid}/@op/Document.Trash                 damaged copies to the trash
  *
  * Same folders (services/ecm-catalog.js), same metadata and the same answer as the gateway
  * ({ uid, path, title, site, deduplicated }), and the same EcmError codes, so callers,
@@ -187,19 +192,37 @@ export async function findEcmDocuments({ site, kind, filters, limit = 200 }, dep
   return searchEcm(buildEcmQuery({ site, kind, filters }), { limit }, deps);
 }
 
-/** A site location's folder uid: the one the ECM team supplied, else the path looked up once. */
+/**
+ * A site location's folder uid, checked once per session: the uid the ECM team supplied is
+ * opened (a folder that was deleted, is not readable by the client, or whose folder type the
+ * ECM no longer has fails here, by name, instead of as a puzzling search error), else the
+ * path is looked up.
+ */
 async function folderUid(conn, site, location) {
   const known = site.folderIds[location];
-  if (known) return known;
   const path = site.locations[location];
-  const cacheKey = `${ECM_CONFIG.domain}|${path}`;
+  const cacheKey = `${ECM_CONFIG.domain}|${known || path}`;
   if (folderUids.has(cacheKey)) return folderUids.get(cacheKey);
-  const entries = await search(conn, `SELECT * FROM Document WHERE ecm:path = ${nxqlLiteral(path)}`, { limit: 1, properties: "dublincore" });
-  if (!entries.length || !entries[0].uid) {
-    throw new EcmError(ECM_ERROR.REJECTED, { detail: `no ECM folder at ${path} (check the path and the client's permissions)` });
+  let uid;
+  if (known) {
+    const response = await call(conn, "GET", `/id/${encodeURIComponent(known)}`, { headers: { Properties: "dublincore" } });
+    const body = await readJson(response);
+    if (response.status >= 500) throw httpError(response, body, `GET /id/${known}`);
+    if (!response.ok || !body || body.uid !== known) {
+      const message = body && typeof body.message === "string" ? ` - ${body.message}` : "";
+      throw new EcmError(ECM_ERROR.REJECTED, { status: response.status, detail: `the ${site.name} ${location} folder ${path} (uid ${known}) cannot be opened on the ECM: HTTP ${response.status}${message}` });
+    }
+    if (body.path && body.path !== path) logger.warn(`ECM folder ${known} is at ${body.path}, not ${path}`);
+    uid = known;
+  } else {
+    const entries = await search(conn, `SELECT * FROM Document WHERE ecm:path = ${nxqlLiteral(path)}`, { limit: 1, properties: "dublincore" });
+    if (!entries.length || !entries[0].uid) {
+      throw new EcmError(ECM_ERROR.REJECTED, { detail: `no ECM folder at ${path} (check the path and the client's permissions)` });
+    }
+    uid = entries[0].uid;
   }
-  folderUids.set(cacheKey, entries[0].uid);
-  return entries[0].uid;
+  folderUids.set(cacheKey, uid);
+  return uid;
 }
 
 /**
@@ -232,14 +255,168 @@ function saved(entry, site, deduplicated) {
 
 const reject = (detail) => new EcmError(ECM_ERROR.REJECTED, { detail });
 
+/** A document's file record at `xpath`: "file:content" (the main file) or "files:files/<n>/file" (an attachment). */
+function fileAt(props, xpath) {
+  if (xpath === "file:content") return props["file:content"] || null;
+  const match = /^files:files\/(\d+)\/file$/.exec(xpath);
+  return match ? ((props["files:files"] || [])[Number(match[1])] || {}).file || null : null;
+}
+
+/** The whole file at `xpath`, or null when the ECM does not serve all `length` bytes of it. */
+async function readFile(conn, uid, xpath, length) {
+  const response = await call(conn, "GET", `/id/${encodeURIComponent(uid)}/@blob/${xpath}`);
+  try {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (response.ok && bytes.length === length) return bytes;
+  } catch {
+    // the ECM dropped the connection mid-file
+  }
+  return null;
+}
+
+/** Upload files into one new batch (file i = "upload-fileId" i) and return the batch id. */
+async function uploadBatch(conn, files) {
+  const batch = await callJson(conn, "POST", "/upload");
+  if (!batch.batchId) throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: "the upload batch answer had no batchId" });
+  for (const [i, file] of files.entries()) {
+    await callJson(conn, "POST", `/upload/${encodeURIComponent(batch.batchId)}/${i}`, {
+      // header values must be ASCII
+      headers: { "X-File-Name": encodeURIComponent(file.name), "X-File-Type": file.mimeType, "Content-Type": file.mimeType },
+      body: file.bytes
+    });
+  }
+  return batch.batchId;
+}
+
+const batchRef = (batchId, i) => ({ "upload-batch": batchId, "upload-fileId": String(i) });
+
+/** "A.pdf" -> "A_old.pdf", or "A_old_2.pdf", ... when that name is taken. */
+export function oldFileName(name, taken = []) {
+  const dot = name.lastIndexOf(".");
+  const [base, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ""];
+  for (let n = 1; ; n += 1) {
+    const candidate = `${base}_old${n === 1 ? "" : `_${n}`}${ext}`;
+    if (!taken.includes(candidate)) return candidate;
+  }
+}
+
+/**
+ * Can the ECM serve the document's file in full? Its last byte is read back (a ranged GET).
+ * The ECM re-saves IC / PO / MA PDFs while creating them; when that goes wrong the record
+ * keeps the uploaded length while the stored file is shorter, and every download of it
+ * breaks off ("Failed to skip in stream" past the real end). Such a document is reported
+ * as ECM_FILE_DAMAGED, so the caller saves it locally instead of calling it stored.
+ */
+async function assertFileReadable(conn, uid, filename, xpath = "file:content") {
+  const doc = await callJson(conn, "GET", `/id/${encodeURIComponent(uid)}`, { headers: { Properties: "file,files" } });
+  const length = Number((fileAt(doc.properties || {}, xpath) || {}).length);
+  const damaged = (detail) => new EcmError(ECM_ERROR.DAMAGED, { detail: `document ${uid}: ${detail}` });
+  if (!(length > 0)) throw damaged(`it has no file${xpath === "file:content" ? "" : ` at ${xpath}`}`);
+  const response = await call(conn, "GET", `/id/${encodeURIComponent(uid)}/@blob/${xpath}`, { headers: { Range: `bytes=${length - 1}-` } });
+  let served = -1;
+  try {
+    served = (await response.arrayBuffer()).byteLength;
+  } catch {
+    // the ECM dropped the connection mid-file
+  }
+  // the one byte asked for (the TEST ECM answers it with 200, not 206), or the whole file when
+  // ranges are not honoured; a damaged file is an HTTP 500 error page
+  if (response.ok && (served === 1 || served === length)) return;
+  logger.warn(`ECM cannot serve ${filename} in full`, { uid, length, status: response.status, served });
+  throw damaged(`the record says ${length} bytes but the file cannot be read to its end (HTTP ${response.status})`);
+}
+
+/**
+ * Move a document to the ECM trash (Nuxeo's Document.Trash; not in ECM_API_DOC). It is not
+ * deleted: the ECM team can restore it. Used only for damaged copies: DocLink's own new one, or
+ * a further damaged copy of a document downloaded again.
+ */
+async function trashDocument(conn, uid) {
+  const body = await callJson(conn, "POST", `/id/${encodeURIComponent(uid)}/@op/Document.Trash`, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ params: {} })
+  });
+  if (body.isTrashed === false) throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: `document ${uid} was not moved to the trash` });
+}
+
+/**
+ * Download again into an existing document (uid): the new PDF becomes its main file, under the
+ * main file's current name (the ECM renames files when it creates a document, e.g.
+ * <PO>_MODIFICATIONADVISE.pdf). The old main file is
+ *   - kept as an attachment (files:files) named <name>_old.pdf when the ECM can serve it in full,
+ *   - dropped when it is damaged (confirmed by the ranged read of assertFileReadable).
+ * A list property is replaced as a whole, so attachments already there are read and sent again;
+ * one that cannot be read leaves the document unchanged (ECM_UNAVAILABLE). Title and metadata
+ * are not touched.
+ */
+async function replaceInDocument(conn, uid, { bytes, filename, mimeType }) {
+  const current = await callJson(conn, "GET", `/id/${encodeURIComponent(uid)}`, { headers: { Properties: "file,files" } });
+  const props = current.properties || {};
+  const main = props["file:content"] || null;
+  const name = (main && main.name) || filename;
+  const unchanged = (detail) => new EcmError(ECM_ERROR.UNAVAILABLE, { detail: `document ${uid}: ${detail}; the document was not changed` });
+
+  const old = main && Number(main.length) > 0 ? await readFile(conn, uid, "file:content", Number(main.length)) : null;
+  let oldDamaged = false;
+  if (main && !old) {
+    // only a file the ECM really cannot serve is dropped; anything else stops the replace
+    try {
+      await assertFileReadable(conn, uid, name);
+    } catch (error) {
+      if (!(error instanceof EcmError && error.code === ECM_ERROR.DAMAGED)) throw error;
+      oldDamaged = true;
+    }
+    if (!oldDamaged) throw unchanged(`its current file ${name} could not be read`);
+  }
+  const kept = [];
+  for (const [i, entry] of (props["files:files"] || []).entries()) {
+    const file = entry && entry.file;
+    if (!file) continue;
+    const content = await readFile(conn, uid, `files:files/${i}/file`, Number(file.length));
+    if (!content) throw unchanged(`its attachment ${file.name} could not be read`);
+    kept.push({ name: file.name, mimeType: file["mime-type"] || "application/octet-stream", bytes: content });
+  }
+  const oldFile = old ? oldFileName(name, kept.map((k) => k.name)) : null;
+  const files = [{ name, mimeType, bytes }, ...kept, ...(old ? [{ name: oldFile, mimeType: main["mime-type"] || mimeType, bytes: old }] : [])];
+
+  const batchId = await uploadBatch(conn, files);
+  const properties = { "file:content": batchRef(batchId, 0) };
+  if (files.length > 1) properties["files:files"] = files.slice(1).map((_, i) => ({ file: batchRef(batchId, i + 1) }));
+  const updated = await callJson(conn, "PUT", `/id/${encodeURIComponent(uid)}`, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ "entity-type": "document", properties })
+  });
+  await assertFileReadable(conn, uid, name);
+  let oldFileReadable = null;
+  if (oldFile) {
+    oldFileReadable = await assertFileReadable(conn, uid, oldFile, `files:files/${files.length - 2}/file`).then(() => true, (error) => {
+      logger.warn(`The ECM cannot serve the kept old file ${oldFile} in full`, { uid, detail: error && error.detail });
+      return false;
+    });
+  }
+  return { document: { ...current, ...updated, uid }, oldFile, oldDamaged, oldFileReadable };
+}
+
 /**
  * Upload one document straight to the ECM folder of the account's unit.
  * Same input and answer as ecm-service uploadToEcm (it dispatches here in direct mode).
  *
+ * A new document the ECM damaged is moved to the trash (DocLink's own copy), and the error is
+ * ECM_FILE_DAMAGED: the caller saves the file locally.
+ *
+ * `replace` (uids of the copies already in the folder, from findInFolder, when the user chose
+ * to download them again): no new document; the first copy gets the new PDF
+ * (replaceInDocument: a healthy old PDF is kept in it as <name>_old.pdf, a damaged one is
+ * dropped). Any further copy the ECM damaged goes to the trash; healthy ones are left alone.
+ *
  * @param {{ kind: string, bytes: Uint8Array, filename: string, title?: string, fields?: object,
- *           account: { irepsAccountId?: string|null, operatingUnit?: string|null }, mimeType?: string }} doc
+ *           account: { irepsAccountId?: string|null, operatingUnit?: string|null }, mimeType?: string,
+ *           replace?: string[] }} doc
  * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
- * @returns {Promise<{ uid: string, path: string|null, title: string|null, site: string, deduplicated: boolean }>}
+ * @returns {Promise<{ uid: string, path: string|null, title: string|null, site: string, deduplicated: boolean,
+ *           replaced?: { oldFile: string|null, oldDamaged: boolean, oldFileReadable: boolean|null, trashed: string[] } }>}
+ *          replaced (a replace only): the old PDF's name in the document (null: it was damaged and dropped),
+ *          and the further damaged copies moved to the trash
  */
 export async function uploadToNuxeo(doc, deps = {}) {
   const conn = await connection(deps);
@@ -271,27 +448,45 @@ export async function uploadToNuxeo(doc, deps = {}) {
   logger.info(`Uploading ${filename} to the ECM directly`, { kind: doc.kind, env, site: siteKey, bytes: doc.bytes.length, fields: Object.keys(values) });
 
   const parent = await folderUid(conn, site, kind.location);
+  const replace = [...new Set((doc.replace || []).filter(Boolean).map(String))];
+  if (replace.length) {
+    const [target, ...others] = replace;
+    const done = await replaceInDocument(conn, target, { bytes: doc.bytes, filename, mimeType });
+    const trashed = [];
+    for (const uid of others) {
+      const damaged = await assertFileReadable(conn, uid, filename).then(() => false, (error) => error instanceof EcmError && error.code === ECM_ERROR.DAMAGED);
+      if (!damaged) continue;
+      await trashDocument(conn, uid).then(() => trashed.push(uid), (error) => logger.warn(`Could not move the damaged copy ${uid} to the ECM trash`, { detail: error && error.detail }));
+    }
+    logger.info(`ECM: ${filename} replaced the PDF of document ${target}`, { oldFile: done.oldFile, oldDamaged: done.oldDamaged, trashed });
+    return { ...saved(done.document, siteKey, false), replaced: { oldFile: done.oldFile, oldDamaged: done.oldDamaged, oldFileReadable: done.oldFileReadable, trashed } };
+  }
   const [existing] = await search(conn, existingDocumentQuery({ kind: doc.kind, folderUid: parent, title, filename, values }), { limit: 1 });
   if (existing) {
     logger.info(`ECM already had ${filename}`, { kind: doc.kind, site: siteKey, uid: existing.uid });
+    // an earlier copy the ECM damaged keeps DocLink's name and metadata, so it is found here
+    await assertFileReadable(conn, existing.uid, filename);
     return saved(existing, siteKey, true);
   }
 
-  const batch = await callJson(conn, "POST", "/upload");
-  if (!batch.batchId) throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: "the upload batch answer had no batchId" });
-  await callJson(conn, "POST", `/upload/${encodeURIComponent(batch.batchId)}/0`, {
-    // header values must be ASCII
-    headers: { "X-File-Name": encodeURIComponent(filename), "X-File-Type": mimeType, "Content-Type": mimeType },
-    body: doc.bytes
-  });
+  const batchId = await uploadBatch(conn, [{ name: filename, mimeType, bytes: doc.bytes }]);
   const properties = { "dc:title": title, [TYPE_PROPERTY]: doc.kind };
   for (const [key, value] of Object.entries(values)) properties[ECM_FIELDS[key]] = value;
-  properties["file:content"] = { "upload-batch": batch.batchId, "upload-fileId": "0" };
+  properties["file:content"] = batchRef(batchId, 0);
   const created = await callJson(conn, "POST", `/id/${encodeURIComponent(parent)}`, {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ "entity-type": "document", name: title.replace(NAME_UNSAFE, "-").slice(0, 120) || doc.kind, type: DOC_TYPE, properties })
   });
   if (!created.uid) throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: "the ECM answer had no document uid" });
+  try {
+    await assertFileReadable(conn, created.uid, filename);
+  } catch (error) {
+    // DocLink's own broken copy is not left in the folder (the file is saved locally instead)
+    if (error instanceof EcmError && error.code === ECM_ERROR.DAMAGED) {
+      await trashDocument(conn, created.uid).catch((e) => logger.warn(`Could not move the damaged copy ${created.uid} to the ECM trash`, { detail: e && e.detail }));
+    }
+    throw error;
+  }
   logger.info(`ECM stored ${filename}`, { kind: doc.kind, site: siteKey, uid: created.uid });
   return saved(created, siteKey, false);
 }
@@ -307,7 +502,8 @@ const IN_CHUNK = 100; // values per "IN (...)" in findInFolder
  * @param {{ kind: string, account: object, candidates: { ref: string, fields: object, title?: string }[] }} query
  *        fields already as ecmFields() makes them
  * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
- * @returns {Promise<Map<string, { uid: string, path: string|null, title: string|null }>>}
+ * @returns {Promise<Map<string, { uid: string, path: string|null, title: string|null, uids: string[] }>>}
+ *          uid / path / title: the first match; uids: every matching copy (what a replace trashes)
  */
 export async function findInFolder({ kind: kindKey, account, candidates }, deps = {}) {
   const conn = await connection(deps);
@@ -342,8 +538,9 @@ export async function findInFolder({ kind: kindKey, account, candidates }, deps 
     return Object.entries(c.fields).every(([key, value]) => String(props[ECM_FIELDS[key]] ?? "").trim() === String(value));
   };
   for (const c of wanted) {
-    const hit = docs.find((d) => same(d, c));
-    if (hit) found.set(c.ref, { uid: hit.uid, path: hit.path ?? null, title: hit.title ?? (hit.properties || {})["dc:title"] ?? null });
+    const hits = docs.filter((d) => same(d, c));
+    const [hit] = hits;
+    if (hit) found.set(c.ref, { uid: hit.uid, path: hit.path ?? null, title: hit.title ?? (hit.properties || {})["dc:title"] ?? null, uids: hits.map((d) => d.uid) });
   }
   return found;
 }

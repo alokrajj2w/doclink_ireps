@@ -645,10 +645,10 @@ no secrets in the manifest, and the side-panel UI (real `popup.html` in jsdom).
 
 ---
 
-## Batch downloads: POs by PO date, ICs from notifications
+## Batch downloads: POs by PO date, ICs by IC date, ICs from notifications
 
 `test/batch-tests.js` (run by `test/run-tests.js`, so Part A covers it) drives
-both workflows against an in-memory IREPS simulator: `searchPO.do` (showPage,
+all three workflows against an in-memory IREPS simulator: `searchPO.do` (showPage,
 search, `postRequest` page links, the portal's 180-day limit), 
 `vendorInspectionCallList.do` (list page, PO + PO Sr. search, `navigate()`
 paging, results table inside the form, one more data cell than headers - the
@@ -663,8 +663,47 @@ range split at 180 days; one / several / repeated / unreadable / LOA / empty
 notifications, leading zeros in the PO serial, no matching call, matching row
 without an IC link, several matching rows, REF_ID mismatch, duplicate
 documents, paging, expired session, invalid JSON, non-PDF content, partial
-failure and retry.
+failure and retry; ICs by IC date: the search with PO No. empty and the IC
+dates, every PO and serial in the range, out-of-range / not-issued / repeated
+rows, paging, a list that ignores the dates, nothing in the range, a reversed
+range, a From date before the Call Date default, ECM fields, a row without a
+link, and retry. The IC parser is also checked on the captured page layout
+(a hidden cell after Offer Qty.).
+
+Manual check against the mock (`node test/mock/mock-ireps-server.mjs`): under
+Download ICs by IC Date, 27/10/2026 - 28/10/2026 gives 2 ICs of PO
+05220028100004; 01/05/2026 - 31/10/2026 gives 6 ICs of 2 POs.
 
 `DOCLINK_TESTS 168/168 passed` is the expected line after these were added.
 Not covered by any automatic test: the live portal itself (see README,
 "Batch downloads - what is not verified").
+
+## Tender: LOA letters and Financial / Commercial Tabulation
+
+Automatic (`tender/tests/run-tests.mjs`): an LOA letter page that links an
+annexure, embeds an iframe / embed and opens a file from a script is saved as
+one `LOA_<tender>.pdf`, printed by Chrome, and none of those files is
+requested; an LOA served as a PDF file is kept as it is; when Chrome cannot
+print, only the text PDF is saved (no `.html`). A Counter Offer letter with a
+document attached (link, iframe, embed, script) saves only the printed letter
+`Counter_Offer_<tender>_<letter id>.pdf`; the attachment is never requested,
+also when Chrome cannot print. Tabulations: a direct PDF, a PDF
+behind an iframe viewer, a self-submitting form or a `window.open` target are
+downloaded; Techno-Commercial links inside the viewer are never requested; a
+web page with no PDF fails with its title and nothing is saved. The 29 Oct
+Closed Tenders capture (`tender/tests/fixtures/closed-tenders-29oct.html`) lists
+the 7 tenders with both tabulations.
+
+Manual check against the mock (`node test/mock/mock-ireps-server.mjs`, log in on
+the mock home page): in Download Tender Documents, with From = 2 days ago and
+To = today,
+
+* **Financial Tabulation** / **Commercial Tabulation**: 24260725 (direct PDF)
+  and 61266411 (PDF behind a viewer page) download to
+  `Tender_<no>/Tabulation/`; 88265708 reads "not available yet".
+* **Advance Acceptance Letter**: one `Tender_29263265/Advance_Acceptance_LOA/LOA_29263265.pdf`.
+  The mock console must not show any `/mock/loa/...` request (those are the
+  files inside the letter).
+
+On the real portal, if a tabulation still fails, run `doclinkLog.download()`
+in the side panel console: the `Tabulation` lines show what IREPS answered.

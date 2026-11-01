@@ -428,25 +428,31 @@ export function flushDownloadLog(deps = {}) {
  * @property {string} destination   "local" | "ecm"
  * @property {{ id: string, label: string, count: number, filename: string, date: string, time: string }[]} alreadyDownloaded
  * @property {{ id: string, label: string, path: string|null }[]} inEcm
+ * @property {boolean} [replacesEcm]  downloading an ECM file again puts the new PDF in the document there
  */
 
 /**
  * Which of a run's documents to skip because this user already downloaded them to the same
  * destination, or (destination "ecm") they are already in their ECM folder. `ask` gets the
  * matches and answers which ids to download again (none when it gives no answer).
+ * With `replaceInEcm`, a file downloaded again that is already in the ECM goes into the
+ * document found there: `replace` names the copies found, for the upload
+ * (ecm-direct.js uploadToNuxeo `replace`: the first gets the new PDF).
  *
  * @param {PreflightItem[]} items
- * @param {{ destination: string, account?: object|null, ask?: (q: RedownloadQuestion) => Promise<{ redownload?: string[] }|null>, deps?: object }} options
- * @returns {Promise<{ skip: Map<string, object>, warnings: string[], checked: boolean }>}
+ * @param {{ destination: string, account?: object|null, ask?: (q: RedownloadQuestion) => Promise<{ redownload?: string[] }|null>, replaceInEcm?: boolean, deps?: object }} options
+ * @returns {Promise<{ skip: Map<string, object>, replace: Map<string, string[]>, warnings: string[], checked: boolean }>}
  *          skip: id -> { reason, date?, time?, count?, filename?, path? };
+ *          replace: id -> uids of the ECM copies found for that file (the first gets the new PDF);
  *          checked: the download log answered (false: off, or unreachable)
  */
-export async function preflightDownloads(items, { destination, account = null, ask = null, deps = {} } = {}) {
+export async function preflightDownloads(items, { destination, account = null, ask = null, replaceInEcm = false, deps = {} } = {}) {
   const skip = new Map();
+  const replace = new Map();
   const warnings = [];
   await loadDownloadLogConfig();
   const list = (items || []).filter((i) => i && i.id);
-  if (!enabled || list.length === 0) return { skip, warnings, checked: false };
+  if (!enabled || list.length === 0) return { skip, replace, warnings, checked: false };
 
   const logged = list.filter((i) => i.log && i.log.key);
   const toEcm = destination === LOG_DESTINATION.ECM;
@@ -469,12 +475,12 @@ export async function preflightDownloads(items, { destination, account = null, a
     const doc = inEcmById.get(item.id);
     if (doc) inEcm.push({ id: item.id, label, path: doc.path || null });
   }
-  if (alreadyDownloaded.length === 0 && inEcm.length === 0) return { skip, warnings, checked: checked.ok };
+  if (alreadyDownloaded.length === 0 && inEcm.length === 0) return { skip, replace, warnings, checked: checked.ok };
 
   let answer = null;
   if (typeof ask === "function") {
     try {
-      answer = await ask({ destination, alreadyDownloaded, inEcm });
+      answer = await ask({ destination, alreadyDownloaded, inEcm, ...(replaceInEcm && inEcm.length ? { replacesEcm: true } : {}) });
     } catch (error) {
       logger.warn("The download-again question was not answered", error);
     }
@@ -483,12 +489,16 @@ export async function preflightDownloads(items, { destination, account = null, a
   const byId = new Map(alreadyDownloaded.map((a) => [a.id, a]));
   for (const e of inEcm) {
     if (!again.has(e.id)) skip.set(e.id, { reason: SKIP_REASON.ALREADY_IN_ECM, path: e.path, ...(byId.has(e.id) ? pick(byId.get(e.id)) : {}) });
+    else if (replaceInEcm) {
+      const doc = inEcmById.get(e.id);
+      replace.set(e.id, doc.uids && doc.uids.length ? doc.uids : [doc.uid]);
+    }
   }
   for (const a of alreadyDownloaded) {
     if (!again.has(a.id) && !skip.has(a.id)) skip.set(a.id, { reason: SKIP_REASON.ALREADY_DOWNLOADED, ...pick(a) });
   }
-  logger.info(`Download check: ${skip.size} skipped, ${again.size} downloaded again`, { alreadyDownloaded: alreadyDownloaded.length, inEcm: inEcm.length, answered: Boolean(answer) });
-  return { skip, warnings, checked: checked.ok };
+  logger.info(`Download check: ${skip.size} skipped, ${again.size} downloaded again`, { alreadyDownloaded: alreadyDownloaded.length, inEcm: inEcm.length, replacing: replace.size, answered: Boolean(answer) });
+  return { skip, replace, warnings, checked: checked.ok };
 }
 
 const pick = ({ count, filename, date, time }) => ({ count, filename, date, time });

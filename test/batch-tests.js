@@ -14,6 +14,7 @@
 
 import { runPoDateDownload, retryPoDateFailures, searchPosByDate, validatePoDateSelection, assignPoDatePaths, PO_ITEM_STATUS } from "../services/po/po-date-service.js";
 import { runIcNotificationDownload, retryIcNotificationFailures, buildIcManifest, matchIcRows, NOTIFICATION_OUTCOME } from "../services/inspection-certificate/ic-notification-service.js";
+import { runIcDateDownload, retryIcDateFailures } from "../services/inspection-certificate/ic-date-service.js";
 import { parseNotificationResponse, selectIcNotifications, parseIcNotification, isIcIssuedNotification } from "../services/notifications/notification-service.js";
 import { splitDateRange, withRetry, isoToIrepsDate } from "../services/batch-utils.js";
 import { parseIrepsDate, IrepsError } from "../services/ireps-api.js";
@@ -79,11 +80,13 @@ function simulator({ searchPage, poPage, listPage, icPage, loginPage }, opts = {
     const poNo = p.get("poNo");
     const poSr = p.get("poSr");
     const pageNo = Number(p.get("pageNo") || 1);
-    state.icSearches.push({ poNo, poSr, pageNo, dateFrom: p.get("dateFrom"), dateFromIC: p.get("dateFromIC"), token: p.get("org.apache.struts.taglib.html.TOKEN") });
+    state.icSearches.push({ poNo, poSr, pageNo, dateFrom: p.get("dateFrom"), dateTo: p.get("dateTo"), dateFromIC: p.get("dateFromIC"), dateToIC: p.get("dateToIC"), token: p.get("org.apache.struts.taglib.html.TOKEN") });
     const pageSize = opts.icPageSize || 100;
     const from = p.get("dateFrom");
     let rows = (opts.icRows || []).filter((r) => (!poNo || r.poNo === poNo) && (!poSr || r.poSerial === poSr));
     if (opts.icWindowFrom) rows = rows.filter(() => day(from) <= day(opts.icWindowFrom));
+    // IREPS filters on IC Date From / To (opts.icIgnoresDates: it does not)
+    if (opts.icDateFilter && !opts.icIgnoresDates) rows = rows.filter((r) => day(r.icDate || "08/05/2026") >= day(p.get("dateFromIC")) && day(r.icDate || "08/05/2026") <= day(p.get("dateToIC")));
     if (opts.icEcho) rows = rows.concat(opts.icEcho);
     const total = rows.length;
     const pages = Math.max(1, Math.ceil(total / pageSize));
@@ -475,6 +478,23 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     assert(r.records[0].icPdfUrl.endsWith("/ic/1.pdf") && r.records[1].icPdfUrl.endsWith("/ic/2.pdf") && r.records[2].icPdfUrl === null);
   });
 
+  await test("IC parser (captured page, HAR entry 683): the hidden cell after Offer Qty. is not a column - Registration / Inspection Start / IC Date read as IREPS shows them", () => {
+    const head = ["Call Date", "TPI Agency", "PO No. / Date", "Call Id", "PO Sr.", "PL No: Description", "Type", "Offer Qty.", "Registration Date", "Inspection Start Date", "IC Date", "Passed Qty.", "Call Status", "Actions"];
+    const row = (lead, call, sr, link) => `<tr>${lead}<td class="dataText">${call}</td><td class="dataText"><a href="#" onclick="x()">${sr}</a></td><td class="dataText">DESC</td><td class="dataText">Product - Final Product Inspection</td>
+      <td class="dataText" style="padding: 5px; text-align: right;">106</td><td class="dataText" style="padding: 5px; display: none;" > 08/05/2026 </td>
+      <td class="dataText" style="padding: 5px;"> 07/05/2026 </td><td class="dataText" style="padding: 5px;"> 07/05/2026 </td><td class="dataText" style="padding: 5px;">08/05/2026</td><td class="dataText">106</td>
+      <td class="dataText">Completed (IC Issued)</td><td class="dataText"><a href="${link}" target="_blank" title="View/ Download IC PDF">p</a></td></tr>`;
+    const html = `<html><body><form name="inspectionCallForm" action="/epsn/tpi/vendorInspectionCallList.do"><table><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr>
+      ${row(`<td rowspan="2">05/05/2026</td><td rowspan="2">TUV INDIA PVT LTD.-MUMBAI</td><td rowspan="2"><a href="#">27253922100240<br /> dt. 16/01/2026</a></td>`, "6038184070", "001", "/ireps/etender/ct/tpi/ic/052026/3480517.pdf")}
+      ${row("", "3778184071", "002", "/ireps/etender/ct/tpi/ic/052026/2975517.pdf")}</table></form></body></html>`;
+    const r = parseIcSearchResults(html, null);
+    eq(r.records.length, 2);
+    for (const x of r.records) {
+      eq([x.offerQty, x.registrationDate, x.inspectionStartDate, x.icDate, x.passedQty, x.callStatus].join("|"), "106|07/05/2026|07/05/2026|08/05/2026|106|Completed (IC Issued)");
+    }
+    eq(r.records.map((x) => `${x.poNo}/${x.poSerial}/${x.icNumber}`).join(","), "27253922100240/001/3480517,27253922100240/002/2975517");
+  });
+
   const ic = (poNo, poSerial, callId, link = true, extra = {}) => ({ poNo, poSerial, callId, link: link ? `/ireps/etender/ct/tpi/ic/102026/${callId}.pdf` : null, ...extra });
   const runIc = (sim, extra = {}) => {
     const s = saved();
@@ -687,5 +707,109 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(r.state.notifications[0].outcome, NOTIFICATION_OUTCOME.ERROR);
     eq(r.state.notifications[1].outcome, NOTIFICATION_OUTCOME.MATCHED);
     eq(r.files.length, 1);
+  });
+
+  /* ------------------------------------------------------------ IC by IC date */
+
+  const runIcd = (sim, range = { dateFrom: "10/09/2026", dateTo: "18/09/2026" }, extra = {}) => {
+    const s = saved();
+    return runIcDateDownload(range, { fetch: sim.fetchImpl, saveFile: s.saveFile, ...ZERO, ...extra }).then((state) => ({ state, files: s.files }));
+  };
+  const inRange = [
+    ic("P1", "001", "C11", true, { icDate: "17/09/2026" }),
+    ic("P1", "002", "C12", true, { icDate: "17/09/2026" }),
+    ic("P1", "004", "C14", true, { icDate: "18/09/2026" }),
+    ic("P2", "001", "C21", true, { icDate: "10/09/2026" })
+  ];
+
+  await test("IC date: one search with PO No. empty and IC Date From / To set downloads EVERY IC issued in the range - all POs, all serials", async () => {
+    const sim = simulator(pages, { icDateFilter: true, icRows: [...inRange, ic("P3", "001", "C31", true, { icDate: "09/09/2026" })] });
+    const { state, files } = await runIcd(sim);
+    eq(state.phase, "complete");
+    eq(state.counts.found, 4);
+    eq(state.counts.pos, 2);
+    eq(state.counts.downloaded, 4);
+    eq(files.map((f) => f.path.split("/").pop()).join(","), "IC_P1_001_C11.pdf,IC_P1_002_C12.pdf,IC_P1_004_C14.pdf,IC_P2_001_C21.pdf");
+    eq(files[0].path, "DocLink/IREPS/IC/P1/IC_P1_001_C11.pdf");
+    eq(sim.state.icSearches.length, 1);
+    const s = sim.state.icSearches[0];
+    eq([s.poNo, s.poSr, s.dateFromIC, s.dateToIC].join("|"), "||10/09/2026|18/09/2026", "no PO, no serial, the IC dates of the range");
+    eq([s.dateFrom, s.dateTo].join("|"), "01/01/2025|18/09/2026", "Call Date keeps the portal's own defaults");
+    assert(s.token && s.token.startsWith("TOKEN-"), "the token of the freshly loaded list page");
+    eq(sim.calls.filter((c) => c.path === "/epsn/vndr/activity/ajax.do").length, 0, "notifications are not read");
+  });
+
+  await test("IC date: rows IREPS returns outside the range, without an IC issued, or twice are not downloaded; the IC date is checked on each row", async () => {
+    const sim = simulator(pages, {
+      icDateFilter: true,
+      icRows: [...inRange, ic("P4", "001", "C41", true, { icDate: "12/09/2026", status: "Call Registered" })],
+      icEcho: [ic("P5", "001", "C51", true, { icDate: "01/08/2026" }), ic("P1", "001", "C11", true, { icDate: "17/09/2026" })]
+    });
+    const { state, files } = await runIcd(sim);
+    eq(files.length, 4);
+    eq(state.counts.outOfRange, 1);
+    eq(state.counts.duplicates, 1);
+    assert(!files.some((f) => /C41|C51/.test(f.path)), files.map((f) => f.path).join("\n"));
+  });
+
+  await test("IC date: every result page is followed, each with the token printed on the page before", async () => {
+    const rows = Array.from({ length: 7 }, (_, i) => ic(`P${i}`, "001", `C${i}`, true, { icDate: "15/09/2026" }));
+    const sim = simulator(pages, { icDateFilter: true, icRows: rows, icPageSize: 3 });
+    const { state, files } = await runIcd(sim);
+    eq(files.length, 7);
+    eq(sim.state.icSearches.map((x) => x.pageNo).join(","), "1,2,3");
+    assert(sim.state.icSearches.slice(1).every((x) => x.token.startsWith("RTOKEN-")), "pages 2.. carry the previous page's token");
+    eq(state.counts.pages, 3);
+  });
+
+  await test("IC date: if IREPS ignores the IC dates, the newest-first list stops being read once whole pages fall before From", async () => {
+    const old = Array.from({ length: 20 }, (_, i) => ic(`O${i}`, "001", `OC${i}`, true, { icDate: "01/06/2026" }));
+    const sim = simulator(pages, { icDateFilter: true, icIgnoresDates: true, icRows: [...inRange, ...old], icPageSize: 4 });
+    const { state, files } = await runIcd(sim);
+    eq(files.length, 4);
+    eq(sim.state.icSearches.length, 3, "page 1 in range, pages 2 and 3 entirely older: stop");
+    eq(state.counts.outOfRange, 8);
+  });
+
+  await test("IC date: no IC in the range is a clear, complete result; a reversed range is refused before any request", async () => {
+    const sim = simulator(pages, { icDateFilter: true, icRows: inRange });
+    const { state, files } = await runIcd(sim, { dateFrom: "01/10/2026", dateTo: "02/10/2026" });
+    eq(state.phase, "complete");
+    eq(state.counts.found, 0);
+    eq(files.length, 0);
+    const none = simulator(pages, { icRows: inRange });
+    await rejects(runIcd(none, { dateFrom: "18/09/2026", dateTo: "10/09/2026" }), "IREPS_INVALID_REQUEST");
+    eq(none.calls.length, 0);
+  });
+
+  await test("IC date: a From date before the portal's Call Date default pulls Call Date From back too (a call precedes its IC)", async () => {
+    const sim = simulator(pages, { icDateFilter: true, icRows: [ic("P1", "001", "C1", true, { icDate: "15/12/2024" })] });
+    const { files } = await runIcd(sim, { dateFrom: "01/12/2024", dateTo: "31/12/2024" });
+    eq(files.length, 1);
+    eq(sim.state.icSearches[0].dateFrom, "01/12/2024");
+  });
+
+  await test("IC date: Save to ECM / S3 files each IC as inspectionCertificate with IC number, PO and IC date; a row without a link is skipped", async () => {
+    const sim = simulator(pages, { icDateFilter: true, icRows: [...inRange.slice(0, 2), ic("P9", "001", "C91", false, { icDate: "12/09/2026" })] });
+    const ecm = ecmSaver();
+    const { state } = await runIcd(sim, undefined, { saveFile: ecm.saveFile });
+    eq(ecm.filed.length, 2);
+    eq(JSON.stringify(ecm.filed[0].ecm), JSON.stringify({ kind: "inspectionCertificate", fields: { ic_number: "C11", customer_po_number: "P1", ic_date: "17/09/2026" } }));
+    eq(state.counts.skipped, 1);
+    eq(state.items[2].error.code, "IREPS_IC_LINK_NOT_FOUND");
+  });
+
+  await test("IC date: failed downloads are retried without fetching the downloaded ones again", async () => {
+    let fail = true;
+    const sim = simulator(pages, { icDateFilter: true, icRows: inRange, pdf: (path) => (fail && path.endsWith("C12.pdf") ? "404" : "ok") });
+    const s = saved();
+    const state = await runIcDateDownload({ dateFrom: "10/09/2026", dateTo: "18/09/2026" }, { fetch: sim.fetchImpl, saveFile: s.saveFile, ...ZERO });
+    eq(state.counts.downloaded, 3);
+    eq(state.counts.failed, 1);
+    fail = false;
+    await retryIcDateFailures(state, { fetch: sim.fetchImpl, saveFile: s.saveFile, ...ZERO });
+    eq(state.counts.downloaded, 4);
+    eq(state.counts.failed, 0);
+    eq(sim.state.pdfHits.get("/ireps/etender/ct/tpi/ic/102026/C11.pdf"), 1, "a downloaded IC is not fetched again");
   });
 }

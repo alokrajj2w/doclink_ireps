@@ -30,8 +30,16 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
 * **Download Tender Documents** (`tender/`): reads the active IREPS account
   from the home page, scans **My Messages** for NIT / corrigendum messages in
   a From-To date range, and downloads each tender's NIT, attachments,
-  corrigenda, My Offer, negotiation / counter offer / LOA letters and
-  correspondence into `Downloads/DocLink/<unit>/Tender_<no>/`. A per-account
+  corrigenda and My Offer (**NIT Documents**) into
+  `Downloads/DocLink/<unit>/Tender_<no>/`. A corrigendum is its IREPS page,
+  printed as Ctrl+P would (`Corrigendum_NN_<tender>.pdf`); a document attached
+  to it is saved next to it as `Corrigendum_NN_<tender>_Attachment_<n>.<ext>`. Negotiation / counter offer / LOA
+  letters have their own buttons (by Letter Date), and correspondence comes
+  from the Correspondence view. An LOA is the published letter page alone,
+  printed as Ctrl+P would: one `LOA_<tender>.pdf` per tender, and nothing the
+  letter links or embeds is downloaded. A counter offer is likewise its
+  published letter page, printed (`Counter_Offer_<tender>_<letter id>.pdf`); a
+  document attached to the counter offer is never downloaded in its place. A per-account
   ledger (`chrome.storage.local`) skips documents already downloaded, so
   "Retry failed" is safe. Financial and Commercial Tabulations are downloaded
   by the tenders' Closing Date from IREPS Closed Tenders (section 19); the
@@ -196,7 +204,7 @@ doclink-extension/
 | `tabs` | Open IREPS / the preview page in a new tab |
 | `offscreen` | Create an invisible offscreen document so the parser can use `DOMParser`; MV3 service workers have no DOM |
 | `identity` | Only for **Sign in with Okta** to the Recon Engine (section 17): `chrome.identity.launchWebAuthFlow` opens the Okta sign-in window and returns to `https://<extension id>.chromiumapp.org/okta` |
-| `debugger` | Only for **published letters** (LOA, Negotiation, Counter Offer, Correspondence - in Download Tender Documents and Pending Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning |
+| `debugger` | Only for **published letters and corrigenda** (LOA, Negotiation, Counter Offer, Correspondence, Corrigendum - in Download Tender Documents and Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both declared permanently) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
 
 | host `http://localhost:8000/*` (the Recon Engine; replace/add the deployed Recon URL) | Only for **Save to: ECM / S3**: the Recon Engine sign-in (section 17) and the uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
@@ -935,8 +943,8 @@ Bill Status, CRN and R-NOTE downloads (remembered in `chrome.storage.local`):
 
 | Choice | What happens to the export file |
 |---|---|
-| **Local** (default) | `chrome.downloads` into `Downloads/DocLink/IREPS/` (Bill Status), `.../CRN/`, `.../RNOTE/` - unchanged behaviour |
-| **Recon (S3)** | `POST {reconBaseUrl}/api/documents` (multipart `customer_id`, `doc_type`, `file`) on the Recon Engine (`recon-engine` repo, `backend/app/routes.py`) |
+| **Local** | `chrome.downloads` into `Downloads/DocLink/IREPS/` (Bill Status), `.../CRN/`, `.../RNOTE/` - unchanged behaviour |
+| **Recon (S3)** (default: "ECM / S3" until Local is picked) | `POST {reconBaseUrl}/api/documents` (multipart `customer_id`, `doc_type`, `file`) on the Recon Engine (`recon-engine` repo, `backend/app/routes.py`) |
 
 The Recon Engine stores the file in its managed storage - S3 when it runs
 with `STORAGE_BACKEND=s3` - one directory per document type, content-addressed
@@ -998,14 +1006,25 @@ settings, sign-in cookie and host permission as section 15:
 | Inspection Certificate | `inspectionCertificate` | `ic_number` (the IC PDF's file name, e.g. `3480517`), `customer_po_number`, `ic_date` | `3480517 - IC` |
 | PO | `poCopy` | `customer_po_number` | `<PO no> - PO` |
 | Modification Advice | `modificationAdvise` | `customer_po_number`, `modification_advise_number` | `<MA no> - MA` |
-| NIT + attached documents | `nit` | `tender_number`, `tender_date` (the tender's closing / "Due Date/Time"; letters found by date look it up once per tender, correspondence reads it from its page; blank when IREPS does not show it) | `<tender no> - NIT`; an attachment `<tender no> - NIT - <name>` |
-| Corrigendum | `extension` | same | `<tender no> - Extension - <corrigendum no>` |
+| NIT + attached documents | `nit` | `tender_number` | `<tender no> - NIT`; an attachment `<tender no> - NIT - <name>` |
+| Corrigendum | `extension` | same | `<tender no> - Extension - <corrigendum no>`; a document attached to it `<tender no> - Extension - <corrigendum no> - Attachment <n>` |
 | Negotiation letter | `nbsp` | same | `<tender no> - NBSP - <letter id>` |
 | Counter offer | `co` | same | `<tender no> - CO - <letter id>` |
-| LOA (Advance Acceptance Letter) | `loi` | same + `loi_number` (letter id), `loi_date` (published) | `<tender no> - LOI` |
+| LOA (Advance Acceptance Letter) | `loi` | same | `<tender no> - LOI - <letter id>` |
 | Correspondence | `crp` | same | `<tender no> - CRP - <subject>` |
-| Financial Tabulation | `vft` | `tender_number`, `tender_date` (the Closed Tenders row's Closing Date/Time; mandatory here) | `<tender no> - Financial Tabulation` |
+| Financial Tabulation | `vft` | same | `<tender no> - Financial Tabulation` |
 | Commercial Tabulation | `vct` | same | `<tender no> - Commercial Tabulation` |
+
+**Only properties the ECM has.** The spec also lists `tenderDate` for every tender
+document and `loiNumber` / `loiDate` for the LOI, but the TEST ECM's
+`InvoiceCertificateSchema` has none of them (checked with
+`GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema` on 26/10/2026). A query or
+create naming one answers HTTP 400 "No such property", so every tender upload
+failed. Tender documents therefore carry the tender number only, and the LOA's
+letter id goes in its title. When the ECM team adds the properties, map them in
+`services/ecm-catalog.js` `ECM_FIELDS` and list them in the kinds. DocLink already
+works out the tender date (the closing date) and sends it once the catalog lists it.
+The gateway's `document_kinds.toml` must match.
 
 The title is `<document number> - <code>`, the codes of the spec's row 4
 (API: "Example Title - IC", "- PO", "- MA", "- NIT", "- LOI", ...) and the
@@ -1075,9 +1094,15 @@ for the Recon sign-in in direct mode.
   | `PROD` | Hosur | `7dfe3fc0-3157-489d-826a-9435e65631fc` | `/FT/workspaces/Sites/HSR/Invoice Certificate/Inputs` (path looked up once) |
   | `PROD` | Rohtak | `f2a5bf87-877b-4e4c-b4fc-7301cabfd236` | `/FT/workspaces/Sites/HPD/Invoice Certificate/Input` (path looked up once) |
 
-  IC, PO and MA go to Inputs. NIT, LOI, corrigendum, negotiation, counter offer and
-  correspondence go to Tenders. PROD has no Tenders folder yet, so tender documents on
-  PROD are refused and saved locally.
+  IC, PO and MA go to Inputs. NIT, LOI, corrigendum, negotiation, counter offer,
+  correspondence and the tabulations go to Tenders. PROD has no Tenders folder yet, so
+  tender documents on PROD are refused and saved locally.
+* **Folder check.** A supplied folder uid is opened once per session (`GET /id/{uid}`).
+  If the ECM cannot open it, the upload is refused with the folder's name, path and uid,
+  and the document is saved locally. On 26/10/2026 both TEST Tenders folders failed this
+  check (HTTP 404). For Hosur `aa28acbe-…`, NXQL answers "Unknown document type:
+  InvoiceCertificateTenderFolder". The Rohtak `a6594520-…` does not exist. The Inputs
+  folders open at their catalog paths.
 * **Host permission.** The `ecm.domain` origin must be in `manifest.json`
   `host_permissions`. `http://wctsrvecmtstsn1.wabtec.com:8080/*` is already there. The
   server is on the Wabtec network.
@@ -1177,12 +1202,46 @@ Nothing is ticked by default; **Skip them, download only new files** or
 are not fetched from IREPS at all and show an **Already downloaded** /
 **Already in ECM** chip (hover for when / where); the summaries count them.
 
+**Download again puts the new PDF in the same ECM document** (MA, PO, IC and
+their batches, direct mode `ecmBackendAws: false` only; the page then says so).
+For a ticked file that is already in the ECM, no new document is made: the
+document the check found (same kind, folder and numbers, whatever its file
+name) is updated in place (`PUT /id/{uid}`), its title and metadata untouched.
+
+- The new PDF becomes the main file, under the main file's current name (the
+  one the ECM gave it, e.g. `LC261044100166_MODIFICATIONADVISE.pdf`).
+- **Old PDF intact:** it stays in the document as an attachment named
+  `<name>_old.pdf` (`_old_2`, ... when taken). Attachments already there are
+  kept (they are read and sent again: the ECM replaces the list as a whole).
+- **Old PDF damaged** (the ECM cannot serve it in full): it is dropped.
+- If a file of the document cannot be read for another reason, nothing is
+  changed and the PDF is saved locally (`ECM_UNAVAILABLE`); if the ECM damages
+  the new PDF, it is saved locally too (`ECM_FILE_DAMAGED`), the old one still
+  being in the document as `_old`.
+- When the check found several copies, the first gets the new PDF; any other
+  copy the ECM damaged goes to the **ECM trash** (Nuxeo `Document.Trash`,
+  restorable), healthy ones are left alone.
+
+The row reads `Saved to ECM (Hosur): new PDF in the existing document; the old
+one is kept in it as <name>_old.pdf` (or `(the damaged one was removed)`).
+Through the Recon gateway, and for tender documents, download again uploads as
+before and replaces nothing.
+
+**Every ECM upload reads back.** The ECM re-saves IC / PO / MA PDFs while it
+creates them, and uploads created at the same moment came out damaged (the
+record keeps the uploaded length, the stored file is shorter, every download of
+it breaks off). So uploads go one at a time, and after each one DocLink reads
+the last byte of the stored file; a copy the ECM cannot serve in full is
+`ECM_FILE_DAMAGED`: DocLink's own new copy is moved to the trash and the file
+is saved locally, and an earlier damaged copy is not reported as "already in
+the ECM".
+
 | Flow | Checked first | Logged |
 |---|---|---|
 | MA, PO, IC (single) | yes | yes |
 | PO by date, IC from notifications | yes (a retry is not re-checked) | yes |
 | Tender documents (all categories, jobs and single tender) | yes, one question per run: *Same answer for the rest of this run* | yes |
-| Pending correspondence | its own "already saved / Download again" (unchanged) | yes |
+| Correspondence | its own "already saved / Download again" (unchanged) | yes |
 | Bill Status, CRN, R-NOTE | yes: the **same rows** (a SHA-256 of the format and the rows IREPS returned) already downloaded to the same destination -> "not saved again" unless you choose to; new or changed rows make a new file | yes (`s3` under ECM / S3) |
 
 **Which document is "the same".** A key built from the document's numbers,
@@ -1245,7 +1304,9 @@ plus the `find_in_folder` tests in the recon-engine repo.
 "ECM - Download speci-v1" columns L and M (ECM types `vft` / `vct`). IREPS
 shows both on a tender's row in **Closed Tenders** (Vendor inbox, Tenders ›
 Closed Tenders) once the bids are opened, next to My Offer
-(`01_api_data/finncial and commercial documentation response.har`):
+(`01_api_data/finncial and commercial documentation response.har`, and the
+29 Oct capture `financial and commercial documentation response_29oct.har`).
+The tabulation opens in a popup window, so neither capture holds its response:
 
 | Link | Request (POST, as `postRequestNewWindow` sends it) |
 |---|---|
@@ -1270,18 +1331,25 @@ Tender No. (Bid Id), Tender Title and Closing Date/Time
   else from its Closed Tenders row (one scan, closing date ± 1 day).
 * **Checks.** The link's `accountID` must be the active IREPS account; what was
   downloaded before is skipped (download log types `financial_tabulation` /
-  `commercial_tabulation`, else the ledger). A PDF is expected; a web page
-  answer is printed to PDF like the letters.
+  `commercial_tabulation`, else the ledger). The tabulation must be a PDF. A
+  PDF behind a viewer page (iframe / embed, a self-submitting form, a
+  `window.open` / `location` target) is followed. A web page that leads to no
+  PDF fails with the page's title and first words, and is never saved as the
+  tabulation. DocLink waits up to 3 minutes for IREPS to build the PDF. Every
+  answer is logged under `Tabulation` (status, content type, file name, size,
+  kind, the files tried) - `doclinkLog.download()` in the side panel console.
 * **ECM.** Under Save to: ECM / S3 they go to the unit's Tenders folder as
   `vft` / `vct` with `tenderNumber` and `tenderDate` (section 16). The gateway's
   `document_kinds.toml` has both kinds.
 * **Excluded.** `isExcludedUrl` (`tender/tender-core.js`) still refuses the
   Techno-Commercial Tabulation and any other `pdfType`; it now reads `pdfType`
-  from a POST body too.
+  from a POST body too. Inside an allowed Financial / Commercial response, a
+  file named only "Tabulation_..." may be fetched, but a Techno-Commercial
+  name or another `commTboPdfAction.do` link never is.
 
-## Pending Correspondence Downloads (`tender/tender-pending.js`, `tender/pending-ui.js`)
+## Correspondence Downloads (`tender/tender-pending.js`, `tender/pending-ui.js`)
 
-Main screen -> **Pending Correspondence Downloads** -> **Download All Pending Correspondence**.
+Main screen -> **Correspondence Downloads** -> **Download All Correspondence**.
 No tender / correspondence / letter ids are typed in; all are read from the live responses.
 
 Request sequence (all in the signed-in browser session, `credentials: include`):
@@ -1296,6 +1364,7 @@ Request sequence (all in the signed-in browser session, `credentials: include`):
 `vendorCorresSubmitReply.do` and anything that looks like a write action is refused in `pcFetch()` (`assertReadOnly`).
 
 Output: `Downloads/DocLink/<verified unit>/Correspondence/Pending/<TenderNo>/Correspondence_<LetterNo>_<dd-mm-yyyy>_<Subject>.pdf`, `Attachment_<LetterNo>_<original name>`, and `Downloads/DocLink/<unit>/Correspondence/Pending/download_manifest.json`.
+Under **Save to: ECM / S3** each letter and attachment goes to the unit's ECM Tenders folder instead, as `crp` with the tender number, titled `<tender no> - CRP - <letter no> - <subject>` (attachments: `<tender no> - CRP - <letter no> - Attachment - <file name>`), with the same Recon sign-in and the same local fallback as the tender documents (section 16). Each letter row shows where it went. When Chrome cannot print a letter, its original `.html` page stays in Downloads.
 Dedupe key: `accountId|nitOid|corresId|letterId` (stored in `chrome.storage.local`, no secrets). **Retry failed** and a repeated run skip letters already saved; tick "Download again" to force.
 Requests are sequential, with bounded retry/backoff on 5xx/429/network errors; a session expiry stops the job and marks the rest `SESSION_EXPIRED`.
 
@@ -1303,11 +1372,11 @@ Unverified against the live portal: the exact response of `viewpubIndltr.do` (it
 
 ---
 
-## Batch downloads (PO by date, IC from notifications)
+## Batch downloads (PO by date, IC by date, IC from notifications)
 
-Both live in the side panel under **Download PO / IC → "Download POs by date / ICs from notifications"**.
+All three live in the side panel under **Download PO / IC → "Download POs / ICs by date, or ICs from notifications"**.
 They are download-only (no inspection call is submitted, approved, withdrawn or revalidated).
-The **Save to** switch applies to both, as to a single PO / IC download: under **ECM / S3**
+The **Save to** switch applies to all of them, as to a single PO / IC download: under **ECM / S3**
 each PO is filed as `poCopy` (`customer_po_number`) and each IC as `inspectionCertificate`
 (`ic_number` from the PDF name, `customer_po_number`, `ic_date`), with the same Recon sign-in
 and the same local fallback when the ECM does not take a document (section 16). A retry uses
@@ -1323,7 +1392,21 @@ PO No. + unit + link, and each row's own "Click to View/Download PO" href is fet
 `Downloads/DocLink/IREPS/PO/<PO date>/PO_<PO>_<date>.pdf` (unit added only when two documents would collide).
 Rows without a link are listed as skipped with the reason.
 
+### Download ICs by IC Date
+Every Inspection Certificate whose **IC Date** is in From-To, for every PO.
+`POST /epsn/tpi/vendorInspectionCallList.do callType=I&status=I` (token, session check, the portal's date defaults) →
+the search with `poNo` and `poSr` empty, `dateFromIC`/`dateToIC` = the selected dates, `statusSelected=Completed / IC Issued`
+and the Call Date fields (`dateFrom`/`dateTo`) left at the portal's defaults - `dateFrom` is only pulled back when the IC
+From date is earlier, since a call precedes its IC → every `navigate(N)` page (50 calls a page), each with the token of
+the page before. Rows are re-checked here: IC-issued status, IC Date in the range, de-duplicated on the IC PDF href.
+Should IREPS ignore the IC dates, the newest-first list stops being read after two whole pages before From (and at
+most 200 pages are read, with a warning). Each row's "View/ Download IC PDF" href is saved as
+`Downloads/DocLink/IREPS/IC/<PO>/IC_<PO>_<SR>_<CALLID>.pdf`, with the same download-log key and ECM fields as the other
+IC downloads, so an IC already downloaded by any of them is recognised.
+
 ### Download ICs from Notifications
+Only the IC of each notified PO **and PO serial** (one per "IC issued" notice); for every IC of a period use
+Download ICs by IC Date.
 `POST /epsn/vndr/activity/ajax.do ajaxMode=getMyActivitesData` → notifications with subject *Inspection* and message
 "IC issued for PONo : … , POSrNo : …" (everything else ignored; identifiers kept verbatim) → for each distinct
 PO + serial: `POST /epsn/tpi/vendorInspectionCallList.do callType=I&status=I` (fresh token), then the search with `poNo`,
@@ -1341,3 +1424,5 @@ network / timeout / HTTP 5xx only. An expired session is never retried.
 * The inspection-call date window: the portal's own default is used first; if nothing matches, one wider retry
   (`dateFrom`/`dateFromIC` = 01/01/2015) is made. Whether IREPS accepts that early a date is unconfirmed.
 * Notifications beyond what `getMyActivitesData` returns (no other notification endpoint is called).
+* The IC Date search with PO No. empty. The captured list page (no PO, portal defaults) lists every PO's ICs and has
+  the IC Date From / To fields, but a submitted search with only the IC dates set is not in a capture.

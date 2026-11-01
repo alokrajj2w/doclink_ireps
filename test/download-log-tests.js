@@ -201,6 +201,16 @@ export async function runDownloadLogTests({ test, assert, eq }) {
     eq(r.skip.get("po-3").reason, SKIP_REASON.ALREADY_IN_ECM);
     eq(r.skip.get("po-3").path, "/FT/workspaces/Sites/HSR/Invoice Certificate - TS/Inputs/PO-3");
     eq(r.skip.has("po-1"), false);
+    eq(r.replace.size, 0, "nothing downloaded again, nothing replaced");
+    eq(question.replacesEcm, undefined, "replacing not offered unless the run can replace");
+
+    // a run that can replace (direct mode): the file downloaded again replaces the ECM copy found
+    const again = await preflightDownloads([PO("1"), PO("3")], { destination: "ecm", account: HOSUR, replaceInEcm: true, ask: async (q) => ((question = q), { redownload: ["po-3"] }), deps: { fetch, hostPermissions: HOSTS } });
+    eq(question.replacesEcm, true, "the panel says the ECM copy is replaced");
+    eq(again.skip.has("po-3"), false);
+    eq(JSON.stringify([...again.replace]), JSON.stringify([["po-3", ["u-9"]]]), "the copy the check found");
+    const keep = await preflightDownloads([PO("3")], { destination: "ecm", account: HOSUR, ask: async () => ({ redownload: ["po-3"] }), deps: { fetch, hostPermissions: HOSTS } });
+    eq(keep.replace.size, 0, "without replaceInEcm (the gateway) a download again replaces nothing");
 
     const unknown = await findInEcm({ kind: "poCopy", account: {}, candidates: [{ ref: "x", fields: { customer_po_number: "1" } }] }, { fetch, hostPermissions: HOSTS });
     eq(unknown.ok, false);
@@ -219,6 +229,8 @@ export async function runDownloadLogTests({ test, assert, eq }) {
         const doc = (uid, po, ma, title) => ({ uid, path: `/FT/workspaces/Sites/HSR/Invoice Certificate - TS/Inputs/${title}`, title, properties: { "dc:title": title, "InvoiceCertificateSchema:customerPONumber": po, "InvoiceCertificateSchema:modificationAdviseNumber": ma, "file:content": { name: "05250369100012_MODIFICATIONADVISE.pdf" } } });
         return json(200, { entries: [doc("u-1", "05250369100012", "007012", "007012"), doc("u-2", "05250369100012", "007099", "007099")], isNextPageAvailable: false });
       }
+      // the Inputs folder is opened once before it is searched
+      if (u.pathname === `/nuxeo/api/v1/id/${HOSUR_INPUTS}`) return json(200, { uid: HOSUR_INPUTS, path: "/FT/workspaces/Sites/HSR/Invoice Certificate - TS/Inputs" });
       return json(404, {});
     };
     const MA = (po, ma) => ({ ref: `ma-${ma}`, fields: { customer_po_number: po, modification_advise_number: ma } });
@@ -226,6 +238,7 @@ export async function runDownloadLogTests({ test, assert, eq }) {
     eq(r.ok, true);
     eq([...r.found.keys()].join(), "ma-007012", "every field must match: 007099 belongs to another PO");
     eq(r.found.get("ma-007012").uid, "u-1");
+    eq(r.found.get("ma-007012").uids.join(), "u-1", "every matching copy (what a replace trashes)");
     eq(queries.length, 1, "one query for the whole list");
     eq(queries[0], `SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'modificationAdvise' AND ecm:parentId = '${HOSUR_INPUTS}' AND InvoiceCertificateSchema:customerPONumber IN ('05250369100012', 'OTHER')`);
     assert(!/file:content|icDate|dc:title/.test(queries[0]), "neither file names nor dates nor titles in the query");
@@ -260,6 +273,17 @@ export async function runDownloadLogTests({ test, assert, eq }) {
       onSaved: async () => { throw new Error("log down"); }
     });
     eq(failingLog.completed, 1, "a broken check or log never fails the download");
+
+    // preflight's replace reaches the saver as item.ecm.replace, for that item only
+    const withEcm = items.map((i) => ({ ...i, ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: i.id } } }));
+    const seen = {};
+    await downloadIrepsDocuments(withEcm, {
+      fetch: fetchImpl,
+      saveFile: async (bytes, path, item) => ((seen[item.id] = item.ecm.replace || null), { downloadId: 1, filename: path.split("/").pop(), path }),
+      preflight: async () => ({ skip: new Map(), replace: new Map([["po-2", ["u-7", "u-8"]]]) })
+    });
+    eq(["po-1", "po-2", "po-3"].map((id) => JSON.stringify(seen[id])).join(" "), 'null ["u-7","u-8"] null');
+    eq(withEcm[1].ecm.replace, undefined, "the caller's item is not changed");
   });
 
   await test("download log: My downloads reads the user's log with the filters, and says why it cannot", async () => {

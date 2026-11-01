@@ -1,8 +1,9 @@
 /**
- * "Download POs by PO Date" and "Download ICs from Notifications" views.
+ * "Download POs by PO Date", "Download ICs by IC Date" and "Download ICs from
+ * Notifications" views.
  *
- * Both are pure views of the state object the service worker keeps per kind
- * ("po-date" / "ic-notif") and broadcasts as BATCH_UPDATE: the panel sends
+ * Each is a pure view of the state object the service worker keeps per kind
+ * ("po-date" / "ic-date" / "ic-notif") and broadcasts as BATCH_UPDATE: the panel sends
  * BATCH_START / BATCH_RETRY, then renders whatever state arrives, so closing
  * and reopening the panel mid-run just fetches the state again
  * (BATCH_GET_STATE). Everything that came from IREPS is written with
@@ -11,7 +12,6 @@
 
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
-import { SAVE_DESTINATION } from "../services/recon-service.js";
 import { describeSkip, skipChipText } from "../services/download-log.js";
 
 const $ = (id) => document.getElementById(id);
@@ -24,15 +24,18 @@ const OUTCOME_LABEL = { pending: "Pending", matched: "Matched", unparsed: "Unrea
 
 const KINDS = {
   "po-date": { prefix: "pod", name: "PO" },
+  "ic-date": { prefix: "icd", name: "IC" },
   "ic-notif": { prefix: "icn", name: "IC" }
 };
 
-const IDLE_LABEL = { pod: "Download All Matching POs", icn: "Download IC from Notifications" };
+/** The kinds with a From / To date pair (inputs <prefix>-from / <prefix>-to). */
+const DATED = ["po-date", "ic-date"];
 
-/** The idle button label; under Save to: ECM / S3 it reads "... to ECM", like the single PO / IC buttons. */
+const IDLE_LABEL = { pod: "Download All Matching POs", icd: "Download ICs Issued in Range", icn: "Download IC from Notifications" };
+
+/** The idle button label: what it downloads, whatever Save to says. */
 function idleLabel(prefix) {
-  const toEcm = ctx && ctx.getDestination && ctx.getDestination() === SAVE_DESTINATION.RECON;
-  return `${IDLE_LABEL[prefix]}${toEcm ? " to ECM" : ""}`;
+  return IDLE_LABEL[prefix];
 }
 
 /**
@@ -49,12 +52,12 @@ function bind() {
   Object.assign(el, {
     view: $("view-po-ic-batch"),
     btnOpen: $("btn-po-ic-batch-open"),
-    btnBack: $("btn-pod-back"),
-    from: $("pod-from"),
-    to: $("pod-to")
+    btnBack: $("btn-pod-back")
   });
   for (const { prefix } of Object.values(KINDS)) {
     el[prefix] = {
+      from: $(`${prefix}-from`),
+      to: $(`${prefix}-to`),
       button: $(`btn-${prefix}-download`),
       label: document.querySelector(`#btn-${prefix}-download .btn-label`),
       progress: $(`${prefix}-progress`),
@@ -236,6 +239,88 @@ function renderPoDate(state) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* IC by IC date                                                              */
+/* -------------------------------------------------------------------------- */
+
+function renderIcDate(state) {
+  const v = el.icd;
+  if (!state || state.phase === "idle") {
+    hideAll("icd");
+    setBusy("icd", false, idleLabel("icd"));
+    v.details.hidden = true;
+    return;
+  }
+  if (state.phase === "error") {
+    showError("icd", state.error);
+    return;
+  }
+  const c = state.counts;
+  const done = c.downloaded + c.failed + c.skipped;
+  // "skipped" holds both: rows without an IC link, and ICs the user already has (not a problem)
+  const already = c.alreadyDownloaded || 0;
+  const noLink = c.skipped - already;
+  const range = `${state.dateFrom}${state.dateFrom === state.dateTo ? "" : " – " + state.dateTo}`;
+  renderCounts("icd", [
+    ["IC dates searched", range],
+    ["ICs issued in the range", c.found],
+    ["POs", c.pos || 0],
+    ["IC PDFs downloaded", c.downloaded],
+    ["Already downloaded (skipped)", already],
+    ["Duplicates skipped", c.duplicates],
+    ["Failed", c.failed, true],
+    ["Skipped (no IC link)", noLink, true]
+  ]);
+
+  const running = state.running || state.phase === "searching" || state.phase === "downloading";
+  hideAll("icd");
+  if (running) {
+    v.progress.hidden = false;
+    const p = state.pageProgress;
+    v.progressMessage.textContent =
+      state.phase === "searching" ? (p ? `Searching IREPS (result page ${p.pageNo}, ${p.found} IC${p.found === 1 ? "" : "s"} so far)...` : "Searching IREPS for ICs...") : `Downloading ICs... ${done} of ${c.found}`;
+    v.bar.max = Math.max(c.found, 1);
+    v.bar.value = state.phase === "searching" ? 0 : done;
+    setBusy("icd", true, state.phase === "searching" ? "Searching..." : "Downloading...");
+    v.result.hidden = false;
+    v.result.className = "result";
+    v.resultTitle.textContent = "";
+    v.resultText.textContent = "";
+  } else {
+    setBusy("icd", false, idleLabel("icd"));
+    ctx.setConnection("connected", "Connected");
+    v.result.hidden = false;
+    const retryable = state.items.filter((i) => i.status === "failed" && i.url).length;
+    if (c.found === 0) {
+      v.result.className = "result result-error is-notice";
+      v.resultTitle.textContent = "No ICs issued in the range";
+      v.resultText.textContent = [`IREPS lists no Inspection Certificate issued ${state.dateFrom === state.dateTo ? "on" : "from"} ${range}.`, ...(state.warnings || [])].filter(Boolean).join("\n");
+    } else if (c.failed === 0 && noLink === 0) {
+      v.result.className = "result result-success";
+      v.resultTitle.textContent = `✓ ${c.downloaded} IC${c.downloaded === 1 ? "" : "s"} downloaded`;
+      v.resultText.textContent = [savedWhere(state.items, "Downloads/DocLink/IREPS/IC/<PO>/"), already ? `${already} already downloaded before: skipped (see the list).` : "", ...(state.warnings || [])].filter(Boolean).join("\n");
+    } else {
+      v.result.className = "result result-error is-notice";
+      v.resultTitle.textContent = c.downloaded ? `Partly done: ${c.downloaded} downloaded, ${c.failed + noLink} not` : already && !c.failed && !noLink ? "Nothing new to download" : "No IC could be downloaded";
+      v.resultText.textContent = [
+        state.sessionExpired ? "Your IREPS session expired. Log in again, then retry the failed downloads." : "Open the list below to see why each IC failed or was skipped.",
+        already ? `${already} already downloaded before: skipped.` : "",
+        summariseEcm(state.items.filter((i) => i.status === "completed")),
+        ...(state.warnings || [])
+      ].filter(Boolean).join("\n");
+    }
+    v.retry.hidden = retryable === 0;
+  }
+
+  v.details.hidden = state.items.length === 0;
+  v.list.replaceChildren(
+    ...state.items.map((i) => {
+      const why = i.skip ? describeSkip(i.skip) : i.error ? errorText(i.error) || i.error.detail : describeEcmOutcome(i.ecm) || null;
+      return listItem(`PO ${i.poNo || "?"} · Sr. ${i.poSerial || "?"}`, [i.icDate ? `IC ${i.icDate}` : null, i.callId ? `Call ${i.callId}` : null, i.filename].filter(Boolean).join(" · "), i.status, ITEM_LABEL, why, i.skip ? skipChipText(i.skip) : undefined);
+    })
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /* IC from notifications                                                      */
 /* -------------------------------------------------------------------------- */
 
@@ -330,16 +415,17 @@ function renderIcNotif(state) {
 
 /* -------------------------------------------------------------------------- */
 
-const RENDERERS = { "po-date": renderPoDate, "ic-notif": renderIcNotif };
+const RENDERERS = { "po-date": renderPoDate, "ic-date": renderIcDate, "ic-notif": renderIcNotif };
 
 async function start(kind) {
   const prefix = KINDS[kind].prefix;
   const message = { kind };
-  if (kind === "po-date") {
-    if (!el.from.value || !el.to.value) return showError("pod", describeError("IREPS_INVALID_REQUEST", { detail: "Please select both From Date and To Date." }));
-    if (el.from.value > el.to.value) return showError("pod", describeError("IREPS_INVALID_REQUEST", { detail: "From Date must not be later than To Date." }));
-    message.dateFrom = el.from.value;
-    message.dateTo = el.to.value;
+  if (DATED.includes(kind)) {
+    const { from, to } = el[prefix];
+    if (!from.value || !to.value) return showError(prefix, describeError("IREPS_INVALID_REQUEST", { detail: "Please select both From Date and To Date." }));
+    if (from.value > to.value) return showError(prefix, describeError("IREPS_INVALID_REQUEST", { detail: "From Date must not be later than To Date." }));
+    message.dateFrom = from.value;
+    message.dateTo = to.value;
   }
   message.destination = ctx.getDestination();
   hideAll(prefix);
@@ -364,8 +450,10 @@ export function initBatch(context) {
   ctx = context;
   bind();
   const today = localIso();
-  el.from.value = today;
-  el.to.value = today;
+  for (const kind of DATED) {
+    el[KINDS[kind].prefix].from.value = today;
+    el[KINDS[kind].prefix].to.value = today;
+  }
   el.btnOpen.addEventListener("click", async () => {
     ctx.showView("po-ic-batch");
     await Promise.all(Object.keys(KINDS).map(refresh));
@@ -378,7 +466,7 @@ export function initBatch(context) {
   }
 }
 
-/** Save to changed: the idle download buttons say where the POs and ICs go. */
+/** Reset the idle download buttons' labels. */
 export function refreshBatchDestination() {
   if (!ctx) return;
   for (const { prefix } of Object.values(KINDS)) {

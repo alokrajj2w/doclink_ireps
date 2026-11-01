@@ -58,13 +58,14 @@ import { buildCrnExport } from "../services/crn/crn-export.js";
 import { buildRnoteExport } from "../services/rnote/rnote-export.js";
 import { searchMa, downloadMaPdfs, MA_ERROR, MA_FLOW_STAGES } from "../services/ma/ma-service.js";
 import { downloadBytes } from "../services/download-service.js";
-import { saveToEcmOrLocally } from "../services/ecm-service.js";
+import { saveToEcmOrLocally, canReplaceInEcm } from "../services/ecm-service.js";
 import { loadDownloadLogConfig, isDownloadLogEnabled, preflightDownloads, logDownload, flushDownloadLog, downloadRecord, downloadKey, exportFingerprint, runDestination, LOG_DESTINATION } from "../services/download-log.js";
 import { HOME_PATH } from "../utils/ireps-account.js";
 import { downloadPo, PO_ERROR, PO_FLOW_STAGES } from "../services/po/po-service.js";
 import { downloadInspectionCertificates, IC_ERROR, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
 import { runPoDateDownload, retryPoDateFailures } from "../services/po/po-date-service.js";
 import { runIcNotificationDownload, retryIcNotificationFailures, publicIcState } from "../services/inspection-certificate/ic-notification-service.js";
+import { runIcDateDownload, retryIcDateFailures } from "../services/inspection-certificate/ic-date-service.js";
 import { isoToIrepsDate } from "../services/batch-utils.js";
 import { IC_DOWNLOAD_SUBFOLDER } from "../utils/filename.js";
 import { buildDocumentExportDownloadPath, buildDocumentExportFilename, buildBillStatusExportDownloadPath, buildBillStatusExportFilename } from "../utils/filename.js";
@@ -318,15 +319,18 @@ function askPanel(panelTabId) {
  *   onSaved    each saved document goes to the download log
  * preflight and onSaved only while the download log is on (config.json "downloadLog").
  * `preflight: false` leaves the check out (a retry only fetches what failed).
+ * Under ECM / S3 in direct mode, a document the user downloads again although it is already
+ * in the ECM goes into the document there (a healthy old PDF is kept in it as <name>_old.pdf).
  */
 async function documentRunHooks(rawDestination, panelTabId, { preflight = true } = {}) {
   const destination = sanitiseDestination(rawDestination);
   const toEcm = destination === SAVE_DESTINATION.RECON;
   const logging = await loadDownloadLogConfig();
   const account = toEcm || logging ? await irepsAccountForEcm({ forEcm: toEcm }) : null;
+  const replaceInEcm = toEcm && (await canReplaceInEcm());
   return {
     saveFile: toEcm ? ecmSaveFile(account) : undefined,
-    preflight: logging && preflight ? (items) => preflightDownloads(items, { destination: runDestination(destination), account, ask: askPanel(panelTabId) }) : undefined,
+    preflight: logging && preflight ? (items) => preflightDownloads(items, { destination: runDestination(destination), account, ask: askPanel(panelTabId), replaceInEcm }) : undefined,
     onSaved: logging ? (item, done) => item.log && logDownload(downloadRecord(item.log, { filename: done.filename, ecm: done.ecm, account })) : undefined
   };
 }
@@ -342,7 +346,7 @@ function ecmSaveFile(account) {
     if (!item || !item.ecm) return saveLocally();
     const filename = path.split("/").pop();
     const { ecm, local } = await saveToEcmOrLocally(
-      { kind: item.ecm.kind, fields: item.ecm.fields, title: item.ecm.title, bytes, filename, account: account || {} },
+      { kind: item.ecm.kind, fields: item.ecm.fields, title: item.ecm.title, replace: item.ecm.replace, bytes, filename, account: account || {} },
       saveLocally
     );
     return local ? { ...local, ecm } : { filename, downloadId: null, ecm };
@@ -1265,14 +1269,16 @@ async function startIcDownload(rawPoNo, destination, panelTabId) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Both batch workflows keep one state object each (kind "po-date" /
+ * Each batch workflow keeps one state object (kind "po-date" / "ic-date" /
  * "ic-notif"); the popup is a pure view of it. The state is broadcast
  * (throttled) as BATCH_UPDATE, mirrored into chrome.storage.session for a
  * popup that opens later, and the full state (including what a retry needs)
  * stays in memory here.
  */
-const batch = { "po-date": null, "ic-notif": null };
-const batchRunning = { "po-date": false, "ic-notif": false };
+const BATCH_KINDS = ["po-date", "ic-date", "ic-notif"];
+const batch = { "po-date": null, "ic-date": null, "ic-notif": null };
+const batchRunning = { "po-date": false, "ic-date": false, "ic-notif": false };
+const anyBatchRunning = () => BATCH_KINDS.some((k) => batchRunning[k]);
 const batchTimers = {};
 
 function publicBatchState(kind) {
@@ -1379,14 +1385,19 @@ function batchParser(kind) {
  */
 async function startBatch(message) {
   const kind = message.kind;
-  if (kind !== "po-date" && kind !== "ic-notif") return { started: false, error: describeError("UNKNOWN", { detail: "unknown download type" }) };
-  if (batchRunning["po-date"] || batchRunning["ic-notif"]) return { started: false, error: describeError("BATCH_BUSY") };
+  if (!BATCH_KINDS.includes(kind)) return { started: false, error: describeError("UNKNOWN", { detail: "unknown download type" }) };
+  if (anyBatchRunning()) return { started: false, error: describeError("BATCH_BUSY") };
   const destination = sanitiseDestination(message.destination);
   if (kind === "po-date") {
     const dateFrom = isoToIrepsDate(message.dateFrom) || message.dateFrom;
     const dateTo = isoToIrepsDate(message.dateTo) || message.dateTo;
     batch[kind] = null;
     runBatch(kind, async (update) => runPoDateDownload({ dateFrom, dateTo }, { parseHtml: batchParser(kind), ...(await documentRunHooks(destination, message.panelTabId)), onUpdate: update }));
+  } else if (kind === "ic-date") {
+    const dateFrom = isoToIrepsDate(message.dateFrom) || message.dateFrom;
+    const dateTo = isoToIrepsDate(message.dateTo) || message.dateTo;
+    batch[kind] = null;
+    runBatch(kind, async (update) => runIcDateDownload({ dateFrom, dateTo }, { parseHtml: batchParser(kind), ...(await documentRunHooks(destination, message.panelTabId)), onUpdate: update }));
   } else {
     batch[kind] = null;
     runBatch(kind, async (update) => runIcNotificationDownload({ parseHtml: batchParser(kind), ...(await documentRunHooks(destination, message.panelTabId)), onUpdate: update }));
@@ -1397,13 +1408,14 @@ async function startBatch(message) {
 
 async function retryBatch(kind, rawDestination, panelTabId) {
   await restoreBatchState(kind);
-  if (batchRunning["po-date"] || batchRunning["ic-notif"]) return { started: false, error: describeError("BATCH_BUSY") };
+  if (anyBatchRunning()) return { started: false, error: describeError("BATCH_BUSY") };
   const state = batch[kind];
   if (!state || state.phase !== "complete") return { started: false, error: describeError("UNKNOWN", { detail: "nothing to retry" }) };
   const destination = sanitiseDestination(rawDestination);
   // a retry only fetches what failed, so it is not checked against the log again
   const hooks = async () => documentRunHooks(destination, panelTabId, { preflight: false });
   if (kind === "po-date") runBatch(kind, async (update) => retryPoDateFailures(state, { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }).then(() => state));
+  else if (kind === "ic-date") runBatch(kind, async (update) => retryIcDateFailures(state, { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }).then(() => state));
   else runBatch(kind, async (update) => retryIcNotificationFailures(ensureIcIndexes(state), { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }));
   pushBatchState(kind, { immediately: true });
   return { started: true };

@@ -53,7 +53,8 @@ export function absUrl(base, ref, relativeTo) {
 }
 
 export function isPdfBytes(bytes) {
-  const n = Math.min(bytes.length - 3, 1024);
+  // JSP output can lead the PDF with whitespace / stray markup, so look a little further in than the header
+  const n = Math.min(bytes.length - 3, 8192);
   for (let i = 0; i < n; i++) {
     if (bytes[i] === 0x25 && bytes[i + 1] === 0x50 && bytes[i + 2] === 0x44 && bytes[i + 3] === 0x46) return true;
   }
@@ -133,10 +134,11 @@ export async function irepsFetch(base, ref, opts = {}) {
   }
 }
 
-async function irepsFetchOnce(base, ref, { method = 'GET', form = null, relativeTo, timeoutMs = fetchSettings.timeoutMs } = {}) {
+async function irepsFetchOnce(base, ref, { method = 'GET', form = null, relativeTo, timeoutMs = fetchSettings.timeoutMs, trusted = false } = {}) {
   let url = absUrl(base, ref, relativeTo);
   const params = form ? (form instanceof URLSearchParams ? form : new URLSearchParams(form)) : null;
-  if (isExcludedUrl(withParams(url, params))) throw new TenderError('EXCLUDED', 'Techno-Commercial Tabulation and other tabulation downloads are excluded from DocLink tender downloads.');
+  // trusted: a file linked from inside an allowed Financial / Commercial Tabulation response (isExcludedTrustedLink)
+  if ((trusted ? isExcludedTrustedLink : isExcludedUrl)(withParams(url, params))) throw new TenderError('EXCLUDED', 'Techno-Commercial Tabulation and other tabulation downloads are excluded from DocLink tender downloads.');
   const init = { method, credentials: 'include', redirect: 'follow', headers: {} };
   if (params) {
     if (method === 'GET') {
@@ -396,7 +398,27 @@ export function extensionFor(kind, res, nameHint) {
 
 const BINARY_DOC_KINDS = new Set(['pdf', 'zip', 'ole', 'png', 'jpg', 'gif', 'tiff', 'rtf']);
 
-function docCandidates(doc, pageUrl, base, allowAnyFile) {
+/**
+ * A link inside a response that is already an allowed Financial / Commercial Tabulation: its file may be named
+ * "Tabulation_<oid>.pdf" without saying which one, so only the Techno-Commercial patterns (and any other
+ * commTboPdfAction.do pdfType) are refused there.
+ */
+function isExcludedTrustedLink(url) {
+  if (isExcludedUrl(url) === false) return false;
+  let u;
+  try {
+    u = new URL(url, 'https://x.invalid/');
+  } catch {
+    return false;
+  }
+  if (/commTboPdfAction\.do/i.test(u.pathname)) return true;
+  return /techno|tech-?tab/i.test(u.pathname + u.search);
+}
+
+/** window.open('...') / location = '...' targets in the page's handlers and scripts (any extension). */
+const SCRIPT_TARGET_RE = /(?:window\.open|location\.(?:href|replace|assign))\s*(?:\(\s*|=\s*)['"]([^'"\s]+)['"]|(?:window\.|document\.)location\s*=\s*['"]([^'"\s]+)['"]/gi;
+
+function docCandidates(doc, pageUrl, base, allowAnyFile, trusted = false) {
   const ext = allowAnyFile ? '(?:pdf|docx?|xlsx?|zip|rar|jpe?g|png|tiff?|rtf|txt)' : 'pdf';
   const isDoc = new RegExp(`\\.${ext}(\\?|#|$)`, 'i');
   const raw = [];
@@ -413,11 +435,15 @@ function docCandidates(doc, pageUrl, base, allowAnyFile) {
   const inline = [...doc.querySelectorAll('[onclick]')].map((e) => e.getAttribute('onclick')).join(' ') +
     ' ' + [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join(' ');
   for (const m of inline.matchAll(new RegExp(`['"]([^'"\\s]*\\.${ext}(?:\\?[^'"\\s]*)?)['"]`, 'gi'))) raw.push(m[1]);
+  // a tabulation viewer may open its file through a servlet URL; only accepted when it answers with a document
+  if (trusted) for (const m of inline.matchAll(SCRIPT_TARGET_RE)) raw.push(m[1] || m[2]);
+  const excluded = trusted ? isExcludedTrustedLink : isExcludedUrl;
   const out = [];
   for (const r of raw) {
+    if (!r || /^(about:|javascript:|#|data:)/i.test(r)) continue;
     try {
       const u = absUrl(base, r, pageUrl);
-      if (!isExcludedUrl(u) && !out.includes(u)) out.push(u);
+      if (!excluded(u) && !out.includes(u)) out.push(u);
     } catch {
       /* off-origin or malformed: skip */
     }
@@ -430,6 +456,35 @@ function metaRedirect(doc, html) {
   const u = /url\s*=\s*['"]?([^'";]+)/i.exec(m)?.[1] ||
     /(?:window\.|document\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i.exec(html)?.[1];
   return u || '';
+}
+
+/**
+ * A viewer page that posts itself on to the file (<form> + .submit() on load), as postRequest.js does:
+ * -> { url, method, form } or null. Only used inside a trusted tabulation response.
+ */
+function selfSubmittingForm(doc, html) {
+  const forms = [...doc.querySelectorAll('form[action]')];
+  if (forms.length !== 1) return null;
+  const onload = doc.body?.getAttribute('onload') || '';
+  if (!/\.submit\s*\(\s*\)/.test(`${onload} ${[...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join(' ')}`) && !/\.submit\s*\(\s*\)/.test(html)) return null;
+  const f = forms[0];
+  return { url: f.getAttribute('action'), method: /^get$/i.test(f.getAttribute('method') || '') ? 'GET' : 'POST', form: formParams(f) };
+}
+
+/** What a response was, for the log: never its body, cookies or tokens. */
+export function describeResponse(res) {
+  const cd = res.headers?.['content-disposition'] || '';
+  const name = /filename\*?=(?:UTF-8'')?"?([^";]+)/i.exec(cd)?.[1] || '';
+  let path = '';
+  try { path = new URL(res.url).pathname; } catch { /* keep blank */ }
+  return `${path} -> HTTP ${res.status}, ${res.contentType || 'no content-type'}${name ? `, file "${name}"` : ''}, ${res.bytes?.length ?? 0} bytes, ${sniffKind(res.bytes)}`;
+}
+
+/** "title: first words" of a web page, for a failure reason. */
+function pageSummary(doc) {
+  const title = norm(doc.querySelector('title')?.textContent);
+  const text = norm(doc.body?.textContent).slice(0, 120);
+  return [title, text].filter(Boolean).join(': ') || 'an empty page';
 }
 
 export function looksLikeErrorPage(doc) {
@@ -445,10 +500,20 @@ export function looksLikeErrorPage(doc) {
  *   -> { kind:'file', bytes, ext, converted:false }                 real PDF / document bytes
  *   -> { kind:'html', html, bytes, ext:'.pdf', converted:true, page } print-ready HTML (+ locally rendered text PDF;
  *                                                                    page = the response as received, for tender-print.js)
+ * A page that links a document file is normally a viewer of it, so the file is returned instead of the page.
+ * keepPage: the page is the document itself (a corrigendum) and the files it links are its attachments:
+ * the page is returned with links = their URLs (fetchLinkedDocument). Only a page with no readable
+ * content of its own still gives way to the file it links.
+ * pageOnly: the page IS the document (an LOA letter): nothing it links, embeds or redirects to is fetched,
+ * so the result is that page alone (or the file IREPS answered with directly).
+ * trusted: the response is an allowed Financial / Commercial Tabulation; the file it leads to is followed
+ * through isExcludedTrustedLink, including a self-submitting form and window.open / location targets.
+ * logAs: a log tag; each response and candidate tried is logged (describeResponse).
  * Throws SESSION_EXPIRED for login pages; NO_DOCUMENT when nothing usable is found.
  * A login / error page is never returned as a document.
  */
-export async function resolveIrepsDocument(base, res, { allowHtml = true, allowAnyFile = false, nameHint = '', depth = 0, wait = null } = {}) {
+export async function resolveIrepsDocument(base, res, { allowHtml = true, allowAnyFile = false, keepPage = false, pageOnly = false, trusted = false, logAs = '', nameHint = '', depth = 0, wait = null } = {}) {
+  if (logAs) log(logAs, `Response ${describeResponse(res)}`);
   assertSession(res);
   if (res.status !== 200) throw new TenderError('HTTP', `IREPS returned HTTP ${res.status}.`);
   const kind = sniffKind(res.bytes);
@@ -464,30 +529,83 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
 
   const html = res.text();
   const doc = parseHtml(html);
-
-  for (const url of docCandidates(doc, res.url, base, allowAnyFile)) {
-    const r = await irepsFetch(base, url, { wait });
-    assertSession(r);
-    const k = sniffKind(r.bytes);
-    if (r.status === 200 && (k === 'pdf' || (allowAnyFile && BINARY_DOC_KINDS.has(k)))) {
-      return { kind: 'file', bytes: r.bytes, ext: extensionFor(k, r, url), converted: false, httpStatus: r.status, contentType: r.contentType };
+  if (pageOnly) {
+    if (!allowHtml) throw new TenderError('NO_DOCUMENT', 'IREPS did not return a document file (only a web page).');
+    const bad = looksLikeErrorPage(doc);
+    if (bad) throw new TenderError('NO_DOCUMENT', bad);
+    const lines = htmlToLines(doc);
+    if (!lines.length) throw new TenderError('NO_DOCUMENT', 'The IREPS page had no readable content.');
+    return { kind: 'html', html, bytes: buildPdf(wrapLines(lines)), ext: '.pdf', converted: true, page: { url: res.url, bytes: res.bytes, contentType: res.contentType }, ...meta };
+  }
+  const candidates = docCandidates(doc, res.url, base, allowAnyFile, trusted);
+  if (logAs) log(logAs, candidates.length ? `The page links ${candidates.map((u) => { try { return new URL(u).pathname; } catch { return u; } }).join(', ')}` : 'The page links no document file');
+  const linkedFile = async () => {
+    for (const url of candidates) {
+      const r = await irepsFetch(base, url, { wait, trusted });
+      if (logAs) log(logAs, `Linked ${describeResponse(r)}`);
+      assertSession(r);
+      const k = sniffKind(r.bytes);
+      if (r.status === 200 && (k === 'pdf' || (allowAnyFile && BINARY_DOC_KINDS.has(k)))) {
+        return { kind: 'file', bytes: r.bytes, ext: extensionFor(k, r, url), converted: false, httpStatus: r.status, contentType: r.contentType };
+      }
     }
+    return null;
+  };
+
+  keepPage = keepPage && allowHtml;
+  if (!keepPage) {
+    const file = await linkedFile();
+    if (file) return file;
   }
 
-  if (depth < 1) {
+  const follow = { allowHtml, allowAnyFile, keepPage, trusted, logAs, nameHint, depth: depth + 1, wait };
+  if (depth < 1 && trusted) {
+    // a viewer that posts itself on to the file, as the IREPS popup would
+    const sub = selfSubmittingForm(doc, html);
+    if (sub) {
+      if (logAs) log(logAs, `The page submits itself to ${sub.method} ${sub.url}`);
+      const r = await irepsFetch(base, sub.url, { method: sub.method, form: sub.form, relativeTo: res.url, wait, trusted });
+      return resolveIrepsDocument(base, r, follow);
+    }
+  }
+  if (depth < 1 && !(keepPage && candidates.length)) {
     const next = metaRedirect(doc, html);
     if (next) {
-      const r = await irepsFetch(base, next, { relativeTo: res.url, wait });
-      return resolveIrepsDocument(base, r, { allowHtml, allowAnyFile, nameHint, depth: depth + 1, wait });
+      const r = await irepsFetch(base, next, { relativeTo: res.url, wait, trusted });
+      return resolveIrepsDocument(base, r, follow);
     }
   }
 
-  if (!allowHtml) throw new TenderError('NO_DOCUMENT', 'IREPS did not return a document file (only a web page).');
+  if (!allowHtml) throw new TenderError('NO_DOCUMENT', `IREPS did not return a document file (only a web page${logAs ? `: "${pageSummary(doc)}"` : ''}).`);
   const bad = looksLikeErrorPage(doc);
+  const lines = bad ? [] : htmlToLines(doc);
+  if (keepPage && !lines.length) {
+    // nothing to read on the page itself: it was a viewer of the file after all
+    const file = await linkedFile();
+    if (file) return file;
+  }
   if (bad) throw new TenderError('NO_DOCUMENT', bad);
-  const lines = htmlToLines(doc);
   if (!lines.length) throw new TenderError('NO_DOCUMENT', 'The IREPS page had no readable content.');
-  return { kind: 'html', html, bytes: buildPdf(wrapLines(lines)), ext: '.pdf', converted: true, page: { url: res.url, bytes: res.bytes, contentType: res.contentType }, ...meta };
+  return { kind: 'html', html, bytes: buildPdf(wrapLines(lines)), ext: '.pdf', converted: true, page: { url: res.url, bytes: res.bytes, contentType: res.contentType },
+    ...(keepPage ? { links: candidates } : {}), ...meta };
+}
+
+const DOC_FILE_URL = /\.(?:pdf|docx?|xlsx?|zip|rar|jpe?g|png|tiff?|rtf|txt)(?:[?#]|$)/i;
+
+/**
+ * A document file a page links to (a corrigendum's attachment, from resolveIrepsDocument links).
+ *   -> { kind:'file', bytes, ext, ... }, or null when the link is not a document at all (an embedded
+ *      viewer or servlet URL with no file extension that answers with a web page).
+ * Throws when a link to a document file (.pdf, .docx, ...) does not give one.
+ */
+export async function fetchLinkedDocument(base, url, { allowAnyFile = false, wait = null } = {}) {
+  const res = await irepsFetch(base, url, { wait });
+  try {
+    return await resolveIrepsDocument(base, res, { allowHtml: false, allowAnyFile, nameHint: url, wait });
+  } catch (e) {
+    if (['NO_DOCUMENT', 'NOT_DOCUMENT'].includes(e.code) && !DOC_FILE_URL.test(url)) return null;
+    throw e;
+  }
 }
 
 /**
@@ -496,6 +614,7 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
  */
 export async function fetchDocument(base, req, opts = {}) {
   const res = await irepsFetch(base, req.url, { method: req.method || 'GET', form: req.form || null, relativeTo: req.relativeTo, wait: req.wait || null });
+  if (opts.logAs) log(opts.logAs, `Requested ${req.method || 'GET'} ${String(req.url).split('?')[0]}${req.form ? ` (fields ${[...new URLSearchParams(req.form).keys()].join(', ')})` : ''}`);
   return resolveIrepsDocument(base, res, { ...opts, wait: req.wait || null });
 }
 

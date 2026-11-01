@@ -25,13 +25,14 @@ function show(open) {
   } else if (gate.hidden) main.hidden = false;
 }
 
-function setBusy(busy) {
+/** Disable every download button while a run goes; the clicked one shows the spinner. */
+function setBusy(busy, button) {
   running = busy;
   $('btn-auto-run').disabled = busy;
   $('btn-auto-retry').disabled = busy;
   document.querySelectorAll('[data-status],[data-tabulation]').forEach((b) => { b.disabled = busy; });
   $('btn-account-refresh').disabled = busy;
-  $('btn-auto-run').classList.toggle('is-busy', busy);
+  document.querySelectorAll('.tender-actions .btn').forEach((b) => b.classList.toggle('is-busy', busy && b === button));
 }
 
 // ---------------------------------------------------------------- account panel
@@ -84,14 +85,16 @@ function li(label, value, cls, title, reason) {
 
 // Save to: ECM / S3 - how many of a category's documents the ECM holds; a document the ECM did not take was saved locally
 const inEcm = (c) => (c.files || []).filter((f) => f.ecm && f.ecm.status !== ECM_OUTCOME.FAILED).length;
+// documents attached to a corrigendum page, saved next to it
+const attached = (c) => (c.files || []).filter((f) => f.role === 'attachment' && f.status === 'DOWNLOADED').length;
 const catText = (c) => {
   // all of a category already downloaded (skipped) reads "already downloaded", not "none"
   const text = c.status === 'NOT_AVAILABLE' ? (c.alreadyDownloaded ? 'already downloaded' : 'none') : c.status === 'FAILED' ? 'failed' : c.status === 'PARTIAL' ? `${c.downloaded} ok, ${c.failed} failed` : `${c.downloaded} downloaded`;
-  const extra = [inEcm(c) ? `${inEcm(c)} in ECM` : '', c.alreadyDownloaded && c.status !== 'NOT_AVAILABLE' ? `${c.alreadyDownloaded} already downloaded` : ''].filter(Boolean);
+  const extra = [attached(c) ? `+${attached(c)} attached` : '', inEcm(c) ? `${inEcm(c)} in ECM` : '', c.alreadyDownloaded && c.status !== 'NOT_AVAILABLE' ? `${c.alreadyDownloaded} already downloaded` : ''].filter(Boolean);
   return extra.length ? `${text} (${extra.join(', ')})` : text;
 };
 // download-log skips say when / where, the ledger's only that they were skipped
-const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : '')), ...(c.skippedFiles || []).map((f) => `${f.title || f.id}: ${describeSkip(f.skip)}`), ...(c.warnings || []).filter((w) => /download log|ECM could not be checked/i.test(w))].filter(Boolean).join('\n');
+const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : '')), ...(c.skippedFiles || []).map((f) => `${f.title || f.id}: ${describeSkip(f.skip)}`), ...(c.warnings || []).filter((w) => /download log|ECM could not be checked|attached document/i.test(w))].filter(Boolean).join('\n');
 const LABEL = { tenderPdf: 'NIT', attachments: 'Attachments', myOffer: 'My Offer', corrigenda: 'Corrigenda', negotiation: 'Negotiation', counterOffer: 'Counter offer', loa: 'LOA', correspondence: 'Correspondence', financialTabulation: 'Financial Tabulation', commercialTabulation: 'Commercial Tabulation' };
 const TABULATION_NAME = { financialTabulation: 'Financial Tabulation', commercialTabulation: 'Commercial Tabulation' };
 
@@ -127,18 +130,6 @@ function renderTender(ev) {
 function renderResult(r) {
   const body = $('tender-result-rows');
   body.replaceChildren();
-  if (r.letters) {
-    const n = r.letters.summary?.newLetters || 0;
-    body.append(li('Negotiation / Counter offer / LOA letters (by date)', n ? `${n} downloaded` : 'none for these dates', n ? 'tender-ok' : 'tender-muted', r.letters.error || '', r.letters.error || ''));
-    for (const [st, msg] of Object.entries(r.letters.listErrors || {})) body.append(li(`  ${LETTER_PAGE[st]}`, 'failed', 'tender-bad', '', msg));
-    for (const t of r.letters.tenders) {
-      const parts = Object.entries(t.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
-      body.append(li(`  ${t.tenderNo}`, t.error ? 'failed' : parts.join(' · '), t.error ? 'tender-bad' : 'tender-ok', '', t.error || Object.values(t.categories).map(reasons).filter(Boolean).join('\n')));
-    }
-  }
-  for (const c of r.correspondence) {
-    if (c.error || c.correspondence?.discovered) body.append(li(`Correspondence ${c.tenderNo}`, c.error ? 'failed' : catText(c.correspondence), c.error ? 'tender-bad' : 'tender-ok', '', c.error || reasons(c.correspondence)));
-  }
   $('tender-result-tender').textContent = `Dates ${r.range.from} - ${r.range.to}: ${r.messages.relevant} NIT/corrigendum message(s) of ${r.messages.scanned}, ${r.messages.pagesRead} page(s) read`;
   $('tender-result-totals').textContent = `Downloaded: ${r.summary.downloaded}   Failed tenders: ${r.summary.failed}   Needs review: ${r.summary.needsReview}${r.messages.truncated ? '   (page limit reached - narrow the date range)' : ''}`;
   $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/';
@@ -208,7 +199,7 @@ function renderTabulationResult(pdfType, r) {
 }
 
 /** A run over the From / To dates (and the optional Tender Number): `task({ from, to, tenderNo, onProgress, onAccount })`. */
-async function runByDate(what, task, render) {
+async function runByDate(what, task, render, button) {
   if (running) return;
   $('tender-error').hidden = true;
   $('tender-result').hidden = true;
@@ -224,7 +215,7 @@ async function runByDate(what, task, render) {
     $('tender-error').hidden = false;
     return;
   }
-  setBusy(true);
+  setBusy(true, button);
   $('tender-progress').hidden = false;
   const stopGuard = guardTabs();
   try {
@@ -244,8 +235,8 @@ async function runByDate(what, task, render) {
   }
 }
 
-const runLetters = (status) => runByDate('letters', (o) => runLetterType({ status, ...o }), (r) => renderLetterResult(status, r));
-const runTabulationType = (pdfType) => runByDate('tabulations', (o) => runTabulations({ pdfType, ...o }), (r) => renderTabulationResult(pdfType, r));
+const runLetters = (status, button) => runByDate('letters', (o) => runLetterType({ status, ...o }), (r) => renderLetterResult(status, r), button);
+const runTabulationType = (pdfType, button) => runByDate('tabulations', (o) => runTabulations({ pdfType, ...o }), (r) => renderTabulationResult(pdfType, r), button);
 
 // ---------------------------------------------------------------- keep the user on the IREPS tab while downloading
 
@@ -295,7 +286,7 @@ async function run() {
     $('tender-error').hidden = false;
     return;
   }
-  setBusy(true);
+  setBusy(true, $('btn-auto-run'));
   $('tender-progress').hidden = false;
   const stopGuard = guardTabs();
   try {
@@ -321,8 +312,8 @@ async function run() {
 $('btn-tender-open').addEventListener('click', () => show(true));
 $('btn-tender-back').addEventListener('click', () => show(false));
 $('btn-auto-run').addEventListener('click', run);
-document.querySelectorAll('[data-status]').forEach((b) => b.addEventListener('click', () => runLetters(b.dataset.status)));
-document.querySelectorAll('[data-tabulation]').forEach((b) => b.addEventListener('click', () => runTabulationType(b.dataset.tabulation)));
+document.querySelectorAll('[data-status]').forEach((b) => b.addEventListener('click', () => runLetters(b.dataset.status, b)));
+document.querySelectorAll('[data-tabulation]').forEach((b) => b.addEventListener('click', () => runTabulationType(b.dataset.tabulation, b)));
 $('btn-auto-retry').addEventListener('click', run); // already-downloaded documents are skipped via the ledger
 $('btn-account-refresh').addEventListener('click', refreshAccount);
 $('btn-copy-diag').addEventListener('click', async () => {
