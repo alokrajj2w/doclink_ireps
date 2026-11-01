@@ -4,7 +4,7 @@
 // Read-only: nothing is deleted, replied to or archived. (Opening a message does mark it "read" in IREPS,
 // exactly as opening it by hand would.)
 
-import { TenderError, log, norm, irepsFetch, assertSession, parseHtml, parseCalls, qparam } from './tender-core.js';
+import { TenderError, log, norm, irepsFetch, assertSession, parseHtml, parseCalls } from './tender-core.js';
 
 export const INBOX_PATH = '/epsn/vendorInboxLink.do';
 export const MESSAGE_DETAIL_PATH = '/epsn/admin/myMessages/ViewMessageDetailAction.do';

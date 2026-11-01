@@ -36,7 +36,6 @@ export function log(tag, msg) {
 export const getLogTail = () => LOG_TAIL.join('\n');
 
 export const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
-export const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 export const fileSafe = (s) => String(s ?? '').trim().replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_') || 'NA';
 
 /** The IREPS origin, from the same loader the service worker uses (config.json + config.local.json). */

@@ -9,12 +9,11 @@
  * parsed records only. Values are copied verbatim; nothing is calculated.
  */
 
-import { buildTableExport, EXPORT_FORMAT, EXPORT_FORMATS, exportFormatInfo } from "../search-po/search-po-export.js";
+import { buildTableExport, EXPORT_FORMAT, EXPORT_FORMATS } from "../search-po/search-po-export.js";
 import { CRN_FIELDS } from "./crn-parser.js";
 
 export const CRN_EXPORT_FORMAT = EXPORT_FORMAT;
 export const CRN_EXPORT_FORMATS = EXPORT_FORMATS;
-export const crnExportFormatInfo = exportFormatInfo;
 
 /** Columns of the export, in order. `key` refers to the parsed record. */
 export const CRN_EXPORT_COLUMNS = Object.freeze([

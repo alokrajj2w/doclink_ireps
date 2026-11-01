@@ -187,10 +187,6 @@ export async function searchEcm(nxql, options = {}, deps = {}) {
   return search(await connection(deps), nxql, options);
 }
 
-/** Documents of a kind in a site, e.g. findEcmDocuments({ site: "hosur", kind: "poCopy", filters: { customer_po_number: "PO-1" } }). */
-export async function findEcmDocuments({ site, kind, filters, limit = 200 }, deps = {}) {
-  return searchEcm(buildEcmQuery({ site, kind, filters }), { limit }, deps);
-}
 
 /**
  * A site location's folder uid, checked once per session: the uid the ECM team supplied is

@@ -1120,8 +1120,8 @@ for the Recon sign-in in direct mode.
   server is on the Wabtec network.
 * **Finding what was stored.** Use the spreadsheet's query, with straight quotes:
   `SELECT * FROM Document WHERE InvoiceCertificateSchema:type = 'poCopy' AND ecm:ancestorId = '<site id>'`.
-  `buildEcmQuery()` / `findEcmDocuments()` in `services/ecm-direct.js` build and run it,
-  optionally filtered by `customer_po_number`, `ic_number`, `tender_number`, and so on.
+  `buildEcmQuery()` in `services/ecm-direct.js` builds it (optionally filtered by
+  `customer_po_number`, `ic_number`, `tender_number`, and so on) and `searchEcm()` runs it.
 
 Tests: `test/ecm-direct-tests.js` (browser suite) and the "ECM direct:" test in
 `tender/tests/run-tests.mjs`.

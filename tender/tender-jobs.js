@@ -4,7 +4,6 @@
 //   downloadNewNits()          once a day   - NIT documents announced in the inbox (covers Sundays/holidays)
 //   downloadTodaysCorrigenda() once a day   - corrigendum published today (only that document)
 //   downloadLettersByDate()    3-4x a day   - negotiation / counter offer / LOA letters published on a date
-//                                            (alias: checkNewLetters)
 //   downloadTabulationsByDate()                - Financial / Commercial Tabulation of tenders CLOSING on the dates
 //                                            (IREPS Closed Tenders); a tabulation shows up some days after closing
 
@@ -267,8 +266,6 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
   return { account: publicAccount(job.account), dates, listed, tenders: [...byTender.values()], aborted, listErrors, summary: { newLetters } };
 }
 
-/** The 3-4x-a-day check: letters dated since the last run (normally just today). */
-export const checkNewLetters = downloadLettersByDate;
 
 /**
  * Financial / Commercial Tabulations of the tenders that CLOSED between `from` and `to` (Dates, both included),

@@ -10,7 +10,7 @@
  * popup never re-asks for it. Today the PO number is typed manually
  * (getManualPoNumber() below); later it can come from a configured source
  * without any other change here, since the service worker only ever
- * receives a bare PO number string (services/po-ic-service.js).
+ * receives a bare PO number string.
  *
  * Each download runs in the service worker (continues if the popup closes)
  * and is a thin view over PO_DOWNLOAD / IC_DOWNLOAD / GET_PO_STATE /

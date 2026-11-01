@@ -8,11 +8,8 @@
  * hard-coded here: the headers come from the parsed page.
  */
 
-import { buildTableExport, EXPORT_FORMAT, EXPORT_FORMATS, exportFormatInfo } from "../search-po/search-po-export.js";
+import { buildTableExport } from "../search-po/search-po-export.js";
 
-export const RNOTE_EXPORT_FORMAT = EXPORT_FORMAT;
-export const RNOTE_EXPORT_FORMATS = EXPORT_FORMATS;
-export const rnoteExportFormatInfo = exportFormatInfo;
 
 /** Extra columns appended after the page's own columns. */
 export const RNOTE_EXTRA_COLUMNS = Object.freeze(["R-Note Document Link", "Other Links"]);

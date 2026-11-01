@@ -5,8 +5,7 @@
 // theirs (runTabulations, by Closing Date), and correspondence comes from the Correspondence view.
 
 import { TenderError, log, norm } from './tender-core.js';
-import { searchTender } from './tender-search.js';
-import { runSteps, publicAccount, startTenderRun } from './tender-workflows.js';
+import { runSteps, publicAccount } from './tender-workflows.js';
 import { beginJob, dayRange, openTender, recordManifest, downloadLettersByDate, downloadTabulationsByDate } from './tender-jobs.js';
 import { scanMessages, readMessageDetail, dmyOf } from './tender-messages.js';
 

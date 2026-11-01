@@ -59,7 +59,7 @@ import { buildRnoteExport } from "../services/rnote/rnote-export.js";
 import { searchMa, downloadMaPdfs, MA_ERROR, MA_FLOW_STAGES } from "../services/ma/ma-service.js";
 import { downloadBytes } from "../services/download-service.js";
 import { saveToEcmOrLocally, canReplaceInEcm } from "../services/ecm-service.js";
-import { loadDownloadLogConfig, isDownloadLogEnabled, preflightDownloads, logDownload, flushDownloadLog, downloadRecord, downloadKey, exportFingerprint, runDestination, LOG_DESTINATION } from "../services/download-log.js";
+import { loadDownloadLogConfig, preflightDownloads, logDownload, flushDownloadLog, downloadRecord, downloadKey, exportFingerprint, runDestination, LOG_DESTINATION } from "../services/download-log.js";
 import { HOME_PATH } from "../utils/ireps-account.js";
 import { downloadPo, PO_ERROR, PO_FLOW_STAGES } from "../services/po/po-service.js";
 import { downloadInspectionCertificates, IC_ERROR, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
