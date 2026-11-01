@@ -13,12 +13,13 @@
  *
  * config.local.json (gitignored, never packaged by scripts/build.mjs) has the same shape
  * and overrides config.json: a top-level key replaces config.json's, the ecm object is
- * merged key by key. That is where the real client id / secret go. The secret is never
+ * merged key by key (utils/config.js). That is where the real client id / secret go. The secret is never
  * logged.
  */
 
 import { logger } from "../utils/logger.js";
 import { compileMatchPatterns } from "../utils/url-scope.js";
+import { readConfigFiles } from "../utils/config.js";
 
 export const ECM_ENV = Object.freeze({ TEST: "TEST", PROD: "PROD" });
 
@@ -69,15 +70,6 @@ function settingsFrom(config) {
   });
 }
 
-/** config.local.json over config.json: top-level keys replace, `ecm` merges key by key. */
-export function mergeConfig(base, local) {
-  const b = base && typeof base === "object" ? base : {};
-  const l = local && typeof local === "object" ? local : {};
-  const merged = { ...b, ...l };
-  if (b.ecm || l.ecm) merged.ecm = { ...(b.ecm || {}), ...(l.ecm || {}) };
-  return merged;
-}
-
 /**
  * Apply ECM settings from a parsed (already merged) config object. Also used by the
  * tests, which have no extension context to read the files from.
@@ -87,32 +79,6 @@ export function applyEcmConfig(config) {
   current = settingsFrom(config);
   configLoaded = true;
   return ECM_CONFIG;
-}
-
-async function readJson(name, { optional = false } = {}) {
-  const url = typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL(name) : `./${name}`;
-  try {
-    const response = await fetch(url, { cache: "no-store" });
-    if (!response.ok) {
-      if (!optional) logger.warn(`Could not read ${name} (HTTP ${response.status})`);
-      return null;
-    }
-    return await response.json();
-  } catch (error) {
-    // a missing config.local.json makes fetch throw for extension URLs
-    if (!optional) logger.warn(`Could not read ${name}`, error);
-    return null;
-  }
-}
-
-/**
- * config.json with config.local.json over it (mergeConfig), plus whether the local file was
- * there; null when neither could be read. Also used by services/download-log.js.
- */
-export async function readConfigFiles() {
-  const base = await readJson("config.json");
-  const local = await readJson("config.local.json", { optional: true });
-  return base || local ? { config: mergeConfig(base, local), local } : null;
 }
 
 /**

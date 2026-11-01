@@ -33,6 +33,7 @@
  */
 
 import { logger } from "../utils/logger.js";
+import { readConfigFiles } from "../utils/config.js";
 import { compileMatchPatterns } from "../utils/url-scope.js";
 
 /** doc_type values the Recon Engine's POST /api/documents accepts. */
@@ -131,16 +132,17 @@ export function applyReconConfig(config) {
 }
 
 /**
- * Read the Recon settings from config.json (the same hand-edited file as the
- * IREPS target). Safe to call repeatedly; a no-op after the first load
+ * Read the Recon settings from config.json / config.local.json (utils/config.js;
+ * the same hand-edited files as the IREPS target). Safe to call repeatedly; a no-op after the first load
  * unless `force` is passed. On any error the current settings are kept.
  * @param {{ force?: boolean }} [options]
  */
 export async function loadReconConfig({ force = false } = {}) {
   if (configLoaded && !force) return RECON_CONFIG;
   try {
-    const url = typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL("config.json") : "./config.json";
-    applyReconConfig(await (await fetch(url, { cache: "no-store" })).json());
+    const files = await readConfigFiles();
+    if (!files) throw new Error("config.json could not be read");
+    applyReconConfig(files.config);
     logger.info(`Recon config loaded: ${currentBaseUrl || "(no reconBaseUrl)"}, customer=${currentCustomerId}`);
   } catch (error) {
     logger.warn("Could not load the Recon settings from config.json", error);

@@ -33,6 +33,7 @@
  */
 
 import { logger } from "../utils/logger.js";
+import { readConfigFiles } from "../utils/config.js";
 import { STRUTS_TOKEN_FIELD, ALL_ZONES_VALUE } from "./ireps-form.js";
 
 const DEFAULT_MOCK_BASE_URL = "http://localhost:8765";
@@ -67,8 +68,9 @@ export const IREPS_CONFIG = Object.freeze({
 });
 
 /**
- * Read config.json (bundled with the extension, hand-editable, never built)
- * and apply its target to IREPS_CONFIG.baseUrl. Safe to call more than once;
+ * Read config.json (bundled with the extension, hand-editable, never built),
+ * with config.local.json over it (utils/config.js), and apply its target to
+ * IREPS_CONFIG.baseUrl. Safe to call more than once;
  * after the first successful load it is a no-op unless `force` is passed.
  * On any error (missing file, bad JSON, running outside an extension
  * context) it silently keeps the current baseUrl.
@@ -79,9 +81,9 @@ export const IREPS_CONFIG = Object.freeze({
 export async function loadIrepsConfig({ force = false } = {}) {
   if (configLoaded && !force) return currentBaseUrl;
   try {
-    const url = typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL("config.json") : "./config.json";
-    const response = await fetch(url, { cache: "no-store" });
-    const config = await response.json();
+    const files = await readConfigFiles();
+    if (!files) throw new Error("config.json could not be read");
+    const config = files.config;
     const portals = Object.freeze({
       mock: (config && config.mockBaseUrl && String(config.mockBaseUrl)) || DEFAULT_MOCK_BASE_URL,
       real: (config && config.realBaseUrl && String(config.realBaseUrl)) || DEFAULT_REAL_BASE_URL

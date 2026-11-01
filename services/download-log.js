@@ -28,7 +28,7 @@
 
 import { logger } from "../utils/logger.js";
 import { RECON_CONFIG, loadReconConfig, reconConfigProblem, manifestHostPermissions, apiErrorDetail } from "./recon-service.js";
-import { readConfigFiles } from "./ecm-config.js";
+import { readConfigFiles } from "../utils/config.js";
 import { findInEcm } from "./ecm-service.js";
 
 /** Where a file went, as the backend records it. */

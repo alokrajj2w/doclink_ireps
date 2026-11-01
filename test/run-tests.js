@@ -690,12 +690,20 @@ await test("error catalogue maps IREPS codes to user messages", () => {
 
 /* ---------------------------------------------------------- config.json */
 
-await test("loadIrepsConfig: target mock/real, explicit baseUrl override, custom mock port, safe fallback on error, cached until forced", async () => {
+await test("loadIrepsConfig: target mock/real, explicit baseUrl override, custom mock port, config.local.json override, safe fallback on error, cached until forced", async () => {
   const realFetch = globalThis.fetch;
   const realChrome = globalThis.chrome;
   let served = null;
+  let servedLocal = null; // config.local.json; null = the file is absent
   globalThis.chrome = { runtime: { getURL: (p) => `file://fake/${p}` } };
-  globalThis.fetch = async () => ({ json: async () => served });
+  const stub = async (url) => {
+    if (String(url).endsWith("config.local.json")) {
+      if (!servedLocal) throw new TypeError("Failed to fetch");
+      return { ok: true, json: async () => servedLocal };
+    }
+    return { ok: true, json: async () => served };
+  };
+  globalThis.fetch = stub;
   try {
     served = { target: "mock" };
     await loadIrepsConfig({ force: true });
@@ -719,9 +727,18 @@ await test("loadIrepsConfig: target mock/real, explicit baseUrl override, custom
     eq(IREPS_CONFIG.baseUrl, "http://localhost:7000");
     eq(IREPS_CONFIG.portals.mock, "http://localhost:7000", "portals follow config.json, not a built-in list");
 
+    served = { target: "real" };
+    servedLocal = { target: "mock" };
+    await loadIrepsConfig({ force: true });
+    eq(IREPS_CONFIG.target, "mock", "config.local.json overrides config.json's target");
+    eq(IREPS_CONFIG.baseUrl, "http://localhost:8765");
+    servedLocal = null;
+
+    served = { target: "mock", mockBaseUrl: "http://localhost:7000" };
+    await loadIrepsConfig({ force: true });
     let fetchCalls = 0;
-    globalThis.fetch = async () => {
-      fetchCalls++;
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith("config.json")) fetchCalls++;
       throw new Error("network down");
     };
     await loadIrepsConfig({ force: true });
@@ -732,7 +749,8 @@ await test("loadIrepsConfig: target mock/real, explicit baseUrl override, custom
     eq(fetchCalls, 1, "without force, an already-loaded config is not re-fetched");
   } finally {
     served = { target: "mock" };
-    globalThis.fetch = async () => ({ json: async () => served });
+    servedLocal = null;
+    globalThis.fetch = stub;
     await loadIrepsConfig({ force: true }); // restore the mock default (via the stub) before undoing it, so every other test sees the real default
     globalThis.fetch = realFetch;
     globalThis.chrome = realChrome;

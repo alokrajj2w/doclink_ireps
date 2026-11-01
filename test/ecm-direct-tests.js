@@ -10,7 +10,8 @@
 
 import { uploadToEcm, saveToEcmOrLocally, describeEcmOutcome, EcmError, ECM_ERROR, ECM_KIND, ECM_OUTCOME } from "../services/ecm-service.js";
 import { uploadToNuxeo, buildEcmQuery, existingDocumentQuery, nxqlLiteral, searchEcm, resetEcmDirectState, oldFileName } from "../services/ecm-direct.js";
-import { applyEcmConfig, mergeConfig, ECM_CONFIG, isDirectEcm } from "../services/ecm-config.js";
+import { applyEcmConfig, ECM_CONFIG, isDirectEcm } from "../services/ecm-config.js";
+import { mergeConfig } from "../utils/config.js";
 import { ECM_KINDS, ECM_SITES, routeSite } from "../services/ecm-catalog.js";
 import { applyReconConfig } from "../services/recon-service.js";
 

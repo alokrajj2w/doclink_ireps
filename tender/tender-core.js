@@ -3,6 +3,8 @@
 // Runs in the side-panel page (has DOMParser; host_permissions + credentials:'include'
 // reuse the user's existing IREPS browser session - no credentials are read or stored).
 
+import { IREPS_CONFIG, loadIrepsConfig } from '../services/ireps-api.js';
+
 export const SESSION_MSG = 'IREPS session expired. Please log in to IREPS and try again.';
 
 /** Error codes meaning "IREPS itself did not answer" (as opposed to a rejected or invalid document). */
@@ -37,10 +39,10 @@ export const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 export const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 export const fileSafe = (s) => String(s ?? '').trim().replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_') || 'NA';
 
+/** The IREPS origin, from the same loader the service worker uses (config.json + config.local.json). */
 export async function getBaseUrl() {
-  const cfg = await (await fetch(chrome.runtime.getURL('config.json'))).json();
-  const base = cfg.target === 'mock' ? cfg.mockBaseUrl : cfg.realBaseUrl;
-  return String(base).replace(/\/+$/, '');
+  await loadIrepsConfig();
+  return String(IREPS_CONFIG.baseUrl).replace(/\/+$/, '');
 }
 
 /** Resolve a (possibly relative) reference; refuses anything off the IREPS origin. */
