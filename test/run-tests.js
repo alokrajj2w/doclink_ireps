@@ -777,6 +777,11 @@ await test("logger redacts cookies, session ids and Struts tokens", () => {
   eq(obj.cookie, "[REDACTED]");
   eq(obj.nested.token, "[REDACTED]");
   eq(obj.nested.size, 5);
+  const flags = redact({ sessionExpired: true, tokenFound: false, sessionId: "abc", token: 123456 });
+  eq(flags.sessionExpired, true, "a boolean flag under a sensitive-looking key stays readable");
+  eq(flags.tokenFound, false);
+  eq(flags.sessionId, "[REDACTED]");
+  eq(flags.token, "[REDACTED]", "numbers are still redacted (a security key can be numeric)");
 });
 
 await test("filename format", () => {

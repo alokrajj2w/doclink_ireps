@@ -86,7 +86,8 @@ export function redact(value) {
   if (value && typeof value === "object") {
     const out = {};
     for (const [key, val] of Object.entries(value)) {
-      out[key] = SENSITIVE_KEY.test(key) ? "[REDACTED]" : redact(val);
+      // a true/false flag (sessionExpired, tokenFound) cannot carry a secret: keep it readable
+      out[key] = SENSITIVE_KEY.test(key) && typeof val !== "boolean" ? "[REDACTED]" : redact(val);
     }
     return out;
   }
