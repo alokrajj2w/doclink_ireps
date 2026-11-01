@@ -25,12 +25,11 @@
 import { IrepsError, parseIrepsDate } from "../ireps-api.js";
 import { SEARCH_PO_CRITERIA, SEARCH_PO_MODE, errorCodesFor } from "../search-po/search-po-api.js";
 import { searchIrepsDocuments } from "../search-po/search-po-service.js";
-import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
-import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
+import { BATCH_ITEM_STATUS, countItemStatuses, downloadStateItems, retryFailedItems } from "../batch-download.js";
 import { NO_RECORDS_MARKERS } from "../session-service.js";
 import { buildPoDateDownloadPath } from "../../utils/filename.js";
-import { splitDateRange, irepsDateToIso } from "../batch-utils.js";
-import { ECM_KIND } from "../ecm-service.js";
+import { splitDateRange, irepsDateToIso, readDateSelection } from "../batch-utils.js";
+import { poFiling } from "./po-service.js";
 
 export const PO_DATE_ERROR = Object.freeze({
   ...errorCodesFor(SEARCH_PO_CRITERIA.PO),
@@ -47,7 +46,7 @@ const DOWNLOAD_CODES = Object.freeze({
 });
 
 /** Item status vocabulary (the downloader's, plus "skipped" for rows with no link). */
-export const PO_ITEM_STATUS = Object.freeze({ ...DOCUMENT_DOWNLOAD_STATUS, SKIPPED: "skipped" });
+export const PO_ITEM_STATUS = BATCH_ITEM_STATUS;
 
 /** Largest selection accepted (about ten years of 180-day windows). */
 export const MAX_PO_DATE_WINDOWS = 20;
@@ -58,16 +57,12 @@ export const MAX_PO_DATE_WINDOWS = 20;
  * @param {string} dateTo   DD/MM/YYYY
  */
 export function validatePoDateSelection(dateFrom, dateTo) {
-  const fail = (detail) => new IrepsError(PO_DATE_ERROR.INVALID_REQUEST, detail, { detail });
-  const from = String(dateFrom || "").trim();
-  const to = String(dateTo || "").trim();
-  const dFrom = parseIrepsDate(from);
-  const dTo = parseIrepsDate(to);
-  if (!dFrom) throw fail("From Date must be a valid date in DD/MM/YYYY format.");
-  if (!dTo) throw fail("To Date must be a valid date in DD/MM/YYYY format.");
-  if (dFrom > dTo) throw fail("From Date must not be later than To Date.");
+  const { dateFrom: from, dateTo: to } = readDateSelection(dateFrom, dateTo, PO_DATE_ERROR.INVALID_REQUEST);
   const windows = splitDateRange(from, to);
-  if (windows.length > MAX_PO_DATE_WINDOWS) throw fail(`Please select a range of at most ${MAX_PO_DATE_WINDOWS * 180} days.`);
+  if (windows.length > MAX_PO_DATE_WINDOWS) {
+    const detail = `Please select a range of at most ${MAX_PO_DATE_WINDOWS * 180} days.`;
+    throw new IrepsError(PO_DATE_ERROR.INVALID_REQUEST, detail, { detail });
+  }
   return { dateFrom: from, dateTo: to, windows };
 }
 
@@ -185,56 +180,12 @@ export function poDateItems(records) {
 }
 
 function summarise(state) {
-  const count = (s) => state.items.filter((i) => i.status === s).length;
-  const c = state.counts;
-  c.found = state.items.length;
-  c.downloaded = count(PO_ITEM_STATUS.COMPLETED);
-  c.failed = count(PO_ITEM_STATUS.FAILED);
-  c.skipped = count(PO_ITEM_STATUS.SKIPPED);
-  c.alreadyDownloaded = state.items.filter((i) => i.status === PO_ITEM_STATUS.SKIPPED && i.skip).length;
-  c.inProgress = count(PO_ITEM_STATUS.DOWNLOADING) + count(PO_ITEM_STATUS.QUEUED);
+  countItemStatuses(state);
+  state.counts.found = state.items.length;
   return state;
 }
 
-function applySnapshot(state, snapshot) {
-  const byId = new Map(snapshot.items.map((s) => [s.id, s]));
-  for (const item of state.items) {
-    const s = byId.get(item.id);
-    if (!s) continue;
-    item.status = s.status;
-    item.filename = s.filename;
-    item.downloadId = s.downloadId;
-    item.ecm = s.ecm || null;
-    item.error = s.error;
-    item.skip = s.skip || null;
-  }
-  state.sessionExpired = snapshot.sessionExpired === true;
-  if (snapshot.warnings && snapshot.warnings.length) state.warnings = [...new Set([...(state.warnings || []), ...snapshot.warnings])];
-}
-
-async function downloadItems(state, items, deps) {
-  const notify = () => typeof deps.onUpdate === "function" && deps.onUpdate(summarise(state));
-  const batch = await downloadIrepsDocuments(
-    // `ecm` says how the PO is filed under Save to: ECM / S3 (ignored by a local save)
-    items.map((i) => ({ id: i.id, url: i.url, path: i.path, label: i.label, ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: i.poNo } }, log: logInfo(LOG_DOC_TYPE.PO, downloadKey.po(i.poNo)) })),
-    {
-      fetch: deps.fetch,
-      saveFile: deps.saveFile,
-      preflight: deps.preflight,
-      onSaved: deps.onSaved,
-      concurrency: deps.concurrency,
-      retries: deps.retries ?? 2,
-      retryDelayMs: deps.retryDelayMs,
-      codes: DOWNLOAD_CODES,
-      onProgress: (snapshot) => {
-        applySnapshot(state, snapshot);
-        notify();
-      }
-    }
-  );
-  applySnapshot(state, batch);
-  summarise(state);
-}
+const downloadItems = (state, items, deps) => downloadStateItems(state, items, deps, { filing: (i) => poFiling(i.poNo), codes: DOWNLOAD_CODES, summarise });
 
 /**
  * Search then download. `deps.onUpdate(state)` receives the whole, current
@@ -287,18 +238,5 @@ export async function runPoDateDownload(options, deps = {}) {
  * @param {object} state a state returned by runPoDateDownload()
  */
 export async function retryPoDateFailures(state, deps = {}) {
-  const retry = state.items.filter((i) => i.status === PO_ITEM_STATUS.FAILED && i.url);
-  if (retry.length === 0) return state;
-  for (const i of retry) {
-    i.status = PO_ITEM_STATUS.QUEUED;
-    i.error = null;
-  }
-  state.phase = "downloading";
-  state.sessionExpired = false;
-  state.finishedAt = null;
-  await downloadItems(state, retry, deps);
-  state.phase = "complete";
-  state.finishedAt = new Date().toISOString();
-  if (typeof deps.onUpdate === "function") deps.onUpdate(summarise(state));
-  return state;
+  return retryFailedItems(state, deps, { download: downloadItems, summarise });
 }

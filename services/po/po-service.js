@@ -81,6 +81,11 @@ export async function searchPo(poNumber, deps = {}) {
   return { ...result, record };
 }
 
+/** How a PO copy is filed under Save to: ECM / S3 and recorded in the download log (one rule for every PO flow). */
+export function poFiling(poNo) {
+  return { ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: poNo } }, log: logInfo(LOG_DOC_TYPE.PO, downloadKey.po(poNo)) };
+}
+
 /** Download item for one PO record. */
 export function poDownloadItem(record, poNo) {
   return {
@@ -89,8 +94,7 @@ export function poDownloadItem(record, poNo) {
     path: buildPoDownloadPath(poNo),
     label: `PO ${poNo}`,
     meta: { poNo, poDate: record ? record.poDate : null, railwayUnit: record ? record.railwayUnit : null },
-    ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: poNo } },
-    log: logInfo(LOG_DOC_TYPE.PO, downloadKey.po(poNo))
+    ...poFiling(poNo)
   };
 }
 

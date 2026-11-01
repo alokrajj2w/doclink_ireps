@@ -15,6 +15,7 @@
 import { runPoDateDownload, retryPoDateFailures, searchPosByDate, validatePoDateSelection, assignPoDatePaths, PO_ITEM_STATUS } from "../services/po/po-date-service.js";
 import { runIcNotificationDownload, retryIcNotificationFailures, buildIcManifest, matchIcRows, NOTIFICATION_OUTCOME } from "../services/inspection-certificate/ic-notification-service.js";
 import { runIcDateDownload, retryIcDateFailures } from "../services/inspection-certificate/ic-date-service.js";
+import { applyDownloadSnapshot, countItemStatuses, BATCH_ITEM_STATUS } from "../services/batch-download.js";
 import { parseNotificationResponse, selectIcNotifications, parseIcNotification, isIcIssuedNotification } from "../services/notifications/notification-service.js";
 import { splitDateRange, withRetry, isoToIrepsDate } from "../services/batch-utils.js";
 import { parseIrepsDate, IrepsError } from "../services/ireps-api.js";
@@ -721,6 +722,26 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     ic("P1", "004", "C14", true, { icDate: "18/09/2026" }),
     ic("P2", "001", "C21", true, { icDate: "10/09/2026" })
   ];
+
+  await test("batch download state: a snapshot updates items and warnings; the session flag follows the snapshot unless sticky", () => {
+    const mk = () => ({ items: [{ id: "a", status: BATCH_ITEM_STATUS.QUEUED }, { id: "b", status: BATCH_ITEM_STATUS.SKIPPED, skip: { reason: "x" } }], counts: {}, warnings: ["w1"], sessionExpired: false });
+    const expired = { items: [{ id: "a", status: BATCH_ITEM_STATUS.FAILED, filename: null, error: { code: "E" } }], sessionExpired: true, warnings: ["w1", "w2"] };
+    const fine = { items: [{ id: "a", status: BATCH_ITEM_STATUS.COMPLETED, filename: "a.pdf", error: null }], sessionExpired: false };
+    const plain = mk();
+    applyDownloadSnapshot(plain, expired);
+    eq(plain.items[0].status, BATCH_ITEM_STATUS.FAILED);
+    eq(plain.warnings.join(","), "w1,w2", "warnings merged without duplicates");
+    eq(plain.sessionExpired, true);
+    applyDownloadSnapshot(plain, fine);
+    eq(plain.sessionExpired, false, "non-sticky: follows the latest snapshot");
+    const sticky = mk();
+    applyDownloadSnapshot(sticky, expired, { stickySessionExpired: true });
+    applyDownloadSnapshot(sticky, fine, { stickySessionExpired: true });
+    eq(sticky.sessionExpired, true, "sticky: an expiry seen earlier in the run stays reported");
+    eq(sticky.items[0].filename, "a.pdf");
+    const c = countItemStatuses(sticky).counts;
+    eq([c.downloaded, c.failed, c.skipped, c.alreadyDownloaded, c.inProgress].join(","), "1,0,1,1,0");
+  });
 
   await test("IC date: one search with PO No. empty and IC Date From / To set downloads EVERY IC issued in the range - all POs, all serials", async () => {
     const sim = simulator(pages, { icDateFilter: true, icRows: [...inRange, ic("P3", "001", "C31", true, { icDate: "09/09/2026" })] });

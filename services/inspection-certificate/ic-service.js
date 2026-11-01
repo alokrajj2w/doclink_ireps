@@ -103,6 +103,14 @@ export async function searchInspectionCertificates(poNumber, deps = {}) {
   };
 }
 
+/** How an IC is filed under Save to: ECM / S3 and recorded in the download log (one rule for every IC flow). */
+export function icFiling({ icNumber, poNo, poSerial, callId, icDate }) {
+  return {
+    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: icNumber, customer_po_number: poNo, ic_date: icDate } },
+    log: logInfo(LOG_DOC_TYPE.IC, downloadKey.ic({ poNo, poSerial, callId, icNumber }))
+  };
+}
+
 /** Download items for a set of IC records (records without a link are kept so they can be reported as failed). */
 export function icDownloadItems(records, poNo) {
   return (records || []).map((r) => ({
@@ -111,8 +119,7 @@ export function icDownloadItems(records, poNo) {
     path: buildIcDownloadPath({ poNo: r.poNo || poNo, poSerial: r.poSerial, callId: r.callId }),
     label: `IC ${r.callId || "?"} (PO Sr. ${r.poSerial || "?"})`,
     meta: { callId: r.callId, icNumber: r.icNumber, poNo: r.poNo || poNo, poSerial: r.poSerial, icDate: r.icDate },
-    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: r.icNumber, customer_po_number: r.poNo || poNo, ic_date: r.icDate } },
-    log: logInfo(LOG_DOC_TYPE.IC, downloadKey.ic({ poNo: r.poNo || poNo, poSerial: r.poSerial, callId: r.callId, icNumber: r.icNumber }))
+    ...icFiling({ ...r, poNo: r.poNo || poNo })
   }));
 }
 
