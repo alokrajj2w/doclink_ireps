@@ -136,61 +136,55 @@ Reopening the popup restores the current or last state via `GET_JOB_STATE`.
 ## 3. Folder structure
 
 ```
-doclink-extension/
-├── manifest.json
+doclink/
+├── manifest.json  config.json  (config.local.json: gitignored overrides, never packaged)
 ├── background/
-│   ├── service-worker.js
-│   ├── offscreen.html
-│   └── offscreen.js
-├── popup/
-│   ├── popup.html
-│   ├── popup.css
-│   ├── popup.js
-│   ├── popup-documents.js
-│   ├── popup-ma.js
-│   └── popup-recon-auth.js   Recon Engine sign-in page + RECON pill (login 2)
+│   ├── service-worker.js      job orchestration, message router (handlers keyed by MESSAGE_TYPES)
+│   ├── offscreen.html / offscreen.js   DOMParser for the worker (one answer() per parse request)
+├── popup/                     the side panel
+│   ├── popup.html  popup.css  popup.js
+│   ├── popup-common.js        fillSelect (shared by the views)
+│   ├── popup-gate.js          which view a tab gets (IREPS mock / real / other)
+│   ├── popup-documents.js  popup-ma.js  popup-po-ic.js  popup-po-ic-batch.js  popup-downloads.js
+│   ├── popup-redownload.js    "download again?" prompt
+│   └── popup-recon-auth.js    Recon Engine sign-in page + RECON pill (login 2)
+├── tender/                    Download Tender Documents + Correspondence (run in the side panel)
+│   ├── tender-ui.js  pending-ui.js  view-common.js  run-lock.js  tender.css
+│   ├── tender-core.js         fetch wrapper, errors, read-only guard, IREPS paths, text-PDF fallback, log
+│   ├── tender-print.js        page-view letters printed to PDF by Chrome (chrome.debugger)
+│   ├── tender-account.js      active account + startTenderJob
+│   ├── tender-workflows.js  tender-auto.js  tender-jobs.js  tender-pending.js
+│   ├── tender-search.js  tender-messages.js  tender-ledger.js  tender-ecm.js
+│   └── tests/                 node:test suites + FakeIreps (need JSDOM_ROOT)
 ├── services/
-│   ├── search-po/
-│   │   ├── search-po-api.js  search-po-form.js  search-po-table.js  search-po-service.js  search-po-export.js  document-downloader.js
-│   ├── crn/
-│   │   ├── crn-parser.js  crn-export.js  crn-service.js
-│   ├── rnote/
-│   │   ├── rnote-parser.js  rnote-export.js  rnote-service.js
-│   ├── ma/
-│   │   ├── ma-parser.js  ma-service.js
-│   ├── ireps-api.js
-│   ├── ireps-form.js
-│   ├── bill-status-service.js
-│   ├── session-service.js
-│   ├── bill-parser.js
-│   ├── recon-service.js
-│   ├── recon-auth.js         Recon Engine sign-in: password + Okta (login 2)
-│   ├── ecm-service.js
-│   ├── pdf-service.js
-│   ├── download-service.js
-│   └── upload-service.js
-├── pages/
-│   ├── preview.html
-│   ├── preview.js
-│   └── preview.css
+│   ├── search-po/             PO Search core: api, form, table, service, export, document-downloader
+│   ├── crn/  rnote/  ma/  po/ per-type parser / export / service (po/: po-date-service.js)
+│   ├── inspection-certificate/  ic-api, ic-form, ic-parser, ic-search (runIcSearch), ic-service,
+│   │                          ic-date-service, ic-notification-service
+│   ├── notifications/         IREPS main-page notifications (IC issued)
+│   ├── batch-download.js      download/state/retry half shared by the batch workflows
+│   ├── batch-utils.js         transient-failure retry, DD/MM/YYYY ranges, readDateSelection
+│   ├── export-save-service.js export -> Downloads or Recon Engine, with the download-log check
+│   ├── ireps-api.js  ireps-form.js  session-service.js  bill-status-service.js  bill-parser.js  bill-status-export.js
+│   ├── recon-service.js  recon-auth.js   Recon Engine (S3) + sign-in (login 2)
+│   ├── ecm-service.js  ecm-direct.js  ecm-config.js  ecm-catalog.js   ECM (gateway or Nuxeo)
+│   ├── download-log.js        what was downloaded, per user and destination
+│   ├── pdf-service.js  download-service.js  upload-service.js
 ├── utils/
-│   ├── logger.js
-│   ├── sanitizer.js
-│   ├── filename.js
-│   ├── messages.js
-│   ├── xlsx-writer.js
-│   └── zip-writer.js
-├── assets/
-│   ├── icon16.png  icon32.png  icon48.png  icon128.png
-├── test/
-│   ├── run-tests.html / run-tests.js      (browser test-suite)
-│   ├── make-sample-pdf.mjs                (Node: writes a sample PDF)
-│   ├── crn-tests.js  rnote-tests.js  ma-tests.js  (CRN / R-NOTE / MA browser tests, run by run-tests.js)
-│   ├── mock/                              (mock IREPS server + target switch)
-│   └── fixtures/                          (real-layout page, legacy table, login, expired, no-records,
-│                                           crn-search-page, crn-results-page, crn-no-records,
-│                                           rnote-results-page (assumed layout), ma-results-page HTML)
-└── README.md
+│   ├── config.js              config.json + config.local.json (the only reader)
+│   ├── dates.js               panel date helpers (local time)
+│   ├── logger.js  messages.js (error catalogue, describeError)  sanitizer.js  filename.js
+│   ├── url-scope.js  ireps-account.js  xlsx-writer.js  zip-writer.js
+├── pages/                     preview.html / preview.js / preview.css
+├── assets/                    icon16/32/48/128.png, logo.png
+├── scripts/build.mjs          shareable build (dist/doclink + zip)
+└── test/
+    ├── run-tests.html / run-tests.js   browser suite (imports every *-tests.js)
+    ├── *-tests.js             crn, rnote, ma, po, ic, batch, recon, recon-auth, ecm, ecm-direct,
+    │                          download-log, export-save
+    ├── make-sample-pdf.mjs
+    ├── mock/                  mock IREPS server (http://localhost:8765) + target switch
+    └── fixtures/              captured / invented IREPS pages
 ```
 
 ---
