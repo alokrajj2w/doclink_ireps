@@ -4,6 +4,7 @@ import { downloadPendingCorrespondence } from './tender-pending.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { SESSION_MSG, getLogTail } from './tender-core.js';
 import { describeEcmOutcome } from '../services/ecm-service.js';
+import { claimPanelRun, releasePanelRun, isPanelBusy, PANEL_BUSY_MSG } from './run-lock.js';
 
 const $ = (id) => document.getElementById(id);
 const main = $('view-main');
@@ -23,6 +24,7 @@ function show(open) {
 
 function setBusy(busy) {
   running = busy;
+  if (busy) claimPanelRun('pending'); else releasePanelRun('pending');
   for (const id of ['btn-pc-run', 'btn-pc-retry', 'btn-pc-account-refresh']) $(id).disabled = busy;
   $('btn-pc-run').classList.toggle('is-busy', busy);
 }
@@ -126,6 +128,11 @@ function renderSummary(s) {
 async function run(mode) {
   if (running) return;
   $('pc-error').hidden = true;
+  if (isPanelBusy('pending')) {
+    $('pc-error-message').textContent = PANEL_BUSY_MSG;
+    $('pc-error').hidden = false;
+    return;
+  }
   $('pc-empty').hidden = true;
   $('pc-tbody').replaceChildren();
   rows.clear();

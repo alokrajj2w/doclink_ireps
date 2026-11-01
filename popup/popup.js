@@ -210,6 +210,10 @@ function showView(name) {
   el.saveTo.hidden = name === "login" || name === "upload" || name === "downloads";
   el.viewPoIcBatch.hidden = name !== "po-ic-batch";
   el.viewDownloads.hidden = name !== "downloads";
+  // the tender / correspondence views (tender/*-ui.js) are opened outside showView; any view
+  // shown here replaces them, so two views are never visible at once
+  $("view-tender").hidden = true;
+  $("view-pending").hidden = true;
   $("btn-downloads-open").setAttribute("aria-pressed", String(name === "downloads"));
 }
 

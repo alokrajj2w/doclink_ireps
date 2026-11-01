@@ -4,6 +4,7 @@ import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-a
 import { SESSION_MSG, getLogTail } from './tender-core.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
 import { describeSkip } from '../services/download-log.js';
+import { claimPanelRun, releasePanelRun, isPanelBusy, PANEL_BUSY_MSG } from './run-lock.js';
 
 const $ = (id) => document.getElementById(id);
 const main = $('view-main');
@@ -28,6 +29,7 @@ function show(open) {
 /** Disable every download button while a run goes; the clicked one shows the spinner. */
 function setBusy(busy, button) {
   running = busy;
+  if (busy) claimPanelRun('tender'); else releasePanelRun('tender');
   $('btn-auto-run').disabled = busy;
   $('btn-auto-retry').disabled = busy;
   document.querySelectorAll('[data-status],[data-tabulation]').forEach((b) => { b.disabled = busy; });
@@ -204,6 +206,11 @@ async function runByDate(what, task, render, button) {
   $('tender-error').hidden = true;
   $('tender-result').hidden = true;
   $('auto-discovered').hidden = true;
+  if (isPanelBusy('tender')) {
+    $('tender-error-message').textContent = PANEL_BUSY_MSG;
+    $('tender-error').hidden = false;
+    return;
+  }
   let from;
   let to;
   try {
@@ -275,6 +282,11 @@ async function run() {
   $('tender-error').hidden = true;
   $('tender-result').hidden = true;
   $('auto-discovered').hidden = true;
+  if (isPanelBusy('tender')) {
+    $('tender-error-message').textContent = PANEL_BUSY_MSG;
+    $('tender-error').hidden = false;
+    return;
+  }
   let from;
   let to;
   try {
