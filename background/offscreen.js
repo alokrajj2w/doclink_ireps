@@ -44,65 +44,50 @@ import { logger } from "../utils/logger.js";
  * from the service worker, so config.json is read here too, before the
  * first parse call - never assumed to already be loaded.
  */
+/** Answer one parse request: { ok: true, result }, or { ok: false, error: message, code } on failure. */
+function answer(sendResponse, label, parse, summary) {
+  loadIrepsConfig()
+    .then(parse)
+    .then((result) => {
+      if (summary) logger.info(...summary(result));
+      sendResponse({ ok: true, result });
+    })
+    .catch((error) => {
+      logger.error(`${label} failed`, error);
+      sendResponse({ ok: false, error: error && error.message ? error.message : String(error), code: (error && error.code) || null });
+    });
+  return true; // the answer is sent asynchronously
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || message.target !== TARGETS.OFFSCREEN) return false;
+  const source = { sourceUrl: message.sourceUrl || null };
 
-  if (message.type === MESSAGE_TYPES.PARSE_BILL_STATUS) {
-    loadIrepsConfig()
-      .then(() => parseBillStatus(message.html, { sourceUrl: message.sourceUrl || null, filter: message.filter || undefined }))
-      .then((result) => {
-        logger.info(`Bills parsed: ${result.recordCount}`, { structure: result.structure, blocks: result.blockCount, skipped: result.skippedCount });
-        sendResponse({ ok: true, result });
-      })
-      .catch((error) => {
-        logger.error("Parser failed", error);
-        sendResponse({ ok: false, error: error && error.message ? error.message : String(error) });
-      });
-    return true;
-  }
-
-  if (message.type === MESSAGE_TYPES.PARSE_SEARCH_PO_RESULTS) {
-    const parser = SEARCH_PO_PARSERS[message.criteria];
-    if (!parser) {
-      sendResponse({ ok: false, error: `UNSUPPORTED_IREPS_SEARCH_TYPE: ${message.criteria}` });
+  switch (message.type) {
+    case MESSAGE_TYPES.PARSE_BILL_STATUS:
+      return answer(sendResponse, "Parser", () => parseBillStatus(message.html, { ...source, filter: message.filter || undefined }), (r) => [
+        `Bills parsed: ${r.recordCount}`,
+        { structure: r.structure, blocks: r.blockCount, skipped: r.skippedCount }
+      ]);
+    case MESSAGE_TYPES.PARSE_SEARCH_PO_RESULTS: {
+      const parser = SEARCH_PO_PARSERS[message.criteria];
+      if (!parser) {
+        sendResponse({ ok: false, error: `UNSUPPORTED_IREPS_SEARCH_TYPE: ${message.criteria}`, code: "UNSUPPORTED_IREPS_SEARCH_TYPE" });
+        return false;
+      }
+      return answer(sendResponse, `${message.criteria} parser`, () => parser(message.html, { ...source, startIndex: message.startIndex || 1 }), (r) => [
+        `${message.criteria} records parsed: ${r.recordCount}`,
+        { structure: r.structure, rows: r.rowCount, skipped: r.skippedCount, pages: r.pagination.maxPage }
+      ]);
+    }
+    case MESSAGE_TYPES.PARSE_IREPS_ACCOUNT:
+      return answer(sendResponse, "Account parser", () => accountFromHomeDocument(new DOMParser().parseFromString(message.html || "", "text/html"), message.html || ""));
+    case MESSAGE_TYPES.PARSE_IC_RESULTS:
+      return answer(sendResponse, "IC parser", () => parseIcSearchResults(message.html, message.poNo || null, source), (r) => [
+        `IC records parsed: ${r.recordCount}`,
+        { structure: r.structure, rows: r.rowCount, filteredOut: r.filteredCount }
+      ]);
+    default:
       return false;
-    }
-    loadIrepsConfig()
-      .then(() => parser(message.html, { sourceUrl: message.sourceUrl || null, startIndex: message.startIndex || 1 }))
-      .then((result) => {
-        logger.info(`${message.criteria} records parsed: ${result.recordCount}`, { structure: result.structure, rows: result.rowCount, skipped: result.skippedCount, pages: result.pagination.maxPage });
-        sendResponse({ ok: true, result });
-      })
-      .catch((error) => {
-        logger.error(`${message.criteria} parser failed`, error);
-        sendResponse({ ok: false, error: error && error.message ? error.message : String(error) });
-      });
-    return true;
   }
-
-  if (message.type === MESSAGE_TYPES.PARSE_IREPS_ACCOUNT) {
-    try {
-      const doc = new DOMParser().parseFromString(message.html || "", "text/html");
-      sendResponse({ ok: true, result: accountFromHomeDocument(doc, message.html || "") });
-    } catch (error) {
-      logger.error("Account parser failed", error);
-      sendResponse({ ok: false, error: error && error.message ? error.message : String(error) });
-    }
-    return false;
-  }
-
-  if (message.type === MESSAGE_TYPES.PARSE_IC_RESULTS) {
-    loadIrepsConfig()
-      .then(() => parseIcSearchResults(message.html, message.poNo || null, { sourceUrl: message.sourceUrl || null }))
-      .then((result) => {
-        logger.info(`IC records parsed: ${result.recordCount}`, { structure: result.structure, rows: result.rowCount, filteredOut: result.filteredCount });
-        sendResponse({ ok: true, result });
-      })
-      .catch((error) => {
-        logger.error("IC parser failed", error);
-        sendResponse({ ok: false, error: error && error.message ? error.message : String(error) });
-      });
-    return true;
-  }
-  return false;
 });

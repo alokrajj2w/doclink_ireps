@@ -184,84 +184,39 @@ async function withOffscreen(fn) {
 }
 
 /**
+ * Ask the offscreen document (which owns DOMParser) to parse `payload.html`. A failed parse
+ * rejects with the parser's message, and its code when the parser gave one.
+ */
+async function askOffscreen(type, payload, what) {
+  return withOffscreen(async () => {
+    const response = await chrome.runtime.sendMessage({ target: TARGETS.OFFSCREEN, type, ...payload });
+    if (!response || !response.ok) {
+      const error = new Error(response && response.error ? response.error : `${what} returned no result`);
+      if (response && response.code) error.code = response.code;
+      throw error;
+    }
+    return response.result;
+  });
+}
+
+/**
  * @param {string} html
  * @param {{ filter?: string, sourceUrl?: string|null }} options
  * @returns {Promise<import("../services/bill-parser.js").BillStatusResult>}
  */
-async function parseInOffscreen(html, options = {}) {
-  return withOffscreen(async () => {
-    const response = await chrome.runtime.sendMessage({
-      target: TARGETS.OFFSCREEN,
-      type: MESSAGE_TYPES.PARSE_BILL_STATUS,
-      html,
-      filter: options.filter || "",
-      sourceUrl: options.sourceUrl || null
-    });
-    if (!response || !response.ok) {
-      throw new Error(response && response.error ? response.error : "Parser returned no result");
-    }
-    return response.result;
-  });
-}
+const parseInOffscreen = (html, options = {}) =>
+  askOffscreen(MESSAGE_TYPES.PARSE_BILL_STATUS, { html, filter: options.filter || "", sourceUrl: options.sourceUrl || null }, "Parser");
 
-/**
- * PO Search results (CRN / R-NOTE) are parsed by the type-specific parser in
- * the same offscreen document; `criteria` selects it.
- * @param {string} html
- * @param {{ criteria: string, sourceUrl?: string|null, startIndex?: number }} options
- */
-async function parseSearchPoInOffscreen(html, options = {}) {
-  return withOffscreen(async () => {
-    const response = await chrome.runtime.sendMessage({
-      target: TARGETS.OFFSCREEN,
-      type: MESSAGE_TYPES.PARSE_SEARCH_PO_RESULTS,
-      criteria: options.criteria,
-      html,
-      sourceUrl: options.sourceUrl || null,
-      startIndex: options.startIndex || 1
-    });
-    if (!response || !response.ok) {
-      throw new Error(response && response.error ? response.error : `${options.criteria} parser returned no result`);
-    }
-    return response.result;
-  });
-}
+/** PO Search results (CRN / R-NOTE / MA / PO) by the type-specific parser; `criteria` selects it. */
+const parseSearchPoInOffscreen = (html, options = {}) =>
+  askOffscreen(MESSAGE_TYPES.PARSE_SEARCH_PO_RESULTS, { criteria: options.criteria, html, sourceUrl: options.sourceUrl || null, startIndex: options.startIndex || 1 }, `${options.criteria} parser`);
 
-/**
- * Inspection Certificate results (vendorInspectionCallList.do) are parsed by
- * their own parser in the offscreen document - a different endpoint from PO
- * Search, so this is a separate bridge from parseSearchPoInOffscreen.
- * @param {string} html
- * @param {string} poNo
- * @param {{ sourceUrl?: string|null }} [options]
- */
-async function parseIcInOffscreen(html, poNo, options = {}) {
-  return withOffscreen(async () => {
-    const response = await chrome.runtime.sendMessage({
-      target: TARGETS.OFFSCREEN,
-      type: MESSAGE_TYPES.PARSE_IC_RESULTS,
-      html,
-      poNo,
-      sourceUrl: options.sourceUrl || null
-    });
-    if (!response || !response.ok) {
-      throw new Error(response && response.error ? response.error : "IC parser returned no result");
-    }
-    return response.result;
-  });
-}
+/** Inspection Certificate results (vendorInspectionCallList.do, a different endpoint from PO Search). */
+const parseIcInOffscreen = (html, poNo, options = {}) =>
+  askOffscreen(MESSAGE_TYPES.PARSE_IC_RESULTS, { html, poNo, sourceUrl: options.sourceUrl || null }, "IC parser");
 
-/**
- * The signed-in IREPS account (home page), parsed in the offscreen document.
- * @returns {Promise<{ irepsAccountId: string|null, operatingUnit: string|null, verified: boolean, note?: string }>}
- */
-async function parseAccountInOffscreen(html) {
-  return withOffscreen(async () => {
-    const response = await chrome.runtime.sendMessage({ target: TARGETS.OFFSCREEN, type: MESSAGE_TYPES.PARSE_IREPS_ACCOUNT, html });
-    if (!response || !response.ok) throw new Error(response && response.error ? response.error : "Account parser returned no result");
-    return response.result;
-  });
-}
+/** The signed-in IREPS account (home page). */
+const parseAccountInOffscreen = (html) => askOffscreen(MESSAGE_TYPES.PARSE_IREPS_ACCOUNT, { html }, "Account parser");
 
 /* -------------------------------------------------------------------------- */
 /* Save to: ECM / S3 (IC, PO, MA)                                             */
