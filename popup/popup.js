@@ -7,13 +7,15 @@
  * job continues even if the popup is closed.
  */
 
-import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError } from "../utils/messages.js";
+import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError, asDescribedError } from "../utils/messages.js";
 import { UPLOAD_SOURCES, DOCUMENT_TYPES } from "../services/upload-service.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
 import { loadEcmConfig, isDirectEcm } from "../services/ecm-config.js";
 import { loadDownloadLogConfig, configureDownloadLog, describeSkip, DOWNLOAD_LOG_ERROR } from "../services/download-log.js";
 import { initRedownload } from "./popup-redownload.js";
 import { formatFriendlyDateTime } from "../utils/filename.js";
+import { toIrepsDate } from "../utils/dates.js";
+import { fillSelect } from "./popup-common.js";
 import { initDocuments, handleDocumentMessage, restoreDocuments, refreshDocumentsDestination } from "./popup-documents.js";
 import { initMa, handleMaMessage, restoreMa, refreshMaDestination } from "./popup-ma.js";
 import { initPoIc, handlePoIcMessage, restorePoIc, refreshPoIcDestination } from "./popup-po-ic.js";
@@ -344,7 +346,7 @@ function renderComplete(summary) {
 }
 
 function renderError(error) {
-  const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN");
+  const described = asDescribedError(error);
   el.progress.hidden = true;
   setButtonBusy(false);
   refreshMeta();
@@ -381,12 +383,6 @@ async function refreshMeta() {
 /* -------------------------------------------------------------------------- */
 /* Search options                                                             */
 /* -------------------------------------------------------------------------- */
-
-/** "2026-08-01" (input[type=date]) -> "01/08/2026" (IREPS). */
-function toIrepsDate(isoDate) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate || "");
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
-}
 
 function selectedDestination() {
   const checked = el.optDestination.find((r) => r.checked);
@@ -465,17 +461,7 @@ function updateOptionsSummary() {
 
 /** Fill the zone list from the IREPS form (values come from the page, never hard-coded). */
 function populateZones(zones) {
-  if (!Array.isArray(zones) || zones.length === 0) return;
-  const current = el.optZone.value;
-  el.optZone.replaceChildren();
-  for (const zone of zones) {
-    const option = document.createElement("option");
-    option.value = zone.value;
-    option.textContent = zone.label;
-    el.optZone.append(option);
-  }
-  el.optZone.value = zones.some((z) => z.value === current) ? current : ALL_ZONES;
-  updateOptionsSummary();
+  if (fillSelect(el.optZone, zones, ALL_ZONES)) updateOptionsSummary();
 }
 
 /* -------------------------------------------------------------------------- */

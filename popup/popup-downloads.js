@@ -12,6 +12,7 @@
 import { describeError } from "../utils/messages.js";
 import { listDownloads, DOC_TYPE_LABEL, LOG_DESTINATION } from "../services/download-log.js";
 import { logger } from "../utils/logger.js";
+import { localIsoDate } from "../utils/dates.js";
 
 const $ = (id) => document.getElementById(id);
 const PAGE = 50;
@@ -21,11 +22,6 @@ let el = null;
 let ctx = null;
 let shown = 0;
 let loading = false;
-
-/** The browser's local day (IST for DocLink's users), YYYY-MM-DD. */
-function day(date) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
 
 const siteName = (site) => (site ? `${site.charAt(0).toUpperCase()}${site.slice(1)}` : "");
 
@@ -196,8 +192,8 @@ export function initDownloads(context) {
     btnSignIn: $("btn-downloads-sign-in")
   };
   const today = new Date();
-  el.to.value = day(today);
-  el.from.value = day(new Date(today.getTime() - 6 * DAY));
+  el.to.value = localIsoDate(today);
+  el.from.value = localIsoDate(new Date(today.getTime() - 6 * DAY));
   el.docType.append(
     ...Object.entries(DOC_TYPE_LABEL).map(([value, label]) => {
       const o = document.createElement("option");

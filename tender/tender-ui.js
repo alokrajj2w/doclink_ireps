@@ -5,6 +5,7 @@ import { SESSION_MSG, getLogTail } from './tender-core.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
 import { describeSkip } from '../services/download-log.js';
 import { claimPanelRun, releasePanelRun, isPanelBusy, PANEL_BUSY_MSG } from './run-lock.js';
+import { localIsoDate } from '../utils/dates.js';
 
 const $ = (id) => document.getElementById(id);
 const main = $('view-main');
@@ -14,14 +15,13 @@ const gate = $('view-gate');
 let running = false;
 let lastIds = [];
 
-const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const fromIso = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 
 function show(open) {
   view.hidden = !open;
   if (open) {
     main.hidden = true;
-    if (!$('auto-from').value) { $('auto-from').value = iso(new Date()); $('auto-to').value = iso(new Date()); }
+    if (!$('auto-from').value) { $('auto-from').value = localIsoDate(new Date()); $('auto-to').value = localIsoDate(new Date()); }
     refreshAccount();
   } else if (gate.hidden) main.hidden = false;
 }

@@ -10,9 +10,10 @@
  * textContent, never as markup.
  */
 
-import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
+import { MESSAGE_TYPES, describeError, asDescribedError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
 import { describeSkip, skipChipText } from "../services/download-log.js";
+import { localIsoDate } from "../utils/dates.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -78,11 +79,6 @@ function bind() {
   }
 }
 
-/** "YYYY-MM-DD" in local time. */
-function localIso(date = new Date()) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
 function setBusy(prefix, busy, label) {
   const v = el[prefix];
   v.button.disabled = busy;
@@ -99,7 +95,7 @@ function hideAll(prefix) {
 
 function showError(prefix, error) {
   const v = el[prefix];
-  const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN", { detail: error && error.detail, status: error && error.status });
+  const described = asDescribedError(error);
   hideAll(prefix);
   setBusy(prefix, false, idleLabel(prefix));
   ctx.setConnectionForError(described);
@@ -449,7 +445,7 @@ async function refresh(kind) {
 export function initBatch(context) {
   ctx = context;
   bind();
-  const today = localIso();
+  const today = localIsoDate();
   for (const kind of DATED) {
     el[KINDS[kind].prefix].from.value = today;
     el[KINDS[kind].prefix].to.value = today;

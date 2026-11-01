@@ -14,6 +14,7 @@ import { confirmReconSignIn } from '../services/recon-auth.js';
 import { loadEcmConfig, isDirectEcm } from '../services/ecm-config.js';
 import { loadDownloadLogConfig } from '../services/download-log.js';
 import { TenderError } from './tender-core.js';
+import { localIsoDate } from '../utils/dates.js';
 
 export const SIGN_IN_REQUIRED_MSG = 'Sign in to the Recon Engine to download: DocLink records every download for the signed-in user. Nothing was downloaded.';
 
@@ -46,7 +47,7 @@ const TITLE_MAX = 200;
 function localDay(iso) {
   const d = iso ? new Date(iso) : null;
   if (!d || Number.isNaN(d.getTime())) return '';
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return localIsoDate(d);
 }
 
 /** The panel's Save to choice; Local when it cannot be read. */

@@ -600,6 +600,15 @@ export function describeError(code, details = {}) {
   };
 }
 
+/**
+ * An error as the panel shows it: an already described error (it has a title) as it is,
+ * otherwise a { code, detail, status } error (or nothing) through describeError.
+ */
+export function asDescribedError(error, fallbackCode = "UNKNOWN") {
+  if (error && error.title) return error;
+  return describeError((error && error.code) || fallbackCode, { detail: error && error.detail, status: error && error.status });
+}
+
 /** chrome.storage.local keys (non-sensitive metadata only). */
 export const STORAGE_KEYS = Object.freeze({
   LAST_DOWNLOAD: "doclink.lastDownload",
