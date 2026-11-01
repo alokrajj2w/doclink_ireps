@@ -19,8 +19,12 @@ export const PRINT_OPTIONS = { paperWidth: 8.27, paperHeight: 11.69, printBackgr
 /** loadWaitMs: how long the page's CSS/images may take before printing anyway; printWaitMs: the print itself. */
 export const printSettings = { loadWaitMs: 30000, printWaitMs: 60000 };
 
-/** The letter's own scripts must not stop the print: no print dialog, no alert / confirm boxes. */
-const QUIET_PAGE = 'window.print=function(){};window.alert=function(){};window.confirm=function(){return true;};window.prompt=function(){return null;};';
+/**
+ * The letter's own scripts must not stop the print: no print dialog, no alert / confirm boxes.
+ * confirm() answers "Cancel", never "OK": the tab carries the user's IREPS session, and an
+ * auto-approved "Are you sure?" could let a page script submit something (DocLink is read-only).
+ */
+const QUIET_PAGE = 'window.print=function(){};window.alert=function(){};window.confirm=function(){return false;};window.prompt=function(){return null;};';
 
 export const canPrintPages = () => typeof chrome !== 'undefined' && !!chrome.debugger?.attach && !!chrome.tabs?.create;
 
@@ -65,7 +69,9 @@ async function printOnce({ url, bytes, contentType }) {
         send('Fetch.continueRequest', { requestId: params.requestId }).catch(() => {});
       }
     } else if (method === 'Page.javascriptDialogOpening') {
-      send('Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
+      // close alerts / leave-page boxes; Cancel anything that asks for consent or input (read-only)
+      const accept = params.type === 'alert' || params.type === 'beforeunload';
+      send('Page.handleJavaScriptDialog', { accept }).catch(() => {});
     } else if (method === 'Page.loadEventFired' && served) {
       onLoaded();
     }
