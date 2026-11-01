@@ -505,7 +505,8 @@ test('two tenders sharing a number get separate folders; a filename collision ac
 // =========================== UI (real popup.html in jsdom) ==============================
 test('UI: clicking "Download All Correspondence" fills the progress table and counts; empty state shown when nothing pending', async () => {
   const dom = new JSDOM(readFileSync(new URL('../../popup/popup.html', import.meta.url), 'utf8').replace(/<script[^>]*><\/script>/g, ''), { pretendToBeVisual: true });
-  Object.assign(globalThis, { document: dom.window.document, window: dom.window, MutationObserver: dom.window.MutationObserver });
+  // the panel's own events (Recon sign-in, download-again prompt) must be jsdom's, as in the real page
+  Object.assign(globalThis, { document: dom.window.document, window: dom.window, MutationObserver: dom.window.MutationObserver, Event: dom.window.Event, CustomEvent: dom.window.CustomEvent });
   Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
   const $ = (id) => document.getElementById(id);
   scenario();
