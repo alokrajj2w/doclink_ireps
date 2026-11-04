@@ -1025,34 +1025,66 @@ async function withDirectEcm(fn) {
   chrome.runtime.getManifest = () => ({ host_permissions: [`${NUXEO}/*`, 'http://localhost:8000/*'] });
   const prev = globalThis.fetch;
   const prevDocument = globalThis.document;
-  const seen = { creates: [], gateway: [], asked: 0 };
+  // creates: the new documents' properties; attaches: [title, file name] added to an existing document;
+  // docs: uid -> { props, main, files } (main / files: { name, length }), what the ECM holds
+  const seen = { creates: [], attaches: [], puts: [], gateway: [], asked: 0, docs: new Map() };
   // the panel's Recon sign-in page answers this event; count whether it is asked at all
   globalThis.document = { dispatchEvent: () => { seen.asked += 1; return true; } };
   const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-  const stored = new Map(); // created uid -> file length
-  let uploaded = 0;
+  let uploaded = { name: '', length: 0 };
+  const fileJson = (f) => ({ name: f.name, length: String(f.length) });
+  const entry = (uid) => {
+    const d = seen.docs.get(uid);
+    return { uid, path: `/x/${uid}`, title: d.props['dc:title'], properties: { ...d.props, 'file:content': fileJson(d.main), 'files:files': d.files.map((f) => ({ file: fileJson(f) })) } };
+  };
+  const literal = (query, prop) => { const m = new RegExp(`${prop} = '((?:[^'\\\\]|\\\\.)*)'`).exec(query); return m ? m[1].replace(/\\(.)/g, '$1') : null; };
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url);
     if (u === ECM_URL) seen.gateway.push(u);
     if (!u.startsWith(NUXEO)) return prev(url, init);
-    const path = new URL(u).pathname;
+    const { pathname: path, searchParams } = new URL(u);
+    const method = init.method || 'GET';
     if (path === '/nuxeo/oauth2/token') return json(200, { access_token: 'tok', expires_in: 3600 });
-    if (path === '/nuxeo/api/v1/search/lang/NXQL/execute') return json(200, { entries: [], isNextPageAvailable: false });
+    if (path === '/nuxeo/api/v1/search/lang/NXQL/execute') {
+      // a document of this type and title (and, for a single-file kind, this file name)
+      const q = searchParams.get('query');
+      const [type, title, file] = [literal(q, 'InvoiceCertificateSchema:type'), literal(q, 'dc:title'), literal(q, 'file:content/name')];
+      const hits = title === null ? [] : [...seen.docs.keys()].filter((uid) => {
+        const d = seen.docs.get(uid);
+        return d.props['InvoiceCertificateSchema:type'] === type && d.props['dc:title'] === title && (file === null || d.main.name === file);
+      });
+      return json(200, { entries: hits.map(entry), isNextPageAvailable: false });
+    }
     if (path === '/nuxeo/api/v1/upload') return json(201, { batchId: 'b' });
+    if (path.endsWith('/execute/Blob.AttachOnDocument')) {
+      const { document: uid, xpath } = JSON.parse(init.body).params;
+      const d = seen.docs.get(uid);
+      if (!d || xpath !== 'files:files') return json(404, { message: `no document ${uid}` });
+      d.files.push({ ...uploaded });
+      seen.attaches.push([d.props['dc:title'], uploaded.name]);
+      return new Response(new Uint8Array(uploaded.length), { status: 200, headers: { 'content-type': 'application/pdf' } });
+    }
     if (path.startsWith('/nuxeo/api/v1/upload/')) {
-      uploaded = init.body.length;
+      uploaded = { name: decodeURIComponent(init.headers['X-File-Name'] || ''), length: init.body.length };
       return json(201, { uploaded: 'true' });
     }
-    if ((init.method || 'GET') === 'GET') {
-      const [uid, blob] = decodeURIComponent(path.replace('/nuxeo/api/v1/id/', '')).split('/@blob/');
-      // the read-back after a create: the document, then the last byte of its file
-      if (stored.has(uid)) return blob ? new Response(new Uint8Array(1), { status: 200 }) : json(200, { uid, properties: { 'file:content': { length: String(stored.get(uid)) } } });
+    const [uid, blob] = decodeURIComponent(path.replace('/nuxeo/api/v1/id/', '')).split('/@blob/');
+    if (method === 'GET') {
+      // the read-back: the document, then the last byte of the file at `blob`
+      if (seen.docs.has(uid)) return blob ? new Response(new Uint8Array(1), { status: 200 }) : json(200, entry(uid));
       return json(200, { uid, path: '/FT/folder' }); // the folder check
     }
     const body = JSON.parse(init.body);
-    seen.creates.push({ folder: path.replace('/nuxeo/api/v1/id/', ''), ...body.properties });
-    stored.set(`n-${seen.creates.length}`, uploaded);
-    return json(201, { uid: `n-${seen.creates.length}`, path: `/x/${body.name}`, title: body.properties['dc:title'] });
+    if (method === 'PUT') {
+      seen.puts.push({ uid, ...body.properties });
+      Object.assign(seen.docs.get(uid).props, body.properties);
+      return json(200, entry(uid));
+    }
+    const { 'file:content': _, ...props } = body.properties;
+    seen.creates.push({ folder: uid, ...body.properties });
+    const created = `n-${seen.creates.length}`;
+    seen.docs.set(created, { props, main: { ...uploaded }, files: [] });
+    return json(201, { uid: created, path: `/x/${body.name}`, title: body.properties['dc:title'] });
   };
   try {
     return await fn(seen);
@@ -1069,19 +1101,30 @@ test('ECM: account 833 is always HOSUR', () => {
   assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-UNIT 1 (IREPS ID- 833)').operatingUnit, 'HOSUR');
   assert.equal(acct.parseWelcomeText('X Y , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED (IREPS ID- 833)').operatingUnit, 'HOSUR');
 });
-test('ECM: each tender category maps to its ECM kind with the tender number (the only tender property the ECM has); My Offer stays local', () => {
+test('ECM: each tender category maps to its ECM kind with the tender number and tender date; My Offer stays local', () => {
   const ctx = { tenderNo: '29263265', closingDate: '09/11/2026 15:00' };
   const doc = (category, action) => tecm.ecmDocumentFor(category, action, ctx);
-  assert.deepEqual(doc('TENDER_PDF', { id: '5569207', meta: { title: 'NIT / Tender document' } }), { kind: 'nit', title: '29263265 - NIT', fields: { tender_number: '29263265' } });
-  assert.equal(doc('ATTACHMENTS', { id: 'Annexure', meta: { title: 'Annexure - SPEC' } }).title, '29263265 - NIT - Annexure - SPEC');
+  assert.deepEqual(doc('TENDER_PDF', { id: '5569207', meta: { title: 'NIT / Tender document' } }), { kind: 'nit', title: '29263265 - NIT', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00' } }, 'the closing date as IREPS shows it; ecmFields() makes it YYYY-MM-DD');
+  assert.equal(doc('ATTACHMENTS', { id: 'Annexure', meta: { title: 'Annexure - SPEC' } }).title, '29263265 - NIT', 'grouped: an attachment goes into the tender\'s "<T> - NIT" document');
   assert.deepEqual([doc('CORRIGENDA', { id: '1204920', meta: { title: '1' } }).title, doc('NEGOTIATION', { id: '77' }).title, doc('COUNTER_OFFER', { id: '78' }).title, doc('CORRESPONDENCE', { id: '9', meta: { title: 'Withdrawal' } }).title], ['29263265 - Extension - 1', '29263265 - NBSP - 77', '29263265 - CO - 78', '29263265 - CRP - Withdrawal'], 'titles: <tender no> - <spec code> - what tells them apart');
   assert.equal(doc('ATTACHMENTS', { id: 'x', meta: {} }).kind, 'nit');
   assert.deepEqual([doc('CORRIGENDA', { id: '1204920', meta: { title: '1' } }).kind, doc('NEGOTIATION', { id: '1' }).kind, doc('COUNTER_OFFER', { id: '1' }).kind, doc('CORRESPONDENCE', { id: '1', meta: { title: 'Withdrawal' } }).kind], ['extension', 'nbsp', 'co', 'crp']);
-  assert.deepEqual(doc('LOA', { id: '1461928', meta: { docDate: '04/10/2026' } }), { kind: 'loi', title: '29263265 - LOI - 1461928', fields: { tender_number: '29263265' } }, 'no loiNumber / loiDate on the ECM: the letter id goes in the title');
+  assert.deepEqual(doc('LOA', { id: '1461928', meta: { docDate: '04/10/2026' } }), { kind: 'loi', title: '29263265 - LOA', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00' } }, 'grouped: every LOA letter goes into "<T> - LOA"');
+  assert.deepEqual(doc('FINANCIAL_TABULATION', { id: 'x' }), { kind: 'tenderResult', title: '29263265 - Result', fields: { tender_number: '29263265', tender_date: '09/11/2026 15:00' } }, 'the Financial Tabulation is the tender\'s Result (ECM type "Tender Result")');
+  assert.deepEqual([doc('COMMERCIAL_TABULATION', { id: 'x' }).kind, doc('COMMERCIAL_TABULATION', { id: 'x' }).title], ['vct', '29263265 - Commercial Tabulation']);
+  // the download check looks only single-file kinds up in the ECM (a grouped title says nothing about one PDF)
+  assert.deepEqual(['TENDER_PDF', 'ATTACHMENTS', 'LOA', 'FINANCIAL_TABULATION'].map((c) => tecm.ecmCheckDocumentFor(c, { id: '1', meta: {} }, ctx)), [null, null, null, null]);
+  assert.equal(tecm.ecmCheckDocumentFor('CORRIGENDA', { id: '1', meta: { title: '1' } }, ctx).title, '29263265 - Extension - 1');
+  // in a grouped document file names tell the PDFs apart: an LOA letter always carries its id
+  assert.equal(tecm.ecmFileName('LOA', 'LOA_29263265.pdf', '1461928'), 'LOA_29263265_1461928.pdf');
+  assert.equal(tecm.ecmFileName('LOA', 'LOA_29263265_1461928.pdf', '1461928'), 'LOA_29263265_1461928.pdf', 'already there: unchanged');
+  assert.equal(tecm.ecmFileName('LOA', 'LOA_29263265.pdf', ''), 'LOA_29263265.pdf');
+  assert.equal(tecm.ecmFileName('ATTACHMENTS', 'Attachment_01_Spec.pdf', 'Spec'), 'Attachment_01_Spec.pdf', 'other categories keep their name');
   assert.equal(doc('MY_OFFER', { id: '1' }), null);
   assert.equal(tecm.ecmDocumentFor('NIT', {}, { tenderNo: 'T', dueDate: '' }), null);
-  assert.deepEqual(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T', dueDate: new Date(2026, 10, 9).toISOString() }).fields, { tender_number: 'T' }, 'no tenderDate on the ECM: the due date is not sent');
-  assert.equal(tecm.ECM_TAKES_TENDER_DATE, false);
+  assert.deepEqual(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T', dueDate: new Date(2026, 10, 9).toISOString() }).fields, { tender_number: 'T', tender_date: '2026-11-09' }, 'without a closing date, the due date\'s local day');
+  assert.deepEqual(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T' }).fields, { tender_number: 'T', tender_date: '' }, 'no date known: blank, which ecmFields() drops');
+  assert.equal(tecm.ECM_TAKES_TENDER_DATE, true);
 });
 test('ECM: Save to Local (the default) never calls the ECM', async () => {
   mk({ tenders: [FULL()] });
@@ -1091,7 +1134,7 @@ test('ECM: Save to Local (the default) never calls the ECM', async () => {
     assert.ok(savedNames().some((n) => n.endsWith('NIT_29263265.pdf')));
   });
 });
-test('ECM: Save to ECM / S3 files every tender document in the Hosur folder; My Offer and the manifest stay local', async () => {
+test('ECM gateway: Save to ECM / S3 files the single-file tender documents in the Hosur folder; NIT, LOA and Result (one document per tender, direct ECM only) and My Offer stay local', async () => {
   mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: CORRES });
   store['doclink.saveDestination'] = 'recon';
   await withEcm((p, n) => [201, { uid: `u-${n}`, path: `/FT/x/${n}`, title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
@@ -1099,22 +1142,26 @@ test('ECM: Save to ECM / S3 files every tender document in the Hosur folder; My 
     const c = r.categories;
     assert.equal(r.summary.failed, 0);
     const kinds = posts.reduce((m, p) => ({ ...m, [p.kind]: (m[p.kind] || 0) + 1 }), {});
-    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2, vft: 1, vct: 1 });
-    assert.deepEqual(posts.filter((p) => /^v[fc]t$/.test(p.kind)).map((p) => p.title).sort(), ['29263265 - Commercial Tabulation', '29263265 - Financial Tabulation']);
+    assert.deepEqual(kinds, { extension: 2, nbsp: 2, co: 1, crp: 2, vct: 1 }, 'the gateway cannot add PDFs to a document: no nit / loi / tenderResult is posted');
+    assert.deepEqual(posts.filter((p) => p.kind === 'vct').map((p) => p.title), ['29263265 - Commercial Tabulation']);
     assert.ok(posts.every((p) => p.account === '833' && p.unit === 'HOSUR' && p.fields.tender_number === '29263265' && p.credentials === 'include'));
-    assert.ok(posts.every((p) => Object.keys(p.fields).join() === 'tender_number'), 'only the tender number: the ECM has no tenderDate / loiNumber / loiDate');
-    const loi = posts.find((p) => p.kind === 'loi');
-    assert.equal(loi.title, '29263265 - LOI - 1461928');
+    assert.ok(posts.every((p) => Object.keys(p.fields).join() === 'tender_number,tender_date' && p.fields.tender_date === '2026-11-09'), `the tender number and closing date: ${JSON.stringify(posts.map((p) => p.fields))}`);
     assert.equal(new Set(posts.map((p) => p.title)).size, posts.length, 'every title is unique within the tender');
-    // nothing that went to the ECM is in Downloads; My Offer (no ECM kind) is, and no manifest file is
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
+    // nothing the gateway took is in Downloads; My Offer (no ECM kind) is, and no manifest file is
     assert.ok(local.includes('My_Offer/My_Offer_29263265.pdf') && !local.some((n) => /manifest/i.test(n)));
-    assert.ok(!local.some((n) => /^(NIT_and_Supporting_Documents|Negotiation|Counter_Offers|Advance_Acceptance_LOA|Correspondence)\//.test(n)), local.join('\n'));
+    assert.ok(!local.some((n) => /^(Negotiation|Counter_Offers|Correspondence)\//.test(n)), local.join('\n'));
     assert.ok(local.includes('Corrigenda/Corrigendum_02_29263265.html'), 'without Chrome printing, a corrigendum page keeps its original HTML locally');
-    assert.equal(c.tenderPdf.files[0].ecm.status, 'stored');
-    assert.equal(c.tenderPdf.files[0].relPath, null);
+    // the grouped kinds: saved locally, with the reason
+    for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf']) assert.ok(local.includes(want), `missing ${want}`);
+    for (const f of [c.tenderPdf.files[0], ...c.attachments.files, c.loa.files[0], c.financialTabulation.files[0]]) {
+      assert.deepEqual([f.ecm.status, f.ecm.code], ['failed', 'ECM_REJECTED'], f.fileName);
+      assert.match(f.ecm.detail, /need the direct ECM upload/);
+      assert.ok(f.relPath, `${f.fileName} is saved locally`);
+    }
     assert.equal(c.myOffer.files[0].ecm, undefined);
-    assert.equal(c.loa.files[0].ecm.uid, `u-${posts.indexOf(loi) + 1}`, 'the result records where each document went');
+    const co = posts.find((p) => p.kind === 'co');
+    assert.equal(c.counterOffer.files[0].ecm.uid, `u-${posts.indexOf(co) + 1}`, 'the result records where each document went');
   });
 });
 test('ECM: a corrigendum\'s attached document is filed next to it as "<tender> - Extension - <corrigendum> - Attachment N"', async () => {
@@ -1138,32 +1185,47 @@ test('ECM: a corrigendum\'s attached document is filed next to it as "<tender> -
 test('ECM: when the ECM refuses or is down, each document is saved locally instead and the reason is kept', async () => {
   mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: CORRES });
   store['doclink.saveDestination'] = 'recon';
-  await withEcm((p, n) => (n === 1 ? [400, { detail: { error: 'INVALID_INPUT', detail: 'nit requires tender_number' } }] : [502, { detail: { error: 'ECM_UPSTREAM_ERROR', detail: 'HTTP 500' } }]), async (posts) => {
+  await withEcm((p) => (p.kind === 'crp' ? [400, { detail: { error: 'INVALID_INPUT', detail: 'crp requires tender_number' } }] : [502, { detail: { error: 'ECM_UPSTREAM_ERROR', detail: 'HTTP 500' } }]), async (posts) => {
     const r = await run();
     assert.equal(r.summary.failed, 0, 'nothing is lost');
-    assert.equal(posts.length, 15);
+    assert.equal(posts.length, 8, 'the single-file kinds; NIT, LOA and Result never reach the gateway');
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
-    for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(local.includes(want), `missing ${want}`);
-    const nit = r.categories.tenderPdf.files[0];
-    assert.deepEqual([nit.ecm.status, nit.ecm.code, nit.ecm.detail], ['failed', 'ECM_REJECTED', 'nit requires tender_number']);
-    assert.equal(r.categories.loa.files[0].ecm.code, 'ECM_UNAVAILABLE');
+    for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(local.includes(want), `missing ${want}:\n${local.join('\n')}`);
+    assert.ok(local.some((n) => /^Negotiation\//.test(n)), 'the gateway being down: saved locally');
+    const crp = r.categories.correspondence.files[0];
+    assert.deepEqual([crp.ecm.status, crp.ecm.code, crp.ecm.detail], ['failed', 'ECM_REJECTED', 'crp requires tender_number']);
+    assert.equal(r.categories.negotiation.files[0].ecm.code, 'ECM_UNAVAILABLE');
   });
 });
-test('ECM direct: with ecmBackendAws false every tender document goes straight to the Hosur TEST Tenders folder, without the Recon sign-in', async () => {
+test('ECM direct: with ecmBackendAws false every tender document goes straight to the Hosur TEST Tenders folder, NIT / LOA / Result as one document each with the PDFs inside, without the Recon sign-in', async () => {
   mk({ tenders: [FULL()], inbox: letters('29263265'), letterAsPdf: true, corres: CORRES });
   store['doclink.saveDestination'] = 'recon';
-  await withDirectEcm(async ({ creates, gateway, asked }) => {
+  await withDirectEcm(async ({ creates, attaches, docs, gateway }) => {
     const r = await run();
+    const c = r.categories;
     assert.equal(r.summary.failed, 0);
     assert.equal(gateway.length, 0, 'the Recon Engine gateway is not called');
     const kinds = creates.reduce((m, p) => ({ ...m, [p['InvoiceCertificateSchema:type']]: (m[p['InvoiceCertificateSchema:type']] || 0) + 1 }), {});
-    assert.deepEqual(kinds, { nit: 5, extension: 2, nbsp: 2, co: 1, loi: 1, crp: 2, vft: 1, vct: 1 });
+    assert.deepEqual(kinds, { nit: 1, loi: 1, tenderResult: 1, extension: 2, nbsp: 2, co: 1, crp: 2, vct: 1 }, 'one NIT, one LOA and one Result document for the tender');
     assert.ok(creates.every((p) => p.folder === 'aa28acbe-add1-49d3-b0ab-16ab1263996c' && p['InvoiceCertificateSchema:tenderNumber'] === '29263265'));
-    const loi = creates.find((p) => p['InvoiceCertificateSchema:type'] === 'loi');
-    assert.equal(loi['dc:title'], '29263265 - LOI - 1461928');
+    const byTitle = (title) => [...docs.values()].find((d) => d.props['dc:title'] === title);
+    // "<T> - NIT": the tender PDF is the main file (the attachments wait for it), the attached documents its attachments
+    const nit = byTitle('29263265 - NIT');
+    assert.equal(nit.main.name, 'NIT_29263265.pdf');
+    assert.equal(nit.files.length, 4);
+    assert.ok(nit.files.every((f) => /^Attachment_0\d_/.test(f.name)), nit.files.map((f) => f.name).join());
+    assert.deepEqual(attaches.map(([title]) => title), Array(4).fill('29263265 - NIT'), 'only the NIT document had more than one PDF');
+    assert.ok(c.attachments.files.every((f) => f.ecm.status === 'stored' && f.ecm.uid === c.tenderPdf.files[0].ecm.uid), 'every attachment is in the NIT document');
+    // "<T> - LOA": the letter id in the file name, so a later letter cannot clash with it
+    assert.equal(byTitle('29263265 - LOA').main.name, 'LOA_29263265_1461928.pdf');
+    // "<T> - Result": the Financial Tabulation, type tenderResult ("Tender Result")
+    const result = byTitle('29263265 - Result');
+    assert.deepEqual([result.props['InvoiceCertificateSchema:type'], result.main.name], ['tenderResult', 'Financial_Tabulation_29263265.pdf']);
+    assert.equal(byTitle('29263265 - Commercial Tabulation').props['InvoiceCertificateSchema:type'], 'vct');
     // the properties the TEST ECM's InvoiceCertificateSchema has (anything else: HTTP 400 "No such property")
-    const props = new Set(['dc:title', 'file:content', 'InvoiceCertificateSchema:type', 'InvoiceCertificateSchema:tenderNumber']);
+    const props = new Set(['dc:title', 'file:content', 'InvoiceCertificateSchema:type', 'InvoiceCertificateSchema:tenderNumber', 'InvoiceCertificateSchema:tenderDate']);
     assert.ok(creates.every((p) => Object.keys(p).filter((k) => k !== 'folder').every((k) => props.has(k))), JSON.stringify(creates[0]));
+    assert.ok(creates.every((p) => p['InvoiceCertificateSchema:tenderDate'] === '2026-11-09'), `the tender date on every document: ${JSON.stringify(creates.map((p) => p['InvoiceCertificateSchema:tenderDate']))}`);
     assert.equal(r.categories.tenderPdf.files[0].ecm.status, 'stored');
     assert.equal(r.categories.tenderPdf.files[0].ecm.uid.startsWith('n-'), true);
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
@@ -1173,7 +1235,24 @@ test('ECM direct: with ecmBackendAws false every tender document goes straight t
   const asked = await withDirectEcm(async (seen) => seen.asked);
   assert.equal(asked, 0, 'no Recon sign-in asked in direct mode');
 });
-test('ECM: letters by date go to the ECM with the tender number only, without searching IREPS for the tender date', async () => {
+test('ECM direct: when IREPS serves the tender PDF last, it is still the main file of "<T> - NIT" (the attachments wait for it)', async () => {
+  mk({ tenders: [FULL()] });
+  store['doclink.saveDestination'] = 'recon';
+  const orig = server.handle.bind(server);
+  server.handle = async (m, u, b) => {
+    if (/viewNitPdf_\d+\.pdf$/.test(new URL(u, 'http://x').pathname)) await new Promise((r) => setTimeout(r, 300));
+    return orig(m, u, b);
+  };
+  await withDirectEcm(async ({ creates, docs }) => {
+    const r = await run('29263265', { only: ['tenderPdf', 'attachments'] });
+    assert.equal(r.summary.failed, 0);
+    assert.equal(creates.length, 1);
+    const nit = [...docs.values()][0];
+    assert.equal(nit.main.name, 'NIT_29263265.pdf');
+    assert.equal(nit.files.length, 4);
+  });
+});
+test('ECM: letters by date go to the ECM with the tender number and the tender date IREPS search finds (blank when it finds no tender)', async () => {
   const at = (n) => new Date(NOW() - n * D);
   const closing = new Date(NOW() - 3 * D);
   mk({
@@ -1189,13 +1268,38 @@ test('ECM: letters by date go to the ECM with the tender number only, without se
   await withEcm((p, n) => [201, { uid: `u-${n}`, path: '/x', title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
     const r = await jobs.downloadLettersByDate();
     assert.equal(r.summary.newLetters, 4);
-    assert.deepEqual(posts.map((p) => p.kind).sort(), ['co', 'loi', 'nbsp', 'nbsp']);
-    const loi = posts.find((p) => p.kind === 'loi');
-    assert.deepEqual([loi.title, loi.fields], ['LOA3 - LOI - 31', { tender_number: 'LOA3' }]);
-    assert.ok(posts.every((p) => Object.keys(p.fields).join() === 'tender_number'));
+    assert.deepEqual(posts.map((p) => p.kind).sort(), ['co', 'nbsp', 'nbsp'], 'the LOA ("<T> - LOA", one document per tender) needs the direct ECM upload');
+    const day = `${closing.getFullYear()}-${String(closing.getMonth() + 1).padStart(2, '0')}-${String(closing.getDate()).padStart(2, '0')}`;
+    assert.ok(posts.filter((p) => p.kind === 'nbsp').every((p) => p.fields.tender_date === day), 'NEG1\'s closing date');
+    assert.deepEqual(posts.find((p) => p.kind === 'co').fields, { tender_number: 'GONE' }, 'a tender IREPS search does not find: no tender date, still uploaded');
     assert.ok(posts.every((p) => p.account === '833' && p.unit === 'HOSUR'));
-    assert.equal(server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do').length, 0, 'no tender search: the ECM has no tenderDate to fill');
-    assert.ok(!savedNames().some((n) => /\/(Negotiation|Counter_Offers|Advance_Acceptance_LOA)\//.test(n)), 'nothing that went to the ECM is in Downloads');
+    assert.ok(server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do').length > 0, 'the tender is searched for its closing date (once per tender)');
+    assert.ok(!savedNames().some((n) => /\/(Negotiation|Counter_Offers)\//.test(n)), 'nothing that went to the ECM is in Downloads');
+    assert.ok(savedNames().some((n) => /\/Advance_Acceptance_LOA\//.test(n)), 'the LOA is saved locally instead');
+  });
+});
+test('ECM direct: an LOA letter found on a later day goes into the tender\'s "<T> - LOA" document as an attachment, with the tender date', async () => {
+  const at = (n) => new Date(NOW() - n * D);
+  const closing = new Date(NOW() - 3 * D);
+  const day = `${closing.getFullYear()}-${String(closing.getMonth() + 1).padStart(2, '0')}-${String(closing.getDate()).padStart(2, '0')}`;
+  const withLetters = (...letterIds) => mk({
+    tenders: [T({ no: 'LOA3', nitId: '31', oid: '310', closing })],
+    inbox: { MyAdvanceAcceptanceLetter: letterIds.map((letter) => ({ no: 'LOA3', oid: '5003', letter, date: at(0) })) },
+    letterAsPdf: true,
+  });
+  await withDirectEcm(async ({ creates, attaches, docs }) => {
+    withLetters('31');
+    store['doclink.saveDestination'] = 'recon';
+    await jobs.downloadLettersByDate();
+    assert.deepEqual(creates.map((p) => [p['InvoiceCertificateSchema:type'], p['dc:title'], p['InvoiceCertificateSchema:tenderDate']]), [['loi', 'LOA3 - LOA', day]]);
+    // a second letter, alone in a later run: locally "LOA_LOA3.pdf" again, in the ECM its own name
+    withLetters('32');
+    store['doclink.saveDestination'] = 'recon';
+    await jobs.downloadLettersByDate();
+    assert.equal(creates.length, 1, 'no second LOA document');
+    assert.deepEqual(attaches, [['LOA3 - LOA', 'LOA_LOA3_32.pdf']]);
+    const loa = [...docs.values()][0];
+    assert.deepEqual([loa.main.name, ...loa.files.map((f) => f.name)], ['LOA_LOA3_31.pdf', 'LOA_LOA3_32.pdf']);
   });
 });
 test('ECM: the correspondence page\'s Closing Date fills the tender date when the run did not search the tender', () => {
@@ -1507,7 +1611,35 @@ test('Tabulation: a web page with no PDF behind it fails with what IREPS showed;
   assert.match(cat.files[0].error, /only a web page: "financialTabulation 107263731/);
   assert.deepEqual(savedNames(), []);
 });
-for (const [mode, file] of [['iframe', '/ireps/upload/tbo/Tabulation_'], ['form', '/epsn/tbo/showTabulation.do'], ['open', '/ireps/upload/tbo/view']]) {
+test('Tabulation: the real IREPS answer (a page that opens the PDF from <body onload>) gives the FIN-TAB PDF, saved as the Financial Tabulation', async () => {
+  mk({ closed: [closed('42263731')], tabulationAs: 'onload' });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
+  assert.ok(paths().includes('/ireps/supply/pdfdocs//112026/107263731/FIN-TAB-42263731-107263731.pdf'), paths().join('\n'));
+  const f = saved.find((x) => x.filename.endsWith('Tabulation/Financial_Tabulation_42263731.pdf'));
+  assert.match(new TextDecoder().decode(f.bytes), /^%PDF/);
+});
+test('Tabulation: the real IREPS Commercial answer opens TECH-TAB-<no>-<oid>.pdf from <body onload>; it is saved as the Commercial Tabulation', async () => {
+  mk({ closed: [closed('42263731')], tabulationAs: 'onload' });
+  const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
+  assert.deepEqual(server.tabFileHits, ['/ireps/supply/pdfdocs//112026/107263731/TECH-TAB-42263731-107263731.pdf']);
+  const f = saved.find((x) => x.filename.endsWith('Tabulation/Commercial_Tabulation_42263731.pdf'));
+  assert.match(new TextDecoder().decode(f.bytes), /^%PDF/);
+});
+test('Tabulation: a TECH-TAB file passes only inside a Commercial Tabulation response; Techno-Commercial names and pdfTypes never do', async () => {
+  mk({});
+  const tech = '/ireps/supply/pdfdocs//112026/1/TECH-TAB-X-1.pdf';
+  const get = (url, trusted) => core.irepsFetch('https://www.ireps.gov.in', url, { trusted });
+  assert.equal((await get(tech, 'commercialTabulation')).status, 200);
+  for (const trusted of [false, true, 'financialTabulation']) await assert.rejects(() => get(tech, trusted), (e) => e.code === 'EXCLUDED', String(trusted));
+  assert.equal(core.isExcludedUrl(tech), true, 'outside a tabulation response it stays blocked');
+  for (const url of ['/ireps/upload/tbo/TechnoCommercial_Tabulation_1.pdf', '/ireps/supply/pdfdocs//112026/1/TECHNO-TAB-X-1.pdf', '/ireps/upload/tbo/TECH-TAB-X-1.pdf', `${tech}?x=1`, '/epsn/tbo/commTboPdfAction.do?pdfType=technoCommercialTabulation&tenderOID=1']) {
+    await assert.rejects(() => get(url, 'commercialTabulation'), (e) => e.code === 'EXCLUDED', url);
+  }
+  assert.ok(!server.excludedHit);
+});
+for (const [mode, file] of [['iframe', '/ireps/upload/tbo/Tabulation_'], ['form', '/epsn/tbo/showTabulation.do'], ['open', '/ireps/upload/tbo/view'], ['onload', '/ireps/supply/pdfdocs//112026/107263731/TECH-TAB-']]) {
   test(`Tabulation: the PDF behind a viewer page (${mode}) is downloaded; Techno-Commercial links in it are never requested`, async () => {
     mk({ closed: [closed('42263731')], tabulationAs: mode });
     const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
@@ -1525,15 +1657,15 @@ test('Tabulation: the 29 Oct capture of Closed Tenders lists the seven tenders w
   assert.deepEqual(withTab.map((r) => r.tenderNo), ['24260725', '61266411', '61262196', '82261482', '26261089', 'LN265570', 'LF265194']);
   assert.deepEqual([withTab[0].closingDate, withTab[0].tenderOid, withTab[0].links.financialTabulation.method], ['29/10/2026 11:30', '107120554', 'POST']);
 });
-test('Tabulation: Save to ECM files them as vft / vct with "<tender no> - <type>" and the tender number', async () => {
+test('Tabulation: Save to ECM files the Financial Tabulation as "<tender no> - Result" (tenderResult) and the Commercial one as vct, with the tender number and the Closed Tenders closing date', async () => {
   mk({ closed: [closed('42263731', { closing: new Date(2026, 9, 23) })] });
   store['doclink.saveDestination'] = 'recon';
-  await withEcm((p, n) => [201, { uid: `u-${n}`, path: `/FT/x/${n}`, title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
+  await withDirectEcm(async ({ creates }) => {
     await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
     await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
-    assert.deepEqual(posts.map((p) => [p.kind, p.title, p.fields.tender_number, p.fields.tender_date, p.account]), [
-      ['vft', '42263731 - Financial Tabulation', '42263731', undefined, '833'],
-      ['vct', '42263731 - Commercial Tabulation', '42263731', undefined, '833'],
+    assert.deepEqual(creates.map((p) => [p['InvoiceCertificateSchema:type'], p['dc:title'], p['InvoiceCertificateSchema:tenderNumber'], p['InvoiceCertificateSchema:tenderDate']]), [
+      ['tenderResult', '42263731 - Result', '42263731', '2026-10-23'],
+      ['vct', '42263731 - Commercial Tabulation', '42263731', '2026-10-23'],
     ]);
     assert.equal(saved.length, 0, 'nothing that went to the ECM is in Downloads');
   });

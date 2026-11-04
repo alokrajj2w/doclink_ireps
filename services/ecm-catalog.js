@@ -22,10 +22,9 @@ export const TYPE_PROPERTY = "InvoiceCertificateSchema:type";
 /**
  * Field key (what DocLink sends) -> Nuxeo property. Values are strings; *_date as YYYY-MM-DD.
  * Only properties the ECM's InvoiceCertificateSchema has: a search or create naming any other
- * answers HTTP 400 "No such property". The spec also lists tenderDate, loiNumber and loiDate,
- * but the TEST ECM does not have them (GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema,
- * 26/10/2026), so tender documents carry the tender number only. When the ECM team adds them,
- * map them here (tender_date, loi_number, loi_date) and list them in the kinds below.
+ * answers HTTP 400 "No such property". tenderDate, loiNumber and loiDate were added to the TEST
+ * ECM after 26/10/2026 (seen in GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema on
+ * 03/11/2026), as the gateway's document_kinds.toml already lists them.
  */
 export const ECM_FIELDS = Object.freeze({
   invoice_number: "InvoiceCertificateSchema:invoiceNumber",
@@ -34,19 +33,28 @@ export const ECM_FIELDS = Object.freeze({
   ic_date: "InvoiceCertificateSchema:icDate",
   co_number: "InvoiceCertificateSchema:coNumber",
   modification_advise_number: "InvoiceCertificateSchema:modificationAdviseNumber",
-  tender_number: "InvoiceCertificateSchema:tenderNumber"
+  tender_number: "InvoiceCertificateSchema:tenderNumber",
+  tender_date: "InvoiceCertificateSchema:tenderDate",
+  loi_number: "InvoiceCertificateSchema:loiNumber",
+  loi_date: "InvoiceCertificateSchema:loiDate"
 });
 
-const TENDER_FIELDS = Object.freeze({ fields: ["tender_number"], required: ["tender_number"], location: "tenders" });
+// tender_date (the IREPS closing date) is sent whenever the run knows it; only the number is required
+const TENDER_FIELDS = Object.freeze({ fields: ["tender_number", "tender_date"], required: ["tender_number"], location: "tenders" });
 const tenderKind = (code, extra = {}) => Object.freeze({ ...TENDER_FIELDS, code, title: `{tender_number} - ${code}`, ...extra });
+// One ECM document per tender, titled "<tender no> - <code>": the first PDF is its main file
+// (file:content), every later one an attachment (files:files), told apart by file name.
+// Direct ECM only (services/ecm-direct.js); the Recon gateway cannot add attachments yet.
+const groupKind = (code, extra = {}) => tenderKind(code, { group: true, ...extra });
 
 /**
  * Keyed by ECM_KIND values (services/ecm-service.js; written out here so this module
  * does not import ecm-service.js, which imports the direct upload that imports this).
  * Per kind: fields it may carry, fields an upload must supply, the site location new
  * documents go to, and the dc:title: "<document number> - <code>", as the sheet's row 4
- * (API) names them ("Example Title - IC", "- PO", "- MA", "- NIT", "- LOI", "- NBSP",
- * "- Extension", "- CRP", "- CO", "- Financial Tabulation", "- Commercial Tabulation") with row 8 (Title) giving the number: IC, PO or MA
+ * (API) names them ("Example Title - IC", "- PO", "- MA", "- NIT", "- NBSP",
+ * "- Extension", "- CRP", "- CO", "- Commercial Tabulation"; "- LOA" and "- Result" as the
+ * Wabtec team asked on 2026-10-29) with row 8 (Title) giving the number: IC, PO or MA
  * number, else the tender number. `title` is the template used when the upload gives no
  * title; tender uploads give their own (tender/tender-ecm.js), which starts the same way.
  * "ECM - Download speci-v1" marks more fields mandatory than IREPS supplies (or the ECM
@@ -57,15 +65,21 @@ export const ECM_KINDS = Object.freeze({
   inspectionCertificate: { fields: ["invoice_number", "customer_po_number", "ic_number", "ic_date", "co_number"], required: ["ic_number", "customer_po_number"], location: "inputs", code: "IC", title: "{ic_number} - IC" },
   poCopy: { fields: ["customer_po_number"], required: ["customer_po_number"], location: "inputs", code: "PO", title: "{customer_po_number} - PO" },
   modificationAdvise: { fields: ["customer_po_number", "modification_advise_number", "tender_number"], required: ["customer_po_number", "modification_advise_number"], location: "inputs", code: "MA", title: "{modification_advise_number} - MA" },
-  nit: tenderKind("NIT"),
+  // grouped (group: true, see groupKind): "<T> - NIT" (tender PDF + its attached documents),
+  // "<T> - LOA" (every Advance Acceptance Letter), "<T> - Result" (Financial Tabulation)
+  nit: groupKind("NIT"),
+  loi: groupKind("LOA", { fields: ["tender_number", "tender_date", "loi_number", "loi_date"] }),
+  tenderResult: groupKind("Result"), // the ECM's type "Tender Result" (vocabulary invoice_certificate_document_types)
   nbsp: tenderKind("NBSP"),
   extension: tenderKind("Extension"),
   crp: tenderKind("CRP"),
   co: tenderKind("CO"),
-  loi: tenderKind("LOI"),
-  vft: tenderKind("Financial Tabulation"),
+  vft: tenderKind("Financial Tabulation"), // no longer used by DocLink (Financial Tabulation -> tenderResult); kept in step with the gateway
   vct: tenderKind("Commercial Tabulation")
 });
+
+/** True for a kind kept as one ECM document per tender (nit, loi, tenderResult). */
+export const isGroupedKind = (kind) => Boolean(ECM_KINDS[kind] && ECM_KINDS[kind].group);
 
 /**
  * Sites by environment.

@@ -35,6 +35,7 @@ import { logger } from "../utils/logger.js";
 import { RECON_CONFIG, loadReconConfig, reconConfigProblem, manifestHostPermissions, apiErrorDetail } from "./recon-service.js";
 import { loadEcmConfig, isDirectEcm } from "./ecm-config.js";
 import { uploadToNuxeo, findInFolder } from "./ecm-direct.js";
+import { isGroupedKind } from "./ecm-catalog.js";
 
 const CHECK_TIMEOUT_MS = 30000;
 
@@ -49,7 +50,8 @@ export const ECM_KIND = Object.freeze({
   EXTENSION: "extension", //     Tender extension / qty change (Corrigendum)
   CRP: "crp", //                 Correspondence Reply pending
   COUNTER_OFFER: "co",
-  FINANCIAL_TABULATION: "vft", // Financial Tabulation (IREPS "View Financial Tabulation")
+  FINANCIAL_TABULATION: "vft", // Financial Tabulation (IREPS "View Financial Tabulation"); DocLink files it as TENDER_RESULT
+  TENDER_RESULT: "tenderResult", // "<T> - Result": the Financial Tabulation (ECM type "Tender Result")
   COMMERCIAL_TABULATION: "vct" // Commercial Tabulation (IREPS "View Commercial Tabulation")
 });
 
@@ -183,6 +185,8 @@ async function uploadViaGateway(doc, deps) {
   const problem = reconConfigProblem(baseUrl, deps.hostPermissions || manifestHostPermissions(), ENDPOINT);
   if (problem) throw new EcmError(ECM_ERROR.NOT_CONFIGURED, { detail: problem });
   if (!Object.values(ECM_KIND).includes(doc.kind)) throw new Error(`Unsupported ECM kind: ${doc.kind}`);
+  // one document per tender with its PDFs as attachments: the gateway cannot add to a document yet
+  if (isGroupedKind(doc.kind)) throw new EcmError(ECM_ERROR.REJECTED, { detail: `${doc.kind} documents (one per tender, PDFs as attachments) need the direct ECM upload (config.json "ecmBackendAws": false)` });
   const account = doc.account || {};
   if (!account.irepsAccountId && !account.operatingUnit) {
     throw new EcmError(ECM_ERROR.ACCOUNT_UNKNOWN, { detail: "the IREPS account could not be verified" });

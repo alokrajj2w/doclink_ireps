@@ -4,7 +4,9 @@
 //
 // Financial and Commercial Tabulation are downloaded from the tender's row (or its row in IREPS "Closed
 // Tenders"); OUT OF SCOPE (never requested, enforced in tender-core.isExcludedUrl):
-//   Techno-Commercial Tabulation (TECH-TAB) and any other commTboPdfAction.do pdfType.
+//   any other commTboPdfAction.do pdfType (e.g. a Techno-Commercial Tabulation). "TECH-TAB-<no>-<oid>.pdf" is
+//   IREPS's name for the Commercial Tabulation itself, not a Techno-Commercial one; it passes only inside a
+//   commercialTabulation response.
 
 import {
   TenderError, SESSION_MSG, log, norm,
@@ -14,7 +16,7 @@ import {
 import { getActiveIrepsAccountContext, assertSameAccount, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { printPageToPdf } from './tender-print.js';
 import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
-import { ecmDocumentFor, tenderEcmSink, ensureDownloadSignIn, CATEGORY_ECM_KIND } from './tender-ecm.js';
+import { ecmDocumentFor, ecmCheckDocumentFor, ecmFileName, tenderEcmSink, ensureDownloadSignIn, CATEGORY_ECM_KIND } from './tender-ecm.js';
 import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
 
 const INBOX_PATH = '/epsn/vendorInboxLink.do';
@@ -88,14 +90,14 @@ export function dedupeItems(items) {
  *                      the page and each attachment are saved, as "<name>_Attachment_N<ext>"
  *   action.pageOnly  : the page alone is the document (an LOA letter): nothing it links is fetched and exactly
  *                      one file is saved (no .html companion when Chrome cannot print it)
- *   action.trusted   : an allowed Financial / Commercial Tabulation response (see resolveIrepsDocument)
+ *   action.trusted   : an allowed Financial / Commercial Tabulation response, its pdfType (see resolveIrepsDocument)
  *   action.logAs     : log tag for what IREPS answered (describeResponse)
  * -> { files, converted, printError, attachmentErrors }
  */
 export async function resolveAndDownloadIrepsDocument(action, run) {
   if (action.before) await action.before();
   let doc = await fetchDocument(run.base, { ...action.req, relativeTo: action.req.relativeTo || run.ctx.searchUrl },
-    { allowHtml: !!action.allowHtml, allowAnyFile: !!action.allowAnyFile, keepPage: !!action.keepPage, pageOnly: !!action.pageOnly, trusted: !!action.trusted, logAs: action.logAs || '', nameHint: action.nameHint || '' });
+    { allowHtml: !!action.allowHtml, allowAnyFile: !!action.allowAnyFile, keepPage: !!action.keepPage, pageOnly: !!action.pageOnly, trusted: action.trusted || false, logAs: action.logAs || '', nameHint: action.nameHint || '' });
   let printError = '';
   if (doc.kind === 'html' && action.print) {
     try {
@@ -145,7 +147,9 @@ async function saveDocument(run, action, { fileName, bytes, contentType, id, met
   let ecm = null;
   if (ecmDoc) {
     const mimeType = /\.pdf$/i.test(fileName) ? 'application/pdf' : contentType || 'application/octet-stream';
-    ({ ecm, local: saved } = await run.ecm.save({ ...ecmDoc, bytes, filename: fileName, mimeType },
+    // "<T> - NIT": the tender PDF becomes the document's main file, so its attachments wait for it (runSteps)
+    if (action.category === 'ATTACHMENTS' && run.nitPdfSaved) await run.nitPdfSaved;
+    ({ ecm, local: saved } = await run.ecm.save({ ...ecmDoc, bytes, filename: ecmFileName(action.category, fileName, id), mimeType },
       () => run.saver.save(action.subdir, fileName, bytes)));
     log('Download', `ECM ${ecm.status}${ecm.site ? ` (${ecm.site})` : ''}: ${fileName}`);
   } else {
@@ -184,7 +188,7 @@ async function checkAlreadyDownloaded(run, result, items, build) {
     id: itemId(it),
     label: `${run.ctx.tenderNo} - ${build(it).meta?.title || it.id || result.category}`,
     log: { docType: TENDER_DOC_TYPE[result.category] || 'tender_document', key: downloadKey.tender(result.category, run.ctx.tenderNo, it.id) },
-    ecm: toEcm ? ecmDocumentFor(result.category, build(it), run.ctx) : null,
+    ecm: toEcm ? ecmCheckDocumentFor(result.category, build(it), run.ctx) : null, // null for grouped kinds (NIT, LOA, Result)
   }));
   const memo = run.redownloadMemo || (run.redownloadMemo = {});
   const ask = (question) => {
@@ -807,7 +811,7 @@ export function downloadTabulation(run, pdfType, rq, { relativeTo = '' } = {}) {
   // the tabulation is a PDF: one behind a viewer page is followed (trusted), a web page alone is a failure,
   // never printed as if it were the tabulation; every response is logged under "Tabulation"
   return downloadItems(run, r, [item], (it) => ({
-    req: it.req, subdir: 'Tabulation', id: it.id, meta: { title: t.label }, trusted: true, logAs: 'Tabulation',
+    req: it.req, subdir: 'Tabulation', id: it.id, meta: { title: t.label }, trusted: pdfType, logAs: 'Tabulation',
     fileName: (ext) => `${t.file}_${safeSegment(ctx.tenderNo)}${ext}`,
   }));
 }
@@ -1279,23 +1283,32 @@ export async function runSteps(run, keys, onProgress = () => {}) {
   let aborted = null;
   if (run.ecm === undefined) run.ecm = await tenderEcmSink(run.account); // Save to: ECM / S3, or null
   const steps = STEPS.filter(([k]) => keys.includes(k));
+  // The ECM's "<T> - NIT" document takes the tender PDF as its main file: when both steps run, the
+  // attachments are fetched in parallel as usual but go to the ECM only once the tender PDF step is over.
+  let nitPdfDone = null;
+  if (run.ecm && keys.includes('tenderPdf') && keys.includes('attachments')) run.nitPdfSaved = new Promise((resolve) => { nitPdfDone = resolve; });
   let started = 0;
   await Promise.all(steps.map(async ([key, msg, fn]) => {
-    if (aborted) {
-      categories[key] = failedCategory(TYPE[key], `Skipped: ${aborted.message}`);
-      return;
-    }
-    onProgress(started++ === 0 ? msg : `${msg} (in parallel)`);
-    run.onProgress = onProgress;
     try {
-      await assertSameAccount(run.account, { base: run.base });
-      categories[key] = await fn(run);
-    } catch (e) {
-      if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = aborted || { code: e.code, message: e.message };
-      else log(TYPE[key], `failed: ${e.message}`);
-      categories[key] = failedCategory(TYPE[key], e.message);
+      if (aborted) {
+        categories[key] = failedCategory(TYPE[key], `Skipped: ${aborted.message}`);
+        return;
+      }
+      onProgress(started++ === 0 ? msg : `${msg} (in parallel)`);
+      run.onProgress = onProgress;
+      try {
+        await assertSameAccount(run.account, { base: run.base });
+        categories[key] = await fn(run);
+      } catch (e) {
+        if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = aborted || { code: e.code, message: e.message };
+        else log(TYPE[key], `failed: ${e.message}`);
+        categories[key] = failedCategory(TYPE[key], e.message);
+      }
+    } finally {
+      if (key === 'tenderPdf' && nitPdfDone) nitPdfDone(); // done, failed or skipped: never hold the attachments
     }
   }));
+  delete run.nitPdfSaved;
   return { categories, aborted };
 }
 

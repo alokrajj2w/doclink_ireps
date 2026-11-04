@@ -9,7 +9,7 @@
  */
 
 import { uploadToEcm, saveToEcmOrLocally, describeEcmOutcome, EcmError, ECM_ERROR, ECM_KIND, ECM_OUTCOME } from "../services/ecm-service.js";
-import { uploadToNuxeo, buildEcmQuery, existingDocumentQuery, nxqlLiteral, searchEcm, resetEcmDirectState, oldFileName } from "../services/ecm-direct.js";
+import { uploadToNuxeo, buildEcmQuery, existingDocumentQuery, groupDocumentQuery, fileXpath, nxqlLiteral, searchEcm, resetEcmDirectState, oldFileName } from "../services/ecm-direct.js";
 import { applyEcmConfig, mergeConfig, ECM_CONFIG, isDirectEcm } from "../services/ecm-config.js";
 import { ECM_KINDS, ECM_SITES, routeSite } from "../services/ecm-catalog.js";
 import { applyReconConfig } from "../services/recon-service.js";
@@ -43,12 +43,14 @@ function jsonResponse(status, body) {
  *                 (the record keeps the uploaded length, as on the TEST ECM); for an existing
  *                 document or one created here
  *   damagedOnPut  uid -> the same for the main file a PUT stores
+ *   damagedOnAttach uid -> the same for a file Blob.AttachOnDocument adds to that document
  *   trashFails    uids whose Document.Trash the ECM refuses (fn.trashed lists the ones trashed)
  * GET /id/{uid} opens a catalog folder (ECM_SITES) or a stored document (its file:content and
- * files:files); /@blob/<xpath> serves one of its files; PUT /id/{uid} sets them from the batch.
+ * files:files); /@blob/<xpath> serves one of its files; PUT /id/{uid} sets them from the batch;
+ * POST /upload/{batch}/0/execute/Blob.AttachOnDocument appends the batch file to files:files.
  */
 const FOLDER_PATHS = Object.fromEntries(Object.values(ECM_SITES).flatMap((sites) => Object.values(sites).flatMap((site) => Object.entries(site.folderIds).map(([location, uid]) => [uid, site.locations[location]]))));
-function fakeNuxeo({ existing = [], folders = {}, respond, damaged = {}, damagedOnPut = {}, trashFails = [] } = {}) {
+function fakeNuxeo({ existing = [], folders = {}, respond, damaged = {}, damagedOnPut = {}, damagedOnAttach = {}, trashFails = [] } = {}) {
   const calls = [];
   const trashed = [];
   let tokens = 0;
@@ -75,6 +77,16 @@ function fakeNuxeo({ existing = [], folders = {}, respond, damaged = {}, damaged
       return jsonResponse(200, { entries: existing, isNextPageAvailable: false });
     }
     if (call.path === "/nuxeo/api/v1/upload") return jsonResponse(201, { batchId: "batch-1" });
+    if (call.path.endsWith("/execute/Blob.AttachOnDocument")) {
+      const { document: uid, xpath, save } = JSON.parse(call.body).params;
+      const doc = stored.get(uid);
+      if (!doc || xpath !== "files:files" || save !== true) return jsonResponse(404, { "entity-type": "exception", status: 404, message: `${uid} ${xpath}` });
+      // /nuxeo/api/v1/upload/{batchId}/{fileId}/execute/Blob.AttachOnDocument
+      const file = fromBatch({ "upload-fileId": call.path.split("/")[6] });
+      doc.files.push(record(file.name, file.length, damagedOnAttach[uid]));
+      // the operation answers with the attached file itself
+      return new Response(new Uint8Array(file.length), { status: 200, headers: { "Content-Type": "application/pdf" } });
+    }
     if (call.path.startsWith("/nuxeo/api/v1/upload/")) {
       const fileId = call.path.split("/").pop();
       batch[fileId] = { name: decodeURIComponent(call.headers["X-File-Name"] || ""), length: call.body ? call.body.length : 0 };
@@ -380,7 +392,7 @@ export async function runEcmDirectTests({ test, assert, eq }) {
       poCopy: { customer_po_number: "PO-1" },
       modificationAdvise: { customer_po_number: "PO-1", modification_advise_number: "MA-1" },
     };
-    const TITLES = { inspectionCertificate: "1 - IC", poCopy: "PO-1 - PO", modificationAdvise: "MA-1 - MA", nit: "T-1 - NIT", nbsp: "T-1 - NBSP", extension: "T-1 - Extension", crp: "T-1 - CRP", co: "T-1 - CO", loi: "T-1 - LOI", vft: "T-1 - Financial Tabulation", vct: "T-1 - Commercial Tabulation" };
+    const TITLES = { inspectionCertificate: "1 - IC", poCopy: "PO-1 - PO", modificationAdvise: "MA-1 - MA", nit: "T-1 - NIT", nbsp: "T-1 - NBSP", extension: "T-1 - Extension", crp: "T-1 - CRP", co: "T-1 - CO", loi: "T-1 - LOA", tenderResult: "T-1 - Result", vft: "T-1 - Financial Tabulation", vct: "T-1 - Commercial Tabulation" };
     eq(Object.keys(ECM_KINDS).sort().join(), Object.values(ECM_KIND).sort().join(), "the catalog covers every kind DocLink uploads");
     for (const [account, siteKey] of [[HOSUR, "hosur"], [ROHTAK, "rohtak"]]) {
       for (const kind of Object.values(ECM_KIND)) {
@@ -396,6 +408,85 @@ export async function runEcmDirectTests({ test, assert, eq }) {
         eq(result.site, siteKey);
       }
     }
+  });
+
+  // A tender's grouped document ("<T> - NIT") already in the Hosur Tenders folder, without a tender date.
+  const groupDoc = (title = "T-1 - NIT", main = "NIT_T-1.pdf", files = ["Attachment_01_A.pdf"]) => ({
+    uid: "g-1", title, file: main, files,
+    properties: {
+      "dc:title": title, "InvoiceCertificateSchema:type": "nit", "InvoiceCertificateSchema:tenderNumber": "T-1",
+      "file:content": { name: main, length: "5" }, "files:files": files.map((name) => ({ file: { name, length: "4" } }))
+    }
+  });
+  const NIT_PDF = (filename) => ({ ...IC, kind: ECM_KIND.NIT, filename, title: "T-1 - NIT", fields: { tender_number: "T-1", tender_date: "09/11/2026" } });
+
+  await test("ECM direct: NIT, LOA and Result are one document per tender: the first PDF creates it, a later one is attached to it", async () => {
+    fresh();
+    const empty = fakeNuxeo();
+    const first = await uploadToNuxeo(NIT_PDF("NIT_T-1.pdf"), { fetch: empty, hostPermissions: HOSTS });
+    eq(empty.creates().length, 1, "no document yet: created, the PDF as its main file");
+    eq(JSON.parse(empty.creates()[0].body).properties["dc:title"], "T-1 - NIT");
+    eq(first.deduplicated, false);
+    const lookup = empty.calls.find((c) => c.query && c.query.includes("dc:title"));
+    eq(lookup.query, groupDocumentQuery({ kind: "nit", folderUid: ECM_SITES.TEST.hosur.folderIds.tenders, title: "T-1 - NIT", values: { tender_number: "T-1", tender_date: "2026-11-09" } }));
+    assert(!lookup.query.includes("file:content/name") && !lookup.query.includes("tenderDate") && lookup.query.endsWith("ORDER BY dc:created ASC"), `found by type, folder, title and tender number, oldest first: ${lookup.query}`);
+
+    fresh();
+    const fetch = fakeNuxeo({ existing: [groupDoc()] });
+    const added = await uploadToNuxeo(NIT_PDF("Attachment_02_B.pdf"), { fetch, hostPermissions: HOSTS });
+    eq(JSON.stringify([added.uid, added.deduplicated]), JSON.stringify(["g-1", false]));
+    eq(fetch.creates().length, 0, "no new document");
+    const attach = fetch.calls.filter((c) => c.path.endsWith("/execute/Blob.AttachOnDocument"));
+    eq(attach.length, 1);
+    eq(attach[0].path, "/nuxeo/api/v1/upload/batch-1/0/execute/Blob.AttachOnDocument");
+    eq(JSON.stringify(JSON.parse(attach[0].body).params), JSON.stringify({ document: "g-1", xpath: "files:files", save: true }));
+    eq(fetch.stored.get("g-1").files.map((f) => f.name).join(), "Attachment_01_A.pdf,Attachment_02_B.pdf", "appended, the other files not re-sent");
+    eq(fetch.of("/nuxeo/api/v1/upload/batch-1/").filter((c) => !c.path.includes("/execute/")).length, 1, "only the new PDF is uploaded");
+    // the tender date the document lacked is filled in; nothing else is changed
+    const puts = fetch.calls.filter((c) => c.method === "PUT");
+    eq(puts.length, 1);
+    eq(JSON.stringify(JSON.parse(puts[0].body).properties), JSON.stringify({ "InvoiceCertificateSchema:tenderDate": "2026-11-09" }));
+    // the new attachment is read back to its last byte
+    assert(fetch.calls.some((c) => c.path === "/nuxeo/api/v1/id/g-1/@blob/files:files/1/file" && c.headers.Range), "files:files/1 read back");
+  });
+
+  await test("ECM direct: a PDF already in the tender's document (main file or attachment, by name) is not added again", async () => {
+    for (const name of ["NIT_T-1.pdf", "Attachment_01_A.pdf"]) {
+      fresh();
+      const fetch = fakeNuxeo({ existing: [groupDoc()] });
+      const result = await uploadToNuxeo(NIT_PDF(name), { fetch, hostPermissions: HOSTS });
+      eq(JSON.stringify([result.uid, result.deduplicated]), JSON.stringify(["g-1", true]), name);
+      eq(fetch.calls.filter((c) => c.method === "POST" && c.path.includes("/upload")).length, 0, `${name}: nothing uploaded`);
+      eq(fetch.calls.filter((c) => c.method === "PUT").length, 0, `${name}: the document is not changed`);
+    }
+    eq(fileXpath(groupDoc().properties, "NIT_T-1.pdf"), "file:content");
+    eq(fileXpath(groupDoc().properties, "Attachment_01_A.pdf"), "files:files/0/file");
+    eq(fileXpath(groupDoc().properties, "other.pdf"), null);
+  });
+
+  await test("ECM direct: an attachment the ECM cannot serve in full is ECM_FILE_DAMAGED (the caller saves it locally); a failed date fill does not undo the attach", async () => {
+    fresh();
+    const fetch = fakeNuxeo({ existing: [groupDoc()], damagedOnAttach: { "g-1": 1 } });
+    await rejectsEcm(uploadToNuxeo(NIT_PDF("Attachment_02_B.pdf"), { fetch, hostPermissions: HOSTS }), ECM_ERROR.DAMAGED);
+    eq(fetch.trashed.length, 0, "the tender's document is never trashed");
+
+    fresh();
+    const failingPut = fakeNuxeo({ existing: [groupDoc()], respond: (call) => (call.method === "PUT" ? jsonResponse(500, { message: "no" }) : null) });
+    const result = await uploadToNuxeo(NIT_PDF("Attachment_02_B.pdf"), { fetch: failingPut, hostPermissions: HOSTS });
+    eq(JSON.stringify([result.uid, result.deduplicated]), JSON.stringify(["g-1", false]), "stored: the PDF is in the document");
+  });
+
+  await test("ECM gateway: NIT, LOA and Result need the direct upload; the gateway is not called and the PDF is saved locally", async () => {
+    fresh({ ...CONFIG, ecmBackendAws: true });
+    applyReconConfig({ reconBaseUrl: "http://localhost:8000" });
+    const gateway = fakeNuxeo();
+    for (const kind of [ECM_KIND.NIT, ECM_KIND.LOI, ECM_KIND.TENDER_RESULT]) {
+      let local = 0;
+      const { ecm } = await saveToEcmOrLocally({ ...IC, kind, fields: { tender_number: "T-1" } }, async () => { local += 1; return { relPath: "x.pdf" }; }, { fetch: gateway, hostPermissions: HOSTS });
+      eq(JSON.stringify([ecm.status, ecm.code, local]), JSON.stringify([ECM_OUTCOME.FAILED, ECM_ERROR.REJECTED, 1]), kind);
+      assert(/need the direct ECM upload/.test(ecm.detail), ecm.detail);
+    }
+    eq(gateway.calls.length, 0, "nothing sent");
   });
 
   await test("ECM direct: on PROD the folder path is looked up once; tender kinds have no PROD folder and are refused", async () => {
@@ -424,7 +515,7 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     const deps = { fetch: untouched, hostPermissions: HOSTS };
     eq((await rejectsEcm(uploadToNuxeo({ ...IC, fields: { ic_number: "1" } }, deps), ECM_ERROR.REJECTED)).detail, "inspectionCertificate requires customer_po_number");
     eq((await rejectsEcm(uploadToNuxeo({ ...IC, fields: { ...IC.fields, tender_number: "T" } }, deps), ECM_ERROR.REJECTED)).detail, "inspectionCertificate has no field tender_number");
-    eq((await rejectsEcm(uploadToNuxeo({ ...IC, kind: ECM_KIND.LOI, fields: { tender_number: "T", loi_number: "1" } }, deps), ECM_ERROR.REJECTED)).detail, "loi has no field loi_number", "the ECM has no loiNumber property (it answers 400 to a query naming it)");
+    eq((await rejectsEcm(uploadToNuxeo({ ...IC, kind: ECM_KIND.LOI, fields: { tender_number: "T", ic_number: "1" } }, deps), ECM_ERROR.REJECTED)).detail, "loi has no field ic_number", "a field the kind does not list is refused before anything is sent");
     eq((await rejectsEcm(uploadToNuxeo({ ...IC, account: { irepsAccountId: "999" } }, deps), ECM_ERROR.REJECTED)).detail, "no ECM site for IREPS account 999");
     await rejectsEcm(uploadToNuxeo({ ...IC, account: { irepsAccountId: "833", operatingUnit: "ROHTAK" } }, deps), ECM_ERROR.REJECTED, "account and unit disagree");
     await rejectsEcm(uploadToNuxeo({ ...IC, account: {} }, deps), ECM_ERROR.ACCOUNT_UNKNOWN, "no account -> no guess");

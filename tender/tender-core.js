@@ -63,9 +63,11 @@ export function isPdfBytes(bytes) {
 
 /**
  * commTboPdfAction.do serves "My Offer" and the tender's tabulations (pdfType=...). DocLink fetches My Offer
- * and the Financial and Commercial Tabulations ("ECM - Download speci-v1" types vft / vct); the
- * Techno-Commercial Tabulation and any other pdfType stay OUT OF SCOPE. The guard sits at the lowest request
- * layer: nothing in this module can reach those endpoints, even by mistake.
+ * and the Financial and Commercial Tabulations ("ECM - Download speci-v1" types vft / vct); any other pdfType
+ * (e.g. a Techno-Commercial Tabulation) stays OUT OF SCOPE. IREPS names the two files FIN-TAB-<no>-<oid>.pdf and
+ * TECH-TAB-<no>-<oid>.pdf: TECH-TAB is the Commercial Tabulation, not a Techno-Commercial one (03 Nov 2026
+ * capture), and passes only inside a commercialTabulation response (isExcludedTrustedLink). The guard sits at
+ * the lowest request layer: nothing in this module can reach those endpoints, even by mistake.
  */
 /** The URL as the server sees the request: a POST's form fields count too (postRequest.js moves the query into the body). */
 function withParams(url, params) {
@@ -88,7 +90,8 @@ export function isExcludedUrl(url) {
     const t = [...u.searchParams].find(([k]) => k.toLowerCase() === 'pdftype')?.[1] || '';
     return !ALLOWED_PDF_TYPES.includes(t.toLowerCase());
   }
-  // a tabulation file the page itself links to: Financial / Commercial pass, Techno-Commercial and unknown ones do not
+  // a tabulation file the page itself links to: Financial / Commercial pass, "techno" and unknown ones do not;
+  // a TECH-TAB file (the Commercial Tabulation) only passes isExcludedTrustedLink, inside its own response
   const s = u.pathname + u.search;
   if (/techno|tech-?tab/i.test(s)) return true;
   return /tabulation/i.test(s) && !/financial|commercial/i.test(s);
@@ -138,7 +141,7 @@ async function irepsFetchOnce(base, ref, { method = 'GET', form = null, relative
   let url = absUrl(base, ref, relativeTo);
   const params = form ? (form instanceof URLSearchParams ? form : new URLSearchParams(form)) : null;
   // trusted: a file linked from inside an allowed Financial / Commercial Tabulation response (isExcludedTrustedLink)
-  if ((trusted ? isExcludedTrustedLink : isExcludedUrl)(withParams(url, params))) throw new TenderError('EXCLUDED', 'Techno-Commercial Tabulation and other tabulation downloads are excluded from DocLink tender downloads.');
+  if ((trusted ? isExcludedTrustedLink(withParams(url, params), trusted) : isExcludedUrl(withParams(url, params)))) throw new TenderError('EXCLUDED', 'This download is excluded from DocLink tender downloads (of the tabulations, only the Financial and Commercial Tabulation are allowed).');
   const init = { method, credentials: 'include', redirect: 'follow', headers: {} };
   if (params) {
     if (method === 'GET') {
@@ -398,12 +401,16 @@ export function extensionFor(kind, res, nameHint) {
 
 const BINARY_DOC_KINDS = new Set(['pdf', 'zip', 'ole', 'png', 'jpg', 'gif', 'tiff', 'rtf']);
 
+/** The file IREPS opens for "View Commercial Tabulation" (pdfType=commercialTabulation), captured 03 Nov 2026. */
+const COMMERCIAL_TAB_FILE = /^\/ireps\/supply\/pdfdocs\/+\d+\/\d+\/TECH-TAB-[^/]+\.pdf$/i;
+
 /**
- * A link inside a response that is already an allowed Financial / Commercial Tabulation: its file may be named
- * "Tabulation_<oid>.pdf" without saying which one, so only the Techno-Commercial patterns (and any other
- * commTboPdfAction.do pdfType) are refused there.
+ * A link inside a response that is already an allowed Financial / Commercial Tabulation (`pdfType`, or true):
+ * its file may be named "Tabulation_<oid>.pdf" without saying which one, so only the Techno-Commercial patterns
+ * (and any other commTboPdfAction.do pdfType) are refused there. IREPS names the Commercial Tabulation's own
+ * PDF "TECH-TAB-<no>-<oid>.pdf": that one file passes, and only inside a commercialTabulation response.
  */
-function isExcludedTrustedLink(url) {
+function isExcludedTrustedLink(url, pdfType = true) {
   if (isExcludedUrl(url) === false) return false;
   let u;
   try {
@@ -412,6 +419,7 @@ function isExcludedTrustedLink(url) {
     return false;
   }
   if (/commTboPdfAction\.do/i.test(u.pathname)) return true;
+  if (pdfType === 'commercialTabulation' && !u.search && COMMERCIAL_TAB_FILE.test(u.pathname) && !/techno/i.test(u.pathname)) return false;
   return /techno|tech-?tab/i.test(u.pathname + u.search);
 }
 
@@ -432,12 +440,13 @@ function docCandidates(doc, pageUrl, base, allowAnyFile, trusted = false) {
     const v = el.getAttribute('src') || el.getAttribute('data') || '';
     if (v && !/^(about:|javascript:|#|data:)/i.test(v) && !raw.includes(v)) raw.push(v);
   }
-  const inline = [...doc.querySelectorAll('[onclick]')].map((e) => e.getAttribute('onclick')).join(' ') +
+  // onload too: the tabulation page opens its PDF from <body onload="openwindow('...FIN-TAB-<no>-<oid>.pdf')">
+  const inline = [...doc.querySelectorAll('[onclick],[onload]')].map((e) => `${e.getAttribute('onclick') || ''} ${e.getAttribute('onload') || ''}`).join(' ') +
     ' ' + [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join(' ');
   for (const m of inline.matchAll(new RegExp(`['"]([^'"\\s]*\\.${ext}(?:\\?[^'"\\s]*)?)['"]`, 'gi'))) raw.push(m[1]);
   // a tabulation viewer may open its file through a servlet URL; only accepted when it answers with a document
   if (trusted) for (const m of inline.matchAll(SCRIPT_TARGET_RE)) raw.push(m[1] || m[2]);
-  const excluded = trusted ? isExcludedTrustedLink : isExcludedUrl;
+  const excluded = trusted ? (u) => isExcludedTrustedLink(u, trusted) : isExcludedUrl;
   const out = [];
   for (const r of raw) {
     if (!r || /^(about:|javascript:|#|data:)/i.test(r)) continue;
@@ -506,8 +515,9 @@ export function looksLikeErrorPage(doc) {
  * content of its own still gives way to the file it links.
  * pageOnly: the page IS the document (an LOA letter): nothing it links, embeds or redirects to is fetched,
  * so the result is that page alone (or the file IREPS answered with directly).
- * trusted: the response is an allowed Financial / Commercial Tabulation; the file it leads to is followed
- * through isExcludedTrustedLink, including a self-submitting form and window.open / location targets.
+ * trusted: the response is an allowed Financial / Commercial Tabulation (its pdfType, or true); the file it
+ * leads to is followed through isExcludedTrustedLink, including a self-submitting form and window.open /
+ * location / onload targets.
  * logAs: a log tag; each response and candidate tried is logged (describeResponse).
  * Throws SESSION_EXPIRED for login pages; NO_DOCUMENT when nothing usable is found.
  * A login / error page is never returned as a document.

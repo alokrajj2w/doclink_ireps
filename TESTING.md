@@ -689,7 +689,10 @@ document attached (link, iframe, embed, script) saves only the printed letter
 `Counter_Offer_<tender>_<letter id>.pdf`; the attachment is never requested,
 also when Chrome cannot print. Tabulations: a direct PDF, a PDF
 behind an iframe viewer, a self-submitting form or a `window.open` target are
-downloaded; Techno-Commercial links inside the viewer are never requested; a
+downloaded, and so is the real IREPS answer (03 Nov 2026): a page that opens
+`FIN-TAB-<no>-<oid>.pdf` / `TECH-TAB-<no>-<oid>.pdf` (Commercial) from
+`<body onload>`. A `TECH-TAB` file passes only inside a Commercial Tabulation
+response; Techno-Commercial links inside the viewer are never requested; a
 web page with no PDF fails with its title and nothing is saved. The 29 Oct
 Closed Tenders capture (`tender/tests/fixtures/closed-tenders-29oct.html`) lists
 the 7 tenders with both tabulations.

@@ -9,11 +9,11 @@
 import { STORAGE_KEYS } from '../utils/messages.js';
 import { SAVE_DESTINATION } from '../services/recon-service.js';
 import { ECM_KIND, saveToEcmOrLocally } from '../services/ecm-service.js';
-import { ECM_KINDS } from '../services/ecm-catalog.js';
+import { ECM_KINDS, isGroupedKind } from '../services/ecm-catalog.js';
 import { confirmReconSignIn } from '../services/recon-auth.js';
 import { loadEcmConfig, isDirectEcm } from '../services/ecm-config.js';
 import { loadDownloadLogConfig } from '../services/download-log.js';
-import { TenderError } from './tender-core.js';
+import { TenderError, safeSegment } from './tender-core.js';
 
 export const SIGN_IN_REQUIRED_MSG = 'Sign in to the Recon Engine to download: DocLink records every download for the signed-in user. Nothing was downloaded.';
 
@@ -27,16 +27,21 @@ export async function ensureDownloadSignIn() {
   if (!(await confirmReconSignIn({ always: true }))) throw new TenderError('SIGN_IN_REQUIRED', SIGN_IN_REQUIRED_MSG);
 }
 
-/** Tender category (tender-workflows newCategory) -> ECM kind. Categories not listed stay local. */
+/**
+ * Tender category (tender-workflows newCategory) -> ECM kind. Categories not listed stay local.
+ * NIT, LOA and Result are grouped kinds (services/ecm-catalog.js): one ECM document per tender,
+ * "<T> - NIT" (the tender PDF, then its attached documents), "<T> - LOA" (every LOA letter),
+ * "<T> - Result" (the Financial Tabulation), each further PDF an attachment of it.
+ */
 export const CATEGORY_ECM_KIND = Object.freeze({
   TENDER_PDF: ECM_KIND.NIT,
   ATTACHMENTS: ECM_KIND.NIT, //            "List of documents attached with the tender"
   CORRIGENDA: ECM_KIND.EXTENSION, //       tender extension / qty reduction / increase
   NEGOTIATION: ECM_KIND.NBSP, //           Negotiation Bid Submission Pending
   COUNTER_OFFER: ECM_KIND.COUNTER_OFFER,
-  LOA: ECM_KIND.LOI, //                    Advance Acceptance Letter / LOI
+  LOA: ECM_KIND.LOI, //                    Advance Acceptance Letter, "<T> - LOA"
   CORRESPONDENCE: ECM_KIND.CRP, //         Correspondence Reply pending
-  FINANCIAL_TABULATION: ECM_KIND.FINANCIAL_TABULATION, // vft
+  FINANCIAL_TABULATION: ECM_KIND.TENDER_RESULT, // "<T> - Result" (ECM type "Tender Result")
   COMMERCIAL_TABULATION: ECM_KIND.COMMERCIAL_TABULATION, // vct
 });
 
@@ -62,11 +67,12 @@ export async function savedDestination() {
 /**
  * How one tender document is filed in the ECM, or null when its category has no ECM kind.
  * The title is "<tender no> - <kind code>" as "ECM - Download speci-v1" names it
- * ("29263265 - NIT", "29263265 - LOI"; codes in services/ecm-catalog.js). A tender can hold
- * several documents of a kind (attachments, corrigenda, letters), so those add what tells
- * them apart: "29263265 - NIT - Annexure - SPEC", "29263265 - NBSP - 1204920", "29263265 - LOI - 1461928".
- * Only the fields the ECM has for the kind are sent (services/ecm-catalog.js): today the
- * tender number; the tender date once the ECM has tenderDate.
+ * ("29263265 - NIT", "29263265 - LOA"; codes in services/ecm-catalog.js). For a grouped kind
+ * (NIT, LOA, Result) that is the whole title: every PDF of the kind goes into that one document.
+ * Other kinds can hold several documents per tender (corrigenda, letters), so those add what
+ * tells them apart: "29263265 - Extension - 1", "29263265 - NBSP - 1204920".
+ * Only the fields the ECM has for the kind are sent (services/ecm-catalog.js): the tender
+ * number, and the tender date (IREPS closing date) when the run knows it.
  *   action = the download action ({ id, meta: { title, docDate } }), ctx = run.ctx
  */
 export function ecmDocumentFor(category, action, ctx) {
@@ -75,13 +81,11 @@ export function ecmDocumentFor(category, action, ctx) {
   const tenderNo = ctx.tenderNo;
   const meta = action.meta || {};
   const id = action.id || '';
-  // TENDER_PDF and the tabulations need nothing more: one of each per tender
-  const detail = {
-    ATTACHMENTS: meta.title || id,
+  // grouped kinds and the Commercial Tabulation need nothing more: one document per tender
+  const detail = isGroupedKind(kind) ? '' : {
     CORRIGENDA: meta.title || id,
     NEGOTIATION: id,
     COUNTER_OFFER: id,
-    LOA: id, //                the letter id: the ECM has no loiNumber property
     CORRESPONDENCE: meta.title || id,
   }[category];
   const known = { tender_number: tenderNo, tender_date: ctx.closingDate || localDay(ctx.dueDate) };
@@ -90,7 +94,30 @@ export function ecmDocumentFor(category, action, ctx) {
   return { kind, title: title.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX), fields };
 }
 
-/** Whether a tender document's ECM record holds the tender date (false until the ECM has tenderDate). */
+/**
+ * The document the download check (services/download-log.js preflightDownloads) looks up in
+ * the ECM, or null. Grouped kinds are not looked up: all their PDFs share one title, so a
+ * title match cannot say whether this PDF is there; the upload itself finds it by file name.
+ */
+export function ecmCheckDocumentFor(category, action, ctx) {
+  const doc = ecmDocumentFor(category, action, ctx);
+  return doc && !isGroupedKind(doc.kind) ? doc : null;
+}
+
+/**
+ * The file name a PDF has in the ECM. Inside a grouped document file names tell the PDFs apart,
+ * so an LOA letter always carries its letter id: locally a tender's only letter is
+ * "LOA_<T>.pdf", which a second letter found on a later day would also be called.
+ */
+export function ecmFileName(category, fileName, id) {
+  const safeId = safeSegment(String(id || ''));
+  if (category !== 'LOA' || !id || safeId === 'NA') return fileName;
+  const dot = fileName.lastIndexOf('.');
+  const [stem, ext] = dot > 0 ? [fileName.slice(0, dot), fileName.slice(dot)] : [fileName, ''];
+  return stem.endsWith(`_${safeId}`) ? fileName : `${stem}_${safeId}${ext}`;
+}
+
+/** Whether a tender document's ECM record holds the tender date (services/ecm-catalog.js lists tender_date). */
 export const ECM_TAKES_TENDER_DATE = Object.values(CATEGORY_ECM_KIND).some((kind) => ECM_KINDS[kind].fields.includes('tender_date'));
 
 /**

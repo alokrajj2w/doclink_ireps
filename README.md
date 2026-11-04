@@ -1006,31 +1006,45 @@ settings, sign-in cookie and host permission as section 15:
 | Inspection Certificate | `inspectionCertificate` | `ic_number` (the IC PDF's file name, e.g. `3480517`), `customer_po_number`, `ic_date` | `3480517 - IC` |
 | PO | `poCopy` | `customer_po_number` | `<PO no> - PO` |
 | Modification Advice | `modificationAdvise` | `customer_po_number`, `modification_advise_number` | `<MA no> - MA` |
-| NIT + attached documents | `nit` | `tender_number` | `<tender no> - NIT`; an attachment `<tender no> - NIT - <name>` |
+| NIT + attached documents | `nit` | `tender_number`, `tender_date` | **one document per tender**, `<tender no> - NIT`: the tender PDF is its main file, each attached document an attachment |
 | Corrigendum | `extension` | same | `<tender no> - Extension - <corrigendum no>`; a document attached to it `<tender no> - Extension - <corrigendum no> - Attachment <n>` |
 | Negotiation letter | `nbsp` | same | `<tender no> - NBSP - <letter id>` |
 | Counter offer | `co` | same | `<tender no> - CO - <letter id>` |
-| LOA (Advance Acceptance Letter) | `loi` | same | `<tender no> - LOI - <letter id>` |
+| LOA (Advance Acceptance Letter) | `loi` | same | **one document per tender**, `<tender no> - LOA`: every letter in it, as `LOA_<tender no>_<letter id>.pdf` |
 | Correspondence | `crp` | same | `<tender no> - CRP - <subject>` |
-| Financial Tabulation | `vft` | same | `<tender no> - Financial Tabulation` |
+| Financial Tabulation | `tenderResult` (ECM "Tender Result") | same | **one document per tender**, `<tender no> - Result` |
 | Commercial Tabulation | `vct` | same | `<tender no> - Commercial Tabulation` |
 
-**Only properties the ECM has.** The spec also lists `tenderDate` for every tender
-document and `loiNumber` / `loiDate` for the LOI, but the TEST ECM's
-`InvoiceCertificateSchema` has none of them (checked with
-`GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema` on 26/10/2026). A query or
-create naming one answers HTTP 400 "No such property", so every tender upload
-failed. Tender documents therefore carry the tender number only, and the LOA's
-letter id goes in its title. When the ECM team adds the properties, map them in
-`services/ecm-catalog.js` `ECM_FIELDS` and list them in the kinds. DocLink already
-works out the tender date (the closing date) and sends it once the catalog lists it.
-The gateway's `document_kinds.toml` must match.
+**One document per tender (NIT, LOA, Result).** As the Wabtec team asked on
+29/10/2026 (example tender 38265117: `38265117 - NIT`, `- LOA`, `- Result`). These
+are the *grouped* kinds of `services/ecm-catalog.js` (`group: true`). The first PDF
+creates the document (its `file:content`). Every later PDF is appended to its
+attachments (`files:files`) by Nuxeo's `Blob.AttachOnDocument`
+(`POST /nuxeo/api/v1/upload/{batch}/0/execute/Blob.AttachOnDocument`), which adds one
+file without re-sending the others. The document is found by type, folder, title and
+tender number (`groupDocumentQuery`); a PDF already in it under the same file name is
+not added again. A tender date the document lacks is filled in. In a full run the
+attachments go to the ECM only after the tender PDF, so the tender PDF is the main
+file. The download check does not look these up in the ECM (a shared title says
+nothing about one PDF); the upload finds a PDF by its name. **Direct ECM only:** the
+Recon gateway cannot add attachments, so with `ecmBackendAws: true` these PDFs are
+saved locally (`ECM_REJECTED`) until the gateway learns it. Documents uploaded before
+this change keep their old titles; an old `<tender no> - NIT` document becomes the
+one new attachments go into.
+
+**Only properties the ECM has.** A query or create naming a property the ECM's
+`InvoiceCertificateSchema` lacks answers HTTP 400 "No such property". `tenderDate`,
+`loiNumber` and `loiDate` were missing on 26/10/2026 and were there on 03/11/2026
+(`GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema`). Tender documents now
+carry `tenderDate` (the IREPS closing date); DocLink does not read the LOI number /
+date yet. Map any new property in `services/ecm-catalog.js` `ECM_FIELDS` and list it
+in the kinds; the gateway's `document_kinds.toml` must match.
 
 The title is `<document number> - <code>`, the codes of the spec's row 4
-(API: "Example Title - IC", "- PO", "- MA", "- NIT", "- LOI", ...) and the
-numbers of its row 8 (Title). It is also the ECM document's `name`. A tender
-holds several attachments, corrigenda and letters, so those add what tells
-them apart. IC, PO and MA titles come from the kind's template
+(API: "Example Title - IC", "- PO", "- MA", "- NIT", ...; "- LOA" and "- Result"
+as the Wabtec team asked) and the numbers of its row 8 (Title). It is also the ECM
+document's `name`. A tender holds several corrigenda and letters, so those (except
+the grouped LOA) add what tells them apart. IC, PO and MA titles come from the kind's template
 (`services/ecm-catalog.js`, and the gateway's `document_kinds.toml`, kept in
 step); tender titles are sent by DocLink (`tender/tender-ecm.js`).
 
@@ -1161,12 +1175,18 @@ and the Recon backend has Okta configured (`GET /api/auth/providers`):
 }
 ```
 
-**Okta setup (once per extension id).** Add
-`https://<extension id>.chromiumapp.org/okta` as a *Sign-in redirect URI* of
-the Recon Engine Okta app. The sign-in page shows the exact value under
-*Okta setup* (with Copy). An unpacked extension's id depends on the folder it
-was loaded from, so a new folder means a new redirect to register. Until it
-is registered Okta refuses the request and DocLink says so
+**Okta setup (once).** Add
+`https://cglncbgakabfoenpkbaoigpclmgkklcl.chromiumapp.org/okta` as a
+*Sign-in redirect URI* of the Recon Engine Okta app. No sign-out redirect is
+needed: Sign out ends only the Recon session. The extension id is fixed by the
+public `"key"` in `manifest.json`, so every copy (unpacked from any folder, or
+the `dist/` build) has the same id and this one redirect. The sign-in page
+shows the exact value under *Okta setup* (with Copy). The matching private key
+(`doclink-key.pem`) is kept **outside** the extension folder and is never
+shared or packaged: Chrome warns about a `.pem` inside a loaded extension, and
+it is needed only to publish to the Chrome Web Store. Removing or changing
+`"key"` changes the id and the redirect. Until the
+redirect is registered Okta refuses the request and DocLink says so
 (`OKTA_REDIRECT_NOT_REGISTERED`); password sign-in keeps working. The client
 secret stays in the Recon backend (`OKTA_CLIENT_SECRET`), never here.
 
@@ -1338,14 +1358,26 @@ Tender No. (Bid Id), Tender Title and Closing Date/Time
   tabulation. DocLink waits up to 3 minutes for IREPS to build the PDF. Every
   answer is logged under `Tabulation` (status, content type, file name, size,
   kind, the files tried) - `doclinkLog.download()` in the side panel console.
-* **ECM.** Under Save to: ECM / S3 they go to the unit's Tenders folder as
-  `vft` / `vct` with `tenderNumber` and `tenderDate` (section 16). The gateway's
-  `document_kinds.toml` has both kinds.
-* **Excluded.** `isExcludedUrl` (`tender/tender-core.js`) still refuses the
-  Techno-Commercial Tabulation and any other `pdfType`; it now reads `pdfType`
-  from a POST body too. Inside an allowed Financial / Commercial response, a
-  file named only "Tabulation_..." may be fetched, but a Techno-Commercial
-  name or another `commTboPdfAction.do` link never is.
+* **ECM.** Under Save to: ECM / S3 they go to the unit's Tenders folder with
+  `tenderNumber` and `tenderDate` (section 16): the Financial Tabulation as the
+  tender's `<tender no> - Result` document (type `tenderResult`, "Tender Result";
+  direct ECM only), the Commercial one as `vct`. `vft` stays in the catalog, in
+  step with the gateway's `document_kinds.toml`, but DocLink no longer uses it.
+* **Excluded.** `isExcludedUrl` (`tender/tender-core.js`) refuses any other
+  `pdfType` (e.g. a Techno-Commercial Tabulation) and any "techno" file name;
+  it reads `pdfType` from a POST body too. Inside an allowed Financial /
+  Commercial response, a file named only "Tabulation_..." may be fetched, but
+  a "techno" name or another `commTboPdfAction.do` link never is. `TECH-TAB`
+  was once taken for the Techno-Commercial Tabulation; it is IREPS's name for
+  the Commercial Tabulation itself (see below).
+* **What IREPS answers** (captured 03 Nov 2026). `commTboPdfAction.do` returns
+  a small page that opens the PDF from `<body onload="openwindow('...')">`:
+  `/ireps/supply/pdfdocs//<MMYYYY>/<tenderOID>/FIN-TAB-<no>-<oid>.pdf` for the
+  Financial Tabulation and `.../TECH-TAB-<no>-<oid>.pdf` for the Commercial
+  one. IREPS names the Commercial Tabulation's own file `TECH-TAB`, so that one
+  file (a `TECH-TAB-*.pdf` under `/ireps/supply/pdfdocs/`, no query, no
+  "techno") is allowed, and only inside a `commercialTabulation` response.
+  Anywhere else `TECH-TAB` stays blocked.
 
 ## Correspondence Downloads (`tender/tender-pending.js`, `tender/pending-ui.js`)
 

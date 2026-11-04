@@ -14,11 +14,16 @@
  *   PUT  {domain}/nuxeo/api/v1/id/{uid}                                   download again: the new PDF in the
  *                                                                          same document (old one kept as _old)
  *   POST {domain}/nuxeo/api/v1/id/{uid}/@op/Document.Trash                 damaged copies to the trash
+ *   POST {domain}/nuxeo/api/v1/upload/{batchId}/0/execute/Blob.AttachOnDocument
+ *                                                                          grouped kinds: one more PDF in the
+ *                                                                          tender's document (files:files)
  *
  * Same folders (services/ecm-catalog.js), same metadata and the same answer as the gateway
  * ({ uid, path, title, site, deduplicated }), and the same EcmError codes, so callers,
  * the local fallback and the panel do not know which path was taken. A document already
  * in the folder (same kind, title, file name and metadata) is not stored twice.
+ * Grouped kinds (NIT, LOA, Result: one document per tender) are direct-only, see
+ * addToTenderDocument.
  *
  * The bearer token is kept in this JS context's memory until shortly before it expires
  * (the service worker and the side panel each fetch their own); it is never stored or
@@ -248,6 +253,31 @@ export function existingDocumentQuery({ kind, folderUid: parent, title, filename
   return `SELECT * FROM Document WHERE ${clauses.join(" AND ")}`;
 }
 
+/**
+ * The live grouped document (services/ecm-catalog.js groupKind) of this kind in this folder with
+ * this title and tender number, oldest first: the one DocLink adds to. Only the kind's required
+ * non-date fields are compared, so a document made before the ECM had tenderDate still matches.
+ */
+export function groupDocumentQuery({ kind, folderUid: parent, title, values }) {
+  const required = (ECM_KINDS[kind] || { required: [] }).required.filter((key) => !isDateField(key) && key in values);
+  const clauses = [
+    "ecm:isVersion = 0",
+    "ecm:isTrashed = 0",
+    `${TYPE_PROPERTY} = ${nxqlLiteral(kind)}`,
+    `ecm:parentId = ${nxqlLiteral(parent)}`,
+    `dc:title = ${nxqlLiteral(title)}`,
+    ...required.map((key) => fieldClause(key, values[key]))
+  ];
+  return `SELECT * FROM Document WHERE ${clauses.join(" AND ")} ORDER BY dc:created ASC`;
+}
+
+/** Where a document holds the file called `name`: "file:content", "files:files/<n>/file", or null. */
+export function fileXpath(props, name) {
+  if ((props["file:content"] || {}).name === name) return "file:content";
+  const index = (props["files:files"] || []).findIndex((entry) => entry && entry.file && entry.file.name === name);
+  return index >= 0 ? `files:files/${index}/file` : null;
+}
+
 function saved(entry, site, deduplicated) {
   const props = entry.properties || {};
   return { uid: entry.uid, path: entry.path ?? null, title: entry.title ?? props["dc:title"] ?? null, site, deduplicated };
@@ -448,6 +478,11 @@ export async function uploadToNuxeo(doc, deps = {}) {
   logger.info(`Uploading ${filename} to the ECM directly`, { kind: doc.kind, env, site: siteKey, bytes: doc.bytes.length, fields: Object.keys(values) });
 
   const parent = await folderUid(conn, site, kind.location);
+  if (kind.group) {
+    // never asked for: the download check does not look grouped documents up in the ECM
+    if (doc.replace && doc.replace.length) logger.warn(`ECM: ${filename} goes into the ${doc.kind} document of its tender; nothing is replaced`);
+    return addToTenderDocument(conn, { kind: doc.kind, parent, siteKey, title, filename, mimeType, bytes: doc.bytes, values });
+  }
   const replace = [...new Set((doc.replace || []).filter(Boolean).map(String))];
   if (replace.length) {
     const [target, ...others] = replace;
@@ -469,13 +504,23 @@ export async function uploadToNuxeo(doc, deps = {}) {
     return saved(existing, siteKey, true);
   }
 
-  const batchId = await uploadBatch(conn, [{ name: filename, mimeType, bytes: doc.bytes }]);
-  const properties = { "dc:title": title, [TYPE_PROPERTY]: doc.kind };
+  const created = await createDocument(conn, { kind: doc.kind, parent, title, filename, mimeType, bytes: doc.bytes, values });
+  logger.info(`ECM stored ${filename}`, { kind: doc.kind, site: siteKey, uid: created.uid });
+  return saved(created, siteKey, false);
+}
+
+/**
+ * A new document in `parent` with the file as its main file, read back in full. A copy the ECM
+ * damaged is moved to the trash (DocLink's own copy) and ECM_FILE_DAMAGED is thrown.
+ */
+async function createDocument(conn, { kind, parent, title, filename, mimeType, bytes, values }) {
+  const batchId = await uploadBatch(conn, [{ name: filename, mimeType, bytes }]);
+  const properties = { "dc:title": title, [TYPE_PROPERTY]: kind };
   for (const [key, value] of Object.entries(values)) properties[ECM_FIELDS[key]] = value;
   properties["file:content"] = batchRef(batchId, 0);
   const created = await callJson(conn, "POST", `/id/${encodeURIComponent(parent)}`, {
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ "entity-type": "document", name: title.replace(NAME_UNSAFE, "-").slice(0, 120) || doc.kind, type: DOC_TYPE, properties })
+    body: JSON.stringify({ "entity-type": "document", name: title.replace(NAME_UNSAFE, "-").slice(0, 120) || kind, type: DOC_TYPE, properties })
   });
   if (!created.uid) throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: "the ECM answer had no document uid" });
   try {
@@ -487,8 +532,61 @@ export async function uploadToNuxeo(doc, deps = {}) {
     }
     throw error;
   }
-  logger.info(`ECM stored ${filename}`, { kind: doc.kind, site: siteKey, uid: created.uid });
-  return saved(created, siteKey, false);
+  return created;
+}
+
+/**
+ * A grouped kind (services/ecm-catalog.js groupKind): one document per tender, "<T> - NIT",
+ * "<T> - LOA", "<T> - Result". The first PDF creates it as its main file; each later PDF is
+ * appended to its attachments (files:files) by Nuxeo's Blob.AttachOnDocument, which adds one
+ * file without re-sending the others. A file already in it under the same name is not added
+ * again (deduplicated). Metadata the document lacks (a tender date) is filled in, never changed.
+ * Uploads are serialised by ecm-service.js uploadToEcm, so two PDFs of a tender never race to
+ * create two documents.
+ *
+ * An attachment the ECM damaged stays in the document (removing one means re-sending the
+ * others) and ECM_FILE_DAMAGED is thrown, so the caller saves the PDF locally; the same happens
+ * on the next run, as the damaged attachment is found by name.
+ */
+async function addToTenderDocument(conn, { kind, parent, siteKey, title, filename, mimeType, bytes, values }) {
+  const [group] = await search(conn, groupDocumentQuery({ kind, folderUid: parent, title, values }), { limit: 1 });
+  if (!group) {
+    const created = await createDocument(conn, { kind, parent, title, filename, mimeType, bytes, values });
+    logger.info(`ECM stored ${filename} as the new document ${title}`, { kind, site: siteKey, uid: created.uid });
+    return saved(created, siteKey, false);
+  }
+  const uid = group.uid;
+  const props = group.properties || {};
+  const held = fileXpath(props, filename);
+  if (held) {
+    logger.info(`ECM already had ${filename} in ${title}`, { kind, site: siteKey, uid, xpath: held });
+    await assertFileReadable(conn, uid, filename, held);
+    return saved(group, siteKey, true);
+  }
+
+  const batchId = await uploadBatch(conn, [{ name: filename, mimeType, bytes }]);
+  const attached = await call(conn, "POST", `/upload/${encodeURIComponent(batchId)}/0/execute/Blob.AttachOnDocument`, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ params: { document: uid, xpath: "files:files", save: true } })
+  });
+  // the answer is the attached file itself, so only its status is read
+  if (!attached.ok) throw httpError(attached, await readJson(attached), `Blob.AttachOnDocument ${uid}`);
+
+  const lacking = Object.entries(values).filter(([key]) => props[ECM_FIELDS[key]] === undefined || props[ECM_FIELDS[key]] === null || props[ECM_FIELDS[key]] === "");
+  if (lacking.length) {
+    // best effort: the PDF is already in the document, so a failure here must not save it locally too
+    await callJson(conn, "PUT", `/id/${encodeURIComponent(uid)}`, {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ "entity-type": "document", properties: Object.fromEntries(lacking.map(([key, value]) => [ECM_FIELDS[key], value])) })
+    }).catch((error) => logger.warn(`Could not fill ${lacking.map(([key]) => key).join(", ")} of ECM document ${uid}`, { detail: error && error.detail }));
+  }
+
+  const after = await callJson(conn, "GET", `/id/${encodeURIComponent(uid)}`, { headers: { Properties: "file,files" } });
+  const xpath = fileXpath(after.properties || {}, filename);
+  if (!xpath) throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: `document ${uid}: ${filename} is not among its files after it was attached` });
+  await assertFileReadable(conn, uid, filename, xpath);
+  logger.info(`ECM added ${filename} to ${title}`, { kind, site: siteKey, uid, xpath });
+  return saved(group, siteKey, false);
 }
 
 const IN_CHUNK = 100; // values per "IN (...)" in findInFolder

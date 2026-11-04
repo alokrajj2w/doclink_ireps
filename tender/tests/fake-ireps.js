@@ -203,8 +203,35 @@ export const corrigendumPage = (c) => letterHtml(`Corrigendum ${c.cn}`, (c.attac
  *           next to a Techno-Commercial link that must never be requested
  *   form    a page that posts itself on to the file (showTabulation.do), as postRequest.js does
  *   open    a page whose script opens a servlet URL with no extension
+ *   onload  what real IREPS answers (captured 03 Nov 2026, LN265611): <body onload="openwindow('<absolute pdfdocs URL>')">,
+ *           FIN-TAB-<no>-<oid>.pdf for the Financial Tabulation and TECH-TAB-<no>-<oid>.pdf for the Commercial one
  */
-export function tabulationViewer(mode, type, oid) {
+export function tabulationViewer(mode, type, oid, no = '') {
+  if (mode === 'onload') {
+    const file = `https://www.ireps.gov.in/ireps/supply/pdfdocs//112026/${oid}/${type === 'financialTabulation' ? 'FIN' : 'TECH'}-TAB-${no}-${oid}.pdf`;
+    return enc(`<html>
+<head>
+<script language="javascript">
+function openwindow(pdfName)
+{
+   day = new Date();
+   id = day.getTime();
+   //alert("inside script");
+   var URL=pdfName;
+   //alert(URL);
+   eval("page" + id + " = window.open(URL, '" + id + "', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1024,height=768');");
+   window.close();
+}
+</script>
+</head>
+
+<body onload="openwindow('${file}');">
+<bean:message key = "bid.label.load"/><br>
+<img src="/ireps/images/common/loderBar.gif">
+
+</body>
+</html>`);
+  }
   if (mode === 'iframe') return html(`<a href="/ireps/upload/tbo/TechnoCommercial_Tabulation_${oid}.pdf">TCT</a><a href="#" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=technoCommercialTabulation&tenderOID=${oid}')">t</a><iframe src="/ireps/upload/tbo/Tabulation_${oid}.pdf" width="100%"></iframe>`, 'Tabulation');
   if (mode === 'form') return html(`<form action="/epsn/tbo/showTabulation.do" method="post"><input type="hidden" name="oid" value="${oid}"><input type="hidden" name="pdfType" value="${type}"></form><script>document.forms[0].submit();</script>`, 'Please wait');
   if (mode === 'open') return html(`<p>Opening...</p><script>window.open('/ireps/upload/tbo/view?oid=${oid}&t=${type}', '_self');</script>`, 'Tabulation');
@@ -291,11 +318,16 @@ export class FakeIreps {
       const type = arg('pdfType');
       if (!['offer', 'financialTabulation', 'commercialTabulation'].includes(type)) { this.excludedHit = true; return pdf('FORBIDDEN'); }
       if (type !== 'offer' && this.s.tabulationAsHtml) return ok(letterHtml(`${type} ${arg('tenderOID')}`));
-      if (type !== 'offer' && this.s.tabulationAs) return ok(tabulationViewer(this.s.tabulationAs, type, arg('tenderOID')));
+      if (type !== 'offer' && this.s.tabulationAs) return ok(tabulationViewer(this.s.tabulationAs, type, arg('tenderOID'), (this.s.closed || []).find((c) => c.oid === arg('tenderOID'))?.no));
       return pdf(type + arg('tenderOID'));
     }
     if (p.startsWith('/ireps/upload/tbo/')) {
       if (/techno/i.test(p)) { this.excludedHit = true; return pdf('FORBIDDEN'); }
+      return pdf('tabfile' + p);
+    }
+    if (/^\/ireps\/supply\/pdfdocs\/.*-TAB-/.test(p)) {
+      if (/techno/i.test(p)) { this.excludedHit = true; return pdf('FORBIDDEN'); }
+      this.tabFileHits = [...(this.tabFileHits || []), p];
       return pdf('tabfile' + p);
     }
     if (p === '/epsn/tbo/showTabulation.do') return method === 'POST' && body.get('oid') ? pdf('tabform' + body.get('oid')) : ok(html('<h1>Error</h1> missing'));

@@ -1346,7 +1346,18 @@ const server = createServer(async (req, res) => {
       // a viewer page around the file, whose name does not say Financial / Commercial
       return html(res, 200, `<html><head><title>Tabulation</title></head><body><iframe src="/mock/tbo/Tabulation_${oid}_${type === "financialTabulation" ? "F" : "C"}.pdf" width="100%" height="600"></iframe></body></html>`);
     }
+    if (t && type !== "offer") {
+      // as real IREPS answers (03 Nov 2026): a page that opens the PDF from <body onload>, FIN-TAB / TECH-TAB (Commercial)
+      const file = `http://${req.headers.host}/ireps/supply/pdfdocs//112026/${oid}/${type === "financialTabulation" ? "FIN" : "TECH"}-TAB-${t.no}-${oid}.pdf`;
+      return html(res, 200, `<html>\n<head>\n<script language="javascript">\nfunction openwindow(pdfName)\n{\n   day = new Date();\n   id = day.getTime();\n   var URL=pdfName;\n   eval("page" + id + " = window.open(URL, '" + id + "', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1024,height=768');");\n   window.close();\n}\n</script>\n</head>\n\n<body onload="openwindow('${file}');">\n<bean:message key = "bid.label.load"/><br>\n<img src="/ireps/images/common/loderBar.gif">\n\n</body>\n</html>`);
+    }
     return sendTinyPdf(res, `${type}_${oid}.pdf`, [`INDIAN RAILWAYS E-PROCUREMENT SYSTEM (MOCK)`, type === "offer" ? "MY OFFER" : type === "financialTabulation" ? "FINANCIAL TABULATION" : "COMMERCIAL TABULATION", `Tender OID: ${oid}`, `Tender No: ${t?.no || "-"}`]);
+  }
+
+  if (/^\/ireps\/supply\/pdfdocs\/+\d+\/\d+\/(FIN|TECH)-TAB-[^/]+\.pdf$/.test(path)) {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const file = path.split("/").pop();
+    return sendTinyPdf(res, file, [`INDIAN RAILWAYS E-PROCUREMENT SYSTEM (MOCK)`, file.startsWith("FIN-") ? "FINANCIAL TABULATION" : "COMMERCIAL TABULATION", `File: ${file}`]);
   }
 
   if (/^\/mock\/tbo\/Tabulation_\d+_[FC]\.pdf$/.test(path)) {
