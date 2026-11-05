@@ -108,7 +108,10 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
     }
   }
   log('Download', `Validating document (${doc.kind}${doc.printed ? ', printed by Chrome' : doc.converted ? ', rendered from HTML' : ''})`);
-  const fileName = action.fileName(doc.ext);
+  // a file IREPS served keeps the name IREPS gave it; DocLink names only what it made itself (a printed or
+  // rendered page) or a file served without a name (a POST to a .do action)
+  const given = doc.kind === 'file' && doc.sourceName ? doc.sourceName : action.fileName(doc.ext);
+  const fileName = reserveFileName(run, action, action.id, given);
   const out = [await saveDocument(run, action, { fileName, bytes: doc.bytes, contentType: doc.contentType, id: action.id, meta: action.meta },
     { converted: !!doc.converted, ...(doc.printed ? { printed: true } : {}), validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '' } })];
   if (doc.kind === 'html' && !doc.printed && !action.pageOnly) {
@@ -126,9 +129,11 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
       const att = await fetchLinkedDocument(run.base, url, { allowAnyFile: !!action.allowAnyFile });
       if (!att) continue;
       n++;
-      const attName = `${fileName.replace(/\.[^.]+$/, '')}_Attachment_${n}${att.ext}`;
       const title = [action.meta?.title, `Attachment ${n}`].filter(Boolean).join(' - ');
-      out.push(await saveDocument(run, action, { fileName: attName, bytes: att.bytes, contentType: att.contentType, id: `${action.id || ''}#${n}`, meta: { ...action.meta, title } },
+      const attId = `${action.id || ''}#${n}`;
+      const attMeta = { ...action.meta, title };
+      const attName = reserveFileName(run, { ...action, meta: attMeta }, attId, att.sourceName || `${fileName.replace(/\.[^.]+$/, '')}_Attachment_${n}${att.ext}`);
+      out.push(await saveDocument(run, action, { fileName: attName, bytes: att.bytes, contentType: att.contentType, id: attId, meta: attMeta },
         { role: 'attachment', attachmentOf: fileName, validation: { kind: att.kind, extension: att.ext, httpStatus: att.httpStatus, contentType: att.contentType || '' } }));
     } catch (e) {
       if (e.code === 'SESSION_EXPIRED' || e.code === 'EXCLUDED') throw e;
@@ -138,6 +143,25 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
   }
   if (doc.links?.length) log('Download', `${fileName}: ${n} attached document(s) saved`);
   return { files: out, converted: doc.kind === 'html' && !doc.printed, htmlKept: doc.kind === 'html' && !doc.printed && !action.pageOnly, printError, attachmentErrors };
+}
+
+/**
+ * The name a document is saved under, the same locally and in the ECM. Two different documents of one run
+ * may come with the same IREPS name: the later one gets "_2", "_3"... when it would share the local folder
+ * or the ECM document (a grouped "<T> - NIT" tells its PDFs apart by file name). Synchronous, so documents
+ * saved in parallel never take the same name.
+ */
+function reserveFileName(run, action, id, fileName) {
+  const ecmDoc = run.ecm ? ecmDocumentFor(action.category, { ...action, id }, run.ctx) : null;
+  const scopes = [`dir:${safeSegment(action.subdir || '')}`, ...(ecmDoc ? [`ecm:${ecmDoc.kind}|${ecmDoc.title}`] : [])];
+  run.fileNames ||= new Set();
+  const taken = (name) => scopes.some((sc) => run.fileNames.has(`${sc}|${name.toLowerCase()}`));
+  const dot = fileName.lastIndexOf('.');
+  const [stem, ext] = dot > 0 ? [fileName.slice(0, dot), fileName.slice(dot)] : [fileName, ''];
+  let name = fileName;
+  for (let n = 2; taken(name); n++) name = `${stem}_${n}${ext}`;
+  for (const sc of scopes) run.fileNames.add(`${sc}|${name.toLowerCase()}`);
+  return name;
 }
 
 /** Save one document file (ECM or local) and record it in the download log. -> the result file entry */
@@ -150,10 +174,10 @@ async function saveDocument(run, action, { fileName, bytes, contentType, id, met
     // "<T> - NIT": the tender PDF becomes the document's main file, so its attachments wait for it (runSteps)
     if (action.category === 'ATTACHMENTS' && run.nitPdfSaved) await run.nitPdfSaved;
     ({ ecm, local: saved } = await run.ecm.save({ ...ecmDoc, bytes, filename: ecmFileName(action.category, fileName, id), mimeType },
-      () => run.saver.save(action.subdir, fileName, bytes)));
+      () => run.saver.save(action.subdir, fileName, bytes, undefined, { exact: true })));
     log('Download', `ECM ${ecm.status}${ecm.site ? ` (${ecm.site})` : ''}: ${fileName}`);
   } else {
-    saved = await run.saver.save(action.subdir, fileName, bytes);
+    saved = await run.saver.save(action.subdir, fileName, bytes, undefined, { exact: true });
   }
   const size = saved ? saved.size : bytes.length;
   const name = saved ? saved.relPath.split('/').pop() : fileName;

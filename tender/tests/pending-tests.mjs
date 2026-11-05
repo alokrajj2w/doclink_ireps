@@ -231,8 +231,10 @@ test('T1/T2/T3/T6/T7/T9 full run: every pending record, every letter, attachment
   assert.ok(names.includes('DocLink/HOSUR/Correspondence/Pending/19264728/Correspondence_501_11-10-2026_Confirmation;.pdf'), names.join('\n'));
   assert.ok(names.some((n) => /Pending\/19264728\/Correspondence_502_11-10-2026_Confirmation;\.pdf$/.test(n)), 'same subject, different letter id -> different file');
   assert.ok(names.some((n) => /Pending\/19264728\/Correspondence_502_.*\.html$/.test(n)), 'original HTML kept next to the rendered PDF');
-  assert.ok(names.some((n) => /Pending\/L1265428\/Attachment_777_B_Annexure 1\.pdf$/.test(n)), names.join('\n'));
-  assert.ok(names.some((n) => /Pending\/L1265428\/Attachment_777_B_drawing\.pdf$/.test(n)));
+  // files IREPS served keep their IREPS names: the embedded letter PDF, and the attachments (Content-Disposition, else the URL)
+  assert.ok(names.some((n) => /Pending\/L1265428\/letter9003\.pdf$/.test(n)), names.join('\n'));
+  assert.ok(names.some((n) => /Pending\/L1265428\/Annexure 1\.pdf$/.test(n)), names.join('\n'));
+  assert.ok(names.some((n) => /Pending\/L1265428\/drawing\.pdf$/.test(n)));
   assert.ok(pdfs().every((s) => core.isPdfBytes(s.bytes) && s.size > 0));
   assert.ok(!names.some((n) => /20263194/.test(n) && n.endsWith('.pdf')), 'no-letters record produced no document');
   assert.ok(!names.some((n) => /LAPSED|PREV|HIST/i.test(n)));
@@ -351,7 +353,7 @@ test('Save to ECM / S3: every pending letter and attachment goes to the unit\'s 
     assert.deepEqual(saved.map((s) => s.filename.split('/').pop()), ['Correspondence_502_11-10-2026_Confirmation;.html']);
     const l3 = stored().letters.find((x) => x.letterId === '9003');
     const letter = l3.files.find((f) => f.role === 'letter');
-    assert.deepEqual([letter.ecm.status, letter.relPath, letter.fileName], ['stored', null, 'Correspondence_777_B_11-10-2026_Clarification _ price.pdf']);
+    assert.deepEqual([letter.ecm.status, letter.relPath, letter.fileName], ['stored', null, 'letter9003.pdf']);
     assert.ok(l3.files.filter((f) => f.role === 'attachment').every((f) => f.ecm.status === 'stored' && f.relPath === null));
   });
 });
@@ -364,7 +366,7 @@ test('Save to ECM / S3: a letter the ECM does not take is saved to Downloads ins
     assert.equal(r.summary.lettersDownloaded, 3);
     const names = saved.map((s) => s.filename);
     assert.ok(names.includes('DocLink/HOSUR/Correspondence/Pending/19264728/Correspondence_501_11-10-2026_Confirmation;.pdf'), names.join('\n'));
-    assert.ok(names.some((n) => /Pending\/L1265428\/Attachment_777_B_Annexure 1\.pdf$/.test(n)));
+    assert.ok(names.some((n) => /Pending\/L1265428\/Annexure 1\.pdf$/.test(n)));
     const letter = stored().letters.find((x) => x.letterId === '9001').files.find((f) => f.role === 'letter');
     assert.equal(letter.ecm.status, 'failed');
     assert.match(letter.relPath, /Correspondence_501/);
@@ -434,9 +436,24 @@ test('T8b a failed attachment keeps the letter saved; retry downloads only the m
   const r2 = await go({ mode: 'retry' });
   assert.deepEqual([r2.summary.failed, r2.summary.lettersDownloaded], [0, 1]);
   assert.equal(pdfs().length, 3);
-  assert.equal(pdfs().filter((s) => /Correspondence_1/.test(s.filename)).length, 1, 'letter not saved twice');
+  assert.equal(pdfs().filter((s) => /\/l\.pdf$/.test(s.filename)).length, 1, 'letter not saved twice');
 });
 
+test('File names: two letters of a tender attach different files with one IREPS name - both are kept, the later with its letter number; again on a re-run', async () => {
+  const page = (dir) => () => ({ status: 200, bytes: enc(`<html><body><iframe src="/ireps/corr/${dir}/letter.pdf"></iframe><a href="/ireps/corr/${dir}/Annexure.pdf">Annexure</a></body></html>`), type: 'text/html', extra: {} });
+  mk({
+    rows: [{ no: 'A', oid: '1' }],
+    details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '11', id: '7', subject: 'first' }, { no: '12', id: '8', subject: 'second' }] } },
+    letters: { 7: page('x'), 8: page('y') },
+    attachments: { 'letter.pdf': letterPdf('l'), 'Annexure.pdf': letterPdf('a') },
+  });
+  await go();
+  const names = () => saved.map((s) => s.filename.replace('DocLink/HOSUR/Correspondence/Pending/A/', '')).sort();
+  assert.deepEqual(names(), ['Annexure.pdf', 'Annexure_12.pdf', 'letter.pdf', 'letter_8.pdf']);
+  saved.length = 0;
+  await go({ force: true });
+  assert.deepEqual(names(), ['Annexure.pdf', 'Annexure_12.pdf', 'letter.pdf', 'letter_8.pdf'], 'the same names each run, so a re-download overwrites its own file');
+});
 test('T6b login page, HTTP error page or empty reply is never saved as a letter', async () => {
   mk({
     rows: [{ no: 'A', oid: '1' }],

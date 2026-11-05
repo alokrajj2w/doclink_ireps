@@ -26,6 +26,7 @@ import { downloadBytes } from "../download-service.js";
 import { logger } from "../../utils/logger.js";
 import { withRetry } from "../batch-utils.js";
 import { isIrepsOriginUrl } from "./search-po-api.js";
+import { sourceFileName } from "../../utils/filename.js";
 
 export const DOCUMENT_DOWNLOAD_CONCURRENCY = 3;
 
@@ -131,7 +132,11 @@ export async function fetchIrepsDocument(url, deps = {}) {
       detail: `IREPS returned HTTP ${response.status}`
     });
   }
-  if (looksLikePdf(bytes)) return { bytes, contentType, status: response.status };
+  if (looksLikePdf(bytes)) {
+    // the name IREPS gave the PDF (Content-Disposition, else the URL), "" when it gave none
+    const sourceName = sourceFileName({ contentDisposition: (response.headers && response.headers.get("content-disposition")) || "", url: response.url || url });
+    return { bytes, contentType, status: response.status, sourceName: /\.pdf$/i.test(sourceName) ? sourceName : "" };
+  }
 
   // Not a PDF. Distinguish "session expired" from "something else".
   const probe = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, Math.min(bytes.length, TEXT_PROBE_BYTES)));
@@ -174,11 +179,20 @@ export async function fetchIrepsDocument(url, deps = {}) {
  */
 export async function downloadIrepsDocument(item, options = {}) {
   const CODES = { ...DEFAULT_CODES, ...(options.codes || {}) };
-  const { bytes } = await fetchIrepsDocument(item.url, { fetch: options.fetch, codes: CODES });
+  const { bytes, sourceName } = await fetchIrepsDocument(item.url, { fetch: options.fetch, codes: CODES });
+  // the PDF keeps the name IREPS gave it, in DocLink's folder. DocLink's own name (item.path, already unique
+  // within the batch) only when IREPS gave none, or when another document of the batch has taken that name -
+  // two different POs of one number would otherwise share a file name, and so one ECM document
+  let path = sourceName ? `${item.path.slice(0, item.path.lastIndexOf("/") + 1)}${sourceName}` : item.path;
+  if (options.takenNames && path !== item.path) {
+    const owner = options.takenNames.get(path.toLowerCase());
+    if (owner !== undefined && owner !== item.id) path = item.path;
+    else options.takenNames.set(path.toLowerCase(), item.id);
+  }
   const saveFile = options.saveFile || ((data, target) => downloadBytes(data, { path: target, mimeType: "application/pdf" }));
   let saved;
   try {
-    saved = await saveFile(bytes, item.path, item);
+    saved = await saveFile(bytes, path, item);
   } catch (error) {
     logger.error("Document could not be saved", error);
     throw new IrepsError(CODES.DOWNLOAD_FAILED, "Chrome could not save the PDF", { detail: "Chrome could not save the file", cause: error });
@@ -186,8 +200,8 @@ export async function downloadIrepsDocument(item, options = {}) {
   const done = {
     id: item.id,
     url: item.url,
-    path: item.path,
-    filename: (saved && saved.filename) || item.path.split("/").pop(),
+    path,
+    filename: (saved && saved.filename) || path.split("/").pop(),
     downloadId: saved && saved.downloadId !== undefined ? saved.downloadId : null,
     ecm: (saved && saved.ecm) || null,
     bytes: bytes.length
@@ -266,6 +280,8 @@ export async function downloadIrepsDocuments(items, options = {}) {
     }
   };
 
+  // IREPS file names used so far in this batch -> the item that has it (see downloadIrepsDocument)
+  const takenNames = new Map();
   const worker = async () => {
     while (cursor < list.length) {
       const index = cursor++;
@@ -281,7 +297,7 @@ export async function downloadIrepsDocuments(items, options = {}) {
       notify();
       try {
         const target = item.ecm && replace.has(item.id) ? { ...item, ecm: { ...item.ecm, replace: replace.get(item.id) } } : item;
-        const attempt = () => downloadIrepsDocument(target, { fetch: options.fetch, saveFile: options.saveFile, onSaved: options.onSaved, codes: CODES });
+        const attempt = () => downloadIrepsDocument(target, { fetch: options.fetch, saveFile: options.saveFile, onSaved: options.onSaved, codes: CODES, takenNames });
         // Transient failures only (network / timeout / HTTP 5xx); never an expired session or a non-PDF.
         const done = options.retries > 0 ? await withRetry(attempt, { attempts: options.retries + 1, delayMs: options.retryDelayMs }) : await attempt();
         state.status = DOCUMENT_DOWNLOAD_STATUS.COMPLETED;

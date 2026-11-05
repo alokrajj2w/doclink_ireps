@@ -12,7 +12,7 @@ import { searchIrepsDocuments } from "../services/search-po/search-po-service.js
 import { parseMaSearchResults, matchMaHeader, maDateKey, MA_FIELDS } from "../services/ma/ma-parser.js";
 import { searchMa, buildMaDateFilter, maDownloadItems, downloadMaPdf, downloadMaPdfs, todayIreps, MA_ERROR, MA_DATE_MODE, MA_DOWNLOAD_STATUS } from "../services/ma/ma-service.js";
 import { fetchIrepsDocument, looksLikePdf } from "../services/search-po/document-downloader.js";
-import { buildMaFilename, buildMaDownloadPath } from "../utils/filename.js";
+import { buildMaFilename, buildMaDownloadPath, sourceFileName, cleanSourceName } from "../utils/filename.js";
 import { describeError, MA_STAGES } from "../utils/messages.js";
 
 const BASE = IREPS_CONFIG.baseUrl;
@@ -270,6 +270,18 @@ export async function runMaTests({ test, assert, eq, rejects, fixture }) {
 
   /* --------------------------------------------------------- downloader */
 
+  await test("source file names: Content-Disposition first, else the URL; a .do action names no file; only illegal characters change", () => {
+    eq(sourceFileName({ contentDisposition: 'attachment; filename="MA 007001.pdf"', url: "https://www.ireps.gov.in/x/07250369100001_007001.pdf" }), "MA 007001.pdf");
+    eq(sourceFileName({ contentDisposition: "attachment; filename*=UTF-8''Spec%20Sheet.pdf" }), "Spec Sheet.pdf");
+    eq(sourceFileName({ url: "https://www.ireps.gov.in/ireps/supply/pdfdocs/102026/107120554/viewNitPdf_5470263.pdf" }), "viewNitPdf_5470263.pdf");
+    eq(sourceFileName({ url: "https://www.ireps.gov.in/epsn/tbo/commTboPdfAction.do" }), "", "no file name: DocLink names it");
+    eq(sourceFileName({ contentDisposition: "inline", url: "https://www.ireps.gov.in/ireps/view?oid=1" }), "");
+    eq(cleanSourceName('a:b|c*.PDF'), "a_b_c_.PDF", "case and extension kept");
+    eq(cleanSourceName("no extension"), "");
+    eq(cleanSourceName(`${"x".repeat(200)}.pdf`).length, 150);
+    eq(cleanSourceName(`${"x".repeat(200)}.pdf`).endsWith(".pdf"), true, "a long name keeps its extension");
+  });
+
   await test("MA file names: MA_<PO>_<MA>.pdf inside a folder named after the MA date", () => {
     eq(buildMaFilename("07250369105448", "007327"), "MA_07250369105448_007327.pdf");
     eq(buildMaFilename("a/b:c", "1*2"), "MA_a_b_c_1_2.pdf");
@@ -324,8 +336,8 @@ export async function runMaTests({ test, assert, eq, rejects, fixture }) {
     const done = await downloadMaPdf(records[0], { fetch: fetchImpl, saveFile });
     eq(fetched[0], records[0].maPdfUrl);
     assert(fetched[0] !== records[0].poPdfUrl && fetched[0].endsWith("_007001.pdf"), "MA document, not the PO document");
-    eq(done.path, "DocLink/IREPS/MA/2026-09-18/MA_07250369100001_007001.pdf");
-    eq(done.filename, "MA_07250369100001_007001.pdf");
+    eq(done.path, "DocLink/IREPS/MA/2026-09-18/07250369100001_007001.pdf", "the MA PDF keeps its IREPS name, in the MA-date folder");
+    eq(done.filename, "07250369100001_007001.pdf");
     await rejects(downloadMaPdf(records[5], { fetch: fetchImpl, saveFile }), MA_ERROR.LINK_NOT_FOUND);
     eq(fetched.length, 1, "nothing fetched for the row without a link");
   });
@@ -351,7 +363,7 @@ export async function runMaTests({ test, assert, eq, rejects, fixture }) {
     eq(summary.failed, 2);
     const byMa = Object.fromEntries(summary.items.map((i) => [i.meta.maNo, i]));
     eq(byMa["007001"].status, MA_DOWNLOAD_STATUS.COMPLETED);
-    eq(byMa["007001"].filename, "MA_07250369100001_007001.pdf");
+    eq(byMa["007001"].filename, "07250369100001_007001.pdf");
     eq(byMa["002003"].status, MA_DOWNLOAD_STATUS.FAILED);
     eq(byMa["002003"].error.code, MA_ERROR.DOWNLOAD_FAILED);
     eq(byMa["002003"].error.status, 404);

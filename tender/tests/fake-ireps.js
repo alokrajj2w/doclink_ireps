@@ -319,6 +319,8 @@ export class FakeIreps {
       if (!['offer', 'financialTabulation', 'commercialTabulation'].includes(type)) { this.excludedHit = true; return pdf('FORBIDDEN'); }
       if (type !== 'offer' && this.s.tabulationAsHtml) return ok(letterHtml(`${type} ${arg('tenderOID')}`));
       if (type !== 'offer' && this.s.tabulationAs) return ok(tabulationViewer(this.s.tabulationAs, type, arg('tenderOID'), (this.s.closed || []).find((c) => c.oid === arg('tenderOID'))?.no));
+      // s.tabulationDisposition: IREPS names the file it serves in Content-Disposition
+      if (type !== 'offer' && this.s.tabulationDisposition) return { ...pdf(type + arg('tenderOID')), disposition: this.s.tabulationDisposition };
       return pdf(type + arg('tenderOID'));
     }
     if (p.startsWith('/ireps/upload/tbo/')) {

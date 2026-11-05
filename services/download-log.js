@@ -300,7 +300,7 @@ export const DOC_TYPE_LABEL = Object.freeze({
   bill_status: "Bill Status",
   crn: "CRN",
   rnote: "R-NOTE",
-  tender_nit: "Tender NIT",
+  tender_nit: "NIT",
   tender_attachment: "Tender attachment",
   corrigendum: "Corrigendum",
   my_offer: "My Offer",

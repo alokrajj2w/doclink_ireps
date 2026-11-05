@@ -398,7 +398,8 @@ number, PO, unit, PO date and MA date. Mock log:
 
 3. Tick two MAs → **Download Selected (2)**: chips go Queued → Downloading →
    Completed; "✓ 2 MA copies downloaded"; files
-   `MA_<PO>_<MA>.pdf` in `Downloads\DocLink\IREPS\MA\<today YYYY-MM-DD>\`.
+   under the name IREPS gives them (e.g. `07250369100001_007001.pdf`; `MA_<PO>_<MA>.pdf`
+   only when IREPS gives none) in `Downloads\DocLink\IREPS\MA\<today YYYY-MM-DD>\`.
    Each PDF opens and reads "MODIFICATION ADVICE".
 4. **Download All**: all of today's MAs; an MA without a link shows Failed
    with the tooltip "MA copy link not found".
@@ -541,7 +542,7 @@ node test/mock/switch-target.mjs status
     `recordsPerPage=2000`) and `MA records parsed: N` where N must equal
     "Total N result(s)" on the portal's MA search. The list must contain
     exactly the MAs whose *MA Date* column reads today. Tick one and
-    **Download Selected (1)**: the saved `MA_<PO>_<MA>.pdf` must be the same
+    **Download Selected (1)**: the saved MA PDF must be the same
     document the portal opens from that row's "View/Download MA" icon (not
     the PO PDF opened from the PO number). If it fails with **MA copy not
     valid**, capture a HAR of clicking that icon on the portal.
@@ -710,3 +711,21 @@ To = today,
 
 On the real portal, if a tabulation still fails, run `doclinkLog.download()`
 in the side panel console: the `Tabulation` lines show what IREPS answered.
+
+## File names (IREPS names kept)
+
+Run once with **Save to: Local** and once with **ECM / S3** (direct ECM).
+
+1. Tender documents: the NIT PDF is `viewNitPdf_<nitId>.pdf` and each attachment has its IREPS name
+   (`5919538.pdf`, ...), in `NIT_and_Supporting_Documents\` and in the ECM document `<T> - NIT`. The
+   Financial / Commercial Tabulation has the name of the file IREPS opens (e.g. `FIN-TAB-<no>-<oid>.pdf`,
+   `TECH-TAB-<no>-<oid>.pdf`), or `Financial_Tabulation_<T>.pdf` / `Commercial_Tabulation_<T>.pdf` when
+   IREPS gives none.
+2. Pages DocLink prints or renders keep DocLink names: `Corrigendum_NN_<T>.pdf`, `LOA_<T>.pdf`,
+   `Counter_Offer_<T>_<id>.pdf`, `Negotiation_...`, `Correspondence_...` (letter pages).
+3. IC / PO / MA: the PDF is saved under its IREPS name (`8794517.pdf`, `27253922100240.pdf`,
+   `07250369100001_007001.pdf`) in the usual folders, and has that name in the ECM.
+4. Two different documents with one IREPS name: the later one is `<name>_2.pdf` (tender) or keeps
+   DocLink's name (IC / PO / MA batch), so neither replaces the other locally or in the ECM.
+5. ECM "Document type" labels (NIT, PO, LOA, MA, Results, Commercial Tabulation) come from the ECM's
+   vocabulary `invoice_certificate_document_types`; check them after the ECM admin renames them.

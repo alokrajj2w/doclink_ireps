@@ -33,7 +33,8 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
   corrigenda and My Offer (**NIT Documents**) into
   `Downloads/DocLink/<unit>/Tender_<no>/`. A corrigendum is its IREPS page,
   printed as Ctrl+P would (`Corrigendum_NN_<tender>.pdf`); a document attached
-  to it is saved next to it as `Corrigendum_NN_<tender>_Attachment_<n>.<ext>`. Negotiation / counter offer / LOA
+  to it is saved next to it under its IREPS name (`Corrigendum_NN_<tender>_Attachment_<n>.<ext>`
+  when IREPS gives none). Negotiation / counter offer / LOA
   letters have their own buttons (by Letter Date), and correspondence comes
   from the Correspondence view. An LOA is the published letter page alone,
   printed as Ctrl+P would: one `LOA_<tender>.pdf` per tender, and nothing the
@@ -48,6 +49,18 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
   runs in the side panel only; it has its own node tests (section 10).
 
 The **Upload Document** card is present in the UI as a Phase 2 placeholder.
+
+**File names.** A PDF (or other file) that IREPS serves keeps the name IREPS gives
+it, in Downloads and in the ECM: the response's `Content-Disposition` file name,
+else the name in the URL that answered (`viewNitPdf_5470263.pdf`, `8794517.pdf`).
+Only characters no file system accepts become `_`. DocLink names a file itself only
+when it made the PDF (a page printed by Chrome, or the text rendering) or when IREPS
+served it without a name (a POST to a `.do` action, e.g. a tabulation answered
+directly). Those are the `NIT_<tender>.pdf`, `Corrigendum_NN_<tender>.pdf`,
+`LOA_<tender>.pdf`, `Financial_Tabulation_<tender>.pdf`, `IC_<PO>_<SR>_<CALLID>.pdf`
+... names below. When two different documents of one run would share a name in one
+folder or one grouped ECM document, the later one gets `_2`, `_3`, ... in both places
+(`utils/filename.js` `sourceFileName`, `tender-workflows.js` `reserveFileName`).
 
 DocLink never asks for, reads, stores or forwards IREPS credentials, security
 keys or session cookies. It acts as an authenticated browser client, not as a
@@ -871,7 +884,7 @@ DocLink keeps the rows whose "MA Date" matches the selection and lists them
         ↓  user: Download Selected / Download All
 GET <href of a[title="View/Download MA"]>   with the browser session, 3 at a time, verified as %PDF-
         ↓
-Downloads/DocLink/IREPS/MA/<YYYY-MM-DD of the MA date>/MA_<PO-NO>_<MA-NO>.pdf
+Downloads/DocLink/IREPS/MA/<YYYY-MM-DD of the MA date>/<IREPS file name, e.g. 07250369100001_007001.pdf>
 ```
 
 ### The captured MA request
@@ -919,9 +932,9 @@ session has expired. Please log in again and retry the MA download."), any
 other non-PDF `IREPS_MA_INVALID_PDF`; nothing that is not a PDF is saved.
 Batches run 3 downloads at a time with Queued / Downloading / Completed /
 Failed per MA; after a session expiry the remaining MAs are not attempted
-and can be retried with **Retry failed downloads**. Files are named
-`MA_<PO-NO>_<MA-NO>.pdf` (sanitised) because MA numbers repeat across POs,
-and grouped in a folder per MA date.
+and can be retried with **Retry failed downloads**. Files keep the IREPS
+name (see "File names" above); `MA_<PO-NO>_<MA-NO>.pdf` is used only when IREPS
+gives none, because MA numbers repeat across POs. Files are grouped in a folder per MA date.
 
 ### MA error codes
 
@@ -1010,10 +1023,19 @@ settings, sign-in cookie and host permission as section 15:
 | Corrigendum | `extension` | same | `<tender no> - Extension - <corrigendum no>`; a document attached to it `<tender no> - Extension - <corrigendum no> - Attachment <n>` |
 | Negotiation letter | `nbsp` | same | `<tender no> - NBSP - <letter id>` |
 | Counter offer | `co` | same | `<tender no> - CO - <letter id>` |
-| LOA (Advance Acceptance Letter) | `loi` | same | **one document per tender**, `<tender no> - LOA`: every letter in it, as `LOA_<tender no>_<letter id>.pdf` |
+| LOA (Advance Acceptance Letter) | `loi` | same | **one document per tender**, `<tender no> - LOA`: every letter in it, as `LOA_<tender no>_<letter id>.pdf` (a printed page, so DocLink names it) |
 | Correspondence | `crp` | same | `<tender no> - CRP - <subject>` |
 | Financial Tabulation | `tenderResult` (ECM "Tender Result") | same | **one document per tender**, `<tender no> - Result` |
 | Commercial Tabulation | `vct` | same | `<tender no> - Commercial Tabulation` |
+
+**Type labels.** DocLink sends only the type id (`InvoiceCertificateSchema:type`: `nit`,
+`poCopy`, `loi`, `modificationAdvise`, `tenderResult`, `vct`, ...). The label the ECM shows
+under "Document type" comes from the ECM's vocabulary `invoice_certificate_document_types`
+and is changed there by the ECM admin, not in DocLink. Wanted labels (Wabtec, 05/11/2026):
+`nit` NIT, `poCopy` PO, `loi` LOA, `modificationAdvise` MA, `tenderResult` Results,
+`vct` Commercial Tabulation (today: "Tender NIT", "Advance Acceptance Letter",
+"Tender Result", "View Commercial Tabulation"). Renaming a label leaves the ids and every
+stored document as they are.
 
 **One document per tender (NIT, LOA, Result).** As the Wabtec team asked on
 29/10/2026 (example tender 38265117: `38265117 - NIT`, `- LOA`, `- Result`). These
@@ -1395,7 +1417,7 @@ Request sequence (all in the signed-in browser session, `credentials: include`):
 
 `vendorCorresSubmitReply.do` and anything that looks like a write action is refused in `pcFetch()` (`assertReadOnly`).
 
-Output: `Downloads/DocLink/<verified unit>/Correspondence/Pending/<TenderNo>/Correspondence_<LetterNo>_<dd-mm-yyyy>_<Subject>.pdf`, `Attachment_<LetterNo>_<original name>`, and `Downloads/DocLink/<unit>/Correspondence/Pending/download_manifest.json`.
+Output: `Downloads/DocLink/<verified unit>/Correspondence/Pending/<TenderNo>/Correspondence_<LetterNo>_<dd-mm-yyyy>_<Subject>.pdf` (a letter IREPS serves as a PDF keeps its IREPS name), attachments under their IREPS name (`<name>_<LetterNo>` when another file of the tender's folder has it), and `Downloads/DocLink/<unit>/Correspondence/Pending/download_manifest.json`.
 Under **Save to: ECM / S3** each letter and attachment goes to the unit's ECM Tenders folder instead, as `crp` with the tender number, titled `<tender no> - CRP - <letter no> - <subject>` (attachments: `<tender no> - CRP - <letter no> - Attachment - <file name>`), with the same Recon sign-in and the same local fallback as the tender documents (section 16). Each letter row shows where it went. When Chrome cannot print a letter, its original `.html` page stays in Downloads.
 Dedupe key: `accountId|nitOid|corresId|letterId` (stored in `chrome.storage.local`, no secrets). **Retry failed** and a repeated run skip letters already saved; tick "Download again" to force.
 Requests are sequential, with bounded retry/backoff on 5xx/429/network errors; a session expiry stops the job and marks the rest `SESSION_EXPIRED`.
@@ -1421,7 +1443,8 @@ the switch's current choice. The IC manifest records each document's ECM outcome
 `postRequest('/epsn/searchPO.do?…&pageNo=N…')` links. A selection longer than IREPS' 180-day limit is split into
 consecutive windows searched one after another. Rows are re-checked against the selected dates, de-duplicated on
 PO No. + unit + link, and each row's own "Click to View/Download PO" href is fetched, verified as `%PDF`, and saved as
-`Downloads/DocLink/IREPS/PO/<PO date>/PO_<PO>_<date>.pdf` (unit added only when two documents would collide).
+`Downloads/DocLink/IREPS/PO/<PO date>/<IREPS file name>` (`PO_<PO>_<date>.pdf`, unit added only when two documents
+would collide, when IREPS gives no name).
 Rows without a link are listed as skipped with the reason.
 
 ### Download ICs by IC Date
@@ -1433,7 +1456,7 @@ From date is earlier, since a call precedes its IC → every `navigate(N)` page 
 the page before. Rows are re-checked here: IC-issued status, IC Date in the range, de-duplicated on the IC PDF href.
 Should IREPS ignore the IC dates, the newest-first list stops being read after two whole pages before From (and at
 most 200 pages are read, with a warning). Each row's "View/ Download IC PDF" href is saved as
-`Downloads/DocLink/IREPS/IC/<PO>/IC_<PO>_<SR>_<CALLID>.pdf`, with the same download-log key and ECM fields as the other
+`Downloads/DocLink/IREPS/IC/<PO>/<IREPS file name>` (`IC_<PO>_<SR>_<CALLID>.pdf` when IREPS gives none), with the same download-log key and ECM fields as the other
 IC downloads, so an IC already downloaded by any of them is recognised.
 
 ### Download ICs from Notifications
@@ -1443,7 +1466,7 @@ Download ICs by IC Date.
 "IC issued for PONo : … , POSrNo : …" (everything else ignored; identifiers kept verbatim) → for each distinct
 PO + serial: `POST /epsn/tpi/vendorInspectionCallList.do callType=I&status=I` (fresh token), then the search with `poNo`,
 `poSr`, `statusSelected=Completed / IC Issued`, every `navigate(N)` page → rows with the exact PO number, exact serial and an
-IC-issued status → each row's "View/ Download IC PDF" href → `Downloads/DocLink/IREPS/IC/<PO>/IC_<PO>_<SR>_<CALLID>.pdf`.
+IC-issued status → each row's "View/ Download IC PDF" href → `Downloads/DocLink/IREPS/IC/<PO>/<IREPS file name>` (`IC_<PO>_<SR>_<CALLID>.pdf` when IREPS gives none).
 `REF_ID` is compared with the row's Call Id and reported, not trusted as the certificate number. A manifest
 (`IC_notifications_manifest_<time>.json`: ids, outcome, reason - never cookies or tokens) is saved beside the ICs.
 Searches run one at a time (the Struts token belongs to the session); downloads run 3 at a time with up to 2 retries for

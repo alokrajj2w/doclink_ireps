@@ -225,7 +225,8 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(p.get("dateFrom"), "05/10/2026");
     eq(p.get("dateTo"), "05/10/2026");
     assert(/^TOKEN-\d+$/.test(p.get("org.apache.struts.taglib.html.TOKEN")), "the token comes from the live page, not a constant");
-    assert(files.every((f) => /^DocLink\/IREPS\/PO\/2026-10-05\/PO_\d+_2026-10-05\.pdf$/.test(f.path)), files.map((f) => f.path).join(","));
+    // in the PO-date folder, under the name IREPS gives each PDF
+    assert(files.every((f) => /^DocLink\/IREPS\/PO\/2026-10-05\/[^/]+\.pdf$/.test(f.path) && !/\/PO_/.test(f.path)), files.map((f) => f.path).join(","));
     eq(state.phase, "complete");
   });
 
@@ -305,10 +306,10 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(files.length, 2);
   });
 
-  await test("PO date: the same PO number from different units gets distinct, unit-qualified file names (no overwrite, no loss)", async () => {
+  await test("PO date: the same PO number from different units gets distinct file names (no overwrite, no loss): the IREPS name, then DocLink's unit-qualified one", async () => {
     const pos = [
-      { poNo: "27253922100240", unit: "HQ/CR", date: "05/10/2026", link: "/ireps/etender/pdfdocs/MMIS/PO/2026/10/a.pdf" },
-      { poNo: "27253922100240", unit: "HQ/NR", date: "05/10/2026", link: "/ireps/etender/pdfdocs/MMIS/PO/2026/10/b.pdf" },
+      { poNo: "27253922100240", unit: "HQ/CR", date: "05/10/2026", link: "/ireps/etender/pdfdocs/MMIS/PO/2026/10/cr/27253922100240.pdf" },
+      { poNo: "27253922100240", unit: "HQ/NR", date: "05/10/2026", link: "/ireps/etender/pdfdocs/MMIS/PO/2026/10/nr/27253922100240.pdf" },
       { poNo: "27253922100241", unit: "HQ/CR", date: "05/10/2026", link: "/ireps/etender/pdfdocs/MMIS/PO/2026/10/c.pdf" }
     ];
     const sim = simulator(pages, { pos });
@@ -317,8 +318,9 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(state.counts.downloaded, 3);
     const names = files.map((f) => f.path.split("/").pop());
     eq(new Set(names).size, 3, names.join(","));
-    assert(names.includes("PO_27253922100240_HQ_CR_2026-10-05.pdf") && names.includes("PO_27253922100240_HQ_NR_2026-10-05.pdf"), names.join(","));
-    assert(names.includes("PO_27253922100241_2026-10-05.pdf"), "a non-colliding PO keeps the plain name");
+    // one keeps the IREPS name; the other (same IREPS name, another PO) gets DocLink's unit-qualified name
+    assert(names.includes("27253922100240.pdf") && names.filter((n) => /^PO_27253922100240_HQ_(CR|NR)_2026-10-05\.pdf$/.test(n)).length === 1, names.join(","));
+    assert(names.includes("c.pdf"), "a non-colliding PO keeps its IREPS name");
     // identical unit labels still never collide
     const same = assignPoDatePaths([
       { poNo: "1", railwayUnit: "U", dateKey: "2026-10-05" },
@@ -507,7 +509,7 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(state.counts.inspected, 1);
     eq(state.counts.icNotifications, 1);
     eq(state.counts.downloaded, 1);
-    eq(files[0].path, "DocLink/IREPS/IC/L1000000000001/IC_L1000000000001_001_8000000001.pdf");
+    eq(files[0].path, "DocLink/IREPS/IC/L1000000000001/8000000001.pdf", "the IC PDF keeps its IREPS name");
     const s = sim.state.icSearches[0];
     eq(s.poNo, "L1000000000001");
     eq(s.poSr, "001");
@@ -561,7 +563,7 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     const { state, files } = await runIc(sim);
     // the simulator filters server-side by exact poSr; also verify the client-side guard on a sloppy server
     eq(files.length, 1);
-    eq(files[0].path.split("/").pop(), "IC_P1_001_RIGHT.pdf");
+    eq(files[0].path.split("/").pop(), "RIGHT.pdf");
     eq(sim.state.icSearches[0].poSr, "001");
     const sloppy = matchIcRows([{ poNo: "P1", poSerial: "1", callStatus: "Completed (IC Issued)" }, { poNo: "P1", poSerial: "001", callStatus: "Completed (IC Issued)" }, { poNo: "P2", poSerial: "001", callStatus: "Completed (IC Issued)" }, { poNo: "P1", poSerial: "001", callStatus: "Call Registered" }], { poNo: "P1", poSerial: "001" });
     eq(sloppy.length, 1, "exact PO + exact serial + IC-issued status only");
@@ -729,8 +731,8 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(state.counts.found, 4);
     eq(state.counts.pos, 2);
     eq(state.counts.downloaded, 4);
-    eq(files.map((f) => f.path.split("/").pop()).join(","), "IC_P1_001_C11.pdf,IC_P1_002_C12.pdf,IC_P1_004_C14.pdf,IC_P2_001_C21.pdf");
-    eq(files[0].path, "DocLink/IREPS/IC/P1/IC_P1_001_C11.pdf");
+    eq(files.map((f) => f.path.split("/").pop()).join(","), "C11.pdf,C12.pdf,C14.pdf,C21.pdf", "IREPS names");
+    eq(files[0].path, "DocLink/IREPS/IC/P1/C11.pdf");
     eq(sim.state.icSearches.length, 1);
     const s = sim.state.icSearches[0];
     eq([s.poNo, s.poSr, s.dateFromIC, s.dateToIC].join("|"), "||10/09/2026|18/09/2026", "no PO, no serial, the IC dates of the range");

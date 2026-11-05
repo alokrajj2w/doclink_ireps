@@ -34,7 +34,7 @@ globalThis.fetch = async (url, init = {}) => {
   const u = String(url);
   if (u.startsWith('blob:')) return fetch0(u);
   const r = await server.handle(init.method || 'GET', u.replace('https://ext.invalid/', 'https://www.ireps.gov.in/'), init.body);
-  return new Response(r.bytes, { status: r.status, headers: { 'content-type': r.type } });
+  return new Response(r.bytes, { status: r.status, headers: { 'content-type': r.type, ...(r.disposition ? { 'content-disposition': r.disposition } : {}) } });
 };
 // downloads.download must read the blob we created
 chrome.downloads.download = async ({ url, filename }) => {
@@ -210,7 +210,7 @@ test('5. Exact tender found; folder is account-specific', async () => {
   const r = await run();
   assert.equal(r.tender.tenderNo, '29263265'); assert.equal(r.tender.nitId, '5569207');
   assert.ok(r.folder.startsWith('Downloads/DocLink/HOSUR/Tender_29263265'));
-  assert.ok(savedNames().includes('DocLink/HOSUR/Tender_29263265/NIT_and_Supporting_Documents/NIT_29263265.pdf'));
+  assert.ok(savedNames().includes('DocLink/HOSUR/Tender_29263265/NIT_and_Supporting_Documents/viewNitPdf_5569207.pdf'), 'the tender PDF keeps its IREPS name');
 });
 test('6. Tender outside the initial date range is found by retry (past and far-future)', async () => {
   mk({ tenders: [T({ closing: new Date(2027, 2, 1) })] });
@@ -287,7 +287,9 @@ test('10-14,15-19 full run: every category, correct methods, no manifest file do
   assert.deepEqual([c.correspondence.status, c.correspondence.downloaded], ['DOWNLOADED', 2]);
   assert.equal(r.summary.failed, 0);
   const n = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
-  for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'My_Offer/My_Offer_29263265.pdf', 'NIT_and_Supporting_Documents/Attachment_01_Annexure.pdf', 'NIT_and_Supporting_Documents/Attachment_02_IRS_CONDITIONS_5595304.pdf', 'NIT_and_Supporting_Documents/Attachment_04_drawing.zip',
+  // files IREPS served keep their IREPS names; DocLink names the printed / rendered pages and files served
+  // without a name (My Offer and the tabulations: POSTs to commTboPdfAction.do)
+  for (const want of ['NIT_and_Supporting_Documents/viewNitPdf_5569207.pdf', 'My_Offer/My_Offer_29263265.pdf', 'NIT_and_Supporting_Documents/Annexure.pdf', 'NIT_and_Supporting_Documents/5595304.pdf', 'NIT_and_Supporting_Documents/drawing.zip',
     'Corrigenda/Corrigendum_01_29263265.pdf', 'Corrigenda/Corrigendum_02_29263265.pdf', 'Corrigenda/Corrigendum_02_29263265.html', 'Negotiation/Negotiation_29263265_224222.pdf', 'Negotiation/Negotiation_29263265_224300.pdf',
     'Counter_Offers/Counter_Offer_29263265_1461275.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf', 'Correspondence/Correspondence_29263265_306789.pdf',
     'Tabulation/Financial_Tabulation_29263265.pdf', 'Tabulation/Commercial_Tabulation_29263265.pdf']) assert.ok(n.includes(want), `missing ${want}\n${n.join('\n')}`);
@@ -531,11 +533,11 @@ test('Corrigendum with an attached document: the corrigendum page (printed) AND 
     assert.equal(c.status, 'DOWNLOADED');
     assert.equal(c.downloaded, 1, 'one corrigendum (its attachment is not counted as another)');
     const files = Object.fromEntries(c.files.map((f) => [f.fileName, f]));
-    assert.deepEqual(Object.keys(files).sort(), ['Corrigendum_02_29263265.pdf', 'Corrigendum_02_29263265_Attachment_1.pdf']);
+    assert.deepEqual(Object.keys(files).sort(), ['Corrigendum_02_29263265.pdf', 'Revised_Spec.pdf'], 'the printed page is named by DocLink, the attached file keeps its IREPS name');
     assert.equal(files['Corrigendum_02_29263265.pdf'].printed, true, 'the page itself is printed by Chrome');
-    assert.equal(files['Corrigendum_02_29263265_Attachment_1.pdf'].role, 'attachment');
-    assert.equal(files['Corrigendum_02_29263265_Attachment_1.pdf'].attachmentOf, 'Corrigendum_02_29263265.pdf');
-    assert.match(savedText('Corrigendum_02_29263265_Attachment_1.pdf'), /corratt\/ireps\/upload\/corrigendum\/1204999\/Revised_Spec\.pdf/, 'the attachment is the linked file');
+    assert.equal(files['Revised_Spec.pdf'].role, 'attachment');
+    assert.equal(files['Revised_Spec.pdf'].attachmentOf, 'Corrigendum_02_29263265.pdf');
+    assert.match(savedText('Revised_Spec.pdf'), /corratt\/ireps\/upload\/corrigendum\/1204999\/Revised_Spec\.pdf/, 'the attachment is the linked file');
     assert.doesNotMatch(savedText('Corrigendum_02_29263265.pdf'), /corratt/, 'the corrigendum is the page, not the attachment');
     assert.equal(dbg.tabs.created, 1);
     assert.deepEqual(c.warnings, []);
@@ -550,8 +552,8 @@ test('Corrigendum attachments: several are numbered in page order; one that fail
   try {
     const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
     assert.equal(c.status, 'DOWNLOADED', 'the corrigendum is saved even when an attachment fails');
-    assert.deepEqual(c.files.map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Corrigendum_02_29263265_Attachment_1.pdf', 'Corrigendum_02_29263265_Attachment_2.pdf']);
-    assert.match(savedText('_Attachment_2.pdf'), /Annexure\.pdf/);
+    assert.deepEqual(c.files.map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Revised_Spec.pdf', 'Annexure.pdf']);
+    assert.match(savedText('Corrigenda/Annexure.pdf'), /Annexure\.pdf/);
     assert.equal(c.warnings.length, 1);
     assert.match(c.warnings[0], /Corrigendum_02_29263265\.pdf: an attached document could not be downloaded/);
   } finally {
@@ -561,7 +563,7 @@ test('Corrigendum attachments: several are numbered in page order; one that fail
 test('Corrigendum attachments without Chrome printing: text PDF + original HTML + the attached file', async () => {
   mk({ tenders: [ATT_CORR(['Revised_Spec.pdf'])] });
   const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
-  assert.deepEqual(c.files.map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Corrigendum_02_29263265.html', 'Corrigendum_02_29263265_Attachment_1.pdf']);
+  assert.deepEqual(c.files.map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Corrigendum_02_29263265.html', 'Revised_Spec.pdf']);
   assert.match(savedText('Corrigendum_02_29263265.pdf'), /%PDF/);
 });
 test('A NIT viewer page still gives the NIT PDF only (keepPage is for corrigenda alone)', async () => {
@@ -729,7 +731,7 @@ test('NIT job: reads every day since the last run (Sunday/holiday gap), download
   const r1 = await jobs.downloadNewNits();
   assert.deepEqual(r1.tenders.map((t) => t.tenderNo).sort(), ['MON1', 'SUN1']);
   assert.ok(r1.tenders.every((t) => t.tenderPdf.status === 'DOWNLOADED' && t.attachments.status === 'DOWNLOADED'));
-  assert.ok(savedNames().some((n) => n.includes('Tender_SUN1/NIT_and_Supporting_Documents/NIT_SUN1.pdf')) && savedNames().some((n) => n.includes('Tender_MON1/NIT_and_Supporting_Documents/Attachment_01_Annexure_m1.pdf')));
+  assert.ok(savedNames().some((n) => /Tender_SUN1\/NIT_and_Supporting_Documents\/viewNitPdf_\w+\.pdf$/.test(n)) && savedNames().filter((n) => n.includes('Tender_MON1/NIT_and_Supporting_Documents/')).length >= 2, savedNames().join('\n'));
   assert.ok(!savedNames().some((n) => n.includes('OLD1')));
   // searched "next 6 months" first
   assert.ok(server.log.find((l) => l.body.advancedSearch === 'MON1').body.dateFrom === dmy(NOW()));
@@ -849,9 +851,9 @@ test('A1-A3. Numeric, alphanumeric (suffix) and hyphen/leading-zero tender numbe
   const r = await autoRun();
   assert.deepEqual(r.tenders.map((t) => t.tenderNo).sort(), [L, '29263265', '33263530A'].sort());
   assert.ok(r.tenders.every((t) => t.status === 'DOWNLOADED'));
-  for (const no of ['29263265', '33263530A', L]) {
-    assert.ok(savedNames().includes(`DocLink/HOSUR/Tender_${no}/NIT_and_Supporting_Documents/NIT_${no}.pdf`), no);
-    assert.ok(savedNames().some((n) => n.startsWith(`DocLink/HOSUR/Tender_${no}/NIT_and_Supporting_Documents/Attachment_01_`)), no);
+  for (const [no, nit] of [['29263265', '1'], ['33263530A', '2'], [L, '3']]) {
+    assert.ok(savedNames().includes(`DocLink/HOSUR/Tender_${no}/NIT_and_Supporting_Documents/viewNitPdf_${nit}.pdf`), no);
+    assert.ok(savedNames().filter((n) => n.startsWith(`DocLink/HOSUR/Tender_${no}/NIT_and_Supporting_Documents/`)).length >= 2, no);
   }
   assert.equal(r.messages.opened, 3);
   assert.ok(server.log.filter((l) => l.path.endsWith('ViewMessageDetailAction.do')).every((l) => l.method === 'POST' && /^\d+$/.test(l.body.oid)));
@@ -868,7 +870,7 @@ test('A4-A5. Many NIT messages across several Inbox pages, duplicates of one ten
   assert.equal(r.messages.pagesRead, 3);
   assert.deepEqual(r.tenders.map((t) => t.tenderNo).sort(), ['T1', 'T2', 'T3']);
   assert.equal(server.log.filter((l) => l.body.advancedSearch === 'T1').length >= 1, true);
-  assert.equal(saved.filter((s) => /NIT_T1\.pdf$/.test(s.filename)).length, 1);
+  assert.equal(saved.filter((s) => /Tender_T1\/NIT_and_Supporting_Documents\/viewNitPdf_1\.pdf$/.test(s.filename)).length, 1);
   assert.equal(new Set(server.log.filter((l) => l.path.endsWith('ViewMessageDetailAction.do')).map((l) => l.body.oid)).size, 5); // 5 NIT messages opened once each
 });
 test('A6. A message without a confident tender number is NEEDS_REVIEW and starts no download', async () => {
@@ -1131,7 +1133,7 @@ test('ECM: Save to Local (the default) never calls the ECM', async () => {
   await withEcm(() => [201, {}], async (posts) => {
     await run();
     assert.equal(posts.length, 0);
-    assert.ok(savedNames().some((n) => n.endsWith('NIT_29263265.pdf')));
+    assert.ok(savedNames().some((n) => n.endsWith('viewNitPdf_5569207.pdf')));
   });
 });
 test('ECM gateway: Save to ECM / S3 files the single-file tender documents in the Hosur folder; NIT, LOA and Result (one document per tender, direct ECM only) and My Offer stay local', async () => {
@@ -1153,7 +1155,7 @@ test('ECM gateway: Save to ECM / S3 files the single-file tender documents in th
     assert.ok(!local.some((n) => /^(Negotiation|Counter_Offers|Correspondence)\//.test(n)), local.join('\n'));
     assert.ok(local.includes('Corrigenda/Corrigendum_02_29263265.html'), 'without Chrome printing, a corrigendum page keeps its original HTML locally');
     // the grouped kinds: saved locally, with the reason
-    for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf']) assert.ok(local.includes(want), `missing ${want}`);
+    for (const want of ['NIT_and_Supporting_Documents/viewNitPdf_5569207.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf']) assert.ok(local.includes(want), `missing ${want}`);
     for (const f of [c.tenderPdf.files[0], ...c.attachments.files, c.loa.files[0], c.financialTabulation.files[0]]) {
       assert.deepEqual([f.ecm.status, f.ecm.code], ['failed', 'ECM_REJECTED'], f.fileName);
       assert.match(f.ecm.detail, /need the direct ECM upload/);
@@ -1173,7 +1175,7 @@ test('ECM: a corrigendum\'s attached document is filed next to it as "<tender> -
       const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
       assert.deepEqual(posts.map((p) => [p.kind, p.title, p.file]), [
         ['extension', '29263265 - Extension - Corrigendum - 2', 'Corrigendum_02_29263265.pdf'],
-        ['extension', '29263265 - Extension - Corrigendum - 2 - Attachment 1', 'Corrigendum_02_29263265_Attachment_1.pdf'],
+        ['extension', '29263265 - Extension - Corrigendum - 2 - Attachment 1', 'Revised_Spec.pdf'],
       ]);
       assert.ok(c.files.every((f) => f.ecm?.status === 'stored'));
       assert.equal(saved.length, 0, 'nothing local');
@@ -1190,7 +1192,7 @@ test('ECM: when the ECM refuses or is down, each document is saved locally inste
     assert.equal(r.summary.failed, 0, 'nothing is lost');
     assert.equal(posts.length, 8, 'the single-file kinds; NIT, LOA and Result never reach the gateway');
     const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/', ''));
-    for (const want of ['NIT_and_Supporting_Documents/NIT_29263265.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(local.includes(want), `missing ${want}:\n${local.join('\n')}`);
+    for (const want of ['NIT_and_Supporting_Documents/viewNitPdf_5569207.pdf', 'Advance_Acceptance_LOA/LOA_29263265.pdf', 'Correspondence/Correspondence_29263265_306789.pdf']) assert.ok(local.includes(want), `missing ${want}:\n${local.join('\n')}`);
     assert.ok(local.some((n) => /^Negotiation\//.test(n)), 'the gateway being down: saved locally');
     const crp = r.categories.correspondence.files[0];
     assert.deepEqual([crp.ecm.status, crp.ecm.code, crp.ecm.detail], ['failed', 'ECM_REJECTED', 'crp requires tender_number']);
@@ -1211,9 +1213,9 @@ test('ECM direct: with ecmBackendAws false every tender document goes straight t
     const byTitle = (title) => [...docs.values()].find((d) => d.props['dc:title'] === title);
     // "<T> - NIT": the tender PDF is the main file (the attachments wait for it), the attached documents its attachments
     const nit = byTitle('29263265 - NIT');
-    assert.equal(nit.main.name, 'NIT_29263265.pdf');
+    assert.equal(nit.main.name, 'viewNitPdf_5569207.pdf', 'the IREPS name, in the ECM too');
     assert.equal(nit.files.length, 4);
-    assert.ok(nit.files.every((f) => /^Attachment_0\d_/.test(f.name)), nit.files.map((f) => f.name).join());
+    assert.deepEqual(nit.files.map((f) => f.name).sort(), ['5595304.pdf', '5595313.pdf', 'Annexure.pdf', 'drawing.zip'], 'the attachments keep their IREPS names');
     assert.deepEqual(attaches.map(([title]) => title), Array(4).fill('29263265 - NIT'), 'only the NIT document had more than one PDF');
     assert.ok(c.attachments.files.every((f) => f.ecm.status === 'stored' && f.ecm.uid === c.tenderPdf.files[0].ecm.uid), 'every attachment is in the NIT document');
     // "<T> - LOA": the letter id in the file name, so a later letter cannot clash with it
@@ -1248,7 +1250,7 @@ test('ECM direct: when IREPS serves the tender PDF last, it is still the main fi
     assert.equal(r.summary.failed, 0);
     assert.equal(creates.length, 1);
     const nit = [...docs.values()][0];
-    assert.equal(nit.main.name, 'NIT_29263265.pdf');
+    assert.equal(nit.main.name, 'viewNitPdf_5569207.pdf', 'the IREPS name, in the ECM too');
     assert.equal(nit.files.length, 4);
   });
 });
@@ -1320,7 +1322,7 @@ test('P1. A slow Negotiation list does not hold back NIT, LOA, counter offer or 
   const r = await run();
   const order = saved.map((s) => s.filename);
   const idx = (re) => order.findIndex((f) => re.test(f));
-  const nego = idx(/\/Negotiation\//), loa = idx(/Advance_Acceptance_LOA/), co = idx(/Counter_Offers/), nit = idx(/NIT_and_Supporting_Documents\/NIT_/);
+  const nego = idx(/\/Negotiation\//), loa = idx(/Advance_Acceptance_LOA/), co = idx(/Counter_Offers/), nit = idx(/NIT_and_Supporting_Documents\/viewNitPdf_/);
   assert.ok(nego >= 0 && loa >= 0 && co >= 0 && nit >= 0, order.join('\n'));
   assert.ok(nego > loa && nego > co && nego > nit, `negotiation must be saved last:\n${order.join('\n')}`);
   assert.equal(r.categories.negotiation.status, 'DOWNLOADED');
@@ -1470,7 +1472,7 @@ test('Download log: documents this user already downloaded are skipped after one
     assert.ok(seen.checks.every((b) => b.destination === 'local'));
     assert.deepEqual([c.tenderPdf.alreadyDownloaded, c.tenderPdf.downloaded, c.corrigenda.alreadyDownloaded, c.corrigenda.downloaded], [1, 0, 2, 0]);
     assert.equal(c.tenderPdf.skippedFiles[0].skip.reason, 'already_downloaded');
-    assert.ok(!savedNames().some((n) => /NIT_29263265\.pdf|Corrigendum_/.test(n)), 'skipped documents are not fetched');
+    assert.ok(!savedNames().some((n) => /viewNitPdf_5569207\.pdf|Corrigendum_/.test(n)), 'skipped documents are not fetched');
     assert.equal(c.attachments.downloaded, 4);
     await dlog.flushDownloadLog();
     const types = seen.logged.reduce((m, x) => ({ ...m, [x.doc_type]: (m[x.doc_type] || 0) + 1 }), {});
@@ -1616,16 +1618,55 @@ test('Tabulation: the real IREPS answer (a page that opens the PDF from <body on
   const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
   assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
   assert.ok(paths().includes('/ireps/supply/pdfdocs//112026/107263731/FIN-TAB-42263731-107263731.pdf'), paths().join('\n'));
-  const f = saved.find((x) => x.filename.endsWith('Tabulation/Financial_Tabulation_42263731.pdf'));
+  const f = saved.find((x) => x.filename.endsWith('Tabulation/FIN-TAB-42263731-107263731.pdf'));
+  assert.ok(f, `the linked IREPS file keeps its name:\n${savedNames().join('\n')}`);
   assert.match(new TextDecoder().decode(f.bytes), /^%PDF/);
 });
+for (const [pdfType, own, other] of [['financialTabulation', 'FIN-TAB', 'TECH-TAB'], ['commercialTabulation', 'TECH-TAB', 'FIN-TAB']]) {
+  test(`Tabulation: the ${pdfType} button downloads that tabulation only, never the other one (both links on the row)`, async () => {
+    mk({ closed: [closed('42263731'), closed('69261051')], tabulationAs: 'onload' });
+    const r = await auto.runTabulations({ pdfType, from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+    assert.equal(r.tabulations.summary.downloaded, 2);
+    const asked = server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do').map((l) => l.body.pdfType || l.query.pdfType);
+    assert.deepEqual(asked, [pdfType, pdfType], 'one request per tender, for this tabulation');
+    assert.ok(!paths().some((p) => p.includes(other)), paths().join('\n'));
+    const names = savedNames().map((n) => n.split('/').pop()).sort();
+    assert.deepEqual(names, [`${own}-42263731-107263731.pdf`, `${own}-69261051-107261051.pdf`]);
+    assert.ok(Object.values(r.tabulations.tenders).every((t) => Object.keys(t.categories).join() === pdfType));
+  });
+}
 test('Tabulation: the real IREPS Commercial answer opens TECH-TAB-<no>-<oid>.pdf from <body onload>; it is saved as the Commercial Tabulation', async () => {
   mk({ closed: [closed('42263731')], tabulationAs: 'onload' });
   const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
   assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
   assert.deepEqual(server.tabFileHits, ['/ireps/supply/pdfdocs//112026/107263731/TECH-TAB-42263731-107263731.pdf']);
-  const f = saved.find((x) => x.filename.endsWith('Tabulation/Commercial_Tabulation_42263731.pdf'));
+  const f = saved.find((x) => x.filename.endsWith('Tabulation/TECH-TAB-42263731-107263731.pdf'));
+  assert.ok(f, `the linked IREPS file keeps its name:\n${savedNames().join('\n')}`);
   assert.match(new TextDecoder().decode(f.bytes), /^%PDF/);
+});
+test('File names: a tabulation IREPS names in Content-Disposition keeps that name; without one it gets DocLink\'s name', async () => {
+  mk({ closed: [closed('42263731')], tabulationDisposition: 'attachment; filename="FinTab 42263731.pdf"' });
+  await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  assert.deepEqual(savedNames(), ['DocLink/HOSUR/Tender_42263731/Tabulation/FinTab 42263731.pdf'], 'spaces and case are kept');
+  mk({ closed: [closed('42263731')] });
+  await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  assert.deepEqual(savedNames(), ['DocLink/HOSUR/Tender_42263731/Tabulation/Financial_Tabulation_42263731.pdf'], 'a POST to commTboPdfAction.do names no file');
+});
+test('File names: two different attachments with one IREPS name are both kept, the later one as "_2" - locally and in the "<T> - NIT" ECM document', async () => {
+  const twins = [{ name: 'Spec.pdf', desc: 'SPEC A', href: '/ireps/upload/att/a/Spec.pdf' }, { name: 'Spec.pdf', desc: 'SPEC B', href: '/ireps/upload/att/b/Spec.pdf' }];
+  mk({ tenders: [T({ attachments: twins })] });
+  await run('29263265', { only: ['tenderPdf', 'attachments'] });
+  const local = savedNames().map((x) => x.replace('DocLink/HOSUR/Tender_29263265/NIT_and_Supporting_Documents/', '')).sort();
+  assert.deepEqual(local, ['Spec.pdf', 'Spec_2.pdf', 'viewNitPdf_5569207.pdf']);
+  mk({ tenders: [T({ attachments: twins })] });
+  store['doclink.saveDestination'] = 'recon';
+  await withDirectEcm(async ({ docs }) => {
+    const r = await run('29263265', { only: ['tenderPdf', 'attachments'] });
+    assert.equal(r.summary.failed, 0);
+    const nit = [...docs.values()].find((d) => d.props['dc:title'] === '29263265 - NIT');
+    assert.equal(nit.main.name, 'viewNitPdf_5569207.pdf');
+    assert.deepEqual(nit.files.map((f) => f.name).sort(), ['Spec.pdf', 'Spec_2.pdf'], 'the second Spec.pdf is not taken for the first');
+  });
 });
 test('Tabulation: a TECH-TAB file passes only inside a Commercial Tabulation response; Techno-Commercial names and pdfTypes never do', async () => {
   mk({});
@@ -1644,7 +1685,11 @@ for (const [mode, file] of [['iframe', '/ireps/upload/tbo/Tabulation_'], ['form'
     mk({ closed: [closed('42263731')], tabulationAs: mode });
     const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
     assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
-    const f = saved.find((x) => x.filename.endsWith('Tabulation/Commercial_Tabulation_42263731.pdf'));
+    const f = saved.find((x) => x.filename.includes('/Tabulation/'));
+    assert.ok(f, savedNames().join('\n'));
+    // the file the viewer leads to keeps its IREPS name; one the viewer POSTs to a .do action has none
+    if (mode === 'form' || mode === 'open') assert.ok(f.filename.endsWith('Tabulation/Commercial_Tabulation_42263731.pdf'), f.filename);
+    else assert.ok(f.filename.split('/').pop().startsWith(file.split('/').pop()), f.filename);
     assert.match(new TextDecoder().decode(f.bytes), /^%PDF/);
     assert.ok(paths().some((x) => x.startsWith(file)), paths().join('\n'));
     assert.ok(!server.excludedHit, 'a Techno-Commercial link was requested');

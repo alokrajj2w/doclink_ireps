@@ -22,6 +22,7 @@ import { openLedger } from './tender-ledger.js';
 import { inferRoute } from './tender-workflows.js';
 import { ensureDownloadSignIn, tenderEcmSink, ecmDocumentFor } from './tender-ecm.js';
 import { printPageToPdf } from './tender-print.js';
+import { contentDispositionName, urlFileName, sourceFileName } from '../utils/filename.js';
 import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE } from '../services/download-log.js';
 
 /** The download log of one saved file (letters keep their own "already saved" check: force / Download again). */
@@ -253,24 +254,13 @@ export function buildLetterRequest(letter, scripts, pageUrl) {
 const DOC_EXT = /\.(?:pdf|docx?|xlsx?|zip|rar|7z|jpe?g|png|tiff?|rtf|txt|csv|dwg|dxf)(?:[?#]|$)/i;
 const ATTACH_WORDS = /download|attach|viewdoc|opendoc|getfile|viewfile|showdoc|openfile|filedown|annex|enclos/i;
 
-function headerFileName(headers = {}) {
-  const cd = headers['content-disposition'] || '';
-  const raw = /filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i.exec(cd)?.[1] || /filename\s*=\s*"?([^";]+)"?/i.exec(cd)?.[1] || '';
-  try {
-    return decodeURIComponent(raw.trim());
-  } catch {
-    return raw.trim();
-  }
-}
-
-function urlBaseName(url) {
-  try {
-    const n = decodeURIComponent(new URL(url, 'https://x.invalid/').pathname.split('/').pop() || '');
-    return /\.[A-Za-z0-9]{2,5}$/.test(n) && !/\.(do|jsp|html?|php|aspx?)$/i.test(n) ? n : '';
-  } catch {
-    return '';
-  }
-}
+const headerFileName = (headers = {}) => contentDispositionName(headers['content-disposition']);
+const urlBaseName = urlFileName;
+/** The name IREPS gave a letter file it served (utils/filename.js sourceFileName), '' when it gave none. */
+const letterSourceName = (res, ext) => {
+  const name = sourceFileName({ contentDisposition: res.headers?.['content-disposition'], url: res.url });
+  return name && name.toLowerCase().endsWith(ext.toLowerCase()) ? name : '';
+};
 
 /** iframe / embed / object documents inside a letter page (an embedded PDF viewer). */
 function embeddedUrls(doc, base, pageUrl) {
@@ -348,9 +338,10 @@ export async function openLetter(base, req, meta = {}) {
   const kind = sniffKind(res.bytes);
   const common = { httpStatus: res.status, contentType: res.contentType, attachments: [] };
   if (kind === 'empty') throw new TenderError('EMPTY', 'IREPS returned an empty response for the letter.');
-  if (kind === 'pdf') return { ...common, form: 'pdf', bytes: res.bytes, ext: '.pdf', via: 'direct_pdf' };
+  if (kind === 'pdf') return { ...common, form: 'pdf', bytes: res.bytes, ext: '.pdf', via: 'direct_pdf', sourceName: letterSourceName(res, '.pdf') };
   if (['zip', 'ole', 'png', 'jpg', 'gif', 'tiff', 'rtf'].includes(kind)) {
-    return { ...common, form: 'file', bytes: res.bytes, ext: extensionFor(kind, res, urlBaseName(res.url)), via: 'direct_file' };
+    const ext = extensionFor(kind, res, urlBaseName(res.url));
+    return { ...common, form: 'file', bytes: res.bytes, ext, via: 'direct_file', sourceName: letterSourceName(res, ext) };
   }
   if (kind !== 'html' && kind !== 'text') throw new TenderError('NOT_DOCUMENT', `IREPS returned an unrecognised file type (${res.contentType || 'unknown'}).`);
 
@@ -362,7 +353,7 @@ export async function openLetter(base, req, meta = {}) {
     const r = await pcFetch(base, url);
     assertSession(r);
     if (r.status === 200 && isPdfBytes(r.bytes)) {
-      letterDoc = { ...common, form: 'pdf', bytes: r.bytes, ext: '.pdf', via: 'embedded_pdf' };
+      letterDoc = { ...common, form: 'pdf', bytes: r.bytes, ext: '.pdf', via: 'embedded_pdf', sourceName: letterSourceName(r, '.pdf') || letterSourceName({ url }, '.pdf') };
       break;
     }
   }
@@ -395,11 +386,12 @@ export async function fetchAttachment(base, att) {
   let ext;
   const kind = sniffKind(bytes);
   if (kind === 'empty') throw new TenderError('EMPTY', 'IREPS returned an empty attachment.');
-  const given = headerFileName(res.headers) || att.nameHint || '';
+  let given = headerFileName(res.headers) || att.nameHint || '';
   if (kind === 'html') {
     const r = await resolveIrepsDocument(base, res, { allowHtml: false, allowAnyFile: true, nameHint: given });
     bytes = r.bytes;
     ext = r.ext;
+    given = given || r.sourceName || '';
   } else {
     ext = extensionFor(kind, res, given);
   }
@@ -438,6 +430,22 @@ async function storeFile({ saver, ecm, rec, letter }, name, bytes, title, conten
 }
 
 /** The file entry of a stored file: where it went (relPath when saved locally, ecm when the ECM took it). */
+/** "Annexure.pdf" + "1204920" -> "Annexure_1204920.pdf". */
+function withSuffix(fileName, suffix) {
+  const dot = fileName.lastIndexOf('.');
+  return dot > 0 ? `${fileName.slice(0, dot)}_${suffix}${fileName.slice(dot)}` : `${fileName}_${suffix}`;
+}
+
+/**
+ * Whether `name` is already a file of this tender's folder: of another letter (any role, or only `role`),
+ * or of this letter's files so far (`files`) other than the file itself (`isSelf`).
+ */
+function nameTaken(state, entry, rec, files, name, isSelf, role = '') {
+  const same = (f) => f.status === 'DOWNLOADED' && lc(String(f.fileName || '').split('/').pop()) === lc(name) && (!role || f.role === role);
+  if (files.some((f) => same(f) && !isSelf(f))) return true;
+  return Object.values(state.letters).some((o) => o.key !== entry.key && o.tenderNo === rec.tenderNo && (o.files || []).some(same));
+}
+
 const storedEntry = (name, bytes, { saved, ecm }) => ({
   fileName: saved ? saved.relPath : name, relPath: saved ? saved.relPath : null, size: saved ? saved.size : bytes.length,
   downloadId: saved ? saved.downloadId : null, ...(ecm ? { ecm } : {}),
@@ -731,9 +739,12 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
       }
     }
     if (opened.form !== 'html' && opened.ext === '.pdf' && !isPdfBytes(opened.bytes)) throw new TenderError('NOT_PDF', 'The letter was not a valid PDF.');
-    const taken = (name) => Object.values(state.letters).some((o) => o.key !== entry.key && o.tenderNo === rec.tenderNo && o.files.some((f) => lc(f.fileName) === lc(name) && f.role === 'letter'));
-    let name = letterFileName(letter, opened.ext);
-    if (taken(name)) name = letterFileName(letter, opened.ext, { withId: true });
+    // a letter file IREPS served keeps its own name; a printed / rendered letter page is named by DocLink
+    const source = opened.form === 'pdf' || opened.form === 'file' ? opened.sourceName || '' : '';
+    let name = source || letterFileName(letter, opened.ext);
+    if (source ? nameTaken(state, entry, rec, files, name, (f) => f.role === 'letter') : nameTaken(state, entry, rec, [], name, () => false, 'letter')) {
+      name = source ? withSuffix(source, letter.letterId) : letterFileName(letter, opened.ext, { withId: true });
+    }
     if (sniffKind(opened.bytes) === 'html') throw new TenderError('NOT_DOCUMENT', 'A web page was about to be saved as the letter.');
     const letterNo = letter.letterNo || letter.letterId;
     const stored = await storeFile({ saver, ecm, rec, letter }, name, opened.bytes, [letterNo, letter.subject].filter(Boolean).join(' - '), opened.contentType);
@@ -761,7 +772,10 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
     try {
       await sleep(pace);
       const got = await withRetry(() => fetchAttachment(base, att), { sleep, label: `attachment ${att.id}` });
-      const name = `Attachment_${safeSegment(letter.letterNo || letter.letterId, 40)}_${got.fileName}`;
+      // the name IREPS gave the attachment; only when another file of this tender's folder has it already,
+      // the letter number is added (the same each run, so a re-download overwrites its own file)
+      const name = nameTaken(state, entry, rec, files, got.fileName, (f) => f.role === 'attachment' && f.attId === att.id)
+        ? withSuffix(got.fileName, safeSegment(letter.letterNo || letter.letterId, 40)) : got.fileName;
       const stored = await storeFile({ saver, ecm, rec, letter }, name, got.bytes, [letter.letterNo || letter.letterId, 'Attachment', got.fileName].join(' - '), got.contentType);
       const check = stored.saved ? await verifySaved(stored.saved, got.bytes, 'attachment') : {};
       logPending(entry, `attachment:${att.id}`, { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm });

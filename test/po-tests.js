@@ -208,8 +208,8 @@ export async function runPoTests({ test, assert, eq, rejects, fixture }) {
     eq(result.poNumber, "27253922100240");
     eq(result.documentType, "PO");
     eq(fetched[0], `${BASE}/ireps/etender/pdfdocs/MMIS/PO/2026/01/27253922100240.pdf`);
-    eq(result.filename, "PO_27253922100240.pdf");
-    eq(saved[0], "DocLink/IREPS/PO/PO_27253922100240.pdf");
+    eq(result.filename, "27253922100240.pdf", "the PO PDF keeps its IREPS name");
+    eq(saved[0], "DocLink/IREPS/PO/27253922100240.pdf");
 
     const noLinkRow = `<tr class="trPoRow"><td>1</td><td>HQ/CR</td><td>27253922100240</td><td>16/01/2026</td><td>S</td><td>830705.84</td><td></td></tr>`;
     const noLinkPage = poPageWithRows(poPage, noLinkRow);

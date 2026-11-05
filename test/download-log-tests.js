@@ -263,7 +263,7 @@ export async function runDownloadLogTests({ test, assert, eq }) {
     eq(summary.items[1].status, DOCUMENT_DOWNLOAD_STATUS.SKIPPED);
     eq(summary.items[1].skip.reason, "already_downloaded");
     eq(fetched.some((u) => u.endsWith("/2.pdf")), false, "a skipped document is not fetched");
-    eq(saved.map((r) => `${r.doc_key}:${r.filename}:${r.destination}`).join(), "po:1:PO_1.pdf:local,po:3:PO_3.pdf:local");
+    eq(saved.map((r) => `${r.doc_key}:${r.filename}:${r.destination}`).join(), "po:1:1.pdf:local,po:3:3.pdf:local");
     eq(summary.warnings.join(), "w");
 
     const failingLog = await downloadIrepsDocuments(items.slice(0, 1), {
@@ -313,7 +313,7 @@ export async function runDownloadLogTests({ test, assert, eq }) {
     eq(await code(401), "RECON_AUTH_REQUIRED");
     eq(await code(403), "FORBIDDEN");
     eq(await code(500), "DOWNLOAD_LOG_UNAVAILABLE");
-    eq(DOC_TYPE_LABEL.tender_nit, "Tender NIT");
+    eq(DOC_TYPE_LABEL.tender_nit, "NIT");
   });
 
   eq(LOG_DESTINATION.S3, "s3");

@@ -3,6 +3,8 @@
 // Runs in the side-panel page (has DOMParser; host_permissions + credentials:'include'
 // reuse the user's existing IREPS browser session - no credentials are read or stored).
 
+import { sourceFileName } from '../utils/filename.js';
+
 export const SESSION_MSG = 'IREPS session expired. Please log in to IREPS and try again.';
 
 /** Error codes meaning "IREPS itself did not answer" (as opposed to a rejected or invalid document). */
@@ -480,6 +482,15 @@ function selfSubmittingForm(doc, html) {
   return { url: f.getAttribute('action'), method: /^get$/i.test(f.getAttribute('method') || '') ? 'GET' : 'POST', form: formParams(f) };
 }
 
+/**
+ * The name IREPS gave a file it served (Content-Disposition, else the URL that answered, else the link
+ * followed), or '' when none names a file of this type: the file is then saved under DocLink's name.
+ */
+function sourceNameOf(res, ext, linkUrl = '') {
+  const name = sourceFileName({ contentDisposition: res.headers?.['content-disposition'], url: res.url }) || sourceFileName({ url: linkUrl });
+  return name && name.toLowerCase().endsWith(ext.toLowerCase()) ? name : '';
+}
+
 /** What a response was, for the log: never its body, cookies or tokens. */
 export function describeResponse(res) {
   const cd = res.headers?.['content-disposition'] || '';
@@ -529,9 +540,10 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
   const kind = sniffKind(res.bytes);
   if (kind === 'empty') throw new TenderError('EMPTY', 'IREPS returned an empty response.');
   const meta = { httpStatus: res.status, contentType: res.contentType };
-  if (kind === 'pdf') return { kind: 'file', bytes: res.bytes, ext: '.pdf', converted: false, ...meta };
+  if (kind === 'pdf') return { kind: 'file', bytes: res.bytes, ext: '.pdf', converted: false, sourceName: sourceNameOf(res, '.pdf'), ...meta };
   if (allowAnyFile && BINARY_DOC_KINDS.has(kind)) {
-    return { kind: 'file', bytes: res.bytes, ext: extensionFor(kind, res, nameHint), converted: false, ...meta };
+    const ext = extensionFor(kind, res, nameHint);
+    return { kind: 'file', bytes: res.bytes, ext, converted: false, sourceName: sourceNameOf(res, ext), ...meta };
   }
   if (kind !== 'html' && kind !== 'text') {
     throw new TenderError('NOT_DOCUMENT', `IREPS returned an unrecognised file type (${res.contentType || 'unknown'}).`);
@@ -556,7 +568,8 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
       assertSession(r);
       const k = sniffKind(r.bytes);
       if (r.status === 200 && (k === 'pdf' || (allowAnyFile && BINARY_DOC_KINDS.has(k)))) {
-        return { kind: 'file', bytes: r.bytes, ext: extensionFor(k, r, url), converted: false, httpStatus: r.status, contentType: r.contentType };
+        const ext = extensionFor(k, r, url);
+        return { kind: 'file', bytes: r.bytes, ext, converted: false, sourceName: sourceNameOf(r, ext, url), httpStatus: r.status, contentType: r.contentType };
       }
     }
     return null;
@@ -792,25 +805,26 @@ export function createSaver({ accountLabel, tenderNo, subPath = null, conflict =
     : `${DOWNLOAD_ROOT}/${safeSegment(accountLabel)}/Tender_${safeSegment(tenderNo)}`;
   const used = new Set();
 
-  function uniquePath(subdir, fileName) {
+  // exact: the name was already made unique by the caller (reserveFileName), so it is not changed here
+  function uniquePath(subdir, fileName, exact = false) {
     const dot = fileName.lastIndexOf('.');
     const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
     const ext = dot > 0 ? fileName.slice(dot) : '';
     const dir = subdir ? `${safeSegment(subdir)}/` : '';
     let name = `${safeSegment(stem, 120)}${ext.replace(/[^.\w]/g, '')}`;
-    for (let n = 2; used.has(`${dir}${name}`.toLowerCase()); n++) name = `${safeSegment(stem, 120)}_${n}${ext.replace(/[^.\w]/g, '')}`;
+    if (!exact) for (let n = 2; used.has(`${dir}${name}`.toLowerCase()); n++) name = `${safeSegment(stem, 120)}_${n}${ext.replace(/[^.\w]/g, '')}`;
     used.add(`${dir}${name}`.toLowerCase());
     return `${dir}${name}`;
   }
 
-  async function save(subdir, fileName, bytes, mime) {
+  async function save(subdir, fileName, bytes, mime, { exact = false } = {}) {
     if (!bytes || !bytes.length) throw new TenderError('EMPTY', 'Refusing to save an empty file.');
     const ext = (/\.[A-Za-z0-9]+$/.exec(fileName) || [''])[0].toLowerCase();
     if (ext === '.pdf' && !isPdfBytes(bytes)) throw new TenderError('NOT_PDF', 'Refusing to save a non-PDF payload as .pdf.');
     if (ext !== '.html' && ext !== '.txt' && ext !== '.json' && sniffKind(bytes) === 'html') {
       throw new TenderError('NOT_DOCUMENT', 'Refusing to save a web page as a document file.');
     }
-    const rel = uniquePath(subdir, fileName);
+    const rel = uniquePath(subdir, fileName, exact);
     const url = URL.createObjectURL(new Blob([bytes], { type: mime || MIME[ext] || 'application/octet-stream' }));
     try {
       const id = await chrome.downloads.download({ url, filename: `${root}/${rel}`, conflictAction: conflict, saveAs: false });
