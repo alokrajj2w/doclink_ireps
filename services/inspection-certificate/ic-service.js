@@ -23,6 +23,7 @@
 import { IrepsError } from "../ireps-api.js";
 import { isIrepsLoginPage } from "../session-service.js";
 import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
+import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
 import { loadIcListPage, submitIcSearch, buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
 import { extractIcForm, hasIcForm } from "./ic-form.js";
@@ -48,7 +49,7 @@ const DOWNLOAD_CODES = Object.freeze({
 });
 
 /** Validate a vendorInspectionCallList.do response and decide whether the user is authenticated. */
-function validateIcSession(html, response = {}, notRecognisedCode = IC_ERROR.LIST_PAGE_FAILED) {
+export function validateIcSession(html, response = {}, notRecognisedCode = IC_ERROR.LIST_PAGE_FAILED) {
   if (response.status !== undefined && response.ok === false) {
     return { authenticated: false, reason: `IREPS returned HTTP ${response.status}`, code: notRecognisedCode, status: response.status };
   }
@@ -140,7 +141,8 @@ export function icDownloadItems(records, poNo) {
     path: buildIcDownloadPath({ poNo: r.poNo || poNo, poSerial: r.poSerial, callId: r.callId }),
     label: `IC ${r.callId || "?"} (PO Sr. ${r.poSerial || "?"})`,
     meta: { callId: r.callId, icNumber: r.icNumber, poNo: r.poNo || poNo, poSerial: r.poSerial, icDate: r.icDate },
-    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: r.icNumber, customer_po_number: r.poNo || poNo, ic_date: r.icDate } }
+    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: r.icNumber, customer_po_number: r.poNo || poNo, ic_date: r.icDate } },
+    log: logInfo(LOG_DOC_TYPE.IC, downloadKey.ic({ poNo: r.poNo || poNo, poSerial: r.poSerial, callId: r.callId, icNumber: r.icNumber }))
   }));
 }
 
@@ -157,7 +159,7 @@ export function icDownloadItems(records, poNo) {
  * A PO with zero issued ICs succeeds with an empty download batch.
  *
  * @param {string} poNumber
- * @param {{ fetch?: typeof fetch, parseHtml?: Function, saveFile?: Function, concurrency?: number,
+ * @param {{ fetch?: typeof fetch, parseHtml?: Function, saveFile?: Function, concurrency?: number, preflight?: Function, onSaved?: Function,
  *          onProgress?: (stage: string) => void, onDownloadProgress?: (snapshot: object) => void }} [deps]
  * @returns {Promise<IcDownloadResult>}
  */
@@ -167,6 +169,8 @@ export async function downloadInspectionCertificates(poNumber, deps = {}) {
   const downloads = await downloadIrepsDocuments(items, {
     fetch: deps.fetch,
     saveFile: deps.saveFile,
+    preflight: deps.preflight,
+    onSaved: deps.onSaved,
     concurrency: deps.concurrency,
     codes: DOWNLOAD_CODES,
     onProgress: deps.onDownloadProgress

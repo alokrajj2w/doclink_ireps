@@ -67,13 +67,15 @@ export const RECON_SIGN_IN_EVENT = "doclink:ensure-recon-sign-in";
 /**
  * From panel code that cannot reach popup-recon-auth.js directly (the tender view is
  * bundled separately): resolves true when the user is signed in to the Recon Engine
- * or signs in now, false when they chose Local. True when no sign-in page answers
- * (no panel, or the tests), so the upload itself reports a missing sign-in.
+ * or signs in now, false when they chose Local or cancelled. `always`: ask whatever Save to
+ * says (the download log). True when no sign-in page answers (no panel, or the tests), so
+ * the upload itself reports a missing sign-in.
+ * @param {{ always?: boolean }} [options]
  */
-export function confirmReconSignIn() {
+export function confirmReconSignIn({ always = false } = {}) {
   if (typeof document === "undefined" || typeof CustomEvent === "undefined") return Promise.resolve(true);
   return new Promise((resolve) => {
-    const event = new CustomEvent(RECON_SIGN_IN_EVENT, { detail: { resolve }, cancelable: true });
+    const event = new CustomEvent(RECON_SIGN_IN_EVENT, { detail: { resolve, always }, cancelable: true });
     if (document.dispatchEvent(event)) resolve(true);
   });
 }
@@ -83,11 +85,15 @@ export function confirmReconSignIn() {
  * @property {number} id
  * @property {string} email
  * @property {string} name
- * @property {string} role    admin | analyst | viewer
+ * @property {string[]} roles   e.g. ["tendering"], ["admin"] (recon-engine app/permissions.py)
+ * @property {string} role      the roles as one line, for display ("admin, finance")
+ * @property {boolean} isAdmin  holds the admin role (sees every user's downloads)
  */
 
+/** The Recon user from /api/auth/me or a sign-in answer: `roles` (a list), or a single `role` from an older backend. */
 function userFrom(body) {
-  return { id: body.id, email: body.email || "", name: body.name || body.email || "", role: body.role || "" };
+  const roles = Array.isArray(body.roles) ? body.roles.map(String) : body.role ? [String(body.role)] : [];
+  return { id: body.id, email: body.email || "", name: body.name || body.email || "", roles, role: roles.join(", "), isAdmin: roles.includes("admin") };
 }
 
 /** The Okta redirect DocLink uses, e.g. https://<id>.chromiumapp.org/okta ("" outside an extension). */
@@ -165,7 +171,7 @@ export async function reconSignIn(email, password, deps = {}) {
     deps
   );
   if (response.ok && body) {
-    logger.info("Signed in to the Recon Engine", { via: "password", role: body.role });
+    logger.info("Signed in to the Recon Engine", { via: "password", roles: userFrom(body).roles });
     return userFrom(body);
   }
   if (response.status === 401 || response.status === 422) throw new ReconAuthError(RECON_AUTH_ERROR.INVALID, { status: response.status });
@@ -267,7 +273,7 @@ export async function reconOktaSignIn(deps = {}) {
 
   const finish = await call(`/api/auth/okta/extension/finish?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`, { method: "GET" }, deps);
   if (finish.response.ok && finish.body) {
-    logger.info("Signed in to the Recon Engine", { via: "okta", role: finish.body.role });
+    logger.info("Signed in to the Recon Engine", { via: "okta", roles: userFrom(finish.body).roles });
     return userFrom(finish.body);
   }
   if (finish.response.status === 401 || finish.response.status === 403 || finish.response.status === 503) {

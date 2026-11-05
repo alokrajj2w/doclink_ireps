@@ -24,7 +24,9 @@ import { IREPS_CONFIG, IREPS_ERROR, IrepsError } from "../ireps-api.js";
 import { isIrepsLoginPage } from "../session-service.js";
 import { downloadBytes } from "../download-service.js";
 import { logger } from "../../utils/logger.js";
+import { withRetry } from "../batch-utils.js";
 import { isIrepsOriginUrl } from "./search-po-api.js";
+import { sourceFileName } from "../../utils/filename.js";
 
 export const DOCUMENT_DOWNLOAD_CONCURRENCY = 3;
 
@@ -32,7 +34,9 @@ export const DOCUMENT_DOWNLOAD_STATUS = Object.freeze({
   QUEUED: "queued",
   DOWNLOADING: "downloading",
   COMPLETED: "completed",
-  FAILED: "failed"
+  FAILED: "failed",
+  // not downloaded: the user already has it (services/download-log.js preflightDownloads)
+  SKIPPED: "skipped"
 });
 
 const DEFAULT_CODES = Object.freeze({
@@ -128,7 +132,11 @@ export async function fetchIrepsDocument(url, deps = {}) {
       detail: `IREPS returned HTTP ${response.status}`
     });
   }
-  if (looksLikePdf(bytes)) return { bytes, contentType, status: response.status };
+  if (looksLikePdf(bytes)) {
+    // the name IREPS gave the PDF (Content-Disposition, else the URL), "" when it gave none
+    const sourceName = sourceFileName({ contentDisposition: (response.headers && response.headers.get("content-disposition")) || "", url: response.url || url });
+    return { bytes, contentType, status: response.status, sourceName: /\.pdf$/i.test(sourceName) ? sourceName : "" };
+  }
 
   // Not a PDF. Distinguish "session expired" from "something else".
   const probe = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, Math.min(bytes.length, TEXT_PROBE_BYTES)));
@@ -154,38 +162,58 @@ export async function fetchIrepsDocument(url, deps = {}) {
  * @property {string} path          Downloads-relative target path (…/name.pdf)
  * @property {string} [label]       shown in progress / logs (e.g. "MA 007327")
  * @property {object} [meta]        anything the caller wants echoed back
- * @property {{ kind: string, fields: object, title?: string }} [ecm]
+ * @property {{ kind: string, fields: object, title?: string, replace?: string[] }} [ecm]
  *                                  how the document is filed in the ECM under "ECM / S3"
- *                                  (services/ecm-service.js)
+ *                                  (services/ecm-service.js); `replace` is set by the run from
+ *                                  preflight: the ECM copies found (the first gets the new PDF)
  */
 
 /**
  * Download one document: fetch, verify, save.
  * @param {DownloadItem} item
  * `saveFile` replaces the local save; it gets the item too (the "ECM / S3" saver reads
- * item.meta.ecm) and may report where the document went as `ecm`.
- * @param {{ fetch?: typeof fetch, saveFile?: (bytes: Uint8Array, path: string, item: DownloadItem) => Promise<{ downloadId?: number|null, filename?: string, path?: string, ecm?: object|null }>, codes?: object }} [options]
+ * item.meta.ecm) and may report where the document went as `ecm`. `onSaved` hears of each
+ * saved document (the download log); it never fails the download.
+ * @param {{ fetch?: typeof fetch, saveFile?: (bytes: Uint8Array, path: string, item: DownloadItem) => Promise<{ downloadId?: number|null, filename?: string, path?: string, ecm?: object|null }>, codes?: object,
+ *           onSaved?: (item: DownloadItem, done: object) => void }} [options]
  */
 export async function downloadIrepsDocument(item, options = {}) {
   const CODES = { ...DEFAULT_CODES, ...(options.codes || {}) };
-  const { bytes } = await fetchIrepsDocument(item.url, { fetch: options.fetch, codes: CODES });
+  const { bytes, sourceName } = await fetchIrepsDocument(item.url, { fetch: options.fetch, codes: CODES });
+  // the PDF keeps the name IREPS gave it, in DocLink's folder. DocLink's own name (item.path, already unique
+  // within the batch) only when IREPS gave none, or when another document of the batch has taken that name -
+  // two different POs of one number would otherwise share a file name, and so one ECM document
+  let path = sourceName ? `${item.path.slice(0, item.path.lastIndexOf("/") + 1)}${sourceName}` : item.path;
+  if (options.takenNames && path !== item.path) {
+    const owner = options.takenNames.get(path.toLowerCase());
+    if (owner !== undefined && owner !== item.id) path = item.path;
+    else options.takenNames.set(path.toLowerCase(), item.id);
+  }
   const saveFile = options.saveFile || ((data, target) => downloadBytes(data, { path: target, mimeType: "application/pdf" }));
   let saved;
   try {
-    saved = await saveFile(bytes, item.path, item);
+    saved = await saveFile(bytes, path, item);
   } catch (error) {
     logger.error("Document could not be saved", error);
     throw new IrepsError(CODES.DOWNLOAD_FAILED, "Chrome could not save the PDF", { detail: "Chrome could not save the file", cause: error });
   }
-  return {
+  const done = {
     id: item.id,
     url: item.url,
-    path: item.path,
-    filename: (saved && saved.filename) || item.path.split("/").pop(),
+    path,
+    filename: (saved && saved.filename) || path.split("/").pop(),
     downloadId: saved && saved.downloadId !== undefined ? saved.downloadId : null,
     ecm: (saved && saved.ecm) || null,
     bytes: bytes.length
   };
+  if (typeof options.onSaved === "function") {
+    try {
+      await options.onSaved(item, done);
+    } catch (error) {
+      logger.warn("Could not record a saved document", error);
+    }
+  }
+  return done;
 }
 
 /** Public, user-safe error info for one failed item. */
@@ -198,7 +226,13 @@ function describeFailure(error, CODES) {
  * Download several documents with limited concurrency.
  *
  * @param {DownloadItem[]} items
+ * `preflight` (before anything is fetched) answers which items not to download, with why:
+ * they are reported as skipped, with that reason as `skip`. Its `replace` (id -> ECM uids)
+ * goes to the saver as item.ecm.replace: the new PDF goes into the first of those ECM copies.
+ *
  * @param {{ concurrency?: number, fetch?: typeof fetch, saveFile?: Function, codes?: object,
+ *          retries?: number, retryDelayMs?: number, onSaved?: Function,
+ *          preflight?: (items: DownloadItem[]) => Promise<{ skip: Map<string, object>, replace?: Map<string, string[]> }>,
  *          onProgress?: (snapshot: DocumentBatchSnapshot) => void }} [options]
  * @returns {Promise<DocumentBatchSnapshot & { startedAt: string, finishedAt: string }>}
  */
@@ -217,10 +251,13 @@ export async function downloadIrepsDocuments(items, options = {}) {
     filename: null,
     downloadId: null,
     ecm: null,
-    error: null
+    error: null,
+    skip: null
   }));
   let sessionExpired = false;
   let cursor = 0;
+  let warnings = [];
+  let replace = new Map();
 
   const snapshot = () => ({
     total: states.length,
@@ -228,7 +265,9 @@ export async function downloadIrepsDocuments(items, options = {}) {
     downloading: states.filter((i) => i.status === DOCUMENT_DOWNLOAD_STATUS.DOWNLOADING).length,
     completed: states.filter((i) => i.status === DOCUMENT_DOWNLOAD_STATUS.COMPLETED).length,
     failed: states.filter((i) => i.status === DOCUMENT_DOWNLOAD_STATUS.FAILED).length,
+    skipped: states.filter((i) => i.status === DOCUMENT_DOWNLOAD_STATUS.SKIPPED).length,
     sessionExpired,
+    warnings,
     items: states.map((i) => ({ ...i }))
   });
   const notify = () => {
@@ -241,11 +280,14 @@ export async function downloadIrepsDocuments(items, options = {}) {
     }
   };
 
+  // IREPS file names used so far in this batch -> the item that has it (see downloadIrepsDocument)
+  const takenNames = new Map();
   const worker = async () => {
     while (cursor < list.length) {
       const index = cursor++;
       const item = list[index];
       const state = states[index];
+      if (state.status === DOCUMENT_DOWNLOAD_STATUS.SKIPPED) continue;
       if (sessionExpired) {
         state.status = DOCUMENT_DOWNLOAD_STATUS.FAILED;
         state.error = { code: CODES.SESSION_EXPIRED, detail: "not attempted: IREPS session expired", status: null, skipped: true };
@@ -254,7 +296,10 @@ export async function downloadIrepsDocuments(items, options = {}) {
       state.status = DOCUMENT_DOWNLOAD_STATUS.DOWNLOADING;
       notify();
       try {
-        const done = await downloadIrepsDocument(item, { fetch: options.fetch, saveFile: options.saveFile, codes: CODES });
+        const target = item.ecm && replace.has(item.id) ? { ...item, ecm: { ...item.ecm, replace: replace.get(item.id) } } : item;
+        const attempt = () => downloadIrepsDocument(target, { fetch: options.fetch, saveFile: options.saveFile, onSaved: options.onSaved, codes: CODES, takenNames });
+        // Transient failures only (network / timeout / HTTP 5xx); never an expired session or a non-PDF.
+        const done = options.retries > 0 ? await withRetry(attempt, { attempts: options.retries + 1, delayMs: options.retryDelayMs }) : await attempt();
         state.status = DOCUMENT_DOWNLOAD_STATUS.COMPLETED;
         state.filename = done.filename;
         state.downloadId = done.downloadId;
@@ -269,10 +314,23 @@ export async function downloadIrepsDocuments(items, options = {}) {
     }
   };
 
+  if (typeof options.preflight === "function" && list.length) {
+    try {
+      const checked = await options.preflight(list);
+      warnings = (checked && checked.warnings) || [];
+      replace = (checked && checked.replace) || new Map();
+      for (const [i, item] of list.entries()) {
+        const skip = checked && checked.skip && checked.skip.get(item.id);
+        if (skip) Object.assign(states[i], { status: DOCUMENT_DOWNLOAD_STATUS.SKIPPED, skip });
+      }
+    } catch (error) {
+      logger.warn("The already-downloaded check failed; downloading everything", error);
+    }
+  }
   notify();
   await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, () => worker()));
   const summary = snapshot();
-  logger.info("Document batch finished", { total: summary.total, completed: summary.completed, failed: summary.failed, sessionExpired });
+  logger.info("Document batch finished", { total: summary.total, completed: summary.completed, failed: summary.failed, skipped: summary.skipped, sessionExpired });
   return { ...summary, startedAt, finishedAt: new Date().toISOString() };
 }
 
@@ -283,6 +341,8 @@ export async function downloadIrepsDocuments(items, options = {}) {
  * @property {number} downloading
  * @property {number} completed
  * @property {number} failed
+ * @property {number} skipped           not downloaded: already downloaded / already in the ECM (item.skip says which)
+ * @property {string[]} warnings        checks before the run that could not be made
  * @property {boolean} sessionExpired
  * @property {{ id: string, label: string, meta: object|null, path: string, status: string, filename: string|null, downloadId: number|null, ecm: { status: string, site?: string|null, uid?: string, code?: string, detail?: string|null }|null, error: { code: string, detail: string|null, status: number|null, skipped?: boolean }|null }[]} items
  */

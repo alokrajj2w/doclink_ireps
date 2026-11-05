@@ -1,0 +1,238 @@
+<!-- IREPS Closed Tenders (Vendor inbox, menuLink=Tenders, listType=MyBidsClosed, page 1 of 9), trimmed to the search form and the list from 01_api_data/finncial and commercial documentation response.har entry 82 (2026-10-23). -->
+<html><head><title>Folder Details</title></head><body>
+<form name="buyerInboxLinkForm" method="post" action="/epsn/vendorInboxLink.do" style="width:1000px;" id="schForm">
+ <table border="1" width="100%" align="center" style="border-collapse: collapse"> <tr ><td> <table style="width: 100%;" >
+	<tr><td colspan="4">&nbsp;</td></tr>
+	
+	<tr height="30px">
+		<td class="formLabel" width="15%" style="padding-left: 20px;">  Link</td>
+		<td width="25%"> 
+			<select id="menuLink" name="menuLink" style="height:25px; width:150px;" onchange="showStatus();">
+					<option value="Tenders" > Tenders  </option>
+					<option value="PostTenders"> Post Tenders </option>
+					<option value="BillTracking"> Bill Tracking </option>
+					<option value="Contracts" > Contracts  </option>
+					<option value="Messages" > my Messages  </option>
+			</select> 
+		</td>
+		<td class="formLabel" width="15%" style="padding-left: 20px;">  Status</td>
+		<td width="45%"> 
+		
+			<select id="status" name="status" style="height:25px; width:315px;" onchange="showDateRangeLabel();"> 
+			
+				<option value="Payments" > My payments </option>
+				<option value="MyTender"> Live Tenders</option>
+				<option value="MyBidsClosed"> Closed Tenders </option>
+				<option value="MyRA"> Reverse Auction </option>
+				
+			  	
+			
+			</select> 
+		</td></tr>
+		<tr height="30px" id="trDateTender">
+			<td class="formLabel" width="15%" style="padding-left: 20px;"> Tender Number</td>
+			<td width="25%" ><input type="text" name="tenderNo" value="" style="height:20px;" id="tenderNumber">  </td>
+			<td class="formLabel" width="15%" style="padding-left: 20px;" id="dateRangeDisplayLbl"><span id="dateRange"> Closing Date </span></td>
+			<td class="formLabel" width="45%" id="dateRangeDisplayVal">
+			
+		 		<table>
+		 		   	<tr>
+			 		    <td class="formLabel">From&nbsp;</td>
+			 		    <td><input type="text" name="startDate" size="12" value="25/07/2026" readonly="readonly" style="height:20px;" id="ddmmyyDateformat1"></td>
+			 		    <td>&nbsp;<a href="javascript:NewCal('ddmmyyDateformat1','ddmmyyyy',false);" id="dateImgFrom"> 
+				   		<img src="/ireps/images/common/cal.gif" width="16" height="16" border="0" alt="Pick a date"></a></td>
+			   			<td>&nbsp; &nbsp; &nbsp;&nbsp;</td>	
+			   			<td class="formLabel">To&nbsp;</td>
+						<td><input type="text" name="endDate" size="12" value="23/10/2026" readonly="readonly" style="height:20px;" id="ddmmyyDateformat2"></td>
+						<td>&nbsp;<a href="javascript:NewCal('ddmmyyDateformat2','ddmmyyyy')" id="dateImgTo"><img src="/ireps/images/common/cal.gif" width="16" height="16" border="0" alt="Pick a date"></a></td>
+		 		   	</tr>
+		 		</table>
+			 </td>
+			 <td class="formLabel" width="15%" style="padding-left: 20px;display:none;" id="raStatusLbl">RA Status</td>
+		     <td class="formLabel" width="45%" id="raStatusVal" style="display:none;">
+		     	<select name="raStatus" style="height:25px; width:315px;" id="raStatus"><option value="-1" selected="selected">All</option>
+		     		<option value="2">Live</option>
+		     		<option value="1">Yet to start</option>
+		     		<option value="3">Closed</option>
+		     		<option value="4">Cancelled</option>
+		     		<option value="5">RA Not Due</option></select>
+			 </td>
+		 </tr>
+	<tr height="30px" align="center"><td colspan="4"> <input type="button" style="height:25px; width:85px;" value ="Search" onclick="searchStatus();"/>  </td></tr>
+	<tr><td colspan="4">&nbsp;</td></tr>
+</table></td></tr>
+
+</table>
+ 	
+
+ <input type="hidden" name="pageNo" id="pageNo" >
+  <input type="hidden" name="listType" id="listType" value='MyBidsClosed'>
+ 
+ 
+<BR>	 
+	 
+<table width="100%" class="nit_summary" border="0" cellpadding="0" cellspacing="0" border="1"><tr><td colspan="5">&nbsp;</td></tr>
+
+
+	
+<tr bgcolor="#E9E9EF">
+		
+		<td width="15%" style="color: black"><strong>Dept/Rly. Unit</strong></td>
+		<td width="15%" style="color: black"><strong>Tender No.
+		/Bid Id</strong></td>
+		<td width="30%" style="color: black"><strong>Tender Title</strong></td>
+		 
+		<td width="15%" style="color: black"><strong>Closing Date/Time</strong></td>
+		   
+		<td width="20%" align="center" style="color: black"><strong>Actions</strong></td>
+<tr>
+<td width="15%" style="color: black;">ELS/GKP-STORES / NORTH EASTERN RLY</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5582621') title="To View NIT Click the NIT No">36265202</a><br>(20867031)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">Combined brake cylinder.</td>
+	
+			<td width="15%" style="padding:5px;color: black;">23/10/2026 11:30</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107211934/viewNitPdf_5582621.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5582621')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107211934')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107211934&accountID=833&bid_id=20867031&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107211934')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107211934&accountID=833&bid_id=20867031',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">STORES / CENTRAL RLY</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5574420') title="To View NIT Click the NIT No">42263731</a><br>(20874501)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">WHEEL MOUNTED BRAKE</td>
+	
+			<td width="15%" style="padding:5px;color: black;">23/10/2026 11:30</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107204732/viewNitPdf_5574420.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5574420')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107204732')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107204732&accountID=833&bid_id=20874501&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107204732')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View Financial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?tenderOID=107204732&pdfType=financialTabulation&accountID=833', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/barchart.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#" title="View Commercial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=107204732&accountID=833',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/techEval.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="Bill Tracking" onclick="postRequest('/epsn/works/bills/billSubmission.do?activity=display&oid=107204732')"><img src="/ireps/images/common/Submit Pending Bill Details.png" alt="Bill Tracking" height="15" width="15" border="0"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107204732&accountID=833&bid_id=20874501',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">ELS/AJNI-STORES / CENTRAL RLY</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5585651') title="To View NIT Click the NIT No">69261051</a><br>(20884497)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">DB equalsing hose to M/s FTRTIL</td>
+	
+			<td width="15%" style="padding:5px;color: black;">23/10/2026 11:30</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107214438/viewNitPdf_5585651.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5585651')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107214438')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107214438&accountID=833&bid_id=20884497&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107214438')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View Financial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?tenderOID=107214438&pdfType=financialTabulation&accountID=833', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/barchart.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#" title="View Commercial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=107214438&accountID=833',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/techEval.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="Bill Tracking" onclick="postRequest('/epsn/works/bills/billSubmission.do?activity=display&oid=107214438')"><img src="/ireps/images/common/Submit Pending Bill Details.png" alt="Bill Tracking" height="15" width="15" border="0"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107214438&accountID=833&bid_id=20884497',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">STORES / NORTH EASTERN RLY</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5519928') title="To View NIT Click the NIT No">24261658</a><br>(20866821)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">Kit for manifold mounting cock as per FTRTIPL part Number 790006151 CONSISTS OF 03 items.1.O- Ring as per FTRTIPL part N</td>
+	
+			<td width="15%" style="padding:5px;color: black;">23/10/2026 11:30</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107160401/viewNitPdf_5519928.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5519928')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107160401')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107160401&accountID=833&bid_id=20866821&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107160401')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107160401&accountID=833&bid_id=20866821',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">STORES / MCF- RAE BARELI</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5565093') title="To View NIT Click the NIT No">04241210</a><br>(20889688)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">DESIGN, SUPPLY AND INSTALLATION OF ONE RAKE SET OF SINGLE LEAF AUTOMATIC SLIDING MAIN ENTRANCE PLUG DOOR ALONG WITH REQU</td>
+	
+			<td width="15%" style="padding:5px;color: black;">23/10/2026 11:30</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107195770/viewNitPdf_5565093.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5565093')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107195770')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107195770&accountID=833&bid_id=20889688&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107195770')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View Financial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?tenderOID=107195770&pdfType=financialTabulation&accountID=833', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/barchart.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#" title="View Commercial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=107195770&accountID=833',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/techEval.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="Bill Tracking" onclick="postRequest('/epsn/works/bills/billSubmission.do?activity=display&oid=107195770')"><img src="/ireps/images/common/Submit Pending Bill Details.png" alt="Bill Tracking" height="15" width="15" border="0"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107195770&accountID=833&bid_id=20889688',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">STORES / NORTH EASTERN RLY</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5521179') title="To View NIT Click the NIT No">24260785</a><br>(20866907)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">Set of Kit for Safety Valve</td>
+	
+			<td width="15%" style="padding:5px;color: black;">23/10/2026 11:30</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107161516/viewNitPdf_5521179.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5521179')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107161516')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107161516&accountID=833&bid_id=20866907&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107161516')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107161516&accountID=833&bid_id=20866907',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">DAHOD / WESTERN RLY</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5566473') title="To View NIT Click the NIT No">61266222</a><br>(20866963)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">	MAINTENANCE KIT FOR DRIP C</td>
+	
+			<td width="15%" style="padding:5px;color: black;">23/10/2026 11:00</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107198137/viewNitPdf_5566473.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5566473')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107198137')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107198137&accountID=833&bid_id=20866963&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107198137')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107198137&accountID=833&bid_id=20866963',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">STORES / DMRC</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5578139') title="To View NIT Click the NIT No">RS11031149</a><br>(20872826)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">Procurement of SPIN-ON OIL FILTER/AGTU/RS-2.</td>
+	
+			<td width="15%" style="padding:5px;color: black;">22/10/2026 15:00</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/92625892/viewNitPdf_5578139.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5578139')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=92625892')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=92625892&accountID=833&bid_id=20872826&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=92625892')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=92625892&accountID=833&bid_id=20872826',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">STORES / ECOR</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5561290') title="To View NIT Click the NIT No">03263926B</a><br>(20879817)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">BRAKE CALLIPER UNIT</td>
+	
+			<td width="15%" style="padding:5px;color: black;">22/10/2026 15:00</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107179986/viewNitPdf_5561290.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5561290')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107179986')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107179986&accountID=833&bid_id=20879817&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107179986')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View Financial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?tenderOID=107179986&pdfType=financialTabulation&accountID=833', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/barchart.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#" title="View Commercial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=107179986&accountID=833',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/techEval.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="Bill Tracking" onclick="postRequest('/epsn/works/bills/billSubmission.do?activity=display&oid=107179986')"><img src="/ireps/images/common/Submit Pending Bill Details.png" alt="Bill Tracking" height="15" width="15" border="0"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107179986&accountID=833&bid_id=20879817',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+<tr>
+<td width="15%" style="color: black;">GSD/NBQ / N F RLY</td><td width="15%"><a class="linkStyle" style="color: #4A4AFB;" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=5582240') title="To View NIT Click the NIT No">NB265748</a><br>(20880128)</td>
+
+	
+			<td width="35%" style="padding:5px;color: black;">Dump Valve (New Type) with Mounting bracket for Faiveley make WSP system of LHB Coaches. As per FTRTIL Part No:- FT00515</td>
+	
+			<td width="15%" style="padding:5px;color: black;">22/10/2026 14:30</td>
+			<td nowrap width="20%" align="left" style="color: black;"><a href="#" title="View Tender Document / Corrigendum" onclick="postRequestNewWindow('/ireps/supply/pdfdocs/102026/107211459/viewNitPdf_5582240.pdf',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/viewTndrDoc.gif"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="View Corrigenda" onclick=postRequest('/epsn/works/rfq/viewCorrigendum.do?nitId=5582240')><img src="/ireps/images/common/View_Corrigendum.gif"  height="15" width="15" border="0"></a>&nbsp;
+<a title="Submit Payment Details" class="linkStyle" href="#" onclick=postRequest('/epsn/bid/paymentProcess.do?oid=107211459')><img src="/ireps/images/common/icon_contract.gif" alt="Submit Payment Details" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=107211459&accountID=833&bid_id=20880128&bidType=N', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')"><img src="/ireps/images/common/view_t_offer.png"  height="16" width="17" border="0"></a>&nbsp; 
+<a title="Update Bank Dtls" class="linkStyle" href="#" onclick=postRequest('/epsn/tbo/updateBankDetails.do?nitOid=107211459')><img src="/ireps/images/common/bank.jpg" alt="Update Bank Dtls" height="15" width="15" border="0" class="linkStyle"></a>&nbsp;
+<a href="#" title="View Financial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?tenderOID=107211459&pdfType=financialTabulation&accountID=833', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/barchart.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#" title="View Commercial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=107211459&accountID=833',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src="/ireps/images/common/techEval.jpg"  height="15" width="15" border="0"></a>&nbsp;<a href="#"  title="Bill Tracking" onclick="postRequest('/epsn/works/bills/billSubmission.do?activity=display&oid=107211459')"><img src="/ireps/images/common/Submit Pending Bill Details.png" alt="Bill Tracking" height="15" width="15" border="0"></a>&nbsp;
+<a href="#" title="View offer Documents"  onclick="postRequestNewWindow('/epsn/tbo/downloaddocs.do?tenderOID=107211459&accountID=833&bid_id=20880128',  'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1000,height=700')"><img src=/ireps/images/common/Vdocs.png alt=Attached Documents height=17  width=10 border=0 class=linkStyle></a>
+</tr>
+</tr>
+</table>
+<table width="98%"><tr><td colspan="3" align="right"><a href="#" style="text-decoration:underline; color:#FF3333;" onClick="return menuexpand('MyBidsClosed',1)">1</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',2)">2</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',3)">3</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',4)">4</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',5)">5</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',6)">6</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',7)">7</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',8)">8</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',9)">9</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',10)">10</a>&nbsp;<a href="#" style="text-decoration:underline; color:#0033FF;" onClick="return menuexpand('MyBidsClosed',11)"><font color="#0033FF">next</font></a>&nbsp;</td></tr>
+</table>
+
+</form>
+</body></html>

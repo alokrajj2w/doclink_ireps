@@ -34,7 +34,7 @@
  * (test/mock/switch-target.mjs) applies here as well.
  */
 
-import { IREPS_CONFIG, IREPS_ERROR, IrepsError, requestIreps } from "../ireps-api.js";
+import { IREPS_CONFIG, IREPS_ERROR, IrepsError, requestIreps, parseIrepsDate } from "../ireps-api.js";
 import { IC_FORM_FIELDS, IC_CALL_TYPE, IC_STATUS, IC_STATUS_SELECTED_LABEL, ALL_INSPECTION_AGENCIES, ALL_STAGES } from "./ic-form.js";
 
 /** Shared configuration. Keep every Inspection Call List URL / constant here. */
@@ -103,9 +103,12 @@ export async function loadIcListPage(deps = {}) {
  *
  * @param {IcFormState} formState  from extractIcForm() on loadIcListPage()'s HTML
  * @param {string} poNumber
+ * @param {{ poSerial?: string, dateFrom?: string, dateFromIC?: string, pageNo?: number }} [options]
+ *        poSerial narrows the search to one PO Sr.; dateFrom / dateFromIC override the
+ *        form's own defaults (used to widen a search that found nothing)
  * @returns {{ poNo: string, body: string }}
  */
-export function buildIcSearchRequest(formState, poNumber) {
+export function buildIcSearchRequest(formState, poNumber, options = {}) {
   if (!formState || typeof formState.token !== "string" || formState.token.trim() === "") {
     throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "A Struts token is required to build the request");
   }
@@ -117,7 +120,7 @@ export function buildIcSearchRequest(formState, poNumber) {
 
   const body = new URLSearchParams();
   body.set(IC_FORM_FIELDS.TOKEN, formState.token);
-  body.set(IC_FORM_FIELDS.PAGE_NO, "1");
+  body.set(IC_FORM_FIELDS.PAGE_NO, String(options.pageNo || 1));
   body.set(IC_FORM_FIELDS.TOTAL_RECORDS, formState.totalRecords ?? "0");
   body.set(IC_FORM_FIELDS.CALL_TYPE, IC_CALL_TYPE);
   body.set(IC_FORM_FIELDS.STATUS, IC_STATUS);
@@ -125,16 +128,85 @@ export function buildIcSearchRequest(formState, poNumber) {
   body.set(IC_FORM_FIELDS.INSP_AGENCY, ALL_INSPECTION_AGENCIES);
   body.set(IC_FORM_FIELDS.PL_NO, "");
   body.set(IC_FORM_FIELDS.INSP_OFFICIAL, "");
-  body.set(IC_FORM_FIELDS.PO_SR, "");
-  body.set(IC_FORM_FIELDS.DATE_FROM, formState.dateFrom ?? "");
+  body.set(IC_FORM_FIELDS.PO_SR, options.poSerial == null ? "" : String(options.poSerial));
+  body.set(IC_FORM_FIELDS.DATE_FROM, options.dateFrom ?? formState.dateFrom ?? "");
   body.set(IC_FORM_FIELDS.DATE_TO, formState.dateTo ?? "");
-  body.set(IC_FORM_FIELDS.DATE_FROM_IC, formState.dateFromIC ?? "");
+  body.set(IC_FORM_FIELDS.DATE_FROM_IC, options.dateFromIC ?? formState.dateFromIC ?? "");
   body.set(IC_FORM_FIELDS.DATE_TO_IC, formState.dateToIC ?? "");
   body.set(IC_FORM_FIELDS.STAGE, ALL_STAGES);
   body.set(IC_FORM_FIELDS.ACTIVITY, IC_CONFIG.activityValue);
   body.set(IC_FORM_FIELDS.STATUS_SELECTED, IC_STATUS_SELECTED_LABEL);
 
   return { poNo, body: body.toString() };
+}
+
+/**
+ * Build the "Show Results" request for every IC issued in a date range, any PO:
+ * the same form with PO No. left empty and the IC Date From / To fields set,
+ * as a user filling in only the IC dates on the portal would. The Call Date
+ * fields keep the portal's own defaults; only a From date earlier than the
+ * default Call Date From pulls that field back (a call always precedes its IC).
+ *
+ * @param {IcFormState} formState  from extractIcForm() on loadIcListPage()'s HTML
+ * @param {{ dateFromIC: string, dateToIC: string }} range  DD/MM/YYYY
+ * @returns {{ poNo: string, body: string }}
+ */
+export function buildIcDateSearchRequest(formState, range) {
+  if (!formState || typeof formState.token !== "string" || formState.token.trim() === "") {
+    throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "A Struts token is required to build the request");
+  }
+  const from = String(range?.dateFromIC || "").trim();
+  const to = String(range?.dateToIC || "").trim();
+  const dFrom = parseIrepsDate(from);
+  const dTo = parseIrepsDate(to);
+  if (!dFrom || !dTo) throw new IrepsError(IC_ERROR.INVALID_REQUEST, "IC date range missing", { detail: "Please select both From Date and To Date." });
+  if (dFrom > dTo) throw new IrepsError(IC_ERROR.INVALID_REQUEST, "IC date range reversed", { detail: "From Date must not be later than To Date." });
+  const callFrom = parseIrepsDate(formState.dateFrom || "");
+  const body = new URLSearchParams();
+  body.set(IC_FORM_FIELDS.TOKEN, formState.token);
+  body.set(IC_FORM_FIELDS.PAGE_NO, "1");
+  body.set(IC_FORM_FIELDS.TOTAL_RECORDS, formState.totalRecords ?? "0");
+  body.set(IC_FORM_FIELDS.CALL_TYPE, IC_CALL_TYPE);
+  body.set(IC_FORM_FIELDS.STATUS, IC_STATUS);
+  body.set(IC_FORM_FIELDS.PO_NO, "");
+  body.set(IC_FORM_FIELDS.INSP_AGENCY, ALL_INSPECTION_AGENCIES);
+  body.set(IC_FORM_FIELDS.PL_NO, "");
+  body.set(IC_FORM_FIELDS.INSP_OFFICIAL, "");
+  body.set(IC_FORM_FIELDS.PO_SR, "");
+  body.set(IC_FORM_FIELDS.DATE_FROM, !callFrom || dFrom < callFrom ? from : formState.dateFrom);
+  body.set(IC_FORM_FIELDS.DATE_TO, formState.dateTo ?? to);
+  body.set(IC_FORM_FIELDS.DATE_FROM_IC, from);
+  body.set(IC_FORM_FIELDS.DATE_TO_IC, to);
+  body.set(IC_FORM_FIELDS.STAGE, ALL_STAGES);
+  body.set(IC_FORM_FIELDS.ACTIVITY, IC_CONFIG.activityValue);
+  body.set(IC_FORM_FIELDS.STATUS_SELECTED, IC_STATUS_SELECTED_LABEL);
+  return { poNo: "", body: body.toString() };
+}
+
+/**
+ * The request for result page `pageNo` of an earlier search: the portal's own
+ * navigate(n) re-submits the results form with only pageNo changed, so the
+ * same fields are re-posted with the token printed on the page just read.
+ *
+ * @param {{ body: string }} request  from buildIcSearchRequest()
+ * @param {string} token              Struts token of the latest results page
+ * @param {number} pageNo
+ */
+export function buildIcPageRequest(request, token, pageNo) {
+  if (typeof token !== "string" || token.trim() === "") throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "A Struts token is required to build the request");
+  const body = new URLSearchParams(request.body);
+  body.set(IC_FORM_FIELDS.TOKEN, token);
+  body.set(IC_FORM_FIELDS.PAGE_NO, String(pageNo));
+  return { poNo: request.poNo, body: body.toString() };
+}
+
+/** Highest page number the results page offers ("navigate('N')" links); 1 when unpaged. */
+export function extractIcPageCount(html) {
+  let max = 1;
+  const re = /navigate\(\s*['"]?(\d+)['"]?\s*\)/g;
+  let m;
+  while ((m = re.exec(String(html || "")))) max = Math.max(max, Number(m[1]));
+  return max;
 }
 
 /**

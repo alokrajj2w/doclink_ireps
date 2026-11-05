@@ -398,7 +398,8 @@ number, PO, unit, PO date and MA date. Mock log:
 
 3. Tick two MAs → **Download Selected (2)**: chips go Queued → Downloading →
    Completed; "✓ 2 MA copies downloaded"; files
-   `MA_<PO>_<MA>.pdf` in `Downloads\DocLink\IREPS\MA\<today YYYY-MM-DD>\`.
+   under the name IREPS gives them (e.g. `07250369100001_007001.pdf`; `MA_<PO>_<MA>.pdf`
+   only when IREPS gives none) in `Downloads\DocLink\IREPS\MA\<today YYYY-MM-DD>\`.
    Each PDF opens and reads "MODIFICATION ADVICE".
 4. **Download All**: all of today's MAs; an MA without a link shows Failed
    with the tooltip "MA copy link not found".
@@ -541,7 +542,7 @@ node test/mock/switch-target.mjs status
     `recordsPerPage=2000`) and `MA records parsed: N` where N must equal
     "Total N result(s)" on the portal's MA search. The list must contain
     exactly the MAs whose *MA Date* column reads today. Tick one and
-    **Download Selected (1)**: the saved `MA_<PO>_<MA>.pdf` must be the same
+    **Download Selected (1)**: the saved MA PDF must be the same
     document the portal opens from that row's "View/Download MA" icon (not
     the PO PDF opened from the PO number). If it fails with **MA copy not
     valid**, capture a HAR of clicking that icon on the portal.
@@ -627,3 +628,104 @@ HTTP status). Cookies, session ids and form tokens are always redacted.
 | 12 | R-NOTE: search → result table saved as .xlsx with page columns + document links | C9c / D10 | ☐ |
 | 13 | MA: today's MAs listed, MA copies (not PO PDFs) saved under the date folder | C9d / D11 | ☐ |
 | 14 | MA: session expiry during PDF download → session message, nothing saved as .pdf | C9d `ma-pdf-login` | ☐ |
+
+
+---
+
+## Pending Correspondence tests
+
+```
+JSDOM_ROOT=/path/to/dir-with-node_modules node --test tender/tests/pending-tests.mjs
+```
+(jsdom is only a test-time stand-in for the browser's DOMParser: `npm i jsdom` in any scratch directory.)
+Fixtures in `tender/tests/fixtures/` are the real list and pending-replies pages from `PENDING CORRESPONDANCE DOWNLOAD.har`
+(user name redacted). The suite covers: all pending rows (count not hardcoded), several letters per tender, Lapsed /
+Previous Replies exclusion, empty table, parent with no pending letters, PDF / embedded-PDF / HTML letters, attachments,
+failure + retry without duplicates, session expiry, the read-only guard (`vendorCorresSubmitReply.do` never requested),
+no secrets in the manifest, and the side-panel UI (real `popup.html` in jsdom).
+
+---
+
+## Batch downloads: POs by PO date, ICs by IC date, ICs from notifications
+
+`test/batch-tests.js` (run by `test/run-tests.js`, so Part A covers it) drives
+all three workflows against an in-memory IREPS simulator: `searchPO.do` (showPage,
+search, `postRequest` page links, the portal's 180-day limit), 
+`vendorInspectionCallList.do` (list page, PO + PO Sr. search, `navigate()`
+paging, results table inside the form, one more data cell than headers - the
+live layout), the notification endpoint and the PDF links. All identifiers in
+the simulator are invented.
+
+Covered: single date, date range, 47 records over 3 pages, no records (empty
+table and "No Record Found" message), out-of-range and duplicate rows,
+duplicate PO numbers across units, missing/broken/HTML/login PDF links,
+expired session, retry of failed items only, transient-failure auto retry,
+range split at 180 days; one / several / repeated / unreadable / LOA / empty
+notifications, leading zeros in the PO serial, no matching call, matching row
+without an IC link, several matching rows, REF_ID mismatch, duplicate
+documents, paging, expired session, invalid JSON, non-PDF content, partial
+failure and retry; ICs by IC date: the search with PO No. empty and the IC
+dates, every PO and serial in the range, out-of-range / not-issued / repeated
+rows, paging, a list that ignores the dates, nothing in the range, a reversed
+range, a From date before the Call Date default, ECM fields, a row without a
+link, and retry. The IC parser is also checked on the captured page layout
+(a hidden cell after Offer Qty.).
+
+Manual check against the mock (`node test/mock/mock-ireps-server.mjs`): under
+Download ICs by IC Date, 27/10/2026 - 28/10/2026 gives 2 ICs of PO
+05220028100004; 01/05/2026 - 31/10/2026 gives 6 ICs of 2 POs.
+
+`DOCLINK_TESTS 168/168 passed` is the expected line after these were added.
+Not covered by any automatic test: the live portal itself (see README,
+"Batch downloads - what is not verified").
+
+## Tender: LOA letters and Financial / Commercial Tabulation
+
+Automatic (`tender/tests/run-tests.mjs`): an LOA letter page that links an
+annexure, embeds an iframe / embed and opens a file from a script is saved as
+one `LOA_<tender>.pdf`, printed by Chrome, and none of those files is
+requested; an LOA served as a PDF file is kept as it is; when Chrome cannot
+print, only the text PDF is saved (no `.html`). A Counter Offer letter with a
+document attached (link, iframe, embed, script) saves only the printed letter
+`Counter_Offer_<tender>_<letter id>.pdf`; the attachment is never requested,
+also when Chrome cannot print. Tabulations: a direct PDF, a PDF
+behind an iframe viewer, a self-submitting form or a `window.open` target are
+downloaded, and so is the real IREPS answer (03 Nov 2026): a page that opens
+`FIN-TAB-<no>-<oid>.pdf` / `TECH-TAB-<no>-<oid>.pdf` (Commercial) from
+`<body onload>`. A `TECH-TAB` file passes only inside a Commercial Tabulation
+response; Techno-Commercial links inside the viewer are never requested; a
+web page with no PDF fails with its title and nothing is saved. The 29 Oct
+Closed Tenders capture (`tender/tests/fixtures/closed-tenders-29oct.html`) lists
+the 7 tenders with both tabulations.
+
+Manual check against the mock (`node test/mock/mock-ireps-server.mjs`, log in on
+the mock home page): in Download Tender Documents, with From = 2 days ago and
+To = today,
+
+* **Financial Tabulation** / **Commercial Tabulation**: 24260725 (direct PDF)
+  and 61266411 (PDF behind a viewer page) download to
+  `Tender_<no>/Tabulation/`; 88265708 reads "not available yet".
+* **Advance Acceptance Letter**: one `Tender_29263265/Advance_Acceptance_LOA/LOA_29263265.pdf`.
+  The mock console must not show any `/mock/loa/...` request (those are the
+  files inside the letter).
+
+On the real portal, if a tabulation still fails, run `doclinkLog.download()`
+in the side panel console: the `Tabulation` lines show what IREPS answered.
+
+## File names (IREPS names kept)
+
+Run once with **Save to: Local** and once with **ECM / S3** (direct ECM).
+
+1. Tender documents: the NIT PDF is `viewNitPdf_<nitId>.pdf` and each attachment has its IREPS name
+   (`5919538.pdf`, ...), in `NIT_and_Supporting_Documents\` and in the ECM document `<T> - NIT`. The
+   Financial / Commercial Tabulation has the name of the file IREPS opens (e.g. `FIN-TAB-<no>-<oid>.pdf`,
+   `TECH-TAB-<no>-<oid>.pdf`), or `Financial_Tabulation_<T>.pdf` / `Commercial_Tabulation_<T>.pdf` when
+   IREPS gives none.
+2. Pages DocLink prints or renders keep DocLink names: `Corrigendum_NN_<T>.pdf`, `LOA_<T>.pdf`,
+   `Counter_Offer_<T>_<id>.pdf`, `Negotiation_...`, `Correspondence_...` (letter pages).
+3. IC / PO / MA: the PDF is saved under its IREPS name (`8794517.pdf`, `27253922100240.pdf`,
+   `07250369100001_007001.pdf`) in the usual folders, and has that name in the ECM.
+4. Two different documents with one IREPS name: the later one is `<name>_2.pdf` (tender) or keeps
+   DocLink's name (IC / PO / MA batch), so neither replaces the other locally or in the ECM.
+5. ECM "Document type" labels (NIT, PO, LOA, MA, Results, Commercial Tabulation) come from the ECM's
+   vocabulary `invoice_certificate_document_types`; check them after the ECM admin renames them.

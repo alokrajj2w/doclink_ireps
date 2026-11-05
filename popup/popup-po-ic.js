@@ -19,7 +19,7 @@
 
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
-import { SAVE_DESTINATION } from "../services/recon-service.js";
+import { describeSkip } from "../services/download-log.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -78,7 +78,7 @@ let icFolderDownloadId = null;
 function setPoBusy(busy, label) {
   el.btnPoDownload.disabled = busy;
   el.btnPoDownload.classList.toggle("is-busy", busy);
-  el.poDownloadLabel.textContent = label || `Download PO${toEcm()}`;
+  el.poDownloadLabel.textContent = label || "Download PO";
 }
 
 function resetPoResults() {
@@ -107,8 +107,14 @@ function renderPoComplete(result) {
   ctx.setConnection("connected", "Connected");
   poDownloadId = result.downloadId ?? null;
   const ecm = result.ecm || null;
-  el.poResultTitle.textContent = ecm ? PO_ECM_TITLE[ecm.status] : "✓ PO downloaded successfully";
-  el.poResultFilename.textContent = ecm ? describeEcmOutcome(ecm) : result.filename || "";
+  if (result.skipped) {
+    // already downloaded by this user / already in the ECM, and not chosen to download again
+    el.poResultTitle.textContent = `PO ${result.poNumber || ""} not downloaded again`.replace(/\s+/g, " ");
+    el.poResultFilename.textContent = [describeSkip(result.skip), ...(result.warnings || [])].filter(Boolean).join("\n");
+  } else {
+    el.poResultTitle.textContent = ecm ? PO_ECM_TITLE[ecm.status] : "✓ PO downloaded successfully";
+    el.poResultFilename.textContent = [ecm ? describeEcmOutcome(ecm) : result.filename || "", ...(result.warnings || [])].filter(Boolean).join("\n");
+  }
   el.btnPoShowFile.hidden = poDownloadId === null;
   el.poResult.hidden = false;
 }
@@ -158,7 +164,7 @@ async function refreshPoState() {
 function setIcBusy(busy, label) {
   el.btnIcDownload.disabled = busy;
   el.btnIcDownload.classList.toggle("is-busy", busy);
-  el.icDownloadLabel.textContent = label || `Download Inspection Certificate${toEcm()}`;
+  el.icDownloadLabel.textContent = label || "Download Inspection Certificate";
 }
 
 function resetIcResults() {
@@ -197,7 +203,12 @@ function renderIcComplete(message, count, downloads) {
   el.icResultText.textContent =
     count === 0
       ? "No issued Inspection Certificates were found for this PO."
-      : [downloads.failed === 0 ? "All issued Inspection Certificates were saved." : "Hover a failed item, or use Retry, to see why.", summariseEcm(downloads.items)].filter(Boolean).join("\n");
+      : [
+          downloads.failed === 0 ? (downloads.skipped ? "Every other issued Inspection Certificate was saved." : "All issued Inspection Certificates were saved.") : "Hover a failed item, or use Retry, to see why.",
+          ...((downloads.items || []).filter((i) => i.status === "skipped" && i.skip).map((i) => `${i.label}: ${describeSkip(i.skip)}`)),
+          summariseEcm(downloads.items),
+          ...(downloads.warnings || [])
+        ].filter(Boolean).join("\n");
   // only files saved on this computer (an IC stored in the ECM has no local copy)
   const local = (downloads && downloads.items ? downloads.items : []).filter((i) => i.status === "completed" && i.path && (!i.ecm || i.ecm.status === ECM_OUTCOME.FAILED));
   const folders = new Set(local.map((i) => i.path.split("/").slice(0, -1).join("/")));
@@ -264,12 +275,7 @@ async function openView() {
 /**
  * @param {{ send: Function, showView: Function, setConnection: Function, setConnectionForError: Function }} context
  */
-/** " to ECM" while Save to is ECM / S3. */
-function toEcm() {
-  return ctx && ctx.getDestination && ctx.getDestination() === SAVE_DESTINATION.RECON ? " to ECM" : "";
-}
-
-/** Save to changed: the idle download buttons say where the PO and ICs go. */
+/** Reset the idle download buttons' labels (the labels name the file type only, whatever Save to says). */
 export function refreshPoIcDestination() {
   if (!ctx) return;
   if (!el.btnPoDownload.classList.contains("is-busy")) setPoBusy(false);

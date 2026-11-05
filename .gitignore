@@ -7,3 +7,4 @@ dist/
 *.zip
 .env*
 01_api_data/
+config.local.json

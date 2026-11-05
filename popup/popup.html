@@ -24,6 +24,12 @@
         <span class="connection-label">RECON</span>
         <span class="connection-status"><span class="dot"></span><span id="recon-connection-text">Checking…</span></span>
       </button>
+      <!-- My downloads (the download log, popup-downloads.js); a second click goes back -->
+      <button class="header-icon" id="btn-downloads-open" type="button" title="My downloads" aria-label="My downloads" aria-pressed="false">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/>
+        </svg>
+      </button>
     </div>
   </header>
 
@@ -34,8 +40,8 @@
     <div class="save-to" id="save-to" role="radiogroup" aria-label="Save downloads to">
       <span class="save-to-label">Save to</span>
       <div class="segmented">
-        <label title="Downloads/DocLink/ on this computer"><input type="radio" name="save-destination" value="local" checked> Local</label>
-        <label title="IC, PO, MA and tender documents: the ECM folder of your IREPS unit. Bill Status, CRN and R-NOTE: Recon Engine storage (S3)."><input type="radio" name="save-destination" value="recon"> ECM / S3</label>
+        <label title="Downloads/DocLink/ on this computer"><input type="radio" name="save-destination" value="local"> Local</label>
+        <label title="IC, PO, MA and tender documents: the ECM folder of your IREPS unit. Bill Status, CRN and R-NOTE: Recon Engine storage (S3)."><input type="radio" name="save-destination" value="recon" checked> ECM / S3</label>
       </div>
     </div>
     <!-- ===================== Not-on-IREPS gate =====================
@@ -57,91 +63,76 @@
 
     <!-- ===================== Main view ===================== -->
     <section id="view-main" class="view">
-      <article class="card" id="card-download">
-        <h2>Download IREPS Bill Status</h2>
+      <!-- Download: every download, by file type. Bill Status, CRN and R-NOTE run here (with their
+           search options); the others open their own view. -->
+      <article class="card" id="card-downloads">
+        <h2>Download</h2>
 
-        <details class="options" id="options">
-          <summary>Search options <span class="options-summary" id="options-summary">Last 90 Days, All Zones</span></summary>
-          <div class="options-body">
-            <fieldset class="field">
-              <legend class="field-label">Range</legend>
-              <label class="radio"><input type="radio" name="opt-range" value="last90Days" checked> Last 90 Days</label>
-              <label class="radio"><input type="radio" name="opt-range" value="dateRange"> Select Date</label>
-              <div class="date-row" id="date-row">
-                <label class="field"><span class="field-label">From</span><input type="date" id="opt-date-from"></label>
-                <label class="field"><span class="field-label">To</span><input type="date" id="opt-date-to"></label>
+        <div class="group-title">Reports</div>
+        <div class="dl-grid">
+          <article class="dl-item" id="card-download">
+            <button id="btn-download" class="btn btn-secondary" type="button">
+              <span class="btn-spinner" aria-hidden="true"></span>
+              <span class="btn-label">Bill Status</span>
+            </button>
+
+            <details class="options" id="options">
+              <summary>Search options <span class="options-summary" id="options-summary">Last 90 Days, All Zones</span></summary>
+              <div class="options-body">
+                <fieldset class="field">
+                  <legend class="field-label">Range</legend>
+                  <label class="radio"><input type="radio" name="opt-range" value="last90Days" checked> Last 90 Days</label>
+                  <label class="radio"><input type="radio" name="opt-range" value="dateRange"> Select Date</label>
+                  <div class="date-row" id="date-row">
+                    <label class="field"><span class="field-label">From</span><input type="date" id="opt-date-from"></label>
+                    <label class="field"><span class="field-label">To</span><input type="date" id="opt-date-to"></label>
+                  </div>
+                  <p class="field-hint">Date range must be within 180 days.</p>
+                </fieldset>
+                <label class="field">
+                  <span class="field-label">Railway Zone</span>
+                  <select id="opt-zone"><option value="-1">All</option></select>
+                </label>
               </div>
-              <p class="field-hint">Date range must be within 180 days.</p>
-            </fieldset>
-            <label class="field">
-              <span class="field-label">Railway Zone</span>
-              <select id="opt-zone"><option value="-1">All</option></select>
-            </label>
-          </div>
-        </details>
+            </details>
 
+            <div id="progress" class="progress" hidden>
+              <ol class="steps" id="steps">
+                <li data-stage="CHECKING_SESSION">Checking IREPS session</li>
+                <li data-stage="FETCHING">Retrieving Bill Status</li>
+                <li data-stage="PROCESSING">Processing bills</li>
+                <li data-stage="GENERATING_FILE">Generating Excel</li>
+                <li data-stage="DOWNLOADING" id="step-save">Downloading</li>
+              </ol>
+              <p class="progress-message" id="progress-message"></p>
+            </div>
 
-        <button id="btn-download" class="btn btn-primary" type="button">
-          <span class="btn-spinner" aria-hidden="true"></span>
-          <span class="btn-label">Download Bill Status</span>
-        </button>
+            <div id="result-error" class="result result-error" hidden>
+              <div class="result-title" id="error-title"></div>
+              <p id="error-message" class="result-text"></p>
+              <div class="result-actions">
+                <button id="btn-error-preview" class="btn btn-link" type="button" hidden>Open printable preview</button>
+                <button id="btn-error-open-recon" class="btn btn-link" type="button" hidden>Sign in to Recon</button>
+                <button id="btn-error-retry" class="btn btn-link" type="button">Try again</button>
+              </div>
+            </div>
+          </article>
 
-        <div id="progress" class="progress" hidden>
-          <ol class="steps" id="steps">
-            <li data-stage="CHECKING_SESSION">Checking IREPS session</li>
-            <li data-stage="FETCHING">Retrieving Bill Status</li>
-            <li data-stage="PROCESSING">Processing bills</li>
-            <li data-stage="GENERATING_FILE">Generating Excel</li>
-            <li data-stage="DOWNLOADING" id="step-save">Downloading</li>
-          </ol>
-          <p class="progress-message" id="progress-message"></p>
+          <!-- CRN / R-NOTE: same layout as Bill Status; the body comes from #tpl-doc-card (popup-documents.js) -->
+          <article class="dl-item doc-card" id="card-crn" data-criteria="CRN"></article>
+          <article class="dl-item doc-card" id="card-rnote" data-criteria="RNOTE"></article>
         </div>
 
-        <div id="result-error" class="result result-error" hidden>
-          <div class="result-title" id="error-title"></div>
-          <p id="error-message" class="result-text"></p>
-          <div class="result-actions">
-            <button id="btn-error-preview" class="btn btn-link" type="button" hidden>Open printable preview</button>
-            <button id="btn-error-open-recon" class="btn btn-link" type="button" hidden>Sign in to Recon</button>
-            <button id="btn-error-retry" class="btn btn-link" type="button">Try again</button>
-          </div>
+        <div class="group-title">Documents</div>
+        <div class="btn-grid">
+          <button id="btn-ma-open" class="btn btn-secondary" type="button" title="IREPS MA copies (Modification Advice)">MA</button>
+          <button id="btn-po-ic-open" class="btn btn-secondary" type="button" title="IREPS PO / Inspection Certificate">PO / IC</button>
+          <button id="btn-tender-open" class="btn btn-secondary" type="button" title="NIT, letters and tabulations">Tender Documents</button>
+          <button id="btn-pending-open" class="btn btn-secondary" type="button" title="Letters in IREPS Correspondence - Pending">Correspondence</button>
         </div>
       </article>
 
-      <!-- CRN / R-NOTE: same layout as Bill Status; the body comes from #tpl-doc-card (popup-documents.js) -->
-      <article class="card doc-card" id="card-crn" data-criteria="CRN">
-        <h2>Download IREPS CRN</h2>
-      </article>
-
-      <article class="card doc-card" id="card-rnote" data-criteria="RNOTE">
-        <h2>Download IREPS R-NOTE</h2>
-      </article>
-
-      <article class="card" id="card-ma">
-        <h2>Download IREPS MA Copies</h2>
-        <button id="btn-ma-open" class="btn btn-primary" type="button">Download MA</button>
-      </article>
-
-      <article class="card" id="card-po-ic">
-        <h2>Download IREPS PO / Inspection Certificate</h2>
-        <button id="btn-po-ic-open" class="btn btn-primary" type="button">Download PO / IC</button>
-      </article>
-
-      <article class="card" id="card-tender">
-        <h2>Download Tender Documents</h2>
-        <button id="btn-tender-open" class="btn btn-primary" type="button">Download Tender Documents</button>
-      </article>
-
-      <article class="card card-muted" id="card-upload">
-        <div class="card-heading">
-          <h2>Upload Document</h2>
-          <span class="badge">Coming Soon</span>
-        </div>
-        <p class="card-text">Upload documents to the configured IREPS workflow.</p>
-        <button id="btn-upload" class="btn btn-secondary" type="button">Upload Document</button>
-      </article>
-
-      <!-- Last completed download (Bill Status, CRN, R-NOTE): pinned to the bottom of the main view -->
+      <!-- Last completed download (Bill Status, CRN, R-NOTE): under the Download section -->
       <article id="main-result" class="result result-success result-panel" hidden>
         <div class="result-title" id="main-result-title"></div>
         <p id="main-result-summary" class="result-text"></p>
@@ -153,6 +144,18 @@
           <button id="btn-main-dismiss" class="btn btn-link" type="button">Dismiss</button>
         </div>
       </article>
+
+      <!-- Upload: at the bottom of the main view -->
+      <article class="card card-muted" id="card-upload">
+        <div class="card-heading">
+          <h2>Upload</h2>
+          <span class="badge">Coming Soon</span>
+        </div>
+        <p class="card-text">Upload documents to the configured IREPS workflow.</p>
+        <div class="btn-grid">
+          <button id="btn-upload" class="btn btn-secondary" type="button">Document</button>
+        </div>
+      </article>
     </section>
 
     <!-- ===================== Recon Engine sign-in (login 2) =====================
@@ -161,7 +164,7 @@
     <section id="view-recon-login" class="view" hidden>
       <article class="card card-attention">
         <h2>Sign in to Recon Engine</h2>
-        <p class="card-text">Needed to save to ECM / S3. This is separate from your IREPS login and e-sign key: use your joulestowatts Recon Engine account or Okta.</p>
+        <p class="card-text" id="recon-login-intro">Needed to save to ECM / S3. This is separate from your IREPS login and e-sign key: use your joulestowatts Recon Engine account or Okta.</p>
         <p class="recon-user" id="recon-user" hidden></p>
         <form id="recon-login-form" class="form" autocomplete="on">
           <label class="field">
@@ -187,6 +190,24 @@
           <code id="recon-okta-redirect"></code>
           <button id="btn-recon-copy-redirect" class="btn btn-link" type="button">Copy</button>
         </details>
+      </article>
+    </section>
+
+    <!-- ===================== Already downloaded: download again? =====================
+         Shown over every other view (they keep their state) when a run finds files the
+         signed-in user already downloaded, or files already in the ECM (popup-redownload.js). -->
+    <section id="view-redownload" class="view" hidden>
+      <article class="card card-attention">
+        <h2>Already downloaded</h2>
+        <p class="card-text" id="redownload-summary"></p>
+        <button id="btn-redownload-all" class="btn btn-link redownload-select-all" type="button">Select all</button>
+        <ul class="redownload-list" id="redownload-list"></ul>
+        <label class="redownload-remember" id="redownload-remember" hidden>
+          <input type="checkbox" id="redownload-remember-box" checked>
+          <span>Same answer for the rest of this run</span>
+        </label>
+        <button id="btn-redownload-skip" class="btn btn-primary" type="button">Skip them, download only new files</button>
+        <button id="btn-redownload-again" class="btn btn-secondary" type="button" disabled>Download selected again</button>
       </article>
     </section>
 
@@ -304,6 +325,7 @@
           <button id="btn-po-ic-back" class="btn btn-link" type="button">Back</button>
         </div>
         <p class="card-text">Enter a PO Number once, then download the Purchase Order and/or its issued Inspection Certificates.</p>
+        <button id="btn-po-ic-batch-open" class="btn btn-link" type="button">Download POs / ICs by date, or ICs from notifications &rarr;</button>
 
         <label class="field">
           <span class="field-label">PO Number</span>
@@ -364,6 +386,146 @@
       </article>
     </section>
 
+    <!-- ===== PO by date + IC by date + IC from notifications (batch downloads) ===== -->
+    <section id="view-po-ic-batch" class="view" hidden>
+      <article class="card" id="card-pod">
+        <div class="card-heading">
+          <h2>Download POs by PO Date</h2>
+          <button id="btn-pod-back" class="btn btn-link" type="button">Back</button>
+        </div>
+        <p class="card-text">Downloads every Purchase Order dated in the range, across all result pages. For one day, use the same date in both fields.</p>
+        <div class="date-row batch-dates">
+          <label class="field"><span class="field-label">From Date</span><input type="date" id="pod-from"></label>
+          <label class="field"><span class="field-label">To Date</span><input type="date" id="pod-to"></label>
+        </div>
+        <button id="btn-pod-download" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Download All Matching POs</span>
+        </button>
+        <div id="pod-progress" class="progress" hidden><p class="progress-message" id="pod-progress-message"></p><progress id="pod-bar" max="1" value="0"></progress></div>
+        <div id="pod-error" class="result result-error" hidden>
+          <div class="result-title" id="pod-error-title"></div>
+          <p id="pod-error-message" class="result-text"></p>
+          <div class="result-actions"><button id="btn-pod-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button></div>
+        </div>
+        <div id="pod-result" class="result" hidden>
+          <div class="result-title" id="pod-result-title"></div>
+          <p id="pod-result-text" class="result-text"></p>
+          <dl class="batch-counts" id="pod-counts"></dl>
+          <div class="result-actions"><button id="btn-pod-retry" class="btn btn-link" type="button" hidden>Retry failed downloads</button></div>
+        </div>
+        <details id="pod-details" class="batch-details" hidden><summary>Individual results</summary><ul class="doc-list" id="pod-list"></ul></details>
+      </article>
+
+      <article class="card" id="card-icd">
+        <div class="card-heading"><h2>Download ICs by IC Date</h2></div>
+        <p class="card-text">Downloads every Inspection Certificate issued in the range, for every PO, across all result pages. For one day, use the same date in both fields.</p>
+        <div class="date-row batch-dates">
+          <label class="field"><span class="field-label">From Date</span><input type="date" id="icd-from"></label>
+          <label class="field"><span class="field-label">To Date</span><input type="date" id="icd-to"></label>
+        </div>
+        <button id="btn-icd-download" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Download ICs Issued in Range</span>
+        </button>
+        <div id="icd-progress" class="progress" hidden><p class="progress-message" id="icd-progress-message"></p><progress id="icd-bar" max="1" value="0"></progress></div>
+        <div id="icd-error" class="result result-error" hidden>
+          <div class="result-title" id="icd-error-title"></div>
+          <p id="icd-error-message" class="result-text"></p>
+          <div class="result-actions"><button id="btn-icd-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button></div>
+        </div>
+        <div id="icd-result" class="result" hidden>
+          <div class="result-title" id="icd-result-title"></div>
+          <p id="icd-result-text" class="result-text"></p>
+          <dl class="batch-counts" id="icd-counts"></dl>
+          <div class="result-actions"><button id="btn-icd-retry" class="btn btn-link" type="button" hidden>Retry failed downloads</button></div>
+        </div>
+        <details id="icd-details" class="batch-details" hidden><summary>Individual results</summary><ul class="doc-list" id="icd-list"></ul></details>
+      </article>
+
+      <article class="card" id="card-icn">
+        <div class="card-heading"><h2>Download ICs from Notifications</h2></div>
+        <p class="card-text">Reads the IC-issued notifications on the IREPS main page and downloads the IC of each notified PO and PO serial only. For every IC of a period, use Download ICs by IC Date.</p>
+        <button id="btn-icn-download" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Download IC from Notifications</span>
+        </button>
+        <div id="icn-progress" class="progress" hidden><p class="progress-message" id="icn-progress-message"></p><progress id="icn-bar" max="1" value="0"></progress></div>
+        <div id="icn-error" class="result result-error" hidden>
+          <div class="result-title" id="icn-error-title"></div>
+          <p id="icn-error-message" class="result-text"></p>
+          <div class="result-actions"><button id="btn-icn-open-ireps" class="btn btn-link" type="button" hidden>Open IREPS</button></div>
+        </div>
+        <div id="icn-result" class="result" hidden>
+          <div class="result-title" id="icn-result-title"></div>
+          <p id="icn-result-text" class="result-text"></p>
+          <dl class="batch-counts" id="icn-counts"></dl>
+          <div class="result-actions"><button id="btn-icn-retry" class="btn btn-link" type="button" hidden>Retry failed</button></div>
+        </div>
+        <details id="icn-details" class="batch-details" hidden><summary>Notifications and documents</summary><ul class="doc-list" id="icn-list"></ul></details>
+      </article>
+    </section>
+
+    <!-- ===================== My downloads (the download log, popup-downloads.js) ===================== -->
+    <section id="view-downloads" class="view" hidden>
+      <article class="card">
+        <div class="card-heading">
+          <h2>My Downloads</h2>
+          <button id="btn-downloads-back" class="btn btn-link" type="button">Back</button>
+        </div>
+        <p class="card-text downloads-who" id="downloads-who"></p>
+        <div class="date-row">
+          <label class="field"><span class="field-label">From</span><input type="date" id="downloads-from"></label>
+          <label class="field"><span class="field-label">To</span><input type="date" id="downloads-to"></label>
+        </div>
+        <div class="date-row">
+          <label class="field">
+            <span class="field-label">Location</span>
+            <select id="downloads-destination">
+              <option value="">All</option>
+              <option value="local">Local</option>
+              <option value="ecm">ECM (all sites)</option>
+              <option value="ecm:hosur">ECM - Hosur</option>
+              <option value="ecm:rohtak">ECM - Rohtak</option>
+              <option value="s3">S3</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Document type</span>
+            <select id="downloads-type"><option value="">All</option></select>
+          </label>
+        </div>
+        <label class="downloads-all" id="downloads-all-wrap" hidden>
+          <input type="checkbox" id="downloads-all">
+          <span>All users (admin)</span>
+        </label>
+        <button id="btn-downloads-refresh" class="btn btn-primary" type="button">Refresh</button>
+        <div id="downloads-error" class="result result-error" hidden>
+          <div class="result-title" id="downloads-error-title"></div>
+          <p id="downloads-error-message" class="result-text"></p>
+          <div class="result-actions"><button id="btn-downloads-sign-in" class="btn btn-link" type="button" hidden>Sign in to Recon</button></div>
+        </div>
+        <p class="downloads-summary" id="downloads-summary"></p>
+        <div class="downloads-table-wrap" id="downloads-table-wrap" hidden>
+          <table class="downloads-table">
+            <colgroup>
+              <col class="downloads-col-date"><col class="downloads-col-type"><col class="downloads-col-file"><col class="downloads-col-location">
+            </colgroup>
+            <thead>
+              <tr>
+                <th scope="col">Date</th>
+                <th scope="col" title="Document type">Type</th>
+                <th scope="col">File</th>
+                <th scope="col">Location</th>
+              </tr>
+            </thead>
+            <tbody id="downloads-list"></tbody>
+          </table>
+        </div>
+        <button id="btn-downloads-more" class="btn btn-link" type="button" hidden>Load more</button>
+      </article>
+    </section>
+
     <!-- ===================== Tender documents view ===================== -->
     <section id="view-tender" class="view" hidden>
       <article class="card">
@@ -383,17 +545,49 @@
           <button id="btn-account-refresh" class="btn btn-link" type="button">Refresh account</button>
         </div>
 
-        <p class="card-text">DocLink reads your IREPS My Messages, takes each tender number from the NIT message itself, downloads the NIT and its supporting documents, then collects corrigenda, negotiation, counter offer, LOA, correspondence and My Offer for the selected dates. Financial and Commercial Tabulations are not downloaded.</p>
-        <div class="tender-dates">
-          <label class="field"><span class="field-label">From</span><input id="auto-from" type="date"></label>
-          <label class="field"><span class="field-label">To</span><input id="auto-to" type="date"></label>
+        <p class="card-text">Choose the dates, then what to download.</p>
+
+        <!-- Filters: every button below uses the dates (both included); Tender Number only letters and tabulations -->
+        <div class="tender-filters">
+          <div class="group-title">Dates apply to every button below</div>
+          <div class="tender-dates">
+            <label class="field"><span class="field-label">From</span><input id="auto-from" type="date"></label>
+            <label class="field"><span class="field-label">To</span><input id="auto-to" type="date"></label>
+          </div>
+          <label class="field">
+            <span class="field-label">Tender Number (optional)</span>
+            <input id="letter-tender-no" type="text" autocomplete="off" spellcheck="false">
+            <span class="field-hint">Letters and tabulations only</span>
+          </label>
         </div>
-        <button id="btn-auto-run" class="btn btn-primary" type="button">
-          <span class="btn-spinner" aria-hidden="true"></span>
-          <span class="btn-label">Scan My Messages &amp; Download</span>
-        </button>
-        <button id="btn-auto-retry" class="btn btn-link" type="button" hidden>Retry failed</button>
-        <button id="btn-copy-diag" class="btn btn-link" type="button">Copy diagnostics</button>
+
+        <div class="tender-actions">
+          <div class="tender-group">
+            <div class="group-title">Tender documents · by message date</div>
+            <div class="btn-grid">
+              <button id="btn-auto-run" class="btn btn-secondary" type="button" title="NIT, attachments, My Offer and corrigenda of the tenders in My Messages"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">NIT Documents</span></button>
+            </div>
+          </div>
+          <div class="tender-group">
+            <div class="group-title">Letters · by Letter Date</div>
+            <div class="btn-grid">
+              <button id="btn-letter-negotiation" class="btn btn-secondary" type="button" data-status="MyNegotiation"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">Negotiation</span></button>
+              <button id="btn-letter-counter" class="btn btn-secondary" type="button" data-status="MyCounterOffer"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">Counter Offer</span></button>
+              <button id="btn-letter-loa" class="btn btn-secondary" type="button" data-status="MyAdvanceAcceptanceLetter"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">Advance Acceptance Letter</span></button>
+            </div>
+          </div>
+          <div class="tender-group">
+            <div class="group-title">Tabulations · by Closing Date</div>
+            <div class="btn-grid">
+              <button id="btn-tab-financial" class="btn btn-secondary" type="button" data-tabulation="financialTabulation"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">Financial Tabulation</span></button>
+              <button id="btn-tab-commercial" class="btn btn-secondary" type="button" data-tabulation="commercialTabulation"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">Commercial Tabulation</span></button>
+            </div>
+          </div>
+        </div>
+        <div class="tender-links">
+          <button id="btn-auto-retry" class="btn btn-link" type="button" hidden>Retry failed</button>
+          <button id="btn-copy-diag" class="btn btn-link" type="button">Copy diagnostics</button>
+        </div>
         <div id="tender-progress" class="progress" hidden>
           <p class="progress-message" id="tender-progress-message"></p>
         </div>
@@ -417,6 +611,61 @@
           <div class="result-actions">
             <button id="btn-tender-show" class="btn btn-link" type="button" hidden>Show in folder</button>
           </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- ===================== Pending correspondence view ===================== -->
+    <section id="view-pending" class="view" hidden>
+      <article class="card">
+        <div class="card-heading">
+          <h2>Correspondence Downloads</h2>
+          <button id="btn-pc-back" class="btn btn-link" type="button">Back</button>
+        </div>
+
+        <div class="tender-account" aria-live="polite">
+          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Connection</span><span id="pc-acc-connection">Checking…</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Company</span><span id="pc-acc-company">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Operating Unit</span><span id="pc-acc-unit">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Account ID</span><span id="pc-acc-id">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Account Status</span><span id="pc-acc-status">Checking…</span></div>
+          <p id="pc-acc-warning" class="result-text tender-bad" hidden></p>
+          <button id="btn-pc-account-refresh" class="btn btn-link" type="button">Refresh account</button>
+        </div>
+
+        <p class="card-text">Downloads every letter listed under <b>Pending Replies</b> for every tender in <b>Correspondence - Pending</b>, plus any attachments of those letters. Read-only: DocLink never submits a reply.</p>
+        <button id="btn-pc-run" class="btn btn-primary" type="button">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Download All Correspondence</span>
+        </button>
+        <button id="btn-pc-retry" class="btn btn-link" type="button" hidden>Retry failed</button>
+        <label class="pc-force"><input id="pc-force" type="checkbox"> Download again even if already saved</label>
+        <button id="btn-pc-diag" class="btn btn-link" type="button">Copy diagnostics</button>
+
+        <div id="pc-progress" class="progress" hidden><p class="progress-message" id="pc-progress-message"></p></div>
+        <div id="pc-error" class="result result-error" hidden><p id="pc-error-message" class="result-text"></p></div>
+        <p id="pc-empty" class="result-text" hidden>No correspondence found</p>
+
+        <div id="pc-counts" class="result" hidden>
+          <div class="result-title">Summary</div>
+          <ul class="tender-rows">
+            <li class="tender-row"><span>Correspondence records</span><span id="pc-n-records">0</span></li>
+            <li class="tender-row"><span>Letters discovered</span><span id="pc-n-letters">0</span></li>
+            <li class="tender-row"><span>Letters downloaded</span><span id="pc-n-downloaded">0</span></li>
+            <li class="tender-row"><span>Attachments downloaded</span><span id="pc-n-attachments">0</span></li>
+            <li class="tender-row"><span>Unavailable letters</span><span id="pc-n-unavailable">0</span></li>
+            <li class="tender-row"><span>Failed downloads</span><span id="pc-n-failed">0</span></li>
+            <li class="tender-row"><span>Needs review</span><span id="pc-n-review">0</span></li>
+            <li class="tender-row"><span>Records with no pending letters</span><span id="pc-n-noletters">0</span></li>
+          </ul>
+          <p id="pc-folder" class="result-filename"></p>
+        </div>
+
+        <div id="pc-table-wrap" class="pc-table-wrap" hidden>
+          <table class="pc-table">
+            <thead><tr><th>Tender No.</th><th>Letter No.</th><th>Subject</th><th>Reply Deadline</th><th>Status</th></tr></thead>
+            <tbody id="pc-tbody"></tbody>
+          </table>
         </div>
       </article>
     </section>
@@ -467,6 +716,11 @@
   <!-- Body of the CRN / R-NOTE cards (IREPS PO Search controls). One copy per
        card; the {label} words and radio group names are filled in per card. -->
   <template id="tpl-doc-card">
+    <button class="btn btn-secondary" type="button" data-role="download">
+      <span class="btn-spinner" aria-hidden="true"></span>
+      <span class="btn-label" data-role="label">Download</span>
+    </button>
+
     <details class="options" data-role="options">
       <summary>Search options <span class="options-summary" data-role="summary">Last 180 Days, All Railways</span></summary>
       <div class="options-body">
@@ -496,12 +750,6 @@
       </div>
     </details>
 
-
-    <button class="btn btn-primary" type="button" data-role="download">
-      <span class="btn-spinner" aria-hidden="true"></span>
-      <span class="btn-label" data-role="label">Download</span>
-    </button>
-
     <div class="progress" data-role="progress" hidden>
       <ol class="steps">
         <li data-stage="CHECKING_SESSION">Checking IREPS session</li>
@@ -526,5 +774,6 @@
 
   <script type="module" src="popup.js"></script>
   <script type="module" src="../tender/tender-ui.js"></script>
+  <script type="module" src="../tender/pending-ui.js"></script>
 </body>
 </html>

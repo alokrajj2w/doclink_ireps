@@ -812,13 +812,19 @@ function renderPoResults(form, { token = issueToken(), message = "" } = {}) {
  * the folder/call-id shapes, modelled on the captured real response: the PO
  * used throughout this feature's design has 4 issued ICs; any other PO has
  * none, so "Download Inspection Certificate" can be tested both ways).
+ * 05220028100004 has two recent ICs on different days, for "Download ICs by
+ * IC Date" (a search with PO No. empty lists every PO's ICs in the IC Date range).
  */
 const MOCK_IC_DB = {
   "27253922100240": [
-    { callId: "6038184070", poSr: "001", pdf: "3480517" },
-    { callId: "3778184071", poSr: "002", pdf: "2975517" },
-    { callId: "9012184072", poSr: "003", pdf: "6691517" },
-    { callId: "4523184073", poSr: "004", pdf: "8794517" }
+    { callId: "6038184070", poSr: "001", pdf: "3480517", icDate: "08/05/2026" },
+    { callId: "3778184071", poSr: "002", pdf: "2975517", icDate: "08/05/2026" },
+    { callId: "9012184072", poSr: "003", pdf: "6691517", icDate: "08/05/2026" },
+    { callId: "4523184073", poSr: "004", pdf: "8794517", icDate: "08/05/2026" }
+  ],
+  "05220028100004": [
+    { callId: "7110184075", poSr: "001", pdf: "4410603", icDate: "27/10/2026" },
+    { callId: "7110184076", poSr: "002", pdf: "4411603", icDate: "28/10/2026" }
   ]
 };
 
@@ -841,10 +847,11 @@ function renderIcRow(ic, po, index, total) {
   <td class="dataText"><a href="#" onclick="viewPastCallpoSr('${ic.poSr}','01','6581067');">${ic.poSr}</a></td>
   <td class="dataText">29160030: KIT FOR UNLOADER EXHAUST VALVE Part no 790002165.</td>
   <td class="dataText">Product - Final Product Inspection</td>
-  <td class="dataText">106</td>
-  <td class="dataText">08/05/2026</td>
-  <td class="dataText">07/05/2026</td>
-  <td class="dataText">08/05/2026</td>
+  <td class="dataText" style="padding: 5px; text-align: right;">106</td>
+  <td class="dataText" style="padding: 5px; display: none;" > ${ic.icDate} </td>
+  <td class="dataText" style="padding: 5px;"> 07/05/2026 </td>
+  <td class="dataText" style="padding: 5px;"> 07/05/2026 </td>
+  <td class="dataText" style="padding: 5px;">${ic.icDate}</td>
   <td class="dataText">106</td>
   <td class="dataText">Completed (IC Issued)</td>
   <td class="dataText">
@@ -861,14 +868,28 @@ function renderIcListPage({ token = issueToken() } = {}) {
   return pages.icListPage.replace(FIXTURE_TOKEN_RE, `$1${token}$2`);
 }
 
-/** Inspection Call List search result for one PO (POST with token, activity=searchResult). */
-function renderIcResults(poNo, { token = issueToken() } = {}) {
-  const ics = scenario === "no-records" ? [] : MOCK_IC_DB[poNo] || [];
+/**
+ * Inspection Call List search result (POST with token, activity=searchResult): one PO's
+ * ICs, or with PO No. empty every PO's ICs whose IC Date is within IC Date From / To.
+ */
+function renderIcResults(form, { token = issueToken() } = {}) {
+  const poNo = form.get("poNo") || "";
+  const dmy = (t) => { const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(t || ""); return m ? Date.UTC(+m[3], +m[2] - 1, +m[1]) : NaN; };
+  const from = dmy(form.get("dateFromIC"));
+  const to = dmy(form.get("dateToIC"));
+  const groups = scenario === "no-records" ? [] : poNo
+    ? [[poNo, MOCK_IC_DB[poNo] || []]]
+    : Object.entries(MOCK_IC_DB).map(([no, ics]) => [no, ics.filter((ic) => !(dmy(ic.icDate) < from) && !(dmy(ic.icDate) > to))]).filter(([, ics]) => ics.length);
+  const total = groups.reduce((n, [, ics]) => n + ics.length, 0);
   let head = icResultsHead.replace(FIXTURE_TOKEN_RE, `$1${token}$2`);
-  head = head.replace('value="27253922100240"', `value="${poNo}"`).replace('value="4" id="totalRecords"', `value="${ics.length}" id="totalRecords"`);
-  head = head.replace(/Total Records: \d+/, `Total Records: ${ics.length}`);
-  const po = MOCK_PO_DB.find((p) => p.poNo === poNo) || { poNo, poDate: "01/01/2026" };
-  const rowsHtml = ics.map((ic, i) => renderIcRow(ic, po, i, ics.length)).join("");
+  head = head.replace('value="27253922100240"', `value="${poNo}"`).replace('value="4" id="totalRecords"', `value="${total}" id="totalRecords"`);
+  head = head.replace(/Total Records: \d+/, `Total Records: ${total}`);
+  const rowsHtml = groups
+    .map(([no, ics]) => {
+      const po = MOCK_PO_DB.find((p) => p.poNo === no) || { poNo: no, poDate: "01/01/2026" };
+      return ics.map((ic, i) => renderIcRow(ic, po, i, ics.length)).join("");
+    })
+    .join("");
   return head + rowsHtml + icResultsTail;
 }
 
@@ -1236,7 +1257,7 @@ const server = createServer(async (req, res) => {
     const kind = form.has("org.apache.struts.taglib.html.TOKEN") ? "search" : "page";
     console.log(
       `[mock-ireps] ${req.method} vendorInspectionCallList.do ${kind}  scenario=${scenario} cookie=${hasSession(req) ? "yes" : "no"}` +
-        (kind === "search" ? `  poNo=${form.get("poNo")} activity=${form.get("activity")}` : "")
+        (kind === "search" ? `  poNo=${form.get("poNo")} icDates=${form.get("dateFromIC")}-${form.get("dateToIC")} activity=${form.get("activity")}` : "")
     );
 
     switch (scenario) {
@@ -1271,7 +1292,7 @@ const server = createServer(async (req, res) => {
         "<html><head><title>Error</title></head><body><h2>Invalid Token</h2><p>The form was already submitted or the page was reloaded. Please try again.</p></body></html>"
       );
     }
-    const page = renderIcResults(form.get("poNo") || "");
+    const page = renderIcResults(form);
     if (scenario === "slow") return setTimeout(() => html(res, 200, page), 6000);
     return html(res, 200, page);
   }
@@ -1301,8 +1322,145 @@ const server = createServer(async (req, res) => {
     return res.end(pdf);
   }
 
+  /* ---------------------------------------------------- Tender: Closed Tenders tabulations, LOA letters */
+
+  if (path === "/epsn/vendorInboxLink.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const form = new URLSearchParams(req.method === "POST" ? await readBody(req) : url.search);
+    const status = form.get("status") || form.get("listType");
+    console.log(`[mock-ireps] ${req.method} vendorInboxLink.do status=${status} dates=${form.get("startDate") || "-"}..${form.get("endDate") || "-"} page=${form.get("pageNo") || "-"}`);
+    if (status === "MyBidsClosed") return html(res, 200, renderClosedTenders(form));
+    if (status === "MyAdvanceAcceptanceLetter") return html(res, 200, renderLoaList());
+    return html(res, 200, renderClosedTenders(new URLSearchParams()).replace(/<tr class="mock-row">[\s\S]*<\/table>/, "</table>"));
+  }
+
+  if (path === "/epsn/tbo/commTboPdfAction.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const form = new URLSearchParams(req.method === "POST" ? await readBody(req) : url.search);
+    const type = form.get("pdfType");
+    const oid = form.get("tenderOID");
+    console.log(`[mock-ireps] ${req.method} commTboPdfAction.do pdfType=${type} tenderOID=${oid}`);
+    if (!["offer", "financialTabulation", "commercialTabulation"].includes(type)) return html(res, 403, "<html><body><h1>Not allowed in the mock</h1></body></html>");
+    const t = MOCK_CLOSED.find((x) => x.oid === oid);
+    if (t?.viewer && type !== "offer") {
+      // a viewer page around the file, whose name does not say Financial / Commercial
+      return html(res, 200, `<html><head><title>Tabulation</title></head><body><iframe src="/mock/tbo/Tabulation_${oid}_${type === "financialTabulation" ? "F" : "C"}.pdf" width="100%" height="600"></iframe></body></html>`);
+    }
+    if (t && type !== "offer") {
+      // as real IREPS answers (03 Nov 2026): a page that opens the PDF from <body onload>, FIN-TAB / TECH-TAB (Commercial)
+      const file = `http://${req.headers.host}/ireps/supply/pdfdocs//112026/${oid}/${type === "financialTabulation" ? "FIN" : "TECH"}-TAB-${t.no}-${oid}.pdf`;
+      return html(res, 200, `<html>\n<head>\n<script language="javascript">\nfunction openwindow(pdfName)\n{\n   day = new Date();\n   id = day.getTime();\n   var URL=pdfName;\n   eval("page" + id + " = window.open(URL, '" + id + "', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1024,height=768');");\n   window.close();\n}\n</script>\n</head>\n\n<body onload="openwindow('${file}');">\n<bean:message key = "bid.label.load"/><br>\n<img src="/ireps/images/common/loderBar.gif">\n\n</body>\n</html>`);
+    }
+    return sendTinyPdf(res, `${type}_${oid}.pdf`, [`INDIAN RAILWAYS E-PROCUREMENT SYSTEM (MOCK)`, type === "offer" ? "MY OFFER" : type === "financialTabulation" ? "FINANCIAL TABULATION" : "COMMERCIAL TABULATION", `Tender OID: ${oid}`, `Tender No: ${t?.no || "-"}`]);
+  }
+
+  if (/^\/ireps\/supply\/pdfdocs\/+\d+\/\d+\/(FIN|TECH)-TAB-[^/]+\.pdf$/.test(path)) {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const file = path.split("/").pop();
+    return sendTinyPdf(res, file, [`INDIAN RAILWAYS E-PROCUREMENT SYSTEM (MOCK)`, file.startsWith("FIN-") ? "FINANCIAL TABULATION" : "COMMERCIAL TABULATION", `File: ${file}`]);
+  }
+
+  if (/^\/mock\/tbo\/Tabulation_\d+_[FC]\.pdf$/.test(path)) {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const file = path.split("/").pop();
+    return sendTinyPdf(res, file, [`INDIAN RAILWAYS E-PROCUREMENT SYSTEM (MOCK)`, file.endsWith("_F.pdf") ? "FINANCIAL TABULATION (via viewer)" : "COMMERCIAL TABULATION (via viewer)", `File: ${file}`]);
+  }
+
+  if (path === "/epsn/supply/tds/ajxdata.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    res.writeHead(200, { "Content-Type": "text/html;charset=ISO-8859-1" });
+    return res.end("OK");
+  }
+
+  if (path === "/epsn/supply/tds/publishLOALetter.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const form = new URLSearchParams(req.method === "POST" ? await readBody(req) : url.search);
+    const t = MOCK_LOA.find((x) => x.letter === form.get("letterId"));
+    console.log(`[mock-ireps] ${req.method} publishLOALetter.do letterId=${form.get("letterId")}`);
+    if (!t) return html(res, 200, "<html><head><title>Error</title></head><body><h1>Error</h1> letter not found</body></html>");
+    // the letter page links and embeds other files: DocLink must save only the letter itself
+    return html(res, 200, `<html><head><title>Advance Acceptance Letter</title></head><body>
+<h2>ADVANCE ACCEPTANCE OF TENDER (MOCK)</h2>
+<table border="1"><tr><td>Letter No</td><td>${t.letter}</td></tr><tr><td>Tender No</td><td>${t.no}</td></tr><tr><td>Firm</td><td>SAMPLE RAIL COMPONENTS PRIVATE LIMITED-UNIT 1</td></tr></table>
+<p>Your offer against the above tender has been accepted. A formal contract will follow.</p>
+<p>Annexure: <a href="/mock/loa/Annexure_${t.letter}.pdf" target="_blank">Annexure_${t.letter}.pdf</a></p>
+<iframe src="/mock/loa/Terms_${t.letter}.pdf" width="100%" height="200"></iframe>
+</body></html>`);
+  }
+
+  if (/^\/mock\/loa\/.+\.pdf$/.test(path)) {
+    console.log(`[mock-ireps] GET ${path} (a file inside the LOA letter: DocLink should NOT request this)`);
+    return sendTinyPdf(res, path.split("/").pop(), ["ATTACHMENT INSIDE THE LOA LETTER", "DocLink should not download this file."]);
+  }
+
   html(res, 404, "<html><body>Not found</body></html>");
 });
+
+/* ---------------------------------------------------- tender data (relative to today, so "by date" runs find it) */
+
+const dmy = (d) => `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
+const daysAgo = (n) => new Date(Date.now() - n * 86400000);
+
+/** Closed Tenders rows: a direct PDF, a PDF behind a viewer page, and a tender whose bids are not opened yet. */
+const MOCK_CLOSED = [
+  { no: "24260725", oid: "107120554", nitId: "5470263", bidId: "20913662", title: "Strainer Wire for A9/SA9 Valve", closing: daysAgo(0), tab: true },
+  { no: "61266411", oid: "107218819", nitId: "5590682", bidId: "20911547", title: "Brake Cylinder Gasket", closing: daysAgo(1), tab: true, viewer: true },
+  { no: "88265708", oid: "107211292", nitId: "5581950", bidId: "20870164", title: "Wheel Mounted Brake Disc", closing: daysAgo(1), tab: false },
+];
+
+const MOCK_LOA = [{ no: "29263265", oid: "107200478", letter: "1461928", date: daysAgo(0) }];
+
+function renderClosedTenders(form) {
+  const from = form.get("startDate");
+  const to = form.get("endDate");
+  const parse = (s) => { const [d, m, y] = s.split("/").map(Number); return new Date(y, m - 1, d); };
+  const want = form.get("tenderNo");
+  const day = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const rows = MOCK_CLOSED.filter((t) => (!from || day(t.closing) >= parse(from)) && (!to || day(t.closing) <= parse(to)) && (!want || t.no === want));
+  const row = (t) => `<tr class="mock-row">
+<td width="15%">STORES / MOCK RLY</td><td width="15%"><a class="linkStyle" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=${t.nitId}') title="To View NIT Click the NIT No">${t.no}</a><br>(${t.bidId})</td>
+<td width="35%">${t.title}</td>
+<td width="15%">${dmy(t.closing)} 11:30</td>
+<td nowrap width="20%"><a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=${t.oid}&accountID=833&bid_id=${t.bidId}&bidType=N', 'toolbar=0')"><img src="/ireps/images/common/view_t_offer.png"></a>&nbsp;
+${t.tab ? `<a href="#" title="View Financial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?tenderOID=${t.oid}&pdfType=financialTabulation&accountID=833', 'toolbar=0')"><img src="/ireps/images/common/barchart.jpg"></a>&nbsp;<a href="#" title="View Commercial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=${t.oid}&accountID=833',  'toolbar=0')"><img src="/ireps/images/common/techEval.jpg"></a>` : ""}
+</td></tr>`;
+  return `<html><head><title>Folder Details</title><script src="/ireps/js/jquery.1.11.1.js"></script><script src="/ireps/js/works/postRequest.js"></script></head><body>
+<form name="buyerInboxLinkForm" method="post" action="/epsn/vendorInboxLink.do" id="schForm">
+<input type="hidden" name="org.apache.struts.taglib.html.TOKEN" value="${issueToken()}">
+<select id="menuLink" name="menuLink"><option value="Tenders" selected>Tenders</option></select>
+<select id="status" name="status"><option value="Payments">My payments</option><option value="MyBidsClosed" selected>Closed Tenders</option></select>
+Tender Number <input type="text" name="tenderNo" value="${want || ""}" id="tenderNumber">
+Closing Date From <input type="text" name="startDate" value="${from || dmy(daysAgo(89))}" readonly> To <input type="text" name="endDate" value="${to || dmy(daysAgo(0))}" readonly>
+<select name="raStatus" id="raStatus"><option value="-1" selected>All</option></select>
+<input type="hidden" name="pageNo" id="pageNo"><input type="hidden" name="listType" id="listType" value="MyBidsClosed">
+<table width="100%" border="1"><tr bgcolor="#E9E9EF"><td><strong>Dept/Rly. Unit</strong></td><td><strong>Tender No./Bid Id</strong></td><td><strong>Tender Title</strong></td><td><strong>Closing Date/Time</strong></td><td><strong>Actions</strong></td></tr>
+${rows.map(row).join("\n")}
+</table></form></body></html>`;
+}
+
+function renderLoaList() {
+  const rows = MOCK_LOA.map((r) => `<tr><td>Dept / MOCK RLY</td><td><a class="linkStyle" title="To View NIT Click the NIT No" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=9${r.letter}')>${r.no}</a></td><td>${dmy(r.date)} 17:40&nbsp;(${r.letter})</td>
+<td><a title="View LOA Letter" class="linkStyle"href="#" onclick=loaLetterViewActivity('/supply/tds/publishLOALetter.do?Action=ViewPublishedLetter&nitOId=${r.oid}&tdId=3&letterId=${r.letter}&tdVersion=1&bidid=2&bidderAccId=833&signId=9${r.letter}','${r.letter}')>View</a></td></tr>`).join("");
+  return `<html><head><title>Folder Details</title></head><body>
+<form name="buyerInboxLinkForm" method="post" action="/epsn/vendorInboxLink.do" id="schForm">
+<input type="text" name="tenderNo" value="" id="tenderNumber"><input type="text" name="startDate" value="${dmy(daysAgo(89))}" readonly><input type="text" name="endDate" value="${dmy(daysAgo(0))}" readonly>
+<input type="hidden" name="pageNo" id="pageNo"><input type="hidden" name="listType" id="listType" value="MyAdvanceAcceptanceLetter"><input type="hidden" name="raStatus" value="-1">
+<table border="1"><tr><td>Dept</td><td>Tender No</td><td>Letter Date</td><td>Action</td></tr>${rows}</table></form>
+<script>
+function loaLetterViewActivity(url,docId){
+	var docType = "11";
+	var getAjaxData = '/epsn/supply/tds/ajxdata.do';
+	$.ajax({ type: "POST", url: getAjaxData, data: {ajaxMode:"updateLoaViewedDataByBidder",docId:docId,docType:docType}, dataType:'text',
+	    success: function(result) { if(result!=null && result == "OK"){ postRequestNewWindow('/epsn'+url,'toolbar=0'); } else { alert("Try Again."); } } });
+}
+</script></body></html>`;
+}
+
+function sendTinyPdf(res, file, lines) {
+  const pdf = tinyPdf([...lines, "Generated by the DocLink mock server for testing."]);
+  res.writeHead(200, { "Content-Type": "application/pdf", "Content-Length": pdf.length, "Content-Disposition": `inline; filename="${file}"`, "Cache-Control": "no-store" });
+  return res.end(pdf);
+}
 
 server.listen(PORT, () => {
   console.log(`[mock-ireps] listening on http://localhost:${PORT}  (scenario: ${scenario})`);

@@ -3,7 +3,12 @@
 // Runs in the side-panel page (has DOMParser; host_permissions + credentials:'include'
 // reuse the user's existing IREPS browser session - no credentials are read or stored).
 
+import { sourceFileName } from '../utils/filename.js';
+
 export const SESSION_MSG = 'IREPS session expired. Please log in to IREPS and try again.';
+
+/** Error codes meaning "IREPS itself did not answer" (as opposed to a rejected or invalid document). */
+export const IREPS_DOWN_CODES = new Set(['TIMEOUT', 'UNREACHABLE']);
 
 export class TenderError extends Error {
   constructor(code, message) {
@@ -50,7 +55,8 @@ export function absUrl(base, ref, relativeTo) {
 }
 
 export function isPdfBytes(bytes) {
-  const n = Math.min(bytes.length - 3, 1024);
+  // JSP output can lead the PDF with whitespace / stray markup, so look a little further in than the header
+  const n = Math.min(bytes.length - 3, 8192);
   for (let i = 0; i < n; i++) {
     if (bytes[i] === 0x25 && bytes[i + 1] === 0x50 && bytes[i + 2] === 0x44 && bytes[i + 3] === 0x46) return true;
   }
@@ -58,10 +64,23 @@ export function isPdfBytes(bytes) {
 }
 
 /**
- * Financial / Commercial / Techno-Commercial Tabulation are OUT OF SCOPE for the tender feature.
- * They live next to "My Offer" on commTboPdfAction.do (pdfType=...), so the guard sits at the
- * lowest request layer: nothing in this module can reach those endpoints, even by mistake.
+ * commTboPdfAction.do serves "My Offer" and the tender's tabulations (pdfType=...). DocLink fetches My Offer
+ * and the Financial and Commercial Tabulations ("ECM - Download speci-v1" types vft / vct); any other pdfType
+ * (e.g. a Techno-Commercial Tabulation) stays OUT OF SCOPE. IREPS names the two files FIN-TAB-<no>-<oid>.pdf and
+ * TECH-TAB-<no>-<oid>.pdf: TECH-TAB is the Commercial Tabulation, not a Techno-Commercial one (03 Nov 2026
+ * capture), and passes only inside a commercialTabulation response (isExcludedTrustedLink). The guard sits at
+ * the lowest request layer: nothing in this module can reach those endpoints, even by mistake.
  */
+/** The URL as the server sees the request: a POST's form fields count too (postRequest.js moves the query into the body). */
+function withParams(url, params) {
+  if (!params) return url;
+  const u = new URL(url);
+  for (const [k, v] of params) if (!u.searchParams.has(k)) u.searchParams.append(k, v);
+  return u.toString();
+}
+
+export const ALLOWED_PDF_TYPES = Object.freeze(['offer', 'financialtabulation', 'commercialtabulation']);
+
 export function isExcludedUrl(url) {
   let u;
   try {
@@ -71,18 +90,62 @@ export function isExcludedUrl(url) {
   }
   if (/commTboPdfAction\.do/i.test(u.pathname)) {
     const t = [...u.searchParams].find(([k]) => k.toLowerCase() === 'pdftype')?.[1] || '';
-    return t.toLowerCase() !== 'offer';
+    return !ALLOWED_PDF_TYPES.includes(t.toLowerCase());
   }
-  return /tabulation|fin-?tab|tech-?tab/i.test(u.pathname + u.search);
+  // a tabulation file the page itself links to: Financial / Commercial pass, "techno" and unknown ones do not;
+  // a TECH-TAB file (the Commercial Tabulation) only passes isExcludedTrustedLink, inside its own response
+  const s = u.pathname + u.search;
+  if (/techno|tech-?tab/i.test(s)) return true;
+  return /tabulation/i.test(s) && !/financial|commercial/i.test(s);
 }
 
 /** Authenticated request. `form` is an object / URLSearchParams (body for POST, query for GET). */
-export async function irepsFetch(base, ref, { method = 'GET', form = null, relativeTo } = {}) {
+export const fetchSettings = { timeoutMs: 45000, waitMs: 180000, waitRetryMs: 5000, waitRetryMaxMs: 60000 };
+
+/** IREPS answers these while a page is still coming up (gateway / overloaded); worth waiting out. */
+const STILL_OPENING = new Set([502, 503, 504]);
+
+/**
+ * `wait` (Negotiation / Counter Offer): DocLink waits up to fetchSettings.waitMs (3 minutes) for IREPS to open
+ * the page. Within that time a slow answer is waited for, and while IREPS cannot be reached or answers
+ * 502/503/504 the request is retried with backoff (5s, 10s ... 60s); after it, the page fails as not responding.
+ * `wait = { what, onWait(msg) }` names the page for the progress line.
+ */
+export async function irepsFetch(base, ref, opts = {}) {
+  const { wait = null } = opts;
+  if (!wait) return irepsFetchOnce(base, ref, opts);
+  const what = wait.what || 'page';
+  const minutes = `${+(fetchSettings.waitMs / 60000).toFixed(1)} minute${fetchSettings.waitMs === 60000 ? '' : 's'}`;
+  const deadline = Date.now() + fetchSettings.waitMs;
+  const giveUp = (why) => new TenderError('TIMEOUT', `Failed because IREPS is not responding (the ${what} did not open within ${minutes}; ${why}).`);
+  for (let attempt = 1; ; attempt++) {
+    let why;
+    try {
+      const res = await irepsFetchOnce(base, ref, { ...opts, timeoutMs: Math.max(deadline - Date.now(), 1) });
+      if (!STILL_OPENING.has(res.status)) return res;
+      why = `IREPS answered HTTP ${res.status}`;
+    } catch (e) {
+      if (e.code === 'TIMEOUT') throw giveUp('no answer');
+      if (e.code !== 'UNREACHABLE') throw e;
+      why = 'IREPS could not be reached';
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) throw giveUp(why);
+    const delay = Math.min(fetchSettings.waitRetryMs * 2 ** Math.min(attempt - 1, 10), fetchSettings.waitRetryMaxMs, left);
+    const msg = `Waiting for IREPS to open the ${what} (${why}; trying again in ${Math.round(delay / 1000)}s, attempt ${attempt}, up to ${minutes} in all)...`;
+    log('Wait', msg);
+    wait.onWait?.(msg);
+    await new Promise((r) => setTimeout(r, delay));
+  }
+}
+
+async function irepsFetchOnce(base, ref, { method = 'GET', form = null, relativeTo, timeoutMs = fetchSettings.timeoutMs, trusted = false } = {}) {
   let url = absUrl(base, ref, relativeTo);
-  if (isExcludedUrl(url)) throw new TenderError('EXCLUDED', 'Financial/Commercial Tabulation downloads are excluded from DocLink tender downloads.');
+  const params = form ? (form instanceof URLSearchParams ? form : new URLSearchParams(form)) : null;
+  // trusted: a file linked from inside an allowed Financial / Commercial Tabulation response (isExcludedTrustedLink)
+  if ((trusted ? isExcludedTrustedLink(withParams(url, params), trusted) : isExcludedUrl(withParams(url, params)))) throw new TenderError('EXCLUDED', 'This download is excluded from DocLink tender downloads (of the tabulations, only the Financial and Commercial Tabulation are allowed).');
   const init = { method, credentials: 'include', redirect: 'follow', headers: {} };
-  if (form) {
-    const params = form instanceof URLSearchParams ? form : new URLSearchParams(form);
+  if (params) {
     if (method === 'GET') {
       const u = new URL(url);
       for (const [k, v] of params) u.searchParams.set(k, v);
@@ -92,8 +155,22 @@ export async function irepsFetch(base, ref, { method = 'GET', form = null, relat
       init.headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
   }
-  const res = await fetch(url, init);
-  const bytes = new Uint8Array(await res.arrayBuffer());
+  // A portal page that never answers must not stall the whole run: give up after timeoutMs (0 = wait as long as it takes).
+  const ctl = new AbortController();
+  init.signal = ctl.signal;
+  const timer = timeoutMs > 0 ? setTimeout(() => ctl.abort(), timeoutMs) : null;
+  let res;
+  let bytes;
+  try {
+    res = await fetch(url, init);
+    bytes = new Uint8Array(await res.arrayBuffer());
+  } catch (e) {
+    if (ctl.signal.aborted) throw new TenderError('TIMEOUT', `Failed because IREPS is not responding (no answer within ${timeoutMs / 1000} seconds for ${new URL(url).pathname}).`);
+    if (e instanceof TypeError) throw new TenderError('UNREACHABLE', `Failed because IREPS is not responding (could not reach ${new URL(url).pathname}).`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   const contentType = res.headers.get('content-type') || '';
   let cached = null;
   return {
@@ -168,6 +245,7 @@ export function findForm(doc, pred) {
 
 /** Parse `fn('a','b',c)` invocations out of an inline handler. -> [{ fn, args: string[] }] */
 export function parseCalls(src) {
+  src = String(src).replace(/(['"])\s*\+\s*(['"])/g, ''); // 'a' + 'b' -> 'ab' (IREPS builds some letter URLs by concatenation)
   const calls = [];
   const re = /([A-Za-z_$][\w$.]*)\s*\(/g;
   let m;
@@ -232,7 +310,7 @@ export function elementActions(root) {
       if (first) addReq(first, post ? 'POST' : 'GET', { fn: c.fn, args: c.args });
     }
     // anything URL-shaped that parseCalls did not classify (e.g. nested handlers)
-    for (const m of (href + ' ' + onclick).matchAll(/['"]([^'"\s]*?(?:\.do|\.pdf)[^'"\s]*)['"]/gi)) {
+    for (const m of (href + ' ' + onclick).replace(/(['"])\s*\+\s*(['"])/g, '').matchAll(/['"]([^'"\s]*?(?:\.do|\.pdf)[^'"\s]*)['"]/gi)) {
       if (!reqs.some((r) => r.url === m[1])) addReq(m[1], 'GET', { fn: 'other' });
     }
     const urls = [...new Set(reqs.map((r) => r.url))];
@@ -325,7 +403,32 @@ export function extensionFor(kind, res, nameHint) {
 
 const BINARY_DOC_KINDS = new Set(['pdf', 'zip', 'ole', 'png', 'jpg', 'gif', 'tiff', 'rtf']);
 
-function docCandidates(doc, pageUrl, base, allowAnyFile) {
+/** The file IREPS opens for "View Commercial Tabulation" (pdfType=commercialTabulation), captured 03 Nov 2026. */
+const COMMERCIAL_TAB_FILE = /^\/ireps\/supply\/pdfdocs\/+\d+\/\d+\/TECH-TAB-[^/]+\.pdf$/i;
+
+/**
+ * A link inside a response that is already an allowed Financial / Commercial Tabulation (`pdfType`, or true):
+ * its file may be named "Tabulation_<oid>.pdf" without saying which one, so only the Techno-Commercial patterns
+ * (and any other commTboPdfAction.do pdfType) are refused there. IREPS names the Commercial Tabulation's own
+ * PDF "TECH-TAB-<no>-<oid>.pdf": that one file passes, and only inside a commercialTabulation response.
+ */
+function isExcludedTrustedLink(url, pdfType = true) {
+  if (isExcludedUrl(url) === false) return false;
+  let u;
+  try {
+    u = new URL(url, 'https://x.invalid/');
+  } catch {
+    return false;
+  }
+  if (/commTboPdfAction\.do/i.test(u.pathname)) return true;
+  if (pdfType === 'commercialTabulation' && !u.search && COMMERCIAL_TAB_FILE.test(u.pathname) && !/techno/i.test(u.pathname)) return false;
+  return /techno|tech-?tab/i.test(u.pathname + u.search);
+}
+
+/** window.open('...') / location = '...' targets in the page's handlers and scripts (any extension). */
+const SCRIPT_TARGET_RE = /(?:window\.open|location\.(?:href|replace|assign))\s*(?:\(\s*|=\s*)['"]([^'"\s]+)['"]|(?:window\.|document\.)location\s*=\s*['"]([^'"\s]+)['"]/gi;
+
+function docCandidates(doc, pageUrl, base, allowAnyFile, trusted = false) {
   const ext = allowAnyFile ? '(?:pdf|docx?|xlsx?|zip|rar|jpe?g|png|tiff?|rtf|txt)' : 'pdf';
   const isDoc = new RegExp(`\\.${ext}(\\?|#|$)`, 'i');
   const raw = [];
@@ -333,14 +436,25 @@ function docCandidates(doc, pageUrl, base, allowAnyFile) {
     const v = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data') || '';
     if (isDoc.test(v)) raw.push(v);
   }
-  const inline = [...doc.querySelectorAll('[onclick]')].map((e) => e.getAttribute('onclick')).join(' ') +
+  // viewers often embed the real file through a servlet URL with no extension; tried after the obvious ones,
+  // and only accepted when the response is actually a document (see resolveIrepsDocument)
+  for (const el of doc.querySelectorAll('iframe[src],frame[src],embed[src],object[data]')) {
+    const v = el.getAttribute('src') || el.getAttribute('data') || '';
+    if (v && !/^(about:|javascript:|#|data:)/i.test(v) && !raw.includes(v)) raw.push(v);
+  }
+  // onload too: the tabulation page opens its PDF from <body onload="openwindow('...FIN-TAB-<no>-<oid>.pdf')">
+  const inline = [...doc.querySelectorAll('[onclick],[onload]')].map((e) => `${e.getAttribute('onclick') || ''} ${e.getAttribute('onload') || ''}`).join(' ') +
     ' ' + [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join(' ');
   for (const m of inline.matchAll(new RegExp(`['"]([^'"\\s]*\\.${ext}(?:\\?[^'"\\s]*)?)['"]`, 'gi'))) raw.push(m[1]);
+  // a tabulation viewer may open its file through a servlet URL; only accepted when it answers with a document
+  if (trusted) for (const m of inline.matchAll(SCRIPT_TARGET_RE)) raw.push(m[1] || m[2]);
+  const excluded = trusted ? (u) => isExcludedTrustedLink(u, trusted) : isExcludedUrl;
   const out = [];
   for (const r of raw) {
+    if (!r || /^(about:|javascript:|#|data:)/i.test(r)) continue;
     try {
       const u = absUrl(base, r, pageUrl);
-      if (!isExcludedUrl(u) && !out.includes(u)) out.push(u);
+      if (!excluded(u) && !out.includes(u)) out.push(u);
     } catch {
       /* off-origin or malformed: skip */
     }
@@ -355,7 +469,45 @@ function metaRedirect(doc, html) {
   return u || '';
 }
 
-function looksLikeErrorPage(doc) {
+/**
+ * A viewer page that posts itself on to the file (<form> + .submit() on load), as postRequest.js does:
+ * -> { url, method, form } or null. Only used inside a trusted tabulation response.
+ */
+function selfSubmittingForm(doc, html) {
+  const forms = [...doc.querySelectorAll('form[action]')];
+  if (forms.length !== 1) return null;
+  const onload = doc.body?.getAttribute('onload') || '';
+  if (!/\.submit\s*\(\s*\)/.test(`${onload} ${[...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join(' ')}`) && !/\.submit\s*\(\s*\)/.test(html)) return null;
+  const f = forms[0];
+  return { url: f.getAttribute('action'), method: /^get$/i.test(f.getAttribute('method') || '') ? 'GET' : 'POST', form: formParams(f) };
+}
+
+/**
+ * The name IREPS gave a file it served (Content-Disposition, else the URL that answered, else the link
+ * followed), or '' when none names a file of this type: the file is then saved under DocLink's name.
+ */
+function sourceNameOf(res, ext, linkUrl = '') {
+  const name = sourceFileName({ contentDisposition: res.headers?.['content-disposition'], url: res.url }) || sourceFileName({ url: linkUrl });
+  return name && name.toLowerCase().endsWith(ext.toLowerCase()) ? name : '';
+}
+
+/** What a response was, for the log: never its body, cookies or tokens. */
+export function describeResponse(res) {
+  const cd = res.headers?.['content-disposition'] || '';
+  const name = /filename\*?=(?:UTF-8'')?"?([^";]+)/i.exec(cd)?.[1] || '';
+  let path = '';
+  try { path = new URL(res.url).pathname; } catch { /* keep blank */ }
+  return `${path} -> HTTP ${res.status}, ${res.contentType || 'no content-type'}${name ? `, file "${name}"` : ''}, ${res.bytes?.length ?? 0} bytes, ${sniffKind(res.bytes)}`;
+}
+
+/** "title: first words" of a web page, for a failure reason. */
+function pageSummary(doc) {
+  const title = norm(doc.querySelector('title')?.textContent);
+  const text = norm(doc.body?.textContent).slice(0, 120);
+  return [title, text].filter(Boolean).join(': ') || 'an empty page';
+}
+
+export function looksLikeErrorPage(doc) {
   const title = norm(doc.querySelector('title')?.textContent);
   const text = norm(doc.body?.textContent);
   if (text.length < 40) return 'The IREPS page was empty.';
@@ -366,19 +518,32 @@ function looksLikeErrorPage(doc) {
 /**
  * Turn an IREPS response into a validated document.
  *   -> { kind:'file', bytes, ext, converted:false }                 real PDF / document bytes
- *   -> { kind:'html', html, bytes, ext:'.pdf', converted:true }     print-ready HTML (+ locally rendered text PDF)
+ *   -> { kind:'html', html, bytes, ext:'.pdf', converted:true, page } print-ready HTML (+ locally rendered text PDF;
+ *                                                                    page = the response as received, for tender-print.js)
+ * A page that links a document file is normally a viewer of it, so the file is returned instead of the page.
+ * keepPage: the page is the document itself (a corrigendum) and the files it links are its attachments:
+ * the page is returned with links = their URLs (fetchLinkedDocument). Only a page with no readable
+ * content of its own still gives way to the file it links.
+ * pageOnly: the page IS the document (an LOA letter): nothing it links, embeds or redirects to is fetched,
+ * so the result is that page alone (or the file IREPS answered with directly).
+ * trusted: the response is an allowed Financial / Commercial Tabulation (its pdfType, or true); the file it
+ * leads to is followed through isExcludedTrustedLink, including a self-submitting form and window.open /
+ * location / onload targets.
+ * logAs: a log tag; each response and candidate tried is logged (describeResponse).
  * Throws SESSION_EXPIRED for login pages; NO_DOCUMENT when nothing usable is found.
  * A login / error page is never returned as a document.
  */
-export async function resolveIrepsDocument(base, res, { allowHtml = true, allowAnyFile = false, nameHint = '', depth = 0 } = {}) {
+export async function resolveIrepsDocument(base, res, { allowHtml = true, allowAnyFile = false, keepPage = false, pageOnly = false, trusted = false, logAs = '', nameHint = '', depth = 0, wait = null } = {}) {
+  if (logAs) log(logAs, `Response ${describeResponse(res)}`);
   assertSession(res);
   if (res.status !== 200) throw new TenderError('HTTP', `IREPS returned HTTP ${res.status}.`);
   const kind = sniffKind(res.bytes);
   if (kind === 'empty') throw new TenderError('EMPTY', 'IREPS returned an empty response.');
   const meta = { httpStatus: res.status, contentType: res.contentType };
-  if (kind === 'pdf') return { kind: 'file', bytes: res.bytes, ext: '.pdf', converted: false, ...meta };
+  if (kind === 'pdf') return { kind: 'file', bytes: res.bytes, ext: '.pdf', converted: false, sourceName: sourceNameOf(res, '.pdf'), ...meta };
   if (allowAnyFile && BINARY_DOC_KINDS.has(kind)) {
-    return { kind: 'file', bytes: res.bytes, ext: extensionFor(kind, res, nameHint), converted: false, ...meta };
+    const ext = extensionFor(kind, res, nameHint);
+    return { kind: 'file', bytes: res.bytes, ext, converted: false, sourceName: sourceNameOf(res, ext), ...meta };
   }
   if (kind !== 'html' && kind !== 'text') {
     throw new TenderError('NOT_DOCUMENT', `IREPS returned an unrecognised file type (${res.contentType || 'unknown'}).`);
@@ -386,30 +551,84 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
 
   const html = res.text();
   const doc = parseHtml(html);
-
-  for (const url of docCandidates(doc, res.url, base, allowAnyFile)) {
-    const r = await irepsFetch(base, url);
-    assertSession(r);
-    const k = sniffKind(r.bytes);
-    if (r.status === 200 && (k === 'pdf' || (allowAnyFile && BINARY_DOC_KINDS.has(k)))) {
-      return { kind: 'file', bytes: r.bytes, ext: extensionFor(k, r, url), converted: false, httpStatus: r.status, contentType: r.contentType };
+  if (pageOnly) {
+    if (!allowHtml) throw new TenderError('NO_DOCUMENT', 'IREPS did not return a document file (only a web page).');
+    const bad = looksLikeErrorPage(doc);
+    if (bad) throw new TenderError('NO_DOCUMENT', bad);
+    const lines = htmlToLines(doc);
+    if (!lines.length) throw new TenderError('NO_DOCUMENT', 'The IREPS page had no readable content.');
+    return { kind: 'html', html, bytes: buildPdf(wrapLines(lines)), ext: '.pdf', converted: true, page: { url: res.url, bytes: res.bytes, contentType: res.contentType }, ...meta };
+  }
+  const candidates = docCandidates(doc, res.url, base, allowAnyFile, trusted);
+  if (logAs) log(logAs, candidates.length ? `The page links ${candidates.map((u) => { try { return new URL(u).pathname; } catch { return u; } }).join(', ')}` : 'The page links no document file');
+  const linkedFile = async () => {
+    for (const url of candidates) {
+      const r = await irepsFetch(base, url, { wait, trusted });
+      if (logAs) log(logAs, `Linked ${describeResponse(r)}`);
+      assertSession(r);
+      const k = sniffKind(r.bytes);
+      if (r.status === 200 && (k === 'pdf' || (allowAnyFile && BINARY_DOC_KINDS.has(k)))) {
+        const ext = extensionFor(k, r, url);
+        return { kind: 'file', bytes: r.bytes, ext, converted: false, sourceName: sourceNameOf(r, ext, url), httpStatus: r.status, contentType: r.contentType };
+      }
     }
+    return null;
+  };
+
+  keepPage = keepPage && allowHtml;
+  if (!keepPage) {
+    const file = await linkedFile();
+    if (file) return file;
   }
 
-  if (depth < 1) {
+  const follow = { allowHtml, allowAnyFile, keepPage, trusted, logAs, nameHint, depth: depth + 1, wait };
+  if (depth < 1 && trusted) {
+    // a viewer that posts itself on to the file, as the IREPS popup would
+    const sub = selfSubmittingForm(doc, html);
+    if (sub) {
+      if (logAs) log(logAs, `The page submits itself to ${sub.method} ${sub.url}`);
+      const r = await irepsFetch(base, sub.url, { method: sub.method, form: sub.form, relativeTo: res.url, wait, trusted });
+      return resolveIrepsDocument(base, r, follow);
+    }
+  }
+  if (depth < 1 && !(keepPage && candidates.length)) {
     const next = metaRedirect(doc, html);
     if (next) {
-      const r = await irepsFetch(base, next, { relativeTo: res.url });
-      return resolveIrepsDocument(base, r, { allowHtml, allowAnyFile, nameHint, depth: depth + 1 });
+      const r = await irepsFetch(base, next, { relativeTo: res.url, wait, trusted });
+      return resolveIrepsDocument(base, r, follow);
     }
   }
 
-  if (!allowHtml) throw new TenderError('NO_DOCUMENT', 'IREPS did not return a document file (only a web page).');
+  if (!allowHtml) throw new TenderError('NO_DOCUMENT', `IREPS did not return a document file (only a web page${logAs ? `: "${pageSummary(doc)}"` : ''}).`);
   const bad = looksLikeErrorPage(doc);
+  const lines = bad ? [] : htmlToLines(doc);
+  if (keepPage && !lines.length) {
+    // nothing to read on the page itself: it was a viewer of the file after all
+    const file = await linkedFile();
+    if (file) return file;
+  }
   if (bad) throw new TenderError('NO_DOCUMENT', bad);
-  const lines = htmlToLines(doc);
   if (!lines.length) throw new TenderError('NO_DOCUMENT', 'The IREPS page had no readable content.');
-  return { kind: 'html', html, bytes: buildPdf(wrapLines(lines)), ext: '.pdf', converted: true, ...meta };
+  return { kind: 'html', html, bytes: buildPdf(wrapLines(lines)), ext: '.pdf', converted: true, page: { url: res.url, bytes: res.bytes, contentType: res.contentType },
+    ...(keepPage ? { links: candidates } : {}), ...meta };
+}
+
+const DOC_FILE_URL = /\.(?:pdf|docx?|xlsx?|zip|rar|jpe?g|png|tiff?|rtf|txt)(?:[?#]|$)/i;
+
+/**
+ * A document file a page links to (a corrigendum's attachment, from resolveIrepsDocument links).
+ *   -> { kind:'file', bytes, ext, ... }, or null when the link is not a document at all (an embedded
+ *      viewer or servlet URL with no file extension that answers with a web page).
+ * Throws when a link to a document file (.pdf, .docx, ...) does not give one.
+ */
+export async function fetchLinkedDocument(base, url, { allowAnyFile = false, wait = null } = {}) {
+  const res = await irepsFetch(base, url, { wait });
+  try {
+    return await resolveIrepsDocument(base, res, { allowHtml: false, allowAnyFile, nameHint: url, wait });
+  } catch (e) {
+    if (['NO_DOCUMENT', 'NOT_DOCUMENT'].includes(e.code) && !DOC_FILE_URL.test(url)) return null;
+    throw e;
+  }
 }
 
 /**
@@ -417,8 +636,9 @@ export async function resolveIrepsDocument(base, res, { allowHtml = true, allowA
  * and resolve the response into a validated document.
  */
 export async function fetchDocument(base, req, opts = {}) {
-  const res = await irepsFetch(base, req.url, { method: req.method || 'GET', form: req.form || null, relativeTo: req.relativeTo });
-  return resolveIrepsDocument(base, res, opts);
+  const res = await irepsFetch(base, req.url, { method: req.method || 'GET', form: req.form || null, relativeTo: req.relativeTo, wait: req.wait || null });
+  if (opts.logAs) log(opts.logAs, `Requested ${req.method || 'GET'} ${String(req.url).split('?')[0]}${req.form ? ` (fields ${[...new URLSearchParams(req.form).keys()].join(', ')})` : ''}`);
+  return resolveIrepsDocument(base, res, { ...opts, wait: req.wait || null });
 }
 
 // ---------------------------------------------------------------- HTML -> text lines -> PDF
@@ -578,32 +798,36 @@ const MIME = { '.pdf': 'application/pdf', '.html': 'text/html', '.json': 'applic
  * Saves into Downloads/DocLink/<accountLabel>/Tender_<tenderNo>/<subdir>/<file>.
  * Names are unique within a run (no silent overwrite) and every path is sanitised.
  */
-export function createSaver({ accountLabel, tenderNo }) {
-  const root = `${DOWNLOAD_ROOT}/${safeSegment(accountLabel)}/Tender_${safeSegment(tenderNo)}`;
+export function createSaver({ accountLabel, tenderNo, subPath = null, conflict = 'uniquify' }) {
+  // `subPath` (e.g. ['Correspondence','Pending',<tenderNo>]) replaces the default Tender_<no> folder.
+  const root = subPath
+    ? [DOWNLOAD_ROOT, safeSegment(accountLabel), ...subPath.map((p) => safeSegment(p))].join('/')
+    : `${DOWNLOAD_ROOT}/${safeSegment(accountLabel)}/Tender_${safeSegment(tenderNo)}`;
   const used = new Set();
 
-  function uniquePath(subdir, fileName) {
+  // exact: the name was already made unique by the caller (reserveFileName), so it is not changed here
+  function uniquePath(subdir, fileName, exact = false) {
     const dot = fileName.lastIndexOf('.');
     const stem = dot > 0 ? fileName.slice(0, dot) : fileName;
     const ext = dot > 0 ? fileName.slice(dot) : '';
     const dir = subdir ? `${safeSegment(subdir)}/` : '';
     let name = `${safeSegment(stem, 120)}${ext.replace(/[^.\w]/g, '')}`;
-    for (let n = 2; used.has(`${dir}${name}`.toLowerCase()); n++) name = `${safeSegment(stem, 120)}_${n}${ext.replace(/[^.\w]/g, '')}`;
+    if (!exact) for (let n = 2; used.has(`${dir}${name}`.toLowerCase()); n++) name = `${safeSegment(stem, 120)}_${n}${ext.replace(/[^.\w]/g, '')}`;
     used.add(`${dir}${name}`.toLowerCase());
     return `${dir}${name}`;
   }
 
-  async function save(subdir, fileName, bytes, mime) {
+  async function save(subdir, fileName, bytes, mime, { exact = false } = {}) {
     if (!bytes || !bytes.length) throw new TenderError('EMPTY', 'Refusing to save an empty file.');
     const ext = (/\.[A-Za-z0-9]+$/.exec(fileName) || [''])[0].toLowerCase();
     if (ext === '.pdf' && !isPdfBytes(bytes)) throw new TenderError('NOT_PDF', 'Refusing to save a non-PDF payload as .pdf.');
     if (ext !== '.html' && ext !== '.txt' && ext !== '.json' && sniffKind(bytes) === 'html') {
       throw new TenderError('NOT_DOCUMENT', 'Refusing to save a web page as a document file.');
     }
-    const rel = uniquePath(subdir, fileName);
+    const rel = uniquePath(subdir, fileName, exact);
     const url = URL.createObjectURL(new Blob([bytes], { type: mime || MIME[ext] || 'application/octet-stream' }));
     try {
-      const id = await chrome.downloads.download({ url, filename: `${root}/${rel}`, conflictAction: 'uniquify', saveAs: false });
+      const id = await chrome.downloads.download({ url, filename: `${root}/${rel}`, conflictAction: conflict, saveAs: false });
       await waitForDownload(id);
       log('Download', `File saved ${rel}`);
       return { relPath: rel, downloadId: id, size: bytes.length };
@@ -612,20 +836,7 @@ export function createSaver({ accountLabel, tenderNo }) {
     }
   }
 
-  /** The manifest is rewritten in place (not uniquified), so there is always exactly one download_manifest.json. */
-  async function saveJson(fileName, obj) {
-    const bytes = new TextEncoder().encode(JSON.stringify(obj, null, 2));
-    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/json' }));
-    try {
-      const id = await chrome.downloads.download({ url, filename: `${root}/${fileName}`, conflictAction: 'overwrite', saveAs: false });
-      await waitForDownload(id);
-      log('Download', `File saved ${fileName}`);
-      return { relPath: fileName, downloadId: id, size: bytes.length };
-    } finally {
-      URL.revokeObjectURL(url);
-    }
-  }
-  return { root, save, saveJson };
+  return { root, save };
 }
 
 function waitForDownload(id, timeoutMs = 60000) {

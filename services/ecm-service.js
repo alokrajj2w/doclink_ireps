@@ -24,10 +24,20 @@
  *
  * Bill Status, CRN and R-NOTE are not ECM documents: under the same switch they keep
  * going to the Recon Engine (S3).
+ *
+ * Direct mode (config.json "ecmBackendAws": false, for local testing): the same document
+ * goes straight to the ECM (Nuxeo) from DocLink instead (services/ecm-direct.js), with
+ * the same folders, metadata, answer and error codes. "ecmBackendAws": true is the
+ * gateway described above.
  */
 
 import { logger } from "../utils/logger.js";
 import { RECON_CONFIG, loadReconConfig, reconConfigProblem, manifestHostPermissions, apiErrorDetail } from "./recon-service.js";
+import { loadEcmConfig, isDirectEcm } from "./ecm-config.js";
+import { uploadToNuxeo, findInFolder } from "./ecm-direct.js";
+import { isGroupedKind } from "./ecm-catalog.js";
+
+const CHECK_TIMEOUT_MS = 30000;
 
 /** ECM document kinds (InvoiceCertificateSchema:type) DocLink uploads. */
 export const ECM_KIND = Object.freeze({
@@ -39,7 +49,10 @@ export const ECM_KIND = Object.freeze({
   NBSP: "nbsp", //               Negotiation Bid Submission Pending
   EXTENSION: "extension", //     Tender extension / qty change (Corrigendum)
   CRP: "crp", //                 Correspondence Reply pending
-  COUNTER_OFFER: "co"
+  COUNTER_OFFER: "co",
+  FINANCIAL_TABULATION: "vft", // Financial Tabulation (IREPS "View Financial Tabulation"); DocLink files it as TENDER_RESULT
+  TENDER_RESULT: "tenderResult", // "<T> - Result": the Financial Tabulation (ECM type "Tender Result")
+  COMMERCIAL_TABULATION: "vct" // Commercial Tabulation (IREPS "View Commercial Tabulation")
 });
 
 /** Error codes; each has an entry in utils/messages.js ERROR_CATALOG. */
@@ -48,7 +61,8 @@ export const ECM_ERROR = Object.freeze({
   ACCOUNT_UNKNOWN: "ECM_ACCOUNT_UNKNOWN",
   AUTH_REQUIRED: "ECM_AUTH_REQUIRED",
   REJECTED: "ECM_REJECTED",
-  UNAVAILABLE: "ECM_UNAVAILABLE"
+  UNAVAILABLE: "ECM_UNAVAILABLE",
+  DAMAGED: "ECM_FILE_DAMAGED" // stored, but the ECM cannot serve the file back in full (ecm-direct.js)
 });
 
 /** What happened to one document under "ECM / S3". */
@@ -127,20 +141,52 @@ export function ecmFields(fields) {
  * @property {boolean} deduplicated        already in the ECM; nothing new was stored
  */
 
+let uploadQueue = Promise.resolve(); // the tail of the one-at-a-time upload chain
+
 /**
- * Upload one document to the ECM folder of the account's unit.
+ * Can "download again" replace a copy already in the ECM? Only in direct mode: DocLink then
+ * puts the new PDF in that document itself (ecm-direct.js uploadToNuxeo `replace`); the
+ * Recon gateway has no such call.
+ */
+export async function canReplaceInEcm() {
+  await loadEcmConfig();
+  return isDirectEcm();
+}
+
+/**
+ * Upload one document to the ECM folder of the account's unit: through the Recon Engine's
+ * ECM gateway ("ecmBackendAws": true) or straight to the ECM (false, services/ecm-direct.js).
+ *
+ * Uploads run one at a time (per JS context), whatever the caller's download concurrency:
+ * the ECM re-saves IC / PO / MA PDFs while it creates them, and documents created within
+ * milliseconds of each other came out damaged (record and stored file disagree) or with
+ * another document's PDF (TEST ECM, 23-30/10/2026). Uploads made alone were always intact.
  *
  * @param {{ kind: string, bytes: Uint8Array, filename: string, title?: string, fields?: object,
  *           account: EcmAccount, mimeType?: string }} doc
  * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
  * @returns {Promise<EcmUploadResult>}
  */
-export async function uploadToEcm(doc, deps = {}) {
+export function uploadToEcm(doc, deps = {}) {
+  const run = uploadQueue.then(async () => {
+    await loadEcmConfig();
+    if (isDirectEcm()) return uploadToNuxeo(doc, deps);
+    if (doc.replace && doc.replace.length) logger.warn(`ECM gateway: ${doc.filename} cannot replace the copy already in the ECM; uploaded as usual`);
+    return uploadViaGateway(doc, deps);
+  });
+  uploadQueue = run.catch(() => {});
+  return run;
+}
+
+/** POST {reconBaseUrl}/api/ecm/documents (see the top of this file). */
+async function uploadViaGateway(doc, deps) {
   await loadReconConfig();
   const baseUrl = RECON_CONFIG.baseUrl;
   const problem = reconConfigProblem(baseUrl, deps.hostPermissions || manifestHostPermissions(), ENDPOINT);
   if (problem) throw new EcmError(ECM_ERROR.NOT_CONFIGURED, { detail: problem });
   if (!Object.values(ECM_KIND).includes(doc.kind)) throw new Error(`Unsupported ECM kind: ${doc.kind}`);
+  // one document per tender with its PDFs as attachments: the gateway cannot add to a document yet
+  if (isGroupedKind(doc.kind)) throw new EcmError(ECM_ERROR.REJECTED, { detail: `${doc.kind} documents (one per tender, PDFs as attachments) need the direct ECM upload (config.json "ecmBackendAws": false)` });
   const account = doc.account || {};
   if (!account.irepsAccountId && !account.operatingUnit) {
     throw new EcmError(ECM_ERROR.ACCOUNT_UNKNOWN, { detail: "the IREPS account could not be verified" });
@@ -195,20 +241,92 @@ export async function uploadToEcm(doc, deps = {}) {
 }
 
 /**
+ * @typedef {Object} EcmCandidate
+ * @property {string} ref        the caller's id for it
+ * @property {object} fields     plain field keys, as for an upload
+ * @property {string} [title]    compared too when given (tender documents: one tender holds several of a kind)
+ */
+
+/**
+ * Before a run under Save to: ECM / S3: which of these documents are already in the folder
+ * their upload would go to (the account's unit, the kind's location). Matched on the field
+ * values (dates aside) and the title when given, not on file names: other tools store the
+ * same document under other names. Through the gateway or straight to the ECM, like
+ * uploadToEcm. Never throws: when the check cannot be made it answers { ok: false } and
+ * the documents are downloaded (an upload is still not stored twice).
+ *
+ * @param {{ kind: string, account: EcmAccount, candidates: EcmCandidate[] }} query
+ * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
+ * @returns {Promise<{ ok: boolean, found: Map<string, { uid: string, path: string|null, title: string|null }>, code?: string, detail?: string }>}
+ */
+export async function findInEcm(query, deps = {}) {
+  const candidates = (query.candidates || []).map((c) => ({ ref: String(c.ref), fields: ecmFields(c.fields), title: c.title || undefined }));
+  if (candidates.length === 0) return { ok: true, found: new Map() };
+  try {
+    await loadEcmConfig();
+    const account = query.account || {};
+    if (!account.irepsAccountId && !account.operatingUnit) throw new EcmError(ECM_ERROR.ACCOUNT_UNKNOWN, { detail: "the IREPS account could not be verified" });
+    const found = isDirectEcm() ? await findInFolder({ kind: query.kind, account, candidates }, deps) : await findViaGateway({ kind: query.kind, account, candidates }, deps);
+    logger.info(`ECM check: ${found.size} of ${candidates.length} ${query.kind} document(s) already in the ECM`);
+    return { ok: true, found };
+  } catch (error) {
+    if (!(error instanceof EcmError)) logger.warn("ECM check failed", error);
+    else logger.warn(`ECM check not made (${error.code})`, { status: error.status, detail: error.detail });
+    return { ok: false, found: new Map(), code: error.code || "UNKNOWN", detail: error.detail || null };
+  }
+}
+
+/** POST {reconBaseUrl}/api/ecm/documents/exists (the gateway's find_in_folder). */
+async function findViaGateway({ kind, account, candidates }, deps) {
+  await loadReconConfig();
+  const baseUrl = RECON_CONFIG.baseUrl;
+  const path = `${ENDPOINT}/exists`;
+  const problem = reconConfigProblem(baseUrl, deps.hostPermissions || manifestHostPermissions(), path);
+  if (problem) throw new EcmError(ECM_ERROR.NOT_CONFIGURED, { detail: problem });
+  const body = { kind, candidates };
+  if (account.irepsAccountId) body.ireps_account_id = String(account.irepsAccountId);
+  if (account.operatingUnit) body.operating_unit = String(account.operatingUnit);
+  const fetchImpl = deps.fetch || globalThis.fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetchImpl(`${baseUrl}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), credentials: "include", signal: controller.signal });
+  } catch {
+    throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: `could not reach ${new URL(baseUrl).origin}` });
+  } finally {
+    clearTimeout(timer);
+  }
+  let answer = null;
+  try {
+    answer = await response.json();
+  } catch {
+    answer = null;
+  }
+  if (response.status === 401 || response.status === 403) throw new EcmError(ECM_ERROR.AUTH_REQUIRED, { status: response.status, detail: apiErrorDetail(answer) });
+  if (!response.ok || !answer || typeof answer.found !== "object") throw new EcmError(response.status < 500 ? ECM_ERROR.REJECTED : ECM_ERROR.UNAVAILABLE, { status: response.status, detail: apiErrorDetail(answer) || `HTTP ${response.status}` });
+  return new Map(Object.entries(answer.found).map(([ref, d]) => [ref, { uid: d.uid, path: d.path ?? null, title: d.title ?? null }]));
+}
+
+/**
  * Upload to the ECM, and save locally instead when that fails, so nothing is lost.
  *
  * @param {{ kind: string, bytes: Uint8Array, filename: string, title?: string, fields?: object, account: EcmAccount, mimeType?: string }} doc
  * @param {() => Promise<object>} saveLocally   the usual local save (its result is returned as `local`)
  * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
- * @returns {Promise<{ ecm: { status: string, site?: string|null, uid?: string, path?: string|null, code?: string, detail?: string }, local: object|null }>}
+ * @returns {Promise<{ ecm: { status: string, site?: string|null, uid?: string, path?: string|null, code?: string, detail?: string,
+ *          replaced?: { oldFile: string|null, oldDamaged: boolean, oldFileReadable: boolean|null, trashed: number } }, local: object|null }>}
  */
 export async function saveToEcmOrLocally(doc, saveLocally, deps = {}) {
   try {
     const stored = await uploadToEcm(doc, deps);
-    return {
-      ecm: { status: stored.deduplicated ? ECM_OUTCOME.ALREADY_STORED : ECM_OUTCOME.STORED, site: stored.site, uid: stored.uid, path: stored.path },
-      local: null
-    };
+    const ecm = { status: stored.deduplicated ? ECM_OUTCOME.ALREADY_STORED : ECM_OUTCOME.STORED, site: stored.site, uid: stored.uid, path: stored.path };
+    // download again into the existing document: where the old PDF went (ecm-direct.js replaceInDocument)
+    if (stored.replaced) {
+      const r = stored.replaced;
+      ecm.replaced = { oldFile: r.oldFile || null, oldDamaged: Boolean(r.oldDamaged), oldFileReadable: r.oldFileReadable ?? null, trashed: (r.trashed || []).length };
+    }
+    return { ecm, local: null };
   } catch (error) {
     if (!(error instanceof EcmError)) throw error;
     logger.warn(`ECM upload failed (${error.code}); saving ${doc.filename} locally`, { status: error.status, detail: error.detail });
@@ -223,6 +341,14 @@ const siteName = (site) => `${site.charAt(0).toUpperCase()}${site.slice(1)}`;
 export function describeEcmOutcome(ecm) {
   if (!ecm) return "";
   const site = ecm.site ? ` (${siteName(ecm.site)})` : "";
+  if (ecm.status === ECM_OUTCOME.STORED && ecm.replaced) {
+    const r = ecm.replaced;
+    const old = r.oldFile
+      ? `; the old one is kept in it as ${r.oldFile}${r.oldFileReadable === false ? " (but the ECM cannot serve that file in full)" : ""}`
+      : r.oldDamaged ? " (the damaged one was removed)" : "";
+    const trashed = r.trashed ? `; ${r.trashed === 1 ? "1 other damaged copy" : `${r.trashed} other damaged copies`} moved to the ECM trash` : "";
+    return `Saved to ECM${site}: new PDF in the existing document${old}${trashed}`;
+  }
   if (ecm.status === ECM_OUTCOME.STORED) return `Saved to ECM${site}`;
   if (ecm.status === ECM_OUTCOME.ALREADY_STORED) return `Already in ECM${site}`;
   if (ecm.status === ECM_OUTCOME.FAILED) return `ECM upload failed, saved locally: ${ECM_FAILURE_TEXT[ecm.code] || ecm.code}${ecm.detail ? ` (${ecm.detail})` : ""}`;
@@ -252,5 +378,6 @@ const ECM_FAILURE_TEXT = Object.freeze({
   [ECM_ERROR.ACCOUNT_UNKNOWN]: "IREPS account not verified",
   [ECM_ERROR.AUTH_REQUIRED]: "sign in to the Recon Engine",
   [ECM_ERROR.REJECTED]: "ECM refused the document",
-  [ECM_ERROR.UNAVAILABLE]: "ECM unavailable"
+  [ECM_ERROR.UNAVAILABLE]: "ECM unavailable",
+  [ECM_ERROR.DAMAGED]: "the ECM's copy is damaged"
 });
