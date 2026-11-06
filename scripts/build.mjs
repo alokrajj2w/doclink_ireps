@@ -41,6 +41,8 @@ const STATIC_FILES = [
   "config.json",
   "assets",
   "background/offscreen.html",
+  // injected into the IREPS tab as a file by the bill upload (services/bill-upload/tab-transport.js)
+  "background/bill-tab-request.js",
   "popup/popup.html",
   "popup/popup.css",
   "pages/preview.html",
