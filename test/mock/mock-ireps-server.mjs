@@ -107,7 +107,7 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { handleBillUpload, markDraftBills } from "./mock-bill-upload.mjs";
+import { handleBillUpload, markDraftBills, extraRnoteRowsHtml, extraCrnRowsHtml, EXTRA_RNOTE_DATA, EXTRA_CRN_DATA, BILL_POS, BILL_HUB_LINK } from "./mock-bill-upload.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = join(here, "..", "fixtures");
@@ -427,7 +427,8 @@ const CRN_FIXTURE_DATA = [
   { poNo: "04220028100005", poDate: "22/08/2025", rly: "04", crnNo: "013805-26-20005", crnDate: "17/09/2026" },
   { poNo: "06220028100006", poDate: "02/11/2025", rly: "06", crnNo: "013806-26-20006", crnDate: "17/09/2026" },
   { poNo: "RR-PR-WC-1007-25-26-07", poDate: "14/02/2026", rly: "01", crnNo: "013807-26-20007", crnDate: "01/09/2026" },
-  { poNo: "09220028100008", poDate: "05/03/2026", rly: "09", crnNo: "013808-26-20008", crnDate: "15/09/2026" }
+  { poNo: "09220028100008", poDate: "05/03/2026", rly: "09", crnNo: "013808-26-20008", crnDate: "15/09/2026" },
+  ...EXTRA_CRN_DATA
 ];
 
 function generatedCrns(count) {
@@ -525,7 +526,7 @@ function filterCrns(list, form) {
 /** Fixture rows are static HTML; select them by the same rules using CRN_FIXTURE_DATA. */
 function fixtureRowsFor(form) {
   const keep = new Set(filterCrns(CRN_FIXTURE_DATA, form).map((r) => r.crnNo));
-  const rows = crnFixtureRows.split(/(?=\n\s*<tr>)/).filter((chunk) => /<tr>/.test(chunk));
+  const rows = (crnFixtureRows + extraCrnRowsHtml()).split(/(?=\n\s*<tr>)/).filter((chunk) => /<tr>/.test(chunk));
   return rows.filter((chunk) => Array.from(keep).some((no) => chunk.includes(no))).join("");
 }
 
@@ -584,7 +585,8 @@ const RNOTE_FIXTURE_DATA = [
   { poNo: "11260000100001", rly: "11", rnoteNo: "4800000001", crnDate: "14/10/2026" },
   { poNo: "22260000100002", rly: "09", rnoteNo: "0600000002", crnDate: "14/10/2026" },
   { poNo: "21260000100003", rly: "06", rnoteNo: "1000000003", crnDate: "06/10/2026" },
-  { poNo: "05260000100004", rly: "05", rnoteNo: "4400000004", crnDate: "04/09/2026" }
+  { poNo: "05260000100004", rly: "05", rnoteNo: "4400000004", crnDate: "04/09/2026" },
+  ...EXTRA_RNOTE_DATA
 ];
 const RNOTE_STATUSES = ["Accepted", "Accepted", "Partially Accepted", "Rejected"];
 
@@ -643,7 +645,7 @@ function renderRnoteRow(r) {
 
 function rnoteFixtureRowsFor(form) {
   const keep = new Set(filterCrns(RNOTE_FIXTURE_DATA, form).map((r) => r.rnoteNo));
-  const rows = rnoteFixtureRows.split(/(?=<tr\b)/).filter((chunk) => /class="trPoRow"/.test(chunk));
+  const rows = (rnoteFixtureRows + extraRnoteRowsHtml()).split(/(?=<tr\b)/).filter((chunk) => /class="trPoRow"/.test(chunk));
   // a receipt with a mock draft bill (mock-bill-upload.mjs) shows it, like the portal
   return markDraftBills(rows.filter((chunk) => Array.from(keep).some((no) => chunk.includes(no))).join(""));
 }
@@ -767,7 +769,8 @@ const poResultsTail = pages.poResults.slice(pages.poResults.indexOf(PO_ROWS_END)
 /** Known Purchase Orders (fictitious except the PO number, an example already used throughout this feature's design). */
 const MOCK_PO_DB = [
   { poNo: "27253922100240", rly: "01", unit: "HQ/CR", poDate: "16/01/2026", stockType: "S", poValue: "830705.84", folder: "2026/01" },
-  { poNo: "05220028100004", rly: "05", unit: "HQ/NR", poDate: "20/05/2026", stockType: "N", poValue: "412300.00", folder: "2026/05" }
+  { poNo: "05220028100004", rly: "05", unit: "HQ/NR", poDate: "20/05/2026", stockType: "N", poValue: "412300.00", folder: "2026/05" },
+  ...BILL_POS
 ];
 
 function renderPoRow(po) {
@@ -786,7 +789,7 @@ function renderPoRow(po) {
 											<a title="View/Download PO" class="linkStyle" href="${href}" target="_blank" >
 												<img src="/ireps/images/common/View Negotiattion Details.png" alt="View/Download" height="15" width="15" border="0" class="linkStyle" />
 											</a>
-											<a title="Manage Your Purchase Order" class="linkStyle" href="#" onclick="postRequest('/epsn/dispatchParticulars/showDispatchParticular.do?rly=${po.rly}&poKey=1000&poNo=${po.poNo}')" >
+											<a title="Manage Your Purchase Order" class="linkStyle" href="#" onclick="postRequest('/epsn/dispatchParticulars/showDispatchParticular.do?rly=${po.rly}&poKey=${po.poKey || 1000}&poNo=${po.poNo}')" >
 												<img src="/ireps/images/common/icon_view.gif" alt="Manage Your Purchase Order" height="15" width="15" border="0" class="linkStyle" />
 											</a>
 											<a onclick="viewDocAckDetails('1000');" href="javascript:void(0);">
@@ -1046,6 +1049,7 @@ function homePage(loggedIn) {
       <table cellpadding="4">
         <tr><td class="formLabel">Bill Status</td><td><a class="linkStyle" href="/epsn/admin/viewBills.do">View Bills Status</a> &rarr; <code>POST /epsn/admin/viewBills.do</code></td></tr>
         <tr><td class="formLabel">CRN / R-NOTE / MA</td><td><a class="linkStyle" href="/epsn/searchPO.do?searchParam=showPage">View &amp; Manage Contracts (PO Search)</a> &rarr; <code>POST /epsn/searchPO.do</code></td></tr>
+        <tr><td class="formLabel">Upload Bill to IREPS</td><td>${BILL_HUB_LINK}: test receipts, field check, reset</td></tr>
       </table>
     </fieldset>
   </td>
@@ -1067,6 +1071,7 @@ function controlPanel(loggedIn) {
   <p><a href="/epsn/home/showHome.do">&larr; Back to the mock portal</a></p>
   <p>Session: <strong>${loggedIn ? "logged in" : "logged out"}</strong> &middot; live sessions: ${liveSessions.size} &middot; scenario: <code>${scenario}</code></p>
   ${scenario === "auto" ? "" : '<p class="warn">A test scenario is active: portal pages answer abnormally on purpose. <a href="/mock/scenario/auto">back to auto</a></p>'}
+  <p><strong>${BILL_HUB_LINK}</strong>: the screens and test receipts for Upload Bill to IREPS.</p>
   <h3>Session tools</h3>
   <p>${loggedIn ? '<a href="/epsn/home/logout.do">Logout</a> &middot; <a href="/mock/session/expire">Expire session server-side (browser keeps the cookie)</a>' : '<form method="post" action="/login" style="display:inline"><button type="submit">Login with security key (simulated)</button></form>'}</p>
   <h3>Bill Status scenarios (for DocLink error testing)</h3>

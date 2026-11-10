@@ -275,9 +275,29 @@ saves another copy; **Print / Save as PDF** opens Chrome's print dialog.
 ### C9. Test: Upload Bill to IREPS (bill upload) with the mock portal
 
 The mock answers the supplier bill calls (`/epsn/ct/*`) and the ECM calls of the
-bill upload (`test/mock/mock-bill-upload.mjs`), so the whole flow runs without
-creating a real draft bill. To use the mock ECM as well, add to
-`config.local.json` (and reload DocLink):
+bill upload (`test/mock/mock-bill-upload.mjs`), and serves the bill screens of
+`BILL SUBMISSION-Screen shot of IREPS.docx` (`test/mock/mock-bill-screens.mjs`,
+`test/mock/bill-entry-page.html`), so the whole flow runs without creating a real
+draft bill. Start at the test hub, **http://localhost:8765/mock/bill/**: it lists
+the test receipts and what each one tests, and has the reset.
+
+**DocLink does not type into the IREPS boxes.** It posts the values to the same
+endpoints. To see where each value landed, open the bill's **field check**
+(`/mock/bill/check?billRegNo=`) or **Open bill** on the PO's *Bills for Pay* tab,
+which shows the saved values in the boxes, in green. The field check works out
+what it expects from the mock's own data, not with DocLink's code.
+
+To run DocLink's bill code against all the test receipts without a browser:
+
+```
+node test/mock/bill-flow-check.mjs
+```
+
+That doesn't cover the search parsers, the panel or sending from the tab, so the
+steps below still matter. Reopening a draft through **Open bill** is a mock
+assumption: how the portal does it has not been captured (`upload.md` section 11).
+
+To use the mock ECM as well, add to `config.local.json` (and reload DocLink):
 
 ```json
 { "ecm": { "domain": "http://localhost:8765", "clientId": "mock", "clientSecret": "mock" } }
@@ -291,10 +311,10 @@ Remove it again afterwards: IC / PO / MA "Save to ECM" needs the real ECM.
    `test/mock/sample.pdf`.
 2. PO Number `11260000100001`, **Find R-Notes / CRNs**. Expected: R-Note
    4800000001 (87 Set, RO 48300000001) selectable; with the PO left blank
-   the four R-NOTE fixture rows and the mock's CRN rows appear, and only
-   4800000001 and 4400000004 can be selected - e.g. 0600000002 shows
-   "Rnote Not Published", 1000000003 "IREPS already shows bill 3999001", the
-   CRNs "Paid" / "Signed" / ...
+   the R-NOTE rows and the mock's CRN rows appear, and only the receipts on the
+   test hub can be selected - e.g. 0600000002 shows "Rnote Not Published",
+   1000000003 "IREPS already shows bill 3999001", the other CRNs "Paid" /
+   "Signed" / ...
 3. Select 4800000001, keep **Find it in ECM**, click **Prepare bill**.
    Expected (mock terminal): `fetchPODetails`, `populatePayAuthList`,
    `populatePOSrList`, `getAjaxData`, `populateROList`, `populateRODetails`
@@ -313,7 +333,9 @@ Remove it again afterwards: IC / PO / MA "Save to ECM" needs the real ECM.
    with the description to type; E-Declaration "not in ECM (if applicable)".
    *Finish in IREPS* lists the remaining manual steps.
 7. **Start over**, search the same PO again: R-Note 4800000001 is now greyed
-   out with "IREPS already shows bill 3900001". (Restart the mock to reset.)
+   out with "IREPS already shows bill 3900001". To test it again, follow *Start
+   again* on the test hub: **Delete all mock bills** alone is not enough, because
+   DocLink keeps its own record of the bills it created.
 8. PO `05260000100004` (R-Note 4400000004): the place of supply
    "Coaching Depot/Guwahati" is cut to 20 characters - a warning that must be
    ticked as read before **Create** is enabled; IGST to Assam, CONSG, and
