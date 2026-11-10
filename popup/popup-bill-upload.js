@@ -52,6 +52,10 @@ function bindElements() {
     stepReview: $("bill-step-review"),
     review: $("bill-review"),
     btnApply: $("btn-bill-apply"),
+    forget: $("bill-forget"),
+    forgetText: $("bill-forget-text"),
+    forgetConfirm: $("bill-forget-confirm"),
+    btnForget: $("btn-bill-forget"),
     checks: $("bill-checks"),
     ackRow: $("bill-ack-row"),
     ack: $("bill-ack"),
@@ -317,6 +321,18 @@ function render(s) {
     updateCreateButton();
   }
 
+  // 3b. an earlier try already created a bill for this receipt -> offer to start fresh
+  const existing = bill && bill.existing;
+  el.forget.hidden = !(existing && s.step === "review");
+  if (!el.forget.hidden) {
+    el.forgetText.textContent = `An earlier try already created draft bill ${existing.billRegNo} in IREPS for this receipt. To start again, DocLink can forget that bill and let you create a new one. Bill ${existing.billRegNo} stays in IREPS - delete it from the PO's Bills for Pay if you no longer need it.`;
+    if (previousStep !== "review") el.forgetConfirm.checked = false;
+    el.forgetConfirm.disabled = s.busy;
+    el.btnForget.disabled = s.busy || !el.forgetConfirm.checked;
+  } else {
+    el.forgetConfirm.checked = false;
+  }
+
   // 4. bill in IREPS
   const billRegNo = bill && bill.billRegNo;
   const showResult = Boolean(billRegNo) && at("item-review");
@@ -481,6 +497,15 @@ async function documents() {
   await request(MESSAGE_TYPES.BILL_UPLOAD_DOCUMENTS);
 }
 
+async function forget() {
+  renderError(null);
+  const response = await request(MESSAGE_TYPES.BILL_UPLOAD_FORGET);
+  if (response && response.ok !== false) {
+    el.forgetConfirm.checked = false;
+    render(await ctx.send(MESSAGE_TYPES.BILL_UPLOAD_GET_STATE));
+  }
+}
+
 async function reset() {
   renderError(null);
   selectedKey = null;
@@ -514,6 +539,10 @@ export function initBillUpload(context) {
   el.review.addEventListener("input", updateCreateButton);
   el.review.addEventListener("change", updateCreateButton);
   el.btnApply.addEventListener("click", applyChanges);
+  el.forgetConfirm.addEventListener("change", () => {
+    el.btnForget.disabled = !state || state.busy || !el.forgetConfirm.checked;
+  });
+  el.btnForget.addEventListener("click", forget);
   el.confirm.addEventListener("change", updateCreateButton);
   el.ack.addEventListener("change", updateCreateButton);
   el.btnCreate.addEventListener("click", create);

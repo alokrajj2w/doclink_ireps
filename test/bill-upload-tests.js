@@ -50,6 +50,7 @@ import {
   prepareBill,
   reviewBill,
   createDraftBill,
+  forgetBill,
   saveItem,
   collectBillDocuments,
   documentNeed
@@ -579,6 +580,16 @@ export async function runBillUploadTests({ test, assert, eq, rejects, fixture })
     assert(again.header.checks.some((c) => c.level === "error" && /already created bill 3744921/.test(c.text)), "flagged in review");
     await rejects(createDraftBill(again, { acknowledged: true }, deps), BILL_ERROR.DRAFT_EXISTS);
     eq(ireps.writes().length, 2, "still two writes");
+    // "Start fresh": forgetting the earlier bill clears the stop and allows a new draft
+    const fresh = await forgetBill(again, deps);
+    eq(fresh.forgotten.billRegNo, "3744921");
+    eq(await store.get(receiptNS().key), null, "record removed");
+    eq(ireps.writes().length, 2, "forgetting writes nothing to IREPS");
+    assert(!fresh.context.header.checks.some((c) => /already created bill/.test(c.text)), "stop cleared");
+    const second = await createDraftBill(fresh.context, { acknowledged: true }, deps);
+    eq(second.outcome, "item-saved");
+    eq(ireps.writes().length, 4, "new header + item");
+    eq((await store.get(receiptNS().key)).status, "item-saved");
   });
 
   await test("bill upload flow: item warnings wait for confirmation; an item failure keeps the created bill", async () => {

@@ -45,6 +45,7 @@ export const MESSAGE_TYPES = Object.freeze({
   BILL_UPLOAD_DOCUMENTS: "BILL_UPLOAD_DOCUMENTS",
   BILL_UPLOAD_GET_STATE: "BILL_UPLOAD_GET_STATE",
   BILL_UPLOAD_RESET: "BILL_UPLOAD_RESET",
+  BILL_UPLOAD_FORGET: "BILL_UPLOAD_FORGET",
 
   // service worker -> popup (broadcast)
   IREPS_PROGRESS: "IREPS_PROGRESS",
@@ -610,7 +611,7 @@ export const ERROR_CATALOG = Object.freeze({
   },
   BILL_DRAFT_EXISTS: {
     title: "Bill already created",
-    message: "{detail}. DocLink does not create a second bill for the same receipt; finish or delete it in IREPS (Bills for Pay).",
+    message: "{detail}. DocLink does not create a second bill for the same receipt; finish or delete it in IREPS (Bills for Pay), or use \"Start fresh for this receipt\" to create a new one.",
     connection: "connected"
   },
   BILL_CHECKS_FAILED: {

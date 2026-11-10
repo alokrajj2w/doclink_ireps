@@ -10,6 +10,7 @@
  *   BILL_UPLOAD_CREATE     { confirmed, acknowledged }       -> done | item-review | item-blocked   WRITES the draft bill
  *   BILL_UPLOAD_SAVE_ITEM  { acknowledged }                  -> done | item-review | item-blocked   WRITES the item
  *   BILL_UPLOAD_DOCUMENTS  {}                                -> documents saved locally
+ *   BILL_UPLOAD_FORGET     {}                                -> review        (forgets DocLink's record of an earlier bill)
  *   BILL_UPLOAD_GET_STATE / BILL_UPLOAD_RESET
  *
  * Each action answers { started: true } at once and finishes in the background; the panel
@@ -20,7 +21,7 @@ import { MESSAGE_TYPES, SESSION_KEYS, describeError } from "../utils/messages.js
 import { IrepsError } from "../services/ireps-api.js";
 import { logger } from "../utils/logger.js";
 import { BILL_ERROR } from "../services/bill-upload/bill-upload-api.js";
-import { findBillableReceipts, prepareBill, reviewBill, createDraftBill, saveItem, collectBillDocuments, billDocumentTypes } from "../services/bill-upload/bill-upload-service.js";
+import { findBillableReceipts, prepareBill, reviewBill, forgetBill, createDraftBill, saveItem, collectBillDocuments, billDocumentTypes } from "../services/bill-upload/bill-upload-service.js";
 import { retrieveInvoice, manualInvoice } from "../services/bill-upload/ecm-invoice.js";
 import { invoiceFromFile, receiptInvoiceKey, MAX_INVOICE_FILE_RECORDS } from "../services/bill-upload/invoice-file.js";
 import { createBillStore } from "../services/bill-upload/bill-upload-store.js";
@@ -197,6 +198,17 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
         await assertIrepsTab(msg.panelTabId);
         return { step: "review", context: await reviewBill(state.context, msg.overrides || {}, irepsDeps(msg.panelTabId)) };
       });
+    },
+
+    // "Start fresh": DocLink already created a bill for this receipt (an earlier try) and the
+    // user wants to create a new one. Only DocLink's record is dropped; IREPS is not touched.
+    [MESSAGE_TYPES.BILL_UPLOAD_FORGET]: async () => {
+      await restore();
+      if (state.busy) return { ok: false, error: describeError(BILL_ERROR.BUSY) };
+      if (!state.context || state.step !== "review") return { ok: false, error: describeError(BILL_ERROR.NOT_PREPARED, { detail: "Prepare the bill first" }) };
+      const { context } = await forgetBill(state.context, { store });
+      await set({ step: "review", context, documents: null, error: null });
+      return { ok: true };
     },
 
     [MESSAGE_TYPES.BILL_UPLOAD_CREATE]: async (msg) => {

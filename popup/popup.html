@@ -734,6 +734,11 @@
           <dl id="bill-review" class="bill-review"></dl>
           <button id="btn-bill-apply" class="btn btn-link" type="button" hidden>Apply my changes and check again</button>
           <ul id="bill-checks" class="bill-checks"></ul>
+          <div id="bill-forget" class="bill-forget" hidden>
+            <p class="field-hint" id="bill-forget-text"></p>
+            <label class="bill-confirm"><input type="checkbox" id="bill-forget-confirm"> I want to create a new bill for this receipt</label>
+            <button id="btn-bill-forget" class="btn btn-secondary" type="button" disabled>Start fresh for this receipt</button>
+          </div>
           <label class="bill-confirm" id="bill-ack-row" hidden><input type="checkbox" id="bill-ack"> I have read the warnings above</label>
           <label class="bill-confirm"><input type="checkbox" id="bill-confirm"> The values are right. Create the bill in IREPS - the header cannot be changed afterwards.</label>
           <button id="btn-bill-create" class="btn btn-primary" type="button" disabled>

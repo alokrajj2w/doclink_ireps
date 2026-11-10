@@ -269,6 +269,20 @@ export async function reviewBill(context, overrides = {}, deps = {}) {
   return next;
 }
 
+/**
+ * "Start fresh" for a receipt DocLink already created a bill for: forgets DocLink's record of
+ * that bill so a new draft can be created, and re-checks the header. Writes nothing to IREPS -
+ * the earlier draft bill stays there until the user deletes it (PO's Bills for Pay).
+ * @returns {Promise<{ forgotten: object|null, context: object }>}
+ */
+export async function forgetBill(context, deps = {}) {
+  const forgotten = await deps.store.remove(context.receipt.key);
+  if (forgotten) logger.info(`Bill upload: forgot bill ${forgotten.billRegNo} for this receipt (start fresh)`, { po: context.receipt.poNo, poSr: context.receipt.poSr });
+  const next = { ...context, existing: null, billRegNo: null, headerSaved: null, item: null, dispatchNo: null, documentsOnBill: null };
+  next.header = assembleHeader(next, deps.today);
+  return { forgotten, context: next };
+}
+
 /* -------------------------------------------------------------------------- */
 /* 4. Write                                                                   */
 /* -------------------------------------------------------------------------- */

@@ -50,6 +50,18 @@ export function createBillStore(area) {
       all[receiptKey] = { ...(all[receiptKey] || { receiptKey, createdAt: now, dispatchNo: null }), ...patch, receiptKey, updatedAt: now };
       await storage.set({ [STORE_KEY]: all });
       return all[receiptKey];
+    },
+    /**
+     * Forget the receipt's entry ("Start fresh"): the next create for this receipt is allowed again.
+     * @returns {Promise<BillUploadEntry|null>} the entry that was removed
+     */
+    async remove(receiptKey) {
+      const all = await readAll();
+      const removed = all[receiptKey] || null;
+      if (!removed) return null;
+      delete all[receiptKey];
+      await storage.set({ [STORE_KEY]: all });
+      return removed;
     }
   };
 }
