@@ -10,6 +10,7 @@
  *   BILL_UPLOAD_CREATE     { confirmed, acknowledged }       -> done | item-review | item-blocked   WRITES the draft bill
  *   BILL_UPLOAD_SAVE_ITEM  { acknowledged }                  -> done | item-review | item-blocked   WRITES the item
  *   BILL_UPLOAD_DOCUMENTS  {}                                -> documents saved locally
+ *   BILL_UPLOAD_ADD_DOCUMENT { file: { name, base64 }, fileDesc } -> signed in the IREPS signer, uploaded to the bill   WRITES
  *   BILL_UPLOAD_FORGET     {}                                -> review        (forgets DocLink's record of an earlier bill)
  *   BILL_UPLOAD_GET_STATE / BILL_UPLOAD_RESET
  *
@@ -25,12 +26,13 @@ import { findBillableReceipts, prepareBill, reviewBill, forgetBill, createDraftB
 import { retrieveInvoice, manualInvoice } from "../services/bill-upload/ecm-invoice.js";
 import { invoiceFromFile, receiptInvoiceKey, MAX_INVOICE_FILE_RECORDS } from "../services/bill-upload/invoice-file.js";
 import { createBillStore } from "../services/bill-upload/bill-upload-store.js";
-import { tabFetch, assertIrepsTab } from "../services/bill-upload/tab-transport.js";
+import { tabFetch, tabSignPdf, tabSaveFile, assertIrepsTab } from "../services/bill-upload/tab-transport.js";
+import { uploadBillDocument, MAX_SIGN_BYTES } from "../services/bill-upload/bill-document-upload.js";
 import { searchRnote } from "../services/rnote/rnote-service.js";
 import { searchCrn } from "../services/crn/crn-service.js";
 import { downloadBytes } from "../services/download-service.js";
 
-const IDLE = Object.freeze({ step: "idle", busy: false, message: "", poNo: "", receipts: [], warnings: [], receiptKey: null, invoiceMode: "ecm", invoice: null, context: null, documents: null, error: null });
+const IDLE = Object.freeze({ step: "idle", busy: false, message: "", poNo: "", receipts: [], warnings: [], receiptKey: null, invoiceMode: "ecm", invoice: null, context: null, documents: null, docUpload: null, error: null });
 
 /**
  * @param {{ broadcast: (type: string, payload: object) => void, parseSearchPo: (html: string, options: object) => Promise<object> }} hooks
@@ -88,6 +90,7 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
           }
         : null,
       documents: state.documents,
+      docUpload: state.docUpload || null,
       documentTypes: billDocumentTypes(),
       error: state.error,
       updatedAt: state.updatedAt
@@ -231,6 +234,34 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
         await assertIrepsTab(msg.panelTabId);
         const { outcome, context } = await saveItem(state.context, { acknowledged: msg.acknowledged === true }, irepsDeps(msg.panelTabId));
         return { step: outcome === "item-saved" ? "done" : outcome, context };
+      });
+    },
+
+    // One PDF onto the draft bill: signed by the user in the IREPS signer, stored and registered
+    // in IREPS (services/bill-upload/bill-document-upload.js).
+    [MESSAGE_TYPES.BILL_UPLOAD_ADD_DOCUMENT]: async (msg) => {
+      await restore();
+      const c = state.context;
+      const billRegNo = c && (c.billRegNo || (c.existing && c.existing.billRegNo));
+      const dispatchNo = c && (c.dispatchNo || (c.existing && c.existing.dispatchNo));
+      if (!c || !billRegNo || !dispatchNo) {
+        return { started: false, error: describeError(BILL_ERROR.NOT_PREPARED, { detail: "Documents can be added once the bill item is saved (IREPS needs the dispatch no.)" }) };
+      }
+      const file = msg.file;
+      if (!(file && typeof file.name === "string" && typeof file.base64 === "string" && file.base64.length && file.base64.length < (MAX_SIGN_BYTES * 4) / 3 + 8)) {
+        return { started: false, error: describeError(BILL_ERROR.DOC_INVALID, { detail: "Choose a PDF below 8 MB first" }) };
+      }
+      const fileDesc = typeof msg.fileDesc === "string" ? msg.fileDesc : "";
+      const step = state.step;
+      return run("add-document", `Sign ${file.name} in the IREPS signer window (select your DSC, enter the PIN); DocLink then uploads it to bill ${billRegNo}...`, async () => {
+        await assertIrepsTab(msg.panelTabId);
+        const bill = { billRegNo, dispatchNo, vendorCode: c.form.literals.vendorCode, thumbprint: c.form.certThumbprint, spmBillRegNo: c.form.literals.spmBillRegNo };
+        const result = await uploadBillDocument(
+          { bill, file, fileDesc },
+          { fetch: tabFetch(msg.panelTabId), signPdf: tabSignPdf(msg.panelTabId), saveFile: tabSaveFile(msg.panelTabId) }
+        );
+        logger.info(`Bill upload: document uploaded to bill ${billRegNo}`, { file: result.fileName, desc: fileDesc, documents: result.documents.length });
+        return { step, context: { ...state.context, documentsOnBill: result.documents }, docUpload: { fileName: result.fileName, fileDesc: fileDesc.trim(), billRegNo, at: new Date().toISOString() } };
       });
     },
 

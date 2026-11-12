@@ -84,6 +84,7 @@ function percentLiteral(html, name) {
  *                                              vendorCode, nitOid, paymentCode, billType, spmBillRegNo
  * @property {string} companyName
  * @property {string|null} bankAccountNo
+ * @property {string} certThumbprint   the user's registered DSC thumbprint ("" when the page has none)
  * @property {string|null} ifscCode
  * @property {{ value: string, label: string }[]} supplierGstins
  * @property {{ value: string, label: string }[]} payingRailways
@@ -121,6 +122,8 @@ export function parseBillForm(html) {
     literals,
     companyName: company ? decodeEntities(company[1]).trim() : "",
     bankAccountNo: inputValue(source, "bankAccountNo"),
+    // the user's registered DSC; the signer must sign documents with this one
+    certThumbprint: (inputValue(source, "certThumbprint") || "").toUpperCase(),
     ifscCode: inputValue(source, "ifscCode"),
     supplierGstins: selectOptions(source, "supplierGSTIN"),
     payingRailways: selectOptions(source, "payingRlySelect"),

@@ -59,6 +59,16 @@ import { callEcmAutomation, resetEcmDirectState } from "../services/ecm-direct.j
 import { applyEcmConfig } from "../services/ecm-config.js";
 import { IrepsError, IREPS_ERROR, loadIrepsConfig } from "../services/ireps-api.js";
 import { describeError, ERROR_CATALOG } from "../utils/messages.js";
+import {
+  signerRequest,
+  signerFrames,
+  parseSignerReply,
+  parseSaveResult,
+  irepsFileName,
+  billDocumentsDir,
+  uploadBillDocument,
+  UPLOAD_DOCUMENT_FIELDS
+} from "../services/bill-upload/bill-document-upload.js";
 
 /* -------------------------------------------------------- captured vectors */
 
@@ -726,5 +736,95 @@ export async function runBillUploadTests({ test, assert, eq, rejects, fixture })
       assert(ERROR_CATALOG[code], `no catalogue entry for ${code}`);
       eq(describeError(code, { detail: "x" }).code, code);
     }
+  });
+
+  /* ---------------------------------------------------------------- document upload */
+
+  const THUMB = "591FB9799E2D08AB09123074F3F166BFCB85CB04";
+  const PDF_B64 = btoa("%PDF-1.4\n" + "x".repeat(40000) + "\n%%EOF\n");
+  const SIGNED_B64 = btoa("%PDF-1.4 signed " + "y".repeat(3000));
+  const signerReply = (sig = SIGNED_B64, thumb = THUMB) =>
+    `signature= ${sig}\nCommon name=TEST USER\nSerail No= 1\nSubject DN= CN=TEST\nExpiry Date= 27 Jan, 2027 4:40:00 PM\nThumbprint= ${thumb.toLowerCase()}\nKeyusage= x\nTotalPages= 2\nSignedByteLength= 3016\nOriginalByteLength= 40017\nFileName=\ncompleted`;
+
+  await test("document upload: signer message and frames follow CRISPKI.js", async () => {
+    const msg = signerRequest({ pdfBase64: "QUJD", thumbprint: THUMB });
+    eq(msg, `action=pdfsign\ntbs=QUJD\nsignaction=2\ncerttype=DS\nexpirycheck=true\nissuername=\nsigntype=detached\ncoordinate=90,90,10,10\nthumbprint=${THUMB}\nreason=IREPS-CRIS\nlocation=New Delhi\npageNo=all\npagination=false`);
+    const big = "a".repeat(40000);
+    const frames = signerFrames(big);
+    eq(frames.length, 3);
+    eq(frames[0].length, 16300);
+    assert(frames[2].endsWith("completed"), "last frame ends with completed");
+    eq(frames.join("").replace(/completed$/, ""), big, "frames rebuild the message");
+    eq(signerFrames("short").join(), "shortcompleted");
+  });
+
+  await test("document upload: signer reply, save.php answer, IREPS file name and folder", async () => {
+    const r = parseSignerReply(signerReply());
+    eq(r.signedBase64, SIGNED_B64);
+    eq(r.thumbprint, THUMB);
+    eq(r.originalBytes, 40017);
+    eq(r.pages, 2);
+    await rejects(Promise.resolve().then(() => parseSignerReply("signing canceled completed")), BILL_ERROR.SIGN_FAILED);
+    await rejects(Promise.resolve().then(() => parseSignerReply("signature= ex\nCommon name=x\ncompleted")), BILL_ERROR.SIGN_FAILED);
+    const saved = parseSaveResult("<html><body onload='window.parent.CRISPKI.afterUpload()'>OK~ireps/upload/billDocuments/092026/3744921/3894570/1061000262-GSTMANDATE.pdf~38729</body></html>");
+    eq(saved.path, "ireps/upload/billDocuments/092026/3744921/3894570/1061000262-GSTMANDATE.pdf");
+    eq(saved.bytes, 38729);
+    await rejects(Promise.resolve().then(() => parseSaveResult("<html><body>ERROR~disk</body></html>")), BILL_ERROR.IREPS_REJECTED);
+    eq(irepsFileName("1061000262 - GSTMANDATE.pdf"), "1061000262-GSTMANDATE.pdf");
+    eq(irepsFileName("MA_04263502102178_003861.pdf"), "MA_04263502102178_003861.pdf");
+    eq(irepsFileName("scan (1)"), "scan1.pdf");
+    eq(billDocumentsDir({ billRegNo: "3744921", dispatchNo: "3894570" }, new Date(2026, 8, 15)), "ireps/upload/billDocuments/092026/3744921/3894570");
+  });
+
+  await test("document upload: sign -> save.php -> uploadBillDocuments.do with the captured fields", async () => {
+    const calls = [];
+    const bill = { billRegNo: "3744921", dispatchNo: "3894570", vendorCode: ":833", thumbprint: THUMB, spmBillRegNo: "null" };
+    const deps = {
+      today: new Date(2026, 8, 15),
+      signPdf: async (frames) => {
+        calls.push({ sign: frames.join("") });
+        return signerReply();
+      },
+      saveFile: async (form) => {
+        calls.push({ save: form });
+        return `<html><body onload='window.parent.CRISPKI.afterUpload()'>OK~${form.relativeDir}/${form.pdfName}~${form.pdfContent.length}</body></html>`;
+      },
+      fetch: async (url, init) => {
+        calls.push({ url: String(url), body: init.body });
+        return new Response("OK#2<>35294-26-66158.pdf#ireps/etender/x.pdf#RNOTE / CRN - SYSTEM UPLOAD#15/09/2026 16:39#USER#16873771<>MA_04263502102178_003861.pdf#ireps/upload/billDocuments/092026/3744921/3894570/MA_04263502102178_003861.pdf#MODIFICATION ADVICE#15/09/2026 16:42#USER#16873799<>", { status: 200, headers: { "content-type": "text/plain" } });
+      }
+    };
+    const out = await uploadBillDocument({ bill, file: { name: "MA_04263502102178_003861.pdf", base64: PDF_B64 }, fileDesc: " MODIFICATION ADVICE " }, deps);
+    eq(calls.length, 3);
+    assert(calls[0].sign.startsWith(`action=pdfsign\ntbs=${PDF_B64}\nsignaction=2`), "the PDF goes to the signer");
+    eq(calls[1].save.relativeDir, "ireps/upload/billDocuments/092026/3744921/3894570");
+    eq(calls[1].save.pdfContent, SIGNED_B64, "the signed PDF is stored");
+    assert(calls[2].url.endsWith("/epsn/ct/uploadBillDocuments.do"), calls[2].url);
+    const body = new URLSearchParams(calls[2].body);
+    eq(Array.from(body.keys()).join(), UPLOAD_DOCUMENT_FIELDS.join(), "field order");
+    eq(calls[2].body, "billRegNo=3744921&dispatchNo=3894570&vendorCode=%3A833&fileName=MA_04263502102178_003861.pdf&filePath=ireps%2Fupload%2FbillDocuments%2F092026%2F3744921%2F3894570%2FMA_04263502102178_003861.pdf&fileDesc=MODIFICATION+ADVICE&spmBillRegNo=null&supplementaryBillType=");
+    eq(out.documents.length, 2);
+    eq(out.documents[1].description, "MODIFICATION ADVICE");
+  });
+
+  await test("document upload: refuses before signing when something is missing", async () => {
+    let touched = false;
+    const deps = { signPdf: async () => { touched = true; return signerReply(); }, saveFile: async () => { touched = true; return ""; }, fetch: async () => { touched = true; } };
+    const bill = { billRegNo: "1", dispatchNo: "2", vendorCode: ":833", thumbprint: THUMB };
+    const file = { name: "a.pdf", base64: PDF_B64 };
+    await rejects(uploadBillDocument({ bill, file, fileDesc: "MA" }, deps), BILL_ERROR.DOC_INVALID, "short description");
+    await rejects(uploadBillDocument({ bill: { ...bill, dispatchNo: null }, file, fileDesc: "MODIFICATION ADVICE" }, deps), BILL_ERROR.NOT_PREPARED, "no dispatch no.");
+    await rejects(uploadBillDocument({ bill: { ...bill, thumbprint: "" }, file, fileDesc: "MODIFICATION ADVICE" }, deps), BILL_ERROR.SIGN_FAILED, "no thumbprint");
+    await rejects(uploadBillDocument({ bill, file: { name: "a.pdf", base64: btoa("hello world") }, fileDesc: "MODIFICATION ADVICE" }, deps), BILL_ERROR.DOC_INVALID, "not a PDF");
+    eq(touched, false, "nothing signed or sent");
+    // signed with another certificate -> not stored
+    const other = { ...deps, signPdf: async () => signerReply(SIGNED_B64, "AAAA") };
+    await rejects(uploadBillDocument({ bill, file, fileDesc: "MODIFICATION ADVICE" }, other), BILL_ERROR.SIGN_FAILED, "other certificate");
+    eq(touched, false, "nothing stored");
+  });
+
+  await test("bill form: the registered DSC thumbprint is read", async () => {
+    const html = (await billPage(fixture)) + `<input type="hidden" name="certThumbprint" value="${THUMB.toLowerCase()}">`;
+    eq(parseBillForm(html).certThumbprint, THUMB);
   });
 }

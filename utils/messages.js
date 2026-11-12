@@ -46,6 +46,7 @@ export const MESSAGE_TYPES = Object.freeze({
   BILL_UPLOAD_GET_STATE: "BILL_UPLOAD_GET_STATE",
   BILL_UPLOAD_RESET: "BILL_UPLOAD_RESET",
   BILL_UPLOAD_FORGET: "BILL_UPLOAD_FORGET",
+  BILL_UPLOAD_ADD_DOCUMENT: "BILL_UPLOAD_ADD_DOCUMENT",
 
   // service worker -> popup (broadcast)
   IREPS_PROGRESS: "IREPS_PROGRESS",
@@ -676,6 +677,22 @@ export const ERROR_CATALOG = Object.freeze({
   BILL_NOT_PREPARED: {
     title: "Bill not prepared",
     message: "{detail}. Start again from the receipt."
+  },
+  BILL_DOC_INVALID: {
+    title: "Document not usable",
+    message: "{detail}. Nothing was sent to IREPS.",
+    notice: true
+  },
+  BILL_SIGNER_UNAVAILABLE: {
+    title: "IREPS signer not reachable",
+    message: "DocLink could not reach the IREPS signing app (eMudhra IREPSSigner) on this computer: {detail}. Start the signer, reload the IREPS tab and try again. Nothing was uploaded.",
+    connection: "connected"
+  },
+  BILL_SIGN_FAILED: {
+    title: "Document not signed",
+    message: "{detail}. Nothing was uploaded.",
+    notice: true,
+    connection: "connected"
   },
   NO_BACKGROUND_RESPONSE: {
     title: "DocLink Needs a Reload",

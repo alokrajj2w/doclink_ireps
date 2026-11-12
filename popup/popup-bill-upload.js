@@ -74,6 +74,14 @@ function bindElements() {
     btnDocs: $("btn-bill-docs"),
     docs: $("bill-docs"),
     btnDocsFolder: $("btn-bill-docs-folder"),
+    upDoc: $("bill-upload-doc"),
+    upDocHint: $("bill-upload-doc-hint"),
+    upDocFile: $("bill-upload-doc-file"),
+    upDocType: $("bill-upload-doc-type"),
+    upDocDesc: $("bill-upload-doc-desc"),
+    btnUpDoc: $("btn-bill-upload-doc"),
+    upDocStatus: $("bill-upload-doc-status"),
+    onIreps: $("bill-on-ireps"),
     next: $("bill-next"),
     nextSteps: $("bill-next-steps"),
     progress: $("bill-progress"),
@@ -241,6 +249,85 @@ function renderDocuments(s) {
   el.btnDocsFolder.hidden = folderDownloadId === null;
 }
 
+/* Upload one PDF to the draft bill (signed in the IREPS signer). */
+const UPLOAD_MAX_BYTES = 8388608;
+
+function updateUploadDocButton() {
+  const s = state;
+  const file = el.upDocFile.files && el.upDocFile.files[0];
+  el.btnUpDoc.disabled = !s || s.busy || !file || el.upDocDesc.value.trim().length < 5;
+}
+
+function renderUploadDoc(s) {
+  const bill = s.bill;
+  const ready = Boolean(bill && bill.billRegNo && bill.dispatchNo);
+  el.upDoc.hidden = !(bill && bill.header && bill.billRegNo);
+  if (el.upDoc.hidden) return;
+  if (!el.upDocType.options.length) {
+    for (const t of s.documentTypes || []) {
+      const o = node("option", null, t.label);
+      o.value = t.fileDesc;
+      el.upDocType.append(o);
+    }
+    const other = node("option", null, "Other (type the description)");
+    other.value = "";
+    el.upDocType.append(other);
+    if (!el.upDocDesc.value) el.upDocDesc.value = el.upDocType.value;
+  }
+  el.upDocHint.textContent = ready
+    ? `Adds the PDF to draft bill ${bill.billRegNo} (dispatch no. ${bill.dispatchNo}), like "Upload Document" on the IREPS bill page.`
+    : `Save the bill item first: IREPS takes documents once bill ${bill.billRegNo} has a dispatch no.`;
+  for (const input of [el.upDocFile, el.upDocType, el.upDocDesc]) input.disabled = s.busy || !ready;
+  setBusy(el.btnUpDoc, s.busy && /signer/i.test(s.message || ""));
+  updateUploadDocButton();
+  if (!ready) el.btnUpDoc.disabled = true;
+
+  const up = s.docUpload;
+  el.upDocStatus.hidden = !(up && up.billRegNo === bill.billRegNo);
+  if (!el.upDocStatus.hidden) el.upDocStatus.textContent = `Uploaded ${up.fileName} as "${up.fileDesc}" to bill ${up.billRegNo}.`;
+
+  const docs = bill.documentsOnBill || [];
+  el.onIreps.replaceChildren();
+  for (const d of docs) {
+    const li = node("li", "bill-item");
+    li.append(node("span", "bill-item-title", `${d.description || "-"}: ${d.fileName}`));
+    li.append(node("span", "bill-item-detail", [d.uploadedAt, d.uploadedBy].filter(Boolean).join(" - ")));
+    el.onIreps.append(li);
+  }
+  el.onIreps.hidden = docs.length === 0;
+}
+
+function readFileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = String(reader.result || "");
+      resolve(url.slice(url.indexOf(",") + 1));
+    };
+    reader.onerror = () => reject(reader.error || new Error("could not read the file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadDocument() {
+  renderError(null);
+  const file = el.upDocFile.files && el.upDocFile.files[0];
+  if (!file) return;
+  if (file.size >= UPLOAD_MAX_BYTES) {
+    renderError(describeError("BILL_DOC_INVALID", { detail: `${file.name} is ${(file.size / 1048576).toFixed(1)} MB; IREPS takes PDFs below 8 MB` }));
+    return;
+  }
+  let base64;
+  try {
+    base64 = await readFileBase64(file);
+  } catch (error) {
+    renderError(describeError("BILL_DOC_INVALID", { detail: `${file.name} could not be read: ${(error && error.message) || error}` }));
+    return;
+  }
+  const response = await request(MESSAGE_TYPES.BILL_UPLOAD_ADD_DOCUMENT, { file: { name: file.name, base64 }, fileDesc: el.upDocDesc.value });
+  if (response && response.started !== false) el.upDocFile.value = "";
+}
+
 function renderNextSteps(s) {
   const bill = s.bill;
   const done = s.step === "done" || (bill && bill.existing && bill.existing.status === "item-saved");
@@ -368,6 +455,7 @@ function render(s) {
   el.btnDocs.disabled = s.busy;
   setBusy(el.btnDocs, s.busy && /documents/i.test(s.message || ""));
   renderDocuments(s);
+  renderUploadDoc(s);
   renderNextSteps(s);
 
   // progress / error
@@ -554,6 +642,14 @@ export function initBillUpload(context) {
   });
   el.btnOpenIreps.addEventListener("click", () => ctx.send(MESSAGE_TYPES.OPEN_IREPS));
   el.btnReset.addEventListener("click", reset);
+  el.upDocFile.addEventListener("change", updateUploadDocButton);
+  el.upDocDesc.addEventListener("input", updateUploadDocButton);
+  el.upDocType.addEventListener("change", () => {
+    el.upDocDesc.value = el.upDocType.value;
+    updateUploadDocButton();
+    if (!el.upDocType.value) el.upDocDesc.focus();
+  });
+  el.btnUpDoc.addEventListener("click", uploadDocument);
 }
 
 /** Broadcasts from the service worker; true when handled. */

@@ -770,6 +770,20 @@
           </button>
           <ul id="bill-docs" class="bill-list" hidden></ul>
           <button id="btn-bill-docs-folder" class="btn btn-link" type="button" hidden>Show in folder</button>
+          <div id="bill-upload-doc" class="bill-upload-doc" hidden>
+            <h3 class="section-heading">Upload a document to IREPS</h3>
+            <p class="field-hint" id="bill-upload-doc-hint"></p>
+            <label class="field"><span class="field-label">PDF (below 8 MB)</span><input id="bill-upload-doc-file" type="file" accept="application/pdf,.pdf"></label>
+            <label class="field"><span class="field-label">Document</span><select id="bill-upload-doc-type"></select></label>
+            <label class="field"><span class="field-label">Description in IREPS (min. 5 characters)</span><input id="bill-upload-doc-desc" type="text" maxlength="100" autocomplete="off"></label>
+            <button id="btn-bill-upload-doc" class="btn btn-primary" type="button" disabled>
+              <span class="btn-spinner" aria-hidden="true"></span>
+              <span class="btn-label">Sign &amp; upload to IREPS</span>
+            </button>
+            <p class="field-hint">The IREPS signer opens: select your DSC and enter the PIN. Keep the IREPS tab open.</p>
+            <p class="field-hint" id="bill-upload-doc-status" hidden></p>
+            <ul id="bill-on-ireps" class="bill-list" hidden></ul>
+          </div>
           <div id="bill-next" hidden>
             <h3 class="section-heading">Finish in IREPS</h3>
             <ol class="instructions" id="bill-next-steps"></ol>

@@ -1270,6 +1270,11 @@ body[data-gate="on"] #view-redownload {
   color: var(--text);
   width: 100%;
 }
+.bill-upload-doc {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
 .bill-manual {
   display: grid;
   gap: 8px;

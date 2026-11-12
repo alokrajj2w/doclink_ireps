@@ -155,7 +155,7 @@ async function send(type, payload = {}) {
   }
   const quiet = QUIET_TYPES.test(type);
   if (quiet) logger.debug(`Panel request: ${type}`);
-  else logger.info(`Panel action: ${type}`, payload);
+  else logger.info(`Panel action: ${type}`, payload && payload.file && typeof payload.file.base64 === "string" ? { ...payload, file: { name: payload.file.name, base64: `<${payload.file.base64.length} chars>` } } : payload);
   try {
     const response = await chrome.runtime.sendMessage({ target: TARGETS.SERVICE_WORKER, type, ...payload });
     // A job DocLink refused to start (busy, bad input) never reaches the worker's workflow log.
