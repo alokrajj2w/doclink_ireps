@@ -110,6 +110,15 @@ test('elementActions: a letter URL built by string concatenation is read as one 
   const r = core.elementActions(d.body).flatMap((a) => a.reqs);
   assert.deepEqual(r.map((x) => `${x.method} ${x.url}`), ['POST /epsn/supply/tds/publishIndiNegotiationLetter.do?nitOId=5&negoLetterId=229935&opValue=ViewPublishedLetter']);
 });
+test('elementActions: mixed literal and variable concatenation still keeps the URL and letter id', () => {
+  const d = new JSDOM(`<a onclick="postRequestNewWindow('/epsn/supply/tds/publishCounterOfferLetter.do?Action=ViewPublishedLetter' + '&responseDate=' + responseDate + '&nitOId=' + oid + '&letterId=781' + '&signId=' + signId, 'toolbar=0')">v</a>`).window.document;
+  const reqs = core.elementActions(d.body).flatMap((a) => a.reqs);
+  assert.equal(reqs.length, 1);
+  assert.equal(reqs[0].method, 'POST');
+  assert.match(reqs[0].url, /publishCounterOfferLetter\.do/);
+  assert.match(reqs[0].url, /Action=ViewPublishedLetter/);
+  assert.match(reqs[0].url, /letterId=781/);
+});
 test('viewer page embedding the document through an extension-less iframe resolves to the real PDF', async () => {
   const realFetch = globalThis.fetch;
   const html = '<html><body><p>Negotiation letter viewer page with enough text to be real</p><iframe src="/epsn/supply/tds/showLetter.do?id=1"></iframe></body></html>';

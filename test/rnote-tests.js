@@ -349,6 +349,43 @@ export async function runRnoteTests({ test, assert, eq, rejects, fixture }) {
     eq(derived.headers.join("|"), headers.join("|"));
   });
 
+  await test("RNOTE export: no page column is lost (grouped headers, cells beyond the header, text in the Action column)", () => {
+    const wrap = (thead, tbody) => `<div id="divResults"><table class="recordsTbl" id="dTbl"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`;
+
+    // "Returned Status" under a grouped "Status" header (colspan + second header row).
+    const grouped = parseRnoteSearchResults(wrap(
+      `<tr><th rowspan="2">#</th><th rowspan="2">PO No.</th><th rowspan="2">R-Note No.</th><th rowspan="2">Qty Received</th><th colspan="2">Status</th><th rowspan="2">Action</th></tr>
+       <tr><th>R-Note Status</th><th>Returned Status</th></tr>`,
+      `<tr><td>1</td><td>PO-1</td><td><a href="/rn/1.pdf">RN-1</a></td><td>5</td><td>Accepted</td><td>Returned</td><td><a href="#">View</a></td></tr>`
+    ));
+    eq(grouped.headerLabels.join("|"), "#|PO No.|R-Note No.|Qty Received|R-Note Status|Returned Status|Action");
+    eq(grouped.records[0].quantity, "5");
+    eq(grouped.records[0].status, "Accepted");
+    let t = rnoteTable(grouped.records, grouped.headerLabels);
+    eq(t.headers.slice(0, 6).join("|"), "#|PO No.|R-Note No.|Qty Received|R-Note Status|Returned Status");
+    eq(t.rows[0][5], "Returned");
+
+    // Data rows carry one cell more than the header row.
+    const extra = parseRnoteSearchResults(wrap(
+      `<tr><th>#</th><th>PO No.</th><th>R-Note No.</th><th>Status</th></tr>`,
+      `<tr><td>1</td><td>PO-1</td><td>RN-1</td><td>Accepted</td><td>Returned</td></tr>`
+    ));
+    t = rnoteTable(extra.records, extra.headerLabels);
+    eq(t.headers.slice(0, 5).join("|"), "#|PO No.|R-Note No.|Status|Column 5");
+    eq(t.rows[0][4], "Returned");
+
+    // A status printed in the Action column next to its links.
+    const action = parseRnoteSearchResults(wrap(
+      `<tr><th>#</th><th>PO No.</th><th>R-Note No.</th><th>Action</th></tr>`,
+      `<tr><td>1</td><td>PO-1</td><td>RN-1</td><td><a href="#">View</a> Returned</td></tr>
+       <tr><td>2</td><td>PO-2</td><td>RN-2</td><td><a href="#">View</a></td></tr>`
+    ));
+    t = rnoteTable(action.records, action.headerLabels);
+    eq(t.headers.slice(0, 4).join("|"), "#|PO No.|R-Note No.|Action");
+    eq(t.rows[0][3], "Returned");
+    eq(t.rows[1][3], null);
+  });
+
   await test("RNOTE file names, stages and error catalogue", () => {
     eq(buildDocumentExportFilename("RNOTE", new Date(2026, 8, 21, 12, 30, 42)), "IREPS_RNOTE_2026-09-21_12-30-42.xlsx");
     eq(buildDocumentExportFilename("RNOTE", new Date(2026, 8, 21, 12, 30, 42), "csv"), "IREPS_RNOTE_2026-09-21_12-30-42.csv");

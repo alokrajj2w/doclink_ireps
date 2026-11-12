@@ -170,7 +170,16 @@ export function parseRnoteRow(row, header, ordinal = 1, options = {}) {
       const url = resolveIrepsUrl(a.href, options.baseUrl);
       record.links.push({ text: a.text, title: a.title, href: a.href, url, column: label, key });
     }
-    if (key === ACTION) return;
+    // Action cells are mostly links; any other text there (a status such as
+    // "Returned") is page data and is kept.
+    if (key === ACTION) {
+      const bare = cell.cloneNode(true);
+      for (const a of Array.from(bare.querySelectorAll("a"))) a.remove();
+      const actionValue = normalizeIrepsValue(cellText(bare));
+      if (actionValue === null) return;
+      record.rawColumns[label in record.rawColumns ? `${label} (${i + 1})` : label] = actionValue;
+      return;
+    }
     const rawLabel = label || "#";
     record.rawColumns[rawLabel in record.rawColumns ? `${rawLabel} (${i + 1})` : rawLabel] = value;
     if (key === "billClaimStatus") record.billClaim = billClaimOf(anchors);

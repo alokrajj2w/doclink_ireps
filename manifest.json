@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DocLink",
-  "version": "1.4.0",
+  "version": "1.4.3",
   "description": "Download IREPS Bill Status, CRN and R-NOTE reports to this computer or to the Recon Engine (S3); upload business documents.",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7bq3ok0tUTzu2W7xuqEm5o6/MtmXGyoA0Lrkm8Cphj5t5tATgcyta4SfD6AyyqiiSwdsOQv948HfJcRfCEPvaSEWQXwDDHVQwOKXFP66jgIObdAVF5VIZcn9+ZeAeeFbW+BHUptMeb7c5OV/auqen2qLtMrM/96saq+hr9OFoCXMYdX0/0Etqzi0LbloU96pfrByU8+M10gWBmeJGtKcabuXEQ6cNwp/ctzXQFOp3UMxgqp3QU46gmd6c2HprJtfFtk7aRXYXbYMMMOZV4+VlaTzAu2xgSj+cHEHqzc8xX+xKL050R1U9e81ZXlzYDx4miUI4JzgUFpzb1vV/Itq/QIDAQAB",

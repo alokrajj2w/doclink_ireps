@@ -281,6 +281,45 @@ export function parseCalls(src) {
 
 const URLISH = /^(?:https?:)?\/[^\s'"]*$|^[^\s'"]*?\.(?:do|pdf|jsp|html?|docx?|xlsx?|zip|rar|jpe?g|png|tiff?)(?:[?#][^\s'"]*)?$/i;
 
+function flattenStringConcat(value) {
+  const text = String(value ?? '');
+  if (!text.includes('+')) return text;
+  const parts = [];
+  let part = '';
+  let quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      part += ch;
+      if (ch === '\\' && i + 1 < text.length) {
+        part += text[++i];
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      part += ch;
+      continue;
+    }
+    if (ch === '+') {
+      parts.push(part);
+      part = '';
+      continue;
+    }
+    part += ch;
+  }
+  parts.push(part);
+  return parts.map((p) => {
+    const s = p.trim();
+    if (!s) return '';
+    if ((/^['"]/).test(s) && /['"]$/.test(s) && s.length >= 2) return s.slice(1, -1);
+    if (/^(?:[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*$/.test(s)) return '';
+    return s;
+  }).join('');
+}
+
 /**
  * Every clickable thing under `root` with the requests it can trigger.
  * `reqs` mirrors how IREPS's own page script would issue each URL:
@@ -306,12 +345,15 @@ export function elementActions(root) {
     const calls = parseCalls(href.startsWith('javascript:') ? href : onclick);
     for (const c of calls) {
       const post = /^postRequest/i.test(c.fn) || /^loaLetterViewActivity$/i.test(c.fn);
-      const first = c.args.find((a) => URLISH.test(a));
-      if (first) addReq(first, post ? 'POST' : 'GET', { fn: c.fn, args: c.args });
+      const first = c.args.find((a) => URLISH.test(flattenStringConcat(a)) || URLISH.test(a));
+      if (first) addReq(flattenStringConcat(first), post ? 'POST' : 'GET', { fn: c.fn, args: c.args });
     }
     // anything URL-shaped that parseCalls did not classify (e.g. nested handlers)
-    for (const m of (href + ' ' + onclick).replace(/(['"])\s*\+\s*(['"])/g, '').matchAll(/['"]([^'"\s]*?(?:\.do|\.pdf)[^'"\s]*)['"]/gi)) {
-      if (!reqs.some((r) => r.url === m[1])) addReq(m[1], 'GET', { fn: 'other' });
+    if (!reqs.length) {
+      const flattened = flattenStringConcat(href + ' ' + onclick);
+      for (const m of flattened.matchAll(/['"]([^'"\s]*?(?:\.do|\.pdf)[^'"\s]*)['"]/gi)) {
+        if (!reqs.some((r) => r.url === m[1])) addReq(m[1], 'GET', { fn: 'other' });
+      }
     }
     const urls = [...new Set(reqs.map((r) => r.url))];
     const key = `${urls.join('|')}#${onclick}#${href}#${title}#${text}`;

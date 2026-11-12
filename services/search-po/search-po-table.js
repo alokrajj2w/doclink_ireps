@@ -139,6 +139,61 @@ export function isMarkupHeaderRow(row) {
 }
 
 /**
+ * One label per data column, read from the header row and any header rows
+ * directly below it (grouped headers), honouring colspan and rowspan:
+ *
+ *   <tr><th rowspan="2">PO No.</th><th colspan="2">Status</th></tr>
+ *   <tr><th>R-Note Status</th><th>Returned Status</th></tr>
+ *   -> ["PO No.", "R-Note Status", "Returned Status"]
+ *
+ * A grouped column is labelled by its bottom header cell, prefixed with the
+ * group label unless the bottom label already contains it ("Challan" over
+ * "No." -> "Challan No."). Without colspan / extra header rows this is
+ * exactly the header row's cell texts.
+ * @param {Element[]} rows        rows of the table
+ * @param {Element} headerRow
+ * @returns {string[]}
+ */
+export function headerColumnLabels(rows, headerRow) {
+  const start = rows.indexOf(headerRow);
+  const headerRows = [headerRow];
+  for (let i = start + 1; i < rows.length && isMarkupHeaderRow(rows[i]); i++) headerRows.push(rows[i]);
+  const span = (cell, name, max) => Math.max(1, Math.min(max, parseInt(cell.getAttribute(name) || "1", 10) || 1));
+
+  const grid = []; // grid[r][c] = { text, colspan }
+  headerRows.forEach((row, r) => {
+    grid[r] = grid[r] || [];
+    let c = 0;
+    for (const cell of Array.from(row.cells)) {
+      while (grid[r][c]) c++;
+      const entry = { text: normaliseText(cell.textContent), colspan: span(cell, "colspan", 50) };
+      const rowspan = span(cell, "rowspan", headerRows.length - r);
+      for (let k = 0; k < rowspan; k++) {
+        grid[r + k] = grid[r + k] || [];
+        for (let j = 0; j < entry.colspan; j++) grid[r + k][c + j] = entry;
+      }
+      c += entry.colspan;
+    }
+  });
+
+  const width = Math.max(...grid.map((row) => row.length));
+  const labels = [];
+  for (let c = 0; c < width; c++) {
+    let label = "";
+    let previous = null;
+    for (const row of grid) {
+      const entry = row[c];
+      if (!entry || entry === previous) continue;
+      previous = entry;
+      if (!entry.text) continue;
+      label = !label || entry.text.toLowerCase().includes(label.toLowerCase()) ? entry.text : `${label} ${entry.text}`;
+    }
+    labels.push(label);
+  }
+  return labels;
+}
+
+/**
  * Find the result table of a document type.
  *
  * @param {Document} doc
@@ -157,12 +212,12 @@ export function locateResultTable(doc, options) {
     const rows = Array.from(table.rows || []);
     const headerRow = rows.find((r) => Array.from(r.cells).length >= minColumns && isHeaderRow(r, matchHeader));
     if (!headerRow) continue;
-    const labels = Array.from(headerRow.cells).map((c) => c.textContent);
+    const labels = headerColumnLabels(rows, headerRow);
     const keys = labels.map(matchHeader);
     if (required.length && !required.every((k) => keys.includes(k))) continue;
     const dataRows = rows.filter((r) => r !== headerRow && Array.from(r.cells).length >= minColumns).length;
     const score = keys.filter((k) => k && !k.startsWith("_")).length + (/^dTbl/.test(table.id || "") ? 100 : 0) + (table.closest && table.closest("#divResults") ? 10 : 0) + Math.min(dataRows, 5);
-    candidates.push({ table, headerRow, labels: labels.map((l) => normaliseText(l)), keys, score });
+    candidates.push({ table, headerRow, labels, keys, score });
   }
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => b.score - a.score);

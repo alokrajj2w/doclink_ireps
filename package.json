@@ -7,6 +7,7 @@
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
-    "javascript-obfuscator": "^4.1.1"
+    "javascript-obfuscator": "^4.1.1",
+    "jsdom": "^31.0.0"
   }
 }

@@ -25,13 +25,24 @@ export const RNOTE_EXTRA_COLUMNS = Object.freeze(["R-Note Document Link", "Other
  */
 export function rnoteTable(records, headerLabels) {
   const list = records || [];
-  let labels = Array.isArray(headerLabels) && headerLabels.length ? headerLabels.slice() : [];
-  if (!labels.length) {
-    const seen = new Set();
-    for (const r of list) for (const k of Object.keys(r.rawColumns || {})) if (!seen.has(k)) seen.add(k) && labels.push(k);
-  }
-  // rawColumns uses "#" for the unlabeled serial column and "Action" columns are not kept.
-  const columns = labels.map((l) => (l === "" ? "#" : l)).filter((l) => !/^actions?$/i.test(l));
+  // Page order first ("#" for the unlabeled serial column, "Label (n)" for a
+  // repeated label, as the parser names them), then every other column any
+  // record carries (cells beyond the header, later result pages), so no
+  // value the page showed is left out. Action columns appear only when a
+  // row had text there besides its links.
+  const columns = [];
+  const seen = new Set();
+  const add = (label) => {
+    if (seen.has(label)) return;
+    seen.add(label);
+    columns.push(label);
+  };
+  (Array.isArray(headerLabels) ? headerLabels : []).forEach((l, i) => {
+    const label = l || "#";
+    if (/^actions?$/i.test(label)) return;
+    add(seen.has(label) ? `${label} (${i + 1})` : label);
+  });
+  for (const r of list) for (const k of Object.keys(r.rawColumns || {})) add(k);
   const headers = [...columns, ...RNOTE_EXTRA_COLUMNS];
   const rows = list.map((record) => {
     const raw = record.rawColumns || {};
