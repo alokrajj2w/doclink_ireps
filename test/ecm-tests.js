@@ -8,12 +8,13 @@
  */
 
 import {
-  uploadToEcm, saveToEcmOrLocally, toIsoDate, ecmFields, describeEcmOutcome, summariseEcm,
-  EcmError, ECM_ERROR, ECM_KIND, ECM_OUTCOME
+  uploadToEcm, saveToEcmOrLocally, findInEcm, toIsoDate, ecmFields, describeEcmOutcome, summariseEcm,
+  EcmError, ECM_ERROR, ECM_KIND, ECM_OUTCOME, isTransientStatus, ecmErrorCode
 } from "../services/ecm-service.js";
-import { applyReconConfig } from "../services/recon-service.js";
+import { applyReconConfig, RECON_CONFIG } from "../services/recon-service.js";
 import { applyEcmConfig } from "../services/ecm-config.js";
 import { describeError } from "../utils/messages.js";
+import { DeadlineError } from "../utils/http.js";
 
 const BASE = "http://localhost:8000";
 const HOSTS = ["http://localhost:8765/*", "https://www.ireps.gov.in/*", "http://localhost:8000/*"];
@@ -152,5 +153,48 @@ export async function runEcmTests({ test, assert, eq }) {
     ];
     eq(summariseEcm(items), "ECM (Hosur): 2 saved, 1 already there, 1 saved locally instead");
     eq(summariseEcm([{ ecm: null }]), "", "nothing went to the ECM");
+  });
+
+  /* ------------------------------------------------------------------- review fixes: M15, L9 */
+
+  await test("ECM (L9): a row's failure reason is the error's title in the one catalogue (utils/messages.js), not a second table", () => {
+    for (const code of Object.values(ECM_ERROR)) {
+      eq(describeEcmOutcome({ status: ECM_OUTCOME.FAILED, code }), `ECM upload failed, saved locally: ${describeError(code).title}`, code);
+    }
+    eq(describeEcmOutcome({ status: ECM_OUTCOME.FAILED, code: ECM_ERROR.AUTH_REQUIRED, detail: "x" }), "ECM upload failed, saved locally: Recon Engine sign-in required (x)");
+    eq(describeEcmOutcome({ status: ECM_OUTCOME.FAILED, code: "SOMETHING_NEW" }), "ECM upload failed, saved locally: SOMETHING_NEW", "a code without catalogue text is shown as it is");
+  });
+
+  await test("ECM (L9): one rule for HTTP answers on the gateway and the direct ECM: a definite 4xx refusal is ECM_REJECTED, a passing fault ECM_UNAVAILABLE", async () => {
+    eq([400, 404, 409, 413, 422].map(ecmErrorCode).join(), Array(5).fill(ECM_ERROR.REJECTED).join());
+    eq([408, 429, 500, 502, 503].map(ecmErrorCode).join(), Array(5).fill(ECM_ERROR.UNAVAILABLE).join());
+    eq([408, 429, 500, 503].every(isTransientStatus) && ![400, 401, 403, 404].some(isTransientStatus), true);
+    applyReconConfig({ reconBaseUrl: BASE });
+    const answer = (status) => fakeFetch(() => jsonResponse(status, { detail: { error: "X", detail: `HTTP ${status} reason` } }));
+    eq((await rejectsEcm(uploadToEcm(DOC, { fetch: answer(404), hostPermissions: HOSTS }), ECM_ERROR.REJECTED)).detail, "HTTP 404 reason", "a refusal (was ECM_UNAVAILABLE)");
+    await rejectsEcm(uploadToEcm(DOC, { fetch: answer(429), hostPermissions: HOSTS }), ECM_ERROR.UNAVAILABLE, "too many requests: passing");
+    // the check never throws: it answers the code
+    const check = (status) => findInEcm({ kind: ECM_KIND.PO_COPY, account: HOSUR, candidates: [{ ref: "a", fields: { customer_po_number: "1" } }] }, { fetch: answer(status), hostPermissions: HOSTS });
+    eq((await check(429)).code, ECM_ERROR.UNAVAILABLE, "the check: too many requests is passing (was ECM_REJECTED)");
+    eq((await check(404)).code, ECM_ERROR.REJECTED);
+    eq((await check(401)).code, ECM_ERROR.AUTH_REQUIRED);
+    eq((await findInEcm({ kind: ECM_KIND.PO_COPY, account: HOSUR, candidates: [{ ref: "a", fields: { customer_po_number: "1" } }] }, { fetch: fakeFetch(() => jsonResponse(200, { found: null })), hostPermissions: HOSTS })).code, ECM_ERROR.UNAVAILABLE, "an answer without a list");
+  });
+
+  await test("ECM gateway (M15): the upload and the check run under one deadline that covers the answer's body, and say how long they waited", async () => {
+    applyReconConfig({ reconBaseUrl: BASE });
+    const created = fakeFetch(() => jsonResponse(201, CREATED));
+    await uploadToEcm(DOC, { fetch: created, hostPermissions: HOSTS });
+    assert(created.calls[0].init.signal instanceof AbortSignal, "the request has a deadline");
+    // fetchWithDeadline throws DeadlineError when the deadline passes in the headers or the body (a stalled body
+    // itself is tested in test/node/ecm-tests.mjs: headless Chrome's virtual clock stops during a pending stream read)
+    const late = (ms) => async () => { throw new DeadlineError(ms); };
+    const upload = await rejectsEcm(uploadToEcm(DOC, { fetch: late(RECON_CONFIG.timeoutMs), hostPermissions: HOSTS }), ECM_ERROR.UNAVAILABLE);
+    eq(upload.detail, `no complete answer within ${Math.round(RECON_CONFIG.timeoutMs / 1000)} seconds`, "the deadline that applied, not a fixed \"2 minutes\"");
+    const checked = await findInEcm({ kind: ECM_KIND.PO_COPY, account: HOSUR, candidates: [{ ref: "a", fields: { customer_po_number: "1" } }] }, { fetch: late(30000), hostPermissions: HOSTS });
+    eq(JSON.stringify([checked.ok, checked.code, checked.detail]), JSON.stringify([false, ECM_ERROR.UNAVAILABLE, "no complete answer within 30 seconds"]));
+    let local = 0;
+    const saved = await saveToEcmOrLocally(DOC, async () => ((local += 1), { downloadId: 1 }), { fetch: late(RECON_CONFIG.timeoutMs), hostPermissions: HOSTS });
+    eq(JSON.stringify([saved.ecm.code, local]), JSON.stringify([ECM_ERROR.UNAVAILABLE, 1]), "saved locally");
   });
 }

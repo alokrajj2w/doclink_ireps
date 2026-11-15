@@ -26,9 +26,9 @@ import {
   describeSearchPoFilter,
   inferSearchPoMode,
   loadSearchPoPage,
-  resolveIrepsUrl,
-  isIrepsOriginUrl
+  resolveIrepsUrl
 } from "../services/search-po/search-po-api.js";
+import { isIrepsOriginUrl } from "../services/ireps-api.js";
 import { parseCrnSearchResults, extractCrnPagination, extractCrnPageMessage, matchCrnHeader, CRN_FIELDS, CRN_LINK_FIELDS } from "../services/crn/crn-parser.js";
 import { searchCrn, validateCrnSession, CRN_ERROR } from "../services/crn/crn-service.js";
 
@@ -778,6 +778,29 @@ export async function runCrnTests({ test, assert, eq, rejects, fixture, FAKE_TOK
     const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(buildCsv(["A", "B"], [["1,2", 'say "hi"'], [null, "multi\nline"]]));
     eq(text.charCodeAt(0), 0xfeff, "BOM");
     eq(text.slice(1), 'A,B\r\n"1,2","say ""hi"""\r\n,"multi\nline"\r\n');
+  });
+
+  await test("csv writer (L2): formula-like cells get a leading apostrophe; plain numbers stay as IREPS gave them", () => {
+    const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+      buildCsv(["A"], [["=HYPERLINK(\"http://x\")"], ["+cmd|' /C calc'!A0"], ["@SUM(A1)"], ["-2+3"], ["-12.50"], ["+91"], ["1,234.50"], ["\tx"], ["PO-1"], ["a=b"]])
+    );
+    const cells = text.slice(1).split("\r\n").slice(1, -1);
+    eq(cells[0], `"'=HYPERLINK(""http://x"")"`);
+    eq(cells[1], "'+cmd|' /C calc'!A0");
+    eq(cells[2], "'@SUM(A1)");
+    eq(cells[3], "'-2+3");
+    eq(cells[4], "-12.50", "a negative amount is a number, not a formula");
+    eq(cells[5], "+91");
+    eq(cells[6], '"1,234.50"');
+    eq(cells[7], "'\tx");
+    eq(cells[8], "PO-1", "only the first character matters");
+    eq(cells[9], "a=b");
+  });
+
+  await test("xlsx writer (L1): a sheet with 130,000 rows is built (no argument-list overflow)", () => {
+    const rows = Array.from({ length: 130000 }, (_, i) => [i, "x"]);
+    const bytes = buildWorkbook({ sheets: [{ name: "Big", headers: ["N", "T"], rows }] });
+    assert(bytes.length > 100000, `workbook built (${bytes.length} bytes)`);
   });
 
   /* -------------------------------------------------------------- export */

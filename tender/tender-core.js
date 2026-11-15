@@ -3,9 +3,13 @@
 // Runs in the side-panel page (has DOMParser; host_permissions + credentials:'include'
 // reuse the user's existing IREPS browser session - no credentials are read or stored).
 
+import { IREPS_CONFIG, loadIrepsConfig } from '../services/ireps-api.js';
+import { logger } from '../utils/logger.js';
+import { describeError } from '../utils/messages.js';
 import { sourceFileName } from '../utils/filename.js';
 
-export const SESSION_MSG = 'IREPS session expired. Please log in to IREPS and try again.';
+/** The panel-wide session-expired text (utils/messages.js), so every view says the same. */
+export const SESSION_MSG = describeError('IREPS_SESSION_EXPIRED').message;
 
 /** Error codes meaning "IREPS itself did not answer" (as opposed to a rejected or invalid document). */
 export const IREPS_DOWN_CODES = new Set(['TIMEOUT', 'UNREACHABLE']);
@@ -25,10 +29,15 @@ export function redact(msg) {
 }
 
 const LOG_TAIL = [];
-export function log(tag, msg) {
-  const line = `[DocLink][${tag}] ${redact(msg)}`;
-  console.log(line);
-  LOG_TAIL.push(`${new Date().toISOString().slice(11, 19)} ${line}`);
+/**
+ * Log a tender / correspondence line: through utils/logger.js (console + DocLink's stored
+ * log, doclinkLog.dump()) and into the panel's own tail for "Copy diagnostics".
+ * `level` is "info" (default), "warn" or "error".
+ */
+export function log(tag, msg, level = 'info') {
+  const text = `[${tag}] ${redact(msg)}`;
+  (logger[level] || logger.info)(text);
+  LOG_TAIL.push(`${new Date().toISOString().slice(11, 19)} [DocLink]${text}`);
   if (LOG_TAIL.length > 400) LOG_TAIL.shift();
 }
 
@@ -36,13 +45,25 @@ export function log(tag, msg) {
 export const getLogTail = () => LOG_TAIL.join('\n');
 
 export const norm = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
-export const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** IREPS pages the tender and correspondence flows read (read-only). */
+export const INBOX_PATH = '/epsn/vendorInboxLink.do';
+export const CORRES_LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
+export const CORRES_REPLY_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
+/** A published correspondence letter, when the page names no route of its own. */
+export const CORRES_VIEW_FALLBACK_PATH = '/epsn/corres/rly/viewpubIndltr.do';
+
+/** A Date as IREPS writes it: dd/mm/yyyy (local time). */
+export const dmyOf = (d = new Date()) => `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+
+/** The text of a page's inline <script> blocks (where IREPS keeps its routes). */
+export const inlineScripts = (doc) => [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join('\n');
+
 export const fileSafe = (s) => String(s ?? '').trim().replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_') || 'NA';
 
+/** The IREPS origin, from the same loader the service worker uses (config.json + config.local.json). */
 export async function getBaseUrl() {
-  const cfg = await (await fetch(chrome.runtime.getURL('config.json'))).json();
-  const base = cfg.target === 'mock' ? cfg.mockBaseUrl : cfg.realBaseUrl;
-  return String(base).replace(/\/+$/, '');
+  await loadIrepsConfig();
+  return String(IREPS_CONFIG.baseUrl).replace(/\/+$/, '');
 }
 
 /** Resolve a (possibly relative) reference; refuses anything off the IREPS origin. */
@@ -71,16 +92,9 @@ export function isPdfBytes(bytes) {
  * capture), and passes only inside a commercialTabulation response (isExcludedTrustedLink). The guard sits at
  * the lowest request layer: nothing in this module can reach those endpoints, even by mistake.
  */
-/** The URL as the server sees the request: a POST's form fields count too (postRequest.js moves the query into the body). */
-function withParams(url, params) {
-  if (!params) return url;
-  const u = new URL(url);
-  for (const [k, v] of params) if (!u.searchParams.has(k)) u.searchParams.append(k, v);
-  return u.toString();
-}
-
 export const ALLOWED_PDF_TYPES = Object.freeze(['offer', 'financialtabulation', 'commercialtabulation']);
 
+/** `url` may carry a request's body fields too (requestRefusal): every pdfType it names must be an allowed one. */
 export function isExcludedUrl(url) {
   let u;
   try {
@@ -89,8 +103,8 @@ export function isExcludedUrl(url) {
     return false;
   }
   if (/commTboPdfAction\.do/i.test(u.pathname)) {
-    const t = [...u.searchParams].find(([k]) => k.toLowerCase() === 'pdftype')?.[1] || '';
-    return !ALLOWED_PDF_TYPES.includes(t.toLowerCase());
+    const types = [...u.searchParams].filter(([k]) => k.toLowerCase() === 'pdftype').map(([, v]) => v.toLowerCase());
+    return !types.length || types.some((t) => !ALLOWED_PDF_TYPES.includes(t));
   }
   // a tabulation file the page itself links to: Financial / Commercial pass, "techno" and unknown ones do not;
   // a TECH-TAB file (the Commercial Tabulation) only passes isExcludedTrustedLink, inside its own response
@@ -99,8 +113,110 @@ export function isExcludedUrl(url) {
   return /tabulation/i.test(s) && !/financial|commercial/i.test(s);
 }
 
+// ---------------------------------------------------------------- the request guard
+//
+// Every request of tender/ (tender documents, correspondence, My Messages, the tender search, the account check)
+// is sent by irepsFetchOnce, and irepsFetchOnce first passes exactly what it sends - the final URL and, for a POST,
+// the form body - through requestRefusal():
+//   1. Tabulations: of commTboPdfAction.do only My Offer and the Financial / Commercial Tabulation, and no
+//      "techno" tabulation file (isExcludedUrl; TECH-TAB-<no>-<oid>.pdf only inside a commercialTabulation response).
+//   2. Read-only: GET and POST only, and nothing that names a write action: a page whose name holds a write verb
+//      (saveReply.do, vendorCorresSubmitReply.do, submitbid.do, finalSubmission.do, withdrawalOfBid.do,
+//      logout.do ...), an IREPS page where a vendor submits something (negoBid.do, coResponse.do, bidProcess.do,
+//      paymentProcess.do), or an action parameter (activity, Action, opValue, ajaxMode ...) that names one.
+//      Files IREPS serves (.pdf, .docx, Submission_List.pdf ...) are not actions; a view such as
+//      viewUploadedDoc.do is not one either (only whole words count, or a verb the name starts with).
+// The ONE write that passes is LOA_VIEWED_UPDATE (below).
+
+/** Write verbs, as a whole word of a page name or an action value ("vendorCorres|Submit|Reply", "final|Submission"). */
+const WRITE_WORDS = new Set(['submit', 'submission', 'save', 'upload', 'delete', 'remove', 'approve', 'archive', 'withdraw', 'withdrawal',
+  'update', 'insert', 'sign', 'cancel', 'reject', 'accept', 'confirm', 'logout', 'logoff', 'signout', 'signoff']);
+/** Verbs that also count when the name starts with them run together with what follows ("submitbid", "logoutuser"). */
+const WRITE_PREFIXES = ['submit', 'save', 'upload', 'delete', 'remove', 'approve', 'archive', 'withdraw', 'update', 'insert', 'logout', 'logoff', 'signout'];
+/** IREPS pages where the vendor submits a bid, a response or a payment: DocLink never opens them. */
+const VENDOR_ACTION_PAGES = /^(?:negoBid|coResponse|bidProcess|paymentProcess)\.do$/i;
+/** Parameters that carry the action an IREPS page is asked to do (activity=viewNIT, opValue=ViewPublishedLetter, ajaxMode=...). */
+const ACTION_PARAMS = /^(?:activity|action|actiontype|opvalue|op|operation|ajaxmode|reqmod|mode|method|dispatch|cmd|command|event|task|submittype)$/i;
+/** Files IREPS serves: a name such as Submission_List.pdf is a document, not an action. */
+const SERVED_FILE = /\.(?:pdf|docx?|xlsx?|pptx?|zip|rar|7z|jpe?g|png|gif|bmp|tiff?|rtf|txt|csv|dwg|dxf|xml|html?)$/i;
+
+/** "vendorCorresSubmitReply" -> vendor, corres, submit, reply; "publishLOALetter" -> publish, loa, letter. */
+const nameWords = (name) => String(name).replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+  .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+/** True when a page name or an action value names a write action (see the rules above). */
+export function namesWriteAction(name) {
+  const words = nameWords(name);
+  return words.some((w) => WRITE_WORDS.has(w)) || WRITE_PREFIXES.some((v) => (words[0] || '').startsWith(v));
+}
+
+/**
+ * The ONE write request DocLink sends to IREPS, a documented exception to the read-only rule (H6; accepted by
+ * the tech lead on 15 Nov 2026 as what IREPS's own button does). IREPS's own "View LOA Letter" link (loaLetterViewActivity)
+ * POSTs this "LOA viewed" update first and opens the letter only when IREPS answers "OK"; DocLink does the
+ * same, with the values read from that live script (tender-workflows.js readLoaViewScript). Only exactly this
+ * request passes: POST, this path, no query, and these three fields (docId and docType digits) - anything else
+ * that names a write, including another ajaxMode on the same path, is refused.
+ */
+export const LOA_VIEWED_UPDATE = Object.freeze({ method: 'POST', path: '/epsn/supply/tds/ajxdata.do', ajaxMode: 'updateLoaViewedDataByBidder', fields: Object.freeze(['ajaxMode', 'docId', 'docType']) });
+
+function isLoaViewedUpdate(method, u, body) {
+  if (method !== LOA_VIEWED_UPDATE.method || u.search || u.pathname !== LOA_VIEWED_UPDATE.path || !body) return false;
+  const keys = [...body.keys()];
+  return keys.length === LOA_VIEWED_UPDATE.fields.length && LOA_VIEWED_UPDATE.fields.every((k) => body.getAll(k).length === 1)
+    && body.get('ajaxMode') === LOA_VIEWED_UPDATE.ajaxMode && /^\d+$/.test(body.get('docId')) && /^\d+$/.test(body.get('docType'));
+}
+
+const blockedMsg = (detail) => describeError('TENDER_REQUEST_BLOCKED', { detail }).message;
+const EXCLUDED_MSG = 'This download is excluded from DocLink tender downloads (of the tabulations, only the Financial and Commercial Tabulation are allowed).';
+
+/** Why the page `pathname` names may not be requested, or ''. */
+function pageRefusal(pathname) {
+  let last = pathname.split('/').pop() || '';
+  try { last = decodeURIComponent(last); } catch { /* keep it encoded */ }
+  if (!last || SERVED_FILE.test(last)) return '';
+  const name = last.replace(/\.[A-Za-z0-9]+$/, '');
+  if (/SubmitReply/i.test(name)) return 'Submitting a correspondence reply is never done by DocLink.';
+  if (VENDOR_ACTION_PAGES.test(last)) return blockedMsg(`${last} is where a vendor submits in IREPS`);
+  if (namesWriteAction(name)) return blockedMsg(last);
+  return '';
+}
+
+/**
+ * Why DocLink refuses to send this request, or null when it may: { code: 'EXCLUDED' (a tabulation out of scope)
+ * | 'BLOCKED' (a write action), message }. `url` is the URL as sent and `body` the POST form (string or
+ * URLSearchParams); `trusted` = inside an allowed tabulation response (isExcludedTrustedLink).
+ */
+export function requestRefusal({ method = 'GET', url, body = null, trusted = false } = {}) {
+  let u;
+  try {
+    u = new URL(url, 'https://x.invalid/');
+  } catch {
+    return { code: 'BLOCKED', message: 'Malformed request refused.' };
+  }
+  const form = body ? (body instanceof URLSearchParams ? body : new URLSearchParams(String(body))) : null;
+  // the request as the server sees it: every query AND body field (a POST's form counts, and a form field never
+  // hides behind a query field of the same name - the tabulation rule runs on what is really sent)
+  const seen = new URL(u.toString());
+  for (const [k, v] of form || []) seen.searchParams.append(k, v);
+  if (trusted ? isExcludedTrustedLink(seen.toString(), trusted) : isExcludedUrl(seen.toString())) return { code: 'EXCLUDED', message: EXCLUDED_MSG };
+  const verb = String(method || 'GET').toUpperCase();
+  if (verb !== 'GET' && verb !== 'POST') return { code: 'BLOCKED', message: blockedMsg(`a ${verb} request`) };
+  if (isLoaViewedUpdate(verb, u, form)) return null;
+  const page = pageRefusal(u.pathname);
+  if (page) return { code: 'BLOCKED', message: page };
+  const action = [...u.searchParams, ...(form || [])].find(([k, v]) => ACTION_PARAMS.test(k) && namesWriteAction(v));
+  return action ? { code: 'BLOCKED', message: blockedMsg(`${action[0]}=${action[1]}`) } : null;
+}
+
+/** Throws EXCLUDED / BLOCKED (TenderError) for a request DocLink must not send (requestRefusal). */
+export function assertAllowedRequest(request) {
+  const r = requestRefusal(request);
+  if (r) throw new TenderError(r.code, r.message);
+}
+
 /** Authenticated request. `form` is an object / URLSearchParams (body for POST, query for GET). */
-export const fetchSettings = { timeoutMs: 45000, waitMs: 180000, waitRetryMs: 5000, waitRetryMaxMs: 60000 };
+export const fetchSettings = { timeoutMs: 45000, waitMs: 180000, waitRetryMs: 5000, waitRetryMaxMs: 60000, netRetryMs: [1000, 3000] };
 
 /** IREPS answers these while a page is still coming up (gateway / overloaded); worth waiting out. */
 const STILL_OPENING = new Set([502, 503, 504]);
@@ -110,10 +226,12 @@ const STILL_OPENING = new Set([502, 503, 504]);
  * the page. Within that time a slow answer is waited for, and while IREPS cannot be reached or answers
  * 502/503/504 the request is retried with backoff (5s, 10s ... 60s); after it, the page fails as not responding.
  * `wait = { what, onWait(msg) }` names the page for the progress line.
+ * Without `wait`, a GET that could not reach IREPS at all (a network failure, not a slow or refused answer) is
+ * tried again after fetchSettings.netRetryMs (1s, then 3s); a POST never is: only a GET is safe to repeat.
  */
 export async function irepsFetch(base, ref, opts = {}) {
   const { wait = null } = opts;
-  if (!wait) return irepsFetchOnce(base, ref, opts);
+  if (!wait) return fetchRetryingNetwork(base, ref, opts);
   const what = wait.what || 'page';
   const minutes = `${+(fetchSettings.waitMs / 60000).toFixed(1)} minute${fetchSettings.waitMs === 60000 ? '' : 's'}`;
   const deadline = Date.now() + fetchSettings.waitMs;
@@ -139,11 +257,23 @@ export async function irepsFetch(base, ref, opts = {}) {
   }
 }
 
+async function fetchRetryingNetwork(base, ref, opts) {
+  const isGet = String(opts.method || 'GET').toUpperCase() === 'GET';
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await irepsFetchOnce(base, ref, opts);
+    } catch (e) {
+      const delay = fetchSettings.netRetryMs[attempt];
+      if (!isGet || e.code !== 'UNREACHABLE' || delay === undefined) throw e;
+      log('Fetch', `${e.message} Trying the GET again in ${delay / 1000}s (network failure ${attempt + 1}).`, 'warn');
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 async function irepsFetchOnce(base, ref, { method = 'GET', form = null, relativeTo, timeoutMs = fetchSettings.timeoutMs, trusted = false } = {}) {
   let url = absUrl(base, ref, relativeTo);
   const params = form ? (form instanceof URLSearchParams ? form : new URLSearchParams(form)) : null;
-  // trusted: a file linked from inside an allowed Financial / Commercial Tabulation response (isExcludedTrustedLink)
-  if ((trusted ? isExcludedTrustedLink(withParams(url, params), trusted) : isExcludedUrl(withParams(url, params)))) throw new TenderError('EXCLUDED', 'This download is excluded from DocLink tender downloads (of the tabulations, only the Financial and Commercial Tabulation are allowed).');
   const init = { method, credentials: 'include', redirect: 'follow', headers: {} };
   if (params) {
     if (method === 'GET') {
@@ -155,6 +285,9 @@ async function irepsFetchOnce(base, ref, { method = 'GET', form = null, relative
       init.headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
   }
+  // the one guard for every tender / correspondence request, run on exactly what is sent: the final URL and the
+  // body (trusted: a file linked from inside an allowed Financial / Commercial Tabulation response)
+  assertAllowedRequest({ method, url, body: init.body ?? null, trusted });
   // A portal page that never answers must not stall the whole run: give up after timeoutMs (0 = wait as long as it takes).
   const ctl = new AbortController();
   init.signal = ctl.signal;
@@ -211,6 +344,81 @@ export function assertSession(res) {
 }
 
 export const parseHtml = (html) => new DOMParser().parseFromString(html, 'text/html');
+
+// ---------------------------------------------------------------- is this the page DocLink asked for? (H4)
+// "Nothing found" is only ever IREPS's own answer on the page DocLink asked for. A page these do not
+// recognise (an error page served with HTTP 200, a changed layout) is never taken as an empty list: it is
+// an error, or - after pages that were read - the list is reported as not read to its end (what was read
+// is still downloaded, exactly as before).
+
+/** True for the Tender Related Correspondence pages (list and details). */
+export function isCorrespondencePage(doc) {
+  return /Tender\s+Related\s+Correspondence/i.test(norm(doc.body?.textContent || ''));
+}
+
+/**
+ * True for a page of the vendor inbox (vendorInboxLink.do: My Messages, the Post Tenders letter lists, Closed
+ * Tenders). IREPS draws every one of them with its search form (buyerInboxLinkForm, id schForm), which holds the
+ * Tender No and listType fields - also when the list itself is empty (captures of 22 Oct and 29 Oct 2026).
+ */
+export function isVendorInboxPage(doc) {
+  return !!findForm(doc, (f) => f.querySelector('[name=tenderNo]') && f.querySelector('[name=listType]'));
+}
+
+/** The page's title (or its first words) for an error message: never its markup. */
+export function pageLabel(doc) {
+  const title = norm(doc.querySelector('title')?.textContent);
+  return title ? `"${title}"` : `"${norm(doc.body?.textContent).slice(0, 60) || 'an empty page'}"`;
+}
+
+/** TenderError PAGE: IREPS answered `what` with a page DocLink does not recognise (`doc`: that page, for its title). */
+export const pageNotRecognised = (what, doc = null) =>
+  new TenderError('PAGE', describeError('TENDER_PAGE_NOT_RECOGNISED', { detail: doc ? `${what}: ${pageLabel(doc)}` : what }).message);
+
+/** TenderError HTTP: IREPS answered `what` with an HTTP error, so the list may be missing documents. */
+export const listFailed = (what, status) => {
+  const e = new TenderError('HTTP', describeError('TENDER_LIST_FAILED', { detail: `${what}: IREPS returned HTTP ${status}` }).message);
+  e.status = status;
+  return e;
+};
+
+// ---------------------------------------------------------------- what DocLink itself opened (M23)
+// The print tabs DocLink creates, the blob: URLs it downloads from and the files it saved: during a run only
+// a tab one of these explains is closed (view-common.js guardTabs), never a tab or file of the user's own.
+// files: the full paths Chrome reported; requested: "DocLink/<unit>/.../<name>" as asked for, noted before the
+// download starts, so a tab Chrome opens for the file the moment it is saved is recognised too
+const OWN = { tabs: new Set(), blobs: new Set(), files: new Set(), requested: new Set() };
+const pathKey = (p) => String(p || '').replace(/\\/g, '/').replace(/^\/(?=[A-Za-z]:\/)/, '').toLowerCase();
+
+/** A file path (pathKey form) that is one DocLink saved: as reported by Chrome, or as requested (also "name (1).ext"). */
+function isOwnFile(p) {
+  if (OWN.files.has(p)) return true;
+  const plain = p.replace(/ \(\d+\)(?=\.[^./]*$|$)/, ''); // Chrome's uniquified "name (1).pdf"
+  for (const r of OWN.requested) if (p.endsWith(`/${r}`) || plain.endsWith(`/${r}`)) return true;
+  return false;
+}
+
+/** Note a tab DocLink created (tender-print.js), so the popups its page opens can be told apart. */
+export const noteOwnTab = (tabId) => { if (tabId !== undefined && tabId !== null) OWN.tabs.add(tabId); };
+
+/**
+ * True when `tab` (a chrome.tabs.Tab) was opened by DocLink's own work: a popup of one of its print tabs, or
+ * Chrome showing a blob: URL DocLink downloaded from or a file DocLink saved (the "open when done" PDF viewer).
+ */
+export function isDocLinkStrayTab(tab) {
+  if (!tab) return false;
+  if (tab.openerTabId !== undefined && tab.openerTabId !== null && OWN.tabs.has(tab.openerTabId)) return true;
+  for (const url of [tab.pendingUrl, tab.url]) {
+    if (!url) continue;
+    if (/^blob:/i.test(url) && OWN.blobs.has(url.split('#')[0])) return true;
+    if (/^file:/i.test(url)) {
+      let path = '';
+      try { path = decodeURIComponent(new URL(url).pathname); } catch { /* not a file URL */ }
+      if (path && isOwnFile(pathKey(path))) return true;
+    }
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------- forms
 
@@ -490,13 +698,13 @@ function docCandidates(doc, pageUrl, base, allowAnyFile, trusted = false) {
   for (const m of inline.matchAll(new RegExp(`['"]([^'"\\s]*\\.${ext}(?:\\?[^'"\\s]*)?)['"]`, 'gi'))) raw.push(m[1]);
   // a tabulation viewer may open its file through a servlet URL; only accepted when it answers with a document
   if (trusted) for (const m of inline.matchAll(SCRIPT_TARGET_RE)) raw.push(m[1] || m[2]);
-  const excluded = trusted ? (u) => isExcludedTrustedLink(u, trusted) : isExcludedUrl;
   const out = [];
   for (const r of raw) {
     if (!r || /^(about:|javascript:|#|data:)/i.test(r)) continue;
     try {
       const u = absUrl(base, r, pageUrl);
-      if (!excluded(u) && !out.includes(u)) out.push(u);
+      // the request guard decides here too: a link to a write action or an excluded tabulation is not a candidate
+      if (!requestRefusal({ method: 'GET', url: u, trusted }) && !out.includes(u)) out.push(u);
     } catch {
       /* off-origin or malformed: skip */
     }
@@ -838,7 +1046,9 @@ const MIME = { '.pdf': 'application/pdf', '.html': 'text/html', '.json': 'applic
 
 /**
  * Saves into Downloads/DocLink/<accountLabel>/Tender_<tenderNo>/<subdir>/<file>.
- * Names are unique within a run (no silent overwrite) and every path is sanitised.
+ * Names are unique within a run (no silent overwrite) and every path is sanitised. A file of an earlier run
+ * with the same name is kept: Chrome saves the new one as "<name> (1).<ext>" (conflict 'uniquify'), and
+ * save() returns that name, the one on disk (L11; requestedPath: the name DocLink asked for).
  */
 export function createSaver({ accountLabel, tenderNo, subPath = null, conflict = 'uniquify' }) {
   // `subPath` (e.g. ['Correspondence','Pending',<tenderNo>]) replaces the default Tender_<no> folder.
@@ -868,17 +1078,39 @@ export function createSaver({ accountLabel, tenderNo, subPath = null, conflict =
     }
     const rel = uniquePath(subdir, fileName, exact);
     const url = URL.createObjectURL(new Blob([bytes], { type: mime || MIME[ext] || 'application/octet-stream' }));
+    OWN.blobs.add(url);
+    OWN.requested.add(pathKey(`${root}/${rel}`));
     try {
       const id = await chrome.downloads.download({ url, filename: `${root}/${rel}`, conflictAction: conflict, saveAs: false });
       await waitForDownload(id);
-      log('Download', `File saved ${rel}`);
-      return { relPath: rel, downloadId: id, size: bytes.length };
+      const relPath = await savedRelPath(id, rel);
+      log('Download', relPath === rel ? `File saved ${rel}` : `File saved ${relPath} (a file ${rel.split('/').pop()} was there already)`);
+      return { relPath, downloadId: id, size: bytes.length, ...(relPath !== rel ? { requestedPath: rel } : {}) };
     } finally {
       URL.revokeObjectURL(url);
     }
   }
 
   return { root, save };
+}
+
+/**
+ * The path, relative to the saver's root, of the file Chrome really wrote for download `id` (its
+ * DownloadItem.filename, which differs from `rel` when Chrome had to uniquify the name), or `rel` when Chrome
+ * does not say. The file is noted as DocLink's own (isDocLinkStrayTab); its full path is never stored.
+ */
+async function savedRelPath(id, rel) {
+  try {
+    const [item] = await chrome.downloads.search({ id });
+    const full = String(item?.filename || '');
+    if (!full) return rel;
+    OWN.files.add(pathKey(full));
+    const parts = full.replace(/\\/g, '/').split('/').filter(Boolean);
+    const depth = rel.split('/').length;
+    return parts.length >= depth ? parts.slice(-depth).join('/') : rel;
+  } catch {
+    return rel;
+  }
 }
 
 function waitForDownload(id, timeoutMs = 60000) {

@@ -9,16 +9,17 @@
  *   ecm.domain     the ECM origin, e.g. http://wctsrvecmtstsn1.wabtec.com:8080 (it must be
  *                  in manifest.json host_permissions)
  *   ecm.clientId / ecm.clientSecret   the ECM's client-credentials pair (direct mode only)
- *   ecm.timeoutMs  per request
+ *   ecm.timeoutMs  per request, the answer's body included
  *
  * config.local.json (gitignored, never packaged by scripts/build.mjs) has the same shape
  * and overrides config.json: a top-level key replaces config.json's, the ecm object is
- * merged key by key. That is where the real client id / secret go. The secret is never
+ * merged key by key (utils/config.js). That is where the real client id / secret go. The secret is never
  * logged.
  */
 
 import { logger } from "../utils/logger.js";
 import { compileMatchPatterns } from "../utils/url-scope.js";
+import { readConfigFiles } from "../utils/config.js";
 
 export const ECM_ENV = Object.freeze({ TEST: "TEST", PROD: "PROD" });
 
@@ -57,6 +58,8 @@ function settingsFrom(config) {
   const c = config && typeof config === "object" ? config : {};
   const e = c.ecm && typeof c.ecm === "object" ? c.ecm : {};
   const env = text(e.env).toUpperCase();
+  // a typo must not quietly pick the TEST folders for a production build: say which value was used
+  if (env && env !== ECM_ENV.PROD && env !== ECM_ENV.TEST) logger.warn(`config.json ecm.env "${text(e.env)}" is neither TEST nor PROD; the TEST ECM folders are used`);
   const timeout = Number(e.timeoutMs);
   return Object.freeze({
     // anything but an explicit true is direct mode
@@ -67,15 +70,6 @@ function settingsFrom(config) {
     clientSecret: text(e.clientSecret),
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT_MS
   });
-}
-
-/** config.local.json over config.json: top-level keys replace, `ecm` merges key by key. */
-export function mergeConfig(base, local) {
-  const b = base && typeof base === "object" ? base : {};
-  const l = local && typeof local === "object" ? local : {};
-  const merged = { ...b, ...l };
-  if (b.ecm || l.ecm) merged.ecm = { ...(b.ecm || {}), ...(l.ecm || {}) };
-  return merged;
 }
 
 /**
@@ -89,32 +83,6 @@ export function applyEcmConfig(config) {
   return ECM_CONFIG;
 }
 
-async function readJson(name, { optional = false } = {}) {
-  const url = typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL(name) : `./${name}`;
-  try {
-    const response = await fetch(url, { cache: "no-store" });
-    if (!response.ok) {
-      if (!optional) logger.warn(`Could not read ${name} (HTTP ${response.status})`);
-      return null;
-    }
-    return await response.json();
-  } catch (error) {
-    // a missing config.local.json makes fetch throw for extension URLs
-    if (!optional) logger.warn(`Could not read ${name}`, error);
-    return null;
-  }
-}
-
-/**
- * config.json with config.local.json over it (mergeConfig), plus whether the local file was
- * there; null when neither could be read. Also used by services/download-log.js.
- */
-export async function readConfigFiles() {
-  const base = await readJson("config.json");
-  const local = await readJson("config.local.json", { optional: true });
-  return base || local ? { config: mergeConfig(base, local), local } : null;
-}
-
 /**
  * Read the ECM settings from config.json and config.local.json. A no-op after the first
  * load unless `force` is passed. On any error the current settings are kept.
@@ -123,7 +91,7 @@ export async function readConfigFiles() {
 export async function loadEcmConfig({ force = false } = {}) {
   if (configLoaded && !force) return ECM_CONFIG;
   try {
-    const files = await readConfigFiles();
+    const files = await readConfigFiles({ force });
     const local = files && files.local;
     if (files) applyEcmConfig(files.config);
     // which file the client id / secret come from (never their values): config.local.json

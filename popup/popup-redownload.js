@@ -19,6 +19,22 @@ const ANSWER_TIMEOUT_MS = 4 * 60 * 1000 - 5000; // just inside the service worke
 
 let el = null;
 let currentTabId = async () => null;
+let ownTabId = () => null;
+let tabExists = async () => false;
+
+/**
+ * Whether this panel started the run that asks (review M3). The panel that started it answers even
+ * while the user looks at another tab (its prompt waits there); the active tab decides only when
+ * this panel's own tab id is unknown or no longer exists (Chrome replaced it).
+ */
+async function startedHere(panelTabId) {
+  if (panelTabId === null || panelTabId === undefined) return true;
+  const own = ownTabId();
+  if (own === panelTabId) return true;
+  if (own !== null && (await tabExists(own))) return false;
+  const active = await currentTabId();
+  return active === null || active === panelTabId;
+}
 /** Questions wait their turn: the page shows one at a time. */
 let turn = Promise.resolve();
 /** The question on screen: { resolve, timer } */
@@ -115,9 +131,11 @@ export function askRedownload(question) {
   return answer;
 }
 
-/** @param {{ currentTabId: () => Promise<number|null> }} context */
+/** @param {{ currentTabId: () => Promise<number|null>, ownTabId?: () => number|null, tabExists?: (id: number) => Promise<boolean> }} context */
 export function initRedownload(context) {
   currentTabId = context.currentTabId;
+  if (context.ownTabId) ownTabId = context.ownTabId;
+  if (context.tabExists) tabExists = context.tabExists;
   el = {
     view: $("view-redownload"),
     summary: $("redownload-summary"),
@@ -143,8 +161,7 @@ export function initRedownload(context) {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || message.target !== TARGETS.POPUP || message.type !== MESSAGE_TYPES.CONFIRM_REDOWNLOAD) return false;
     (async () => {
-      const mine = await currentTabId();
-      if (message.panelTabId !== null && message.panelTabId !== undefined && mine !== null && mine !== message.panelTabId) return null;
+      if (!(await startedHere(message.panelTabId))) return null;
       return askRedownload(message.question || {});
     })()
       .then((reply) => reply && sendResponse(reply))

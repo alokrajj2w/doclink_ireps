@@ -3,7 +3,7 @@
 import { createRequire } from 'node:module';
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeIreps, PDF, corresPage, fakeChromeDebugger } from './fake-ireps.js';
+import { FakeIreps, PDF, corresPage, fakeChromeDebugger, LOA_SCRIPT } from './fake-ireps.js';
 
 const req = createRequire((process.env.JSDOM_ROOT || process.cwd()) + '/');
 const { JSDOM } = req('jsdom');
@@ -36,13 +36,23 @@ globalThis.fetch = async (url, init = {}) => {
   const r = await server.handle(init.method || 'GET', u.replace('https://ext.invalid/', 'https://www.ireps.gov.in/'), init.body);
   return new Response(r.bytes, { status: r.status, headers: { 'content-type': r.type, ...(r.disposition ? { 'content-disposition': r.disposition } : {}) } });
 };
-// downloads.download must read the blob we created
-chrome.downloads.download = async ({ url, filename }) => {
+// downloads.download must read the blob we created. Like Chrome, a name already on disk is uniquified
+// ("name (1).pdf", conflictAction 'uniquify') and the DownloadItem's filename is the full path written.
+const disk = new Set();
+const DOWNLOADS_DIR = 'C:\\Users\\tester\\Downloads\\';
+chrome.downloads.download = async ({ url, filename, conflictAction }) => {
   const b = blobs.get(url);
   const buf = new Uint8Array(await b.arrayBuffer());
+  let final = filename;
+  if (conflictAction !== 'overwrite') for (let n = 1; disk.has(final.toLowerCase()); n++) final = filename.replace(/(\.[^./]+)?$/, ` (${n})$1`);
+  disk.add(final.toLowerCase());
   const id = saved.length + 1;
-  saved.push({ id, filename, size: buf.length, bytes: buf });
+  saved.push({ id, filename, final, size: buf.length, bytes: buf });
   return id;
+};
+chrome.downloads.search = async ({ id }) => {
+  const s = saved.find((x) => x.id === id);
+  return [{ id, state: 'complete', ...(s ? { filename: DOWNLOADS_DIR + s.final.replace(/\//g, '\\') } : {}) }];
 };
 
 const core = await import('../tender-core.js');
@@ -64,7 +74,7 @@ const daysAgo = (n) => new Date(2026, 9, 9 - n);
 const paths = () => server.log.map((l) => l.path);
 const savedNames = () => saved.map((s) => s.filename);
 const run = (no = '29263265', opts = {}) => wf.downloadTenderDocuments(no, opts);
-const mk = (state) => { server = new FakeIreps(state); saved.length = 0; for (const k of Object.keys(store)) delete store[k]; };
+const mk = (state) => { server = new FakeIreps(state); saved.length = 0; disk.clear(); for (const k of Object.keys(store)) delete store[k]; };
 beforeEach(() => mk({}));
 
 // =========================== unit tests =====================================================
@@ -830,9 +840,7 @@ test('Download by tender number: the date ranges stop once IREPS returns the sam
   assert.equal(negoPages().length, 2, JSON.stringify(negoPages()));
   assert.equal(new Set(negoPages().map((l) => l.startDate)).size, 2);
 });
-test('Jobs never request tabulation endpoints', () => {
-  assert.ok(!server.log.some((l) => /tabulation/i.test(JSON.stringify(l))));
-});
+// 'Jobs never request tabulation endpoints': see the L12 section at the end (it now runs the jobs)
 
 // =========================== automatic mode: tender numbers come from My Messages ===========
 const TODAY = () => new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
@@ -990,11 +998,7 @@ test('24-26. FIN-TAB / COM-TAB are fetched from the row; TECH-TAB is never invok
   assert.deepEqual(r.exclusions, ['Techno-Commercial Tabulation']);
   await assert.rejects(() => core.irepsFetch('https://www.ireps.gov.in', '/epsn/tbo/commTboPdfAction.do?pdfType=technoCommercialTabulation&tenderOID=1'), (e) => e.code === 'EXCLUDED');
 });
-test('no password / cookie / token is stored by the extension code', async () => {
-  const fs = await import('node:fs');
-  const src = ['tender-core.js', 'tender-account.js', 'tender-search.js', 'tender-workflows.js', 'tender-ui.js'].map((f) => fs.readFileSync(new URL('../' + f, import.meta.url), 'utf8')).join('\n');
-  assert.ok(!/chrome\.storage|localStorage|sessionStorage|document\.cookie/.test(src));
-});
+// 'no password / cookie / token is stored': see the L12 section at the end (every tender file, and what is stored)
 
 // =========================== Save to: ECM / S3 ==============================================
 const tecm = await import('../tender-ecm.js');
@@ -1317,6 +1321,98 @@ test('ECM: the correspondence page\'s Closing Date fills the tender date when th
   const doc = new JSDOM(new TextDecoder().decode(corresPage({ nitOid: '1', tenderNo: 'X1', letters: [] }))).window.document;
   assert.equal(wf.pageClosingDate(doc), '09/09/2026');
   assert.equal(wf.pageClosingDate(new JSDOM('<table><tr><td>Tender No</td><td>X</td></tr></table>').window.document), '');
+});
+
+// =========================== 13 Nov 2026 meeting: the ECM fields the client asked for ============
+const isoDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const dmyDay = (d) => `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+test('ECM (13 Nov meeting): an LOA carries its LOA number and LOA date, built from its list row', () => {
+  const ctx = { tenderNo: '61265711C', closingDate: '12/11/2026 11:00' };
+  const loa = { id: '1503282', unit: 'DAHOD / WESTERN RLY', meta: { docDate: '12/11/2026' } };
+  const fields = (action = loa, category = 'LOA') => tecm.ecmDocumentFor(category, action, ctx).fields;
+  assert.deepEqual(fields(), { tender_number: '61265711C', tender_date: '12/11/2026 11:00', loi_number: 'DAHOD / 61265711C / 1503282', loi_date: '12/11/2026' },
+    'the number as IREPS prints it on the letter: "Letter No: DAHOD / 61265711C / 1503282 Dated: 12/11/2026"');
+  assert.equal(fields({ ...loa, unit: 'TRS/ELS/HWH-STORES / EASTERN RLY' }).loi_number, 'TRS/ELS/HWH-STORES / 61265711C / 1503282', 'a department with slashes of its own');
+  assert.equal(fields({ ...loa, unit: '  BCT DIVISION-STORES /\n WESTERN RLY ' }).loi_number, 'BCT DIVISION-STORES / 61265711C / 1503282', 'the cell\'s line breaks and spaces');
+  for (const [why, action] of [['no unit', { ...loa, unit: '' }], ['a unit without " / "', { ...loa, unit: 'ICF' }], ['no Letter Date', { ...loa, meta: {} }], ['no letter id', { ...loa, id: '' }]]) {
+    assert.deepEqual(Object.keys(fields(action)), ['tender_number', 'tender_date'], `${why}: neither the number nor the date`);
+  }
+  assert.deepEqual(fields({ id: '232721', unit: 'KGP DIV / SOUTH EASTERN RLY', meta: { docDate: '07/11/2026' } }, 'NEGOTIATION'), { tender_number: '61265711C', tender_date: '12/11/2026 11:00' }, 'only LOA documents get them');
+});
+test('LOA list (13 Nov meeting): the "Dept/Rly. Unit" column is found by its header in the page as IREPS sends it (the header row left open)', () => {
+  // the markup of the 22 Oct 2026 capture ("Response LOI.txt"), other values
+  const page = `<table width="100%" class="nit_summary"><tr><td colspan="5">&nbsp;</td></tr> <tr bgcolor="#E9E9EF"> <td width="15%"><strong>Dept/Rly. Unit</strong></td> <td><strong>Tender No. </strong></td> <td><strong>Tender Title</strong></td> <td><strong>Letter Date (LetterId)</strong></td> <td><strong>LOA Status</strong></td> <td><strong>Actions</strong></td> <tr> <td width="15%" style="color: black">RATLAM-DIV / WESTERN RLY</td><td><a class="linkStyle" title="To View NIT Click the NIT No" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=1')>83260001</a></td> <td>ITEM </td> <td nowrap="nowrap">10/09/2026 18:33&nbsp;(1461928)</td><td>Published</td><td>v</td></tr></table>`;
+  const doc = new JSDOM(page).window.document;
+  const col = wf.listColumn(doc, /^Dept\/Rly\.?\s*Unit$/i);
+  assert.equal(col, 0);
+  const row = [...doc.querySelectorAll('tr')].find((tr) => tr.querySelector('a'));
+  assert.equal(core.norm([...row.children][col].textContent), 'RATLAM-DIV / WESTERN RLY');
+  assert.equal(wf.listColumn(new JSDOM('<table><tr><td>Tender No</td><td>Dept</td></tr></table>').window.document, /^Dept\/Rly\.?\s*Unit$/i), -1, 'no such header: -1, the unit is then unknown');
+});
+test('ECM direct (13 Nov meeting): the "<T> - LOA" document gets the LOA number and date from the LOA list row; a list without a "Dept/Rly. Unit" column sends neither', async () => {
+  const letterDay = new Date(NOW());
+  const closing = new Date(NOW() - 3 * D);
+  const scenario = (liveInbox) => {
+    mk({
+      tenders: [T({ no: 'LOA3', nitId: '31', oid: '310', closing })],
+      inbox: { MyAdvanceAcceptanceLetter: [{ no: 'LOA3', oid: '5003', letter: '1503282', date: letterDay, unit: 'DAHOD / WESTERN RLY' }] },
+      letterAsPdf: true,
+      liveInbox,
+    });
+    store['doclink.saveDestination'] = 'recon';
+  };
+  const props = (creates) => creates.map((p) => [p['dc:title'], p['InvoiceCertificateSchema:tenderDate'], p['InvoiceCertificateSchema:loiNumber'], p['InvoiceCertificateSchema:loiDate']]);
+  scenario(true);
+  await withDirectEcm(async ({ creates }) => {
+    await jobs.downloadLettersByDate();
+    assert.deepEqual(props(creates), [['LOA3 - LOA', isoDay(closing), 'DAHOD / LOA3 / 1503282', isoDay(letterDay)]], 'the list as IREPS sends it (22 Oct 2026 capture)');
+  });
+  scenario(false);
+  await withDirectEcm(async ({ creates }) => {
+    await jobs.downloadLettersByDate();
+    assert.deepEqual(props(creates), [['LOA3 - LOA', isoDay(closing), undefined, undefined]], 'no "Dept/Rly. Unit" header: the LOA document as before');
+  });
+});
+test('Tender search (13 Nov meeting): when two railways use one tender number, the letter\'s railway or the NIT message\'s due date picks the tender; a hint no row fits changes nothing', async () => {
+  const nf = new Date(NOW() + 10 * D);
+  const ec = new Date(NOW() + 40 * D);
+  mk({ tenders: [T({ no: '10263703', nitId: '71', oid: '710', dept: 'STORES/N F RLY', closing: nf }), T({ no: '10263703', nitId: '72', oid: '720', dept: 'STORES/EAST CENTRAL RLY', closing: ec })] });
+  const find = async (prefer) => (await search.searchTender('https://www.ireps.gov.in', '10263703', { prefer })).closingDate;
+  assert.match(await find({}), new RegExp(`^${dmyDay(nf)}`), 'no hint: the first of two equal rows, as before');
+  assert.match(await find({ railway: 'TRS-GMO-STORES / EAST CENTRAL RLY' }), new RegExp(`^${dmyDay(ec)}`));
+  assert.match(await find({ railway: 'KATIHAR / N F RLY' }), new RegExp(`^${dmyDay(nf)}`));
+  assert.match(await find({ dueDate: new Date(ec.getFullYear(), ec.getMonth(), ec.getDate(), 14, 0) }), new RegExp(`^${dmyDay(ec)}`));
+  assert.match(await find({ railway: 'STORES / WESTERN RLY' }), new RegExp(`^${dmyDay(nf)}`), 'a railway no row has: as without a hint');
+  assert.equal(search.railwayOf('LOWER PAREL/WESTERN RLY'), search.railwayOf('DAHOD / WESTERN RLY'));
+});
+test('ECM (13 Nov meeting): letters by date take the tender date of the letter\'s own railway when another railway uses the tender number', async () => {
+  const nf = new Date(NOW() - 20 * D);
+  const ec = new Date(NOW() - 5 * D);
+  mk({
+    tenders: [T({ no: '10263703', nitId: '71', oid: '710', dept: 'STORES/N F RLY', closing: nf }), T({ no: '10263703', nitId: '72', oid: '720', dept: 'STORES/EAST CENTRAL RLY', closing: ec })],
+    inbox: { MyNegotiation: [{ no: '10263703', oid: '5001', letter: '11', date: new Date(NOW()), unit: 'DEMU-SEE-STORES / EAST CENTRAL RLY' }] },
+    letterAsPdf: true,
+    liveInbox: true,
+  });
+  store['doclink.saveDestination'] = 'recon';
+  await withEcm((p, n) => [201, { uid: `u-${n}`, path: '/x', title: p.title, site: 'hosur', deduplicated: false }], async (posts) => {
+    await jobs.downloadLettersByDate();
+    assert.deepEqual(posts.map((p) => [p.kind, p.fields.tender_date]), [['nbsp', isoDay(ec)]]);
+  });
+});
+test('Automatic mode (13 Nov meeting): when two railways use one tender number, the NIT message\'s due date picks the tender whose NIT is downloaded', async () => {
+  const other = new Date(NOW() + 10 * D);
+  const due = new Date(NOW() + 40 * D);
+  const mon = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][due.getMonth()];
+  const body = `Dear Sir/Madam, <br><br>Your attention is invited towards X, Tender No. 10263703 due on ${String(due.getDate()).padStart(2, '0')}-${mon}-${due.getFullYear()} 14:00 IST for <i>'Magnet coil'</i>.<br><br>Thanks`;
+  mk({
+    tenders: [futureT({ no: '10263703', nitId: '71', oid: '710', dept: 'STORES/N F RLY', closing: other, attachments: att('d71') }), futureT({ no: '10263703', nitId: '72', oid: '720', dept: 'STORES/EAST CENTRAL RLY', closing: due, attachments: att('d72') })],
+    messages: [{ ...nitMsg('10263703'), body }],
+  });
+  const r = await autoRun();
+  assert.equal(r.tenders[0].status, 'DOWNLOADED');
+  const nit = savedNames().filter((n) => n.includes('/Tender_10263703/NIT_and_Supporting_Documents/viewNitPdf_'));
+  assert.deepEqual(nit.map((n) => n.split('/').pop()), ['viewNitPdf_72.pdf'], 'the EAST CENTRAL RLY tender, due on the message\'s date');
 });
 
 // =========================== parallel scanning =============================================
@@ -1723,4 +1819,370 @@ test('Tabulation: Save to ECM files the Financial Tabulation as "<tender no> - R
     ]);
     assert.equal(saved.length, 0, 'nothing that went to the ECM is in Downloads');
   });
+});
+
+// =========================== review fixes: H4-H7, M20-M23, L11, L12 =========================
+const ledgerMod = await import('../tender-ledger.js');
+const printMod = await import('../tender-print.js');
+const viewCommon = await import('../view-common.js');
+const BASE = 'https://www.ireps.gov.in';
+const enc8 = (s) => new TextEncoder().encode(s);
+const ledgerOf = (id = '833') => store[`doclink.tender.ledger.${id}`];
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+/** Answer the requests `when(method, url, body)` picks with `answer` instead of the fake IREPS. */
+const intercept = (when, answer) => { const orig = server.handle.bind(server); server.handle = async (m, u, b) => (when(m, u, new URLSearchParams(b || '')) ? answer() : orig(m, u, b)); };
+const html200 = (title, body) => () => ({ status: 200, type: 'text/html', bytes: enc8(`<html><head><title>${title}</title></head><body>${body}</body></html>`) });
+
+// ---- H5: one write guard in the shared request function
+test('H5: the request layer refuses write actions for every tender request (submitbid, finalSubmission, withdrawalOfBid, logout ...); nothing reaches IREPS', async () => {
+  const writes = ['/epsn/supply/bid/submitbid.do', '/epsn/supply/tds/finalSubmission.do', '/epsn/supply/tds/withdrawalOfBid.do', '/epsn/home/logout.do',
+    '/epsn/corres/vendor/vendorCorresSubmitReply.do', '/epsn/x/saveReply.do', '/epsn/x/uploadDocument.do', '/epsn/supply/tds/negoBid.do', '/epsn/supply/tds/coResponse.do'];
+  for (const path of writes) {
+    for (const method of ['GET', 'POST']) await assert.rejects(() => core.irepsFetch(BASE, path, { method, form: { a: '1' } }), (e) => e.code === 'BLOCKED', `${method} ${path}`);
+  }
+  // an action parameter that names a write is refused on any page, as is a method other than GET / POST
+  for (const form of [{ activity: 'saveBid' }, { ajaxMode: 'updateBankDetails' }, { opValue: 'SubmitBid' }, { Action: 'withdrawLetter' }]) {
+    await assert.rejects(() => core.irepsFetch(BASE, '/epsn/supply/tds/ajxdata.do', { method: 'POST', form }), (e) => e.code === 'BLOCKED', JSON.stringify(form));
+  }
+  await assert.rejects(() => core.irepsFetch(BASE, '/epsn/x/view.do', { method: 'DELETE' }), (e) => e.code === 'BLOCKED');
+  assert.deepEqual(server.log, [], 'nothing was sent');
+});
+test('H5: every request the real flows send passes the guard (captured IREPS requests and the links the flows follow)', () => {
+  const allowed = [
+    ['GET', '/epsn/home/showHome.do'],
+    ['POST', '/epsn/search/advancedSearch.do', 'searchParam=showPage'],
+    ['POST', '/epsn/search/advancedSearch.do', 'org.apache.struts.taglib.html.TOKEN=0a1b2c&searchOption=1&searchOptorOption=0&advancedSearch=29263265&division=-1&dateFrom=09%2F10%2F2026&dateTo=09%2F11%2F2026&radioDuration=0&submit=Show+Results&searchParam='],
+    ['POST', '/epsn/vendorInboxLink.do', 'listType=MyMsg&pageNo=2'],
+    ['POST', '/epsn/vendorInboxLink.do', 'menuLink=PostTenders&status=MyAdvanceAcceptanceLetter&tenderNo=&startDate=24%2F07%2F2026&endDate=22%2F10%2F2026&raStatus=-1&pageNo=1&listType=MyAdvanceAcceptanceLetter'],
+    ['POST', '/epsn/vendorInboxLink.do', 'menuLink=Tenders&status=MyBidsClosed&tenderNo=&startDate=31%2F07%2F2026&endDate=29%2F10%2F2026&raStatus=-1&pageNo=1&listType=MyBidsClosed'],
+    ['POST', '/epsn/admin/myMessages/ViewMessageDetailAction.do', 'oid=27534757'],
+    ['GET', '/epsn/supply/rfq/nitPublish.do?nitId=5567396&activity=viewNIT'],
+    ['GET', '/ireps/supply/pdfdocs/112026/107200478/viewNitPdf_5569207.pdf'],
+    ['GET', '/epsn/works/rfq/viewCorrigendum.do?nitId=5569207'],
+    ['POST', '/epsn/supply/viewCorrigendum.do', 'activity=displayPubCorri&nitId=5569207&cn=1&corrigendumId=1204920'],
+    ['POST', '/epsn/tbo/commTboPdfAction.do', 'pdfType=offer&tenderOID=107200478&accountID=833&bid_id=1&bidType=N'],
+    ['POST', '/epsn/tbo/commTboPdfAction.do', 'tenderOID=107204732&pdfType=financialTabulation&accountID=833'],
+    ['GET', '/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=107204732&accountID=833'],
+    ['POST', '/epsn/supply/tds/publishIndiNegotiationLetter.do', 'nitOId=107164217&negoLetterId=224222&opValue=ViewPublishedLetter'],
+    ['POST', '/epsn/supply/tds/publishCounterOfferLetter.do', 'Action=ViewPublishedLetter&responseDate=14/09/2026&nitOId=1&tdId=3&tdVersion=1&bidid=2&bidderAccId=833&letterId=5&signId=95'],
+    ['POST', '/epsn/supply/tds/ajxdata.do', 'ajaxMode=updateLoaViewedDataByBidder&docId=1488946&docType=11'],
+    ['POST', '/epsn/supply/tds/publishLOALetter.do', 'Action=ViewPublishedLetter&nitOId=107198913&tdId=3096443&letterId=1488946&tdVersion=1&bidid=20834392&bidderAccId=833&signId=179112494'],
+    ['POST', '/epsn/corres/vendorRelatedCorrespondence.do', ''],
+    ['POST', '/epsn/corres/vendorCorrespondencePendingReply.do', 'nitOid=107202979'],
+    ['POST', '/epsn/corres/rly/viewpubIndltr.do', 'nitOid=107202979&letterID=313083&corresId=229609'],
+    ['GET', '/ireps/upload/att/Annexure.pdf'], ['GET', '/ireps/upload/corrigendum/1204999/Revised_Spec.pdf'], ['GET', '/ireps/corr/Submission_List.pdf'],
+    ['GET', '/epsn/x/viewUploadedDoc.do'], ['GET', '/epsn/supply/tds/showLetter.do?id=1'],
+    ['GET', '/ireps/supply/pdfdocs//112026/107263731/FIN-TAB-42263731-107263731.pdf'],
+    ['GET', '/ireps/supply/pdfdocs//112026/107263731/TECH-TAB-42263731-107263731.pdf', '', 'commercialTabulation'],
+    ['GET', '/ireps/upload/tbo/Tabulation_107263731.pdf', '', 'commercialTabulation'],
+    ['POST', '/epsn/tbo/showTabulation.do', 'oid=1&pdfType=commercialTabulation', 'commercialTabulation'],
+  ];
+  for (const [method, path, body = '', trusted = false] of allowed) assert.equal(core.requestRefusal({ method, url: BASE + path, body: body || null, trusted }), null, `${method} ${path} ${body}`);
+});
+test('H5/H6: only the exact "LOA viewed" update passes; that page with another write, method, field or a query is refused', () => {
+  const code = (method, path, body) => core.requestRefusal({ method, url: BASE + path, body })?.code || 'ok';
+  assert.equal(code('POST', '/epsn/supply/tds/ajxdata.do', 'ajaxMode=updateLoaViewedDataByBidder&docId=1488946&docType=11'), 'ok');
+  assert.deepEqual([
+    code('GET', '/epsn/supply/tds/ajxdata.do?ajaxMode=updateLoaViewedDataByBidder&docId=1&docType=11', null),
+    code('POST', '/epsn/supply/tds/ajxdata.do?x=1', 'ajaxMode=updateLoaViewedDataByBidder&docId=1&docType=11'),
+    code('POST', '/epsn/supply/tds/ajxdata.do', 'ajaxMode=updateLoaViewedDataByBidder&docId=1&docType=11&extra=1'),
+    code('POST', '/epsn/supply/tds/ajxdata.do', 'ajaxMode=updateLoaViewedDataByBidder&docId=abc&docType=11'),
+    code('POST', '/epsn/supply/tds/ajxdata.do', 'ajaxMode=updateBidAmount&docId=1&docType=11'),
+    code('POST', '/epsn/bid/getAjaxData.do', 'ajaxMode=updateLoaViewedDataByBidder&docId=1&docType=11'),
+  ], Array(6).fill('BLOCKED'));
+});
+test('H5: a write-action frame on a page DocLink reads is never requested; the corrigendum and its attached file still download as before', async () => {
+  mk({ tenders: [T({ corrigenda: [{ id: '1204999', cn: '2', date: '07/10/2026 10:00', attached: ['Revised_Spec.pdf'], extra: '<iframe src="/epsn/supply/bid/submitbid.do?bidId=1"></iframe><iframe src="/epsn/home/logout.do"></iframe>' }] })] });
+  const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
+  assert.deepEqual(c.files.map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Corrigendum_02_29263265.html', 'Revised_Spec.pdf']);
+  assert.ok(!paths().some((p) => /submitbid|logout/.test(p)), paths().join('\n'));
+});
+
+// ---- M22: the tabulation guard runs on the request as sent
+test('M22: a form field cannot change the pdfType behind an allowed URL (GET or POST); the allowed tabulations still pass as sent', async () => {
+  const url = '/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=1&accountID=833';
+  for (const method of ['GET', 'POST']) await assert.rejects(() => core.irepsFetch(BASE, url, { method, form: { pdfType: 'technoCommercialTabulation' } }), (e) => e.code === 'EXCLUDED', method);
+  assert.ok(!server.excludedHit);
+  assert.deepEqual(server.log, []);
+  for (const t of ['offer', 'financialTabulation', 'commercialTabulation']) assert.equal((await core.irepsFetch(BASE, '/epsn/tbo/commTboPdfAction.do', { method: 'POST', form: { tenderOID: '1', pdfType: t, accountID: '833' } })).status, 200, t);
+});
+
+// ---- H6: the "LOA viewed" update only from the live script
+const loaByDate = (o = {}) => mk({ inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [{ no: 'L1', oid: '9', letter: '77', date: new Date(NOW()), ...o.row }] }, letterAsPdf: true, ...o.state });
+const loaRun = async () => (await auto.runLetterType({ status: 'MyAdvanceAcceptanceLetter', from: TODAY(), to: TODAY() })).letters.tenders[0].categories.loa;
+test('H6: when the LOA list page\'s own View LOA script cannot be read, no "viewed" update is sent (nothing hard-coded) and the LOA fails clearly', async () => {
+  for (const loaScript of ['', LOA_SCRIPT.replace('var docType = "11";', ''), LOA_SCRIPT.replace('ajaxMode:"updateLoaViewedDataByBidder",', '')]) {
+    loaByDate({ state: { loaScript } });
+    const loa = await loaRun();
+    assert.equal(loa.status, 'FAILED');
+    assert.match(loa.files[0].error, /could not read how IREPS's "View LOA Letter" link opens this letter/);
+    assert.ok(!paths().some((p) => /ajxdata|publishLOALetter/.test(p)), paths().join('\n'));
+  }
+});
+test('H6: the letter id of the update is the one the row\'s own link passes, never guessed from its URL', async () => {
+  loaByDate({ row: { noDocId: true } });
+  const loa = await loaRun();
+  assert.equal(loa.status, 'FAILED');
+  assert.match(loa.files[0].error, /passes no letter id/);
+  assert.ok(!paths().some((p) => /ajxdata|publishLOALetter/.test(p)));
+  loaByDate();
+  assert.equal((await loaRun()).status, 'DOWNLOADED', 'with the script and the id, the LOA downloads as before');
+  assert.deepEqual(server.log.filter((l) => /ajxdata|publishLOALetter/.test(l.path)).map((l) => [l.path, l.body.ajaxMode || '', l.body.docId || '', l.body.docType || '']),
+    [['/epsn/supply/tds/ajxdata.do', 'updateLoaViewedDataByBidder', '77', '11'], ['/epsn/supply/tds/publishLOALetter.do', '', '', '']]);
+});
+
+// ---- H4: "nothing found" only when IREPS says so
+test('H4: letters by date - a list page IREPS fails to give keeps the letters already read and says the list was not read in full', async () => {
+  const rows = [1, 2].map((n) => ({ no: `P${n}`, oid: `70${n}`, letter: `80${n}`, date: new Date(NOW()), page: n }));
+  mk({ inbox: { MyNegotiation: rows, MyCounterOffer: [], MyAdvanceAcceptanceLetter: [] }, inboxPages: { MyNegotiation: 2 }, letterAsPdf: true });
+  intercept((m, u, b) => b.get('status') === 'MyNegotiation' && b.get('pageNo') === '2', () => ({ status: 500, type: 'text/html', bytes: enc8('<html><body>boom</body></html>') }));
+  const r = await jobs.downloadLettersByDate({ dates: [dmy(NOW())], statuses: ['MyNegotiation'] });
+  assert.deepEqual(r.tenders.map((t) => t.tenderNo), ['P1'], 'the letter of page 1 is downloaded, as before');
+  assert.match(r.listWarnings.MyNegotiation, /not read in full .*HTTP 500/);
+  assert.equal(r.listErrors.MyNegotiation, undefined);
+});
+test('H4: letters by date - a page that is not the list (no rows, no list form) is an error, never "none for these dates"', async () => {
+  mk({ inbox: { MyNegotiation: [{ no: 'Q1', oid: '1', letter: '9', date: new Date(NOW()) }], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
+  intercept((m, u, b) => u.includes('vendorInboxLink') && b.has('pageNo'), html200('Maintenance', 'IREPS is under maintenance, please visit later.'));
+  const r = await jobs.downloadLettersByDate({ dates: [dmy(NOW())], statuses: ['MyNegotiation'] });
+  assert.equal(r.tenders.length, 0);
+  assert.match(r.listErrors.MyNegotiation, /does not recognise .*Maintenance/);
+});
+test('H4: NIT Documents - a first My Messages page that is not the inbox is an error; a later one keeps the messages read and says so', async () => {
+  const notInbox = (n) => intercept((m, u, b) => b.get('listType') === 'MyMsg' && b.get('pageNo') === String(n), html200('Error', 'Please try again later.'));
+  mk({ messages: [nitMsg('Z1')], tenders: [futureT({ no: 'Z1', nitId: '1', oid: '10' })] });
+  notInbox(1);
+  await assert.rejects(() => autoRun(), (e) => e.code === 'PAGE' && /My Messages page 1/.test(e.message));
+  mk({ msgPageSize: 1, messages: [nitMsg('Z1'), nitMsg('Z2')], tenders: [futureT({ no: 'Z1', nitId: '1', oid: '10' }), futureT({ no: 'Z2', nitId: '2', oid: '20' })] });
+  notInbox(2);
+  const r = await autoRun();
+  assert.deepEqual(r.tenders.map((t) => [t.tenderNo, t.status]), [['Z1', 'DOWNLOADED']], 'the NIT of page 1 is downloaded, as before');
+  assert.match(r.messages.incomplete, /My Messages page 2/);
+});
+test('H4: Closed Tenders - an empty page that is not the list keeps the tenders read and says so', async () => {
+  mk({ closed: [closed('42263731'), closed('69261051', { page: 2 })] });
+  intercept((m, u, b) => b.get('status') === 'MyBidsClosed' && b.get('pageNo') === '2', html200('Busy', 'The server is busy.'));
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  assert.equal(r.tabulations.summary.downloaded, 1);
+  assert.match(r.tabulations.incomplete, /does not recognise .*Closed Tenders/);
+});
+test('H4: a tender search IREPS does not answer (HTTP errors) is "search incomplete", never "not found"', async () => {
+  mk({ tenders: [T({})] });
+  intercept((m, u, b) => b.get('advancedSearch'), () => ({ status: 500, type: 'text/html', bytes: enc8('<html><body>error</body></html>') }));
+  await assert.rejects(() => run(), (e) => e.code === 'SEARCH_INCOMPLETE' && /could not tell whether the tender is in IREPS/.test(e.message));
+});
+
+// ---- H7: a NIT message is done only when every NIT category succeeded
+test('H7: NIT Documents retries a NIT whose attachment failed; the next run fetches only what failed, then the message is done', async () => {
+  mk({ tenders: [futureT({ no: 'R1', nitId: '1', oid: '10', offer: true, attachments: [...att('r1'), { name: 'r2.pdf', desc: 'B', href: '/ireps/upload/att/r2.pdf' }] })], messages: [nitMsg('R1')], failPaths: ['r2.pdf'] });
+  const r1 = await autoRun();
+  assert.deepEqual([r1.tenders[0].status, r1.tenders[0].categories.tenderPdf.status, r1.tenders[0].categories.attachments.status], ['FAILED', 'DOWNLOADED', 'PARTIAL']);
+  const before = saved.length;
+  server.s.failPaths = [];
+  const r2 = await autoRun();
+  assert.equal(r2.messages.opened, 1, 'the message is opened again');
+  assert.equal(r2.tenders[0].status, 'DOWNLOADED');
+  assert.deepEqual(savedNames().slice(before), ['DocLink/HOSUR/Tender_R1/NIT_and_Supporting_Documents/r2.pdf'], 'only the attachment that failed: the NIT PDF, the other attachment and My Offer are not downloaded again');
+  assert.equal((await autoRun()).messages.opened, 0, 'now done: not opened again');
+});
+
+// ---- M21: the ledger is saved as it goes, and stays small
+test('M21: the ledger is saved after every tender, so a run cut short keeps what it did', async () => {
+  mk({ tenders: [futureT({ no: 'S1', nitId: '1', oid: '10' }), futureT({ no: 'S2', nitId: '2', oid: '20' })], messages: [nitMsg('S1'), nitMsg('S2')] });
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const orig = server.handle.bind(server);
+  server.handle = async (m, u, b) => { if (new URLSearchParams(b || '').get('advancedSearch') === 'S2') await held; return orig(m, u, b); };
+  const running = autoRun();
+  for (let i = 0; i < 300 && !ledgerOf()?.nit?.S1; i++) await sleepMs(10);
+  assert.ok(ledgerOf()?.nit?.S1, 'S1 is recorded while S2 is still being looked for');
+  assert.equal(Object.keys(ledgerOf().msgs).length, 1);
+  release();
+  await running;
+  assert.ok(ledgerOf().nit.S2);
+});
+test('M21: pruning drops old and surplus entries and keeps the newest tender records within the byte budget (the correspondence record stays)', () => {
+  const now = Date.parse('2026-11-15T10:00:00Z');
+  const iso = (days) => new Date(now - days * D).toISOString();
+  const data = { v: 1, nit: { OLD: iso(500), NEW: iso(1) }, corrigenda: {}, letters: {}, msgs: {}, docs: {}, manifests: {}, meta: {} };
+  for (let i = 0; i < 6000; i++) data.letters[`NEGOTIATION|T|${i}`] = iso(i % 300);
+  for (let i = 0; i < 400; i++) data.manifests[`T${i}`] = { generatedAt: iso(i), files: [{ note: 'x'.repeat(10000) }] };
+  data.manifests['pending-correspondence'] = { records: {}, letters: {} };
+  ledgerMod.pruneLedger(data, now);
+  const L = ledgerMod.LEDGER_LIMITS;
+  assert.deepEqual(Object.keys(data.nit), ['NEW'], 'older than 400 days: gone');
+  assert.equal(Object.keys(data.letters).length, L.maxPerBucket);
+  assert.ok(JSON.stringify(data).length <= L.budgetBytes, `${JSON.stringify(data).length} bytes`);
+  assert.ok(data.manifests['pending-correspondence']);
+  const kept = Object.keys(data.manifests).filter((k) => k !== 'pending-correspondence');
+  assert.ok(kept.length > 0 && kept.length <= L.maxManifests && kept.includes('T0') && !kept.includes('T399'), 'the newest tender records are kept');
+});
+test('M21: when chrome.storage refuses the ledger (quota full), it is pruned harder and saved again', async () => {
+  const writes = [];
+  let refuse = true;
+  const storage = { get: async () => ({}), set: async (o) => { if (refuse) { refuse = false; throw new Error('QUOTA_BYTES quota exceeded'); } writes.push(JSON.stringify(o).length); } };
+  const ledger = await ledgerMod.openLedger('quota-test', storage);
+  for (let i = 0; i < 300; i++) ledger.setManifest(`T${i}`, { generatedAt: new Date(Date.now() - i * 1000).toISOString(), files: [{ note: 'y'.repeat(12000) }] });
+  assert.equal(await ledger.save(), true);
+  assert.equal(writes.length, 1);
+  assert.ok(writes[0] <= ledgerMod.LEDGER_LIMITS.budgetBytes / 2 + 200, `${writes[0]} bytes`);
+});
+
+// ---- M20: the print tab
+test('M20: in the print tab only requests the write guard refuses are failed; every other GET and POST goes on, and the letter prints the same', async () => {
+  loaOnly();
+  const dbg = fakeDebugger({ pageRequests: [
+    { method: 'POST', url: `${BASE}/epsn/supply/tds/ajxdata.do`, postData: 'ajaxMode=updateBidAmount&docId=1', resourceType: 'XHR' },
+    { method: 'GET', url: `${BASE}/epsn/home/logout.do`, resourceType: 'Image' },
+    { method: 'POST', url: `${BASE}/epsn/supply/tds/ajxdata.do`, postData: 'ajaxMode=getLetterDetails&docId=1', resourceType: 'XHR' },
+    { method: 'GET', url: `${BASE}/ireps/images/common/logo.gif`, resourceType: 'Image' },
+    { method: 'GET', url: `${BASE}/epsn/home/showHome.do`, resourceType: 'Document' },
+  ] });
+  try {
+    const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
+    assert.deepEqual([loa.status, loa.downloaded, loa.warnings], ['DOWNLOADED', 1, []]);
+    const files = saved.filter((s) => s.filename.includes('Advance_Acceptance_LOA'));
+    assert.deepEqual(files.map((s) => s.filename.split('/').pop()), ['LOA_29263265.pdf']);
+    assert.match(new TextDecoder().decode(files[0].bytes), /chrome-print/);
+    assert.deepEqual(['p1', 'p2', 'p3', 'p4', 'p5'].map(dbg.outcome), ['failed', 'failed', 'continued', 'continued', 'continued']);
+    assert.deepEqual(dbg.cmd('Fetch.enable').patterns, [{ urlPattern: '*', requestStage: 'Request' }], 'every request of the tab is seen, not only documents');
+  } finally {
+    withoutDebugger();
+  }
+});
+test('M20: a print tab still open when the side panel closes is stopped, detached and closed', async () => {
+  const dbg = fakeDebugger({ hang: true });
+  try {
+    const printing = printMod.printPageToPdf({ url: `${BASE}/epsn/supply/tds/publishLOALetter.do`, bytes: enc8('<html><body>Letter text</body></html>'), contentType: 'text/html' });
+    for (let i = 0; i < 100 && !dbg.calls.some((c) => c[0] === 'Fetch.fulfillRequest'); i++) await sleepMs(5);
+    await printMod.closePrintTabs();
+    await assert.rejects(printing, (e) => e.code === 'PRINT' && /side panel was closed/.test(e.message));
+    assert.deepEqual(dbg.tabs.removed, [7]);
+    assert.ok(dbg.calls.some((c) => c[0] === 'detach'));
+  } finally {
+    withoutDebugger();
+  }
+});
+
+// ---- M23: during a run only DocLink's own tabs are closed
+test('M23: only the tabs DocLink opened are closed (its print tab\'s popups, Chrome opening a file it saved) - never the user\'s own PDF, file, data: or downloads tabs', async () => {
+  const listeners = { onCreated: new Set(), onUpdated: new Set(), onActivated: new Set() };
+  const removed = [];
+  const tabs = {
+    query: async () => [{ id: 1, url: `${BASE}/epsn/home/showHome.do` }], update: async () => {}, get: async (id) => ({ id }), remove: async (id) => { removed.push(id); },
+    ...Object.fromEntries(Object.entries(listeners).map(([k, set]) => [k, { addListener: (f) => set.add(f), removeListener: (f) => set.delete(f) }])),
+  };
+  core.noteOwnTab(7); // a DocLink print tab
+  await core.createSaver({ accountLabel: 'HOSUR', tenderNo: 'G1' }).save('NIT_and_Supporting_Documents', 'viewNitPdf_1.pdf', PDF());
+  const stop = viewCommon.guardTabs({ tabs });
+  await sleepMs(0);
+  const create = (tab) => listeners.onCreated.forEach((f) => f(tab));
+  // the user's own
+  create({ id: 10, url: 'file:///C:/Users/tester/Documents/own.pdf' });
+  create({ id: 11, openerTabId: 1, url: `${BASE}/ireps/upload/att/Spec.pdf` });
+  create({ id: 12, url: 'chrome://downloads/' });
+  create({ id: 13, url: 'data:application/pdf;base64,JVBERi0=' });
+  create({ id: 14, url: 'blob:https://example.com/0f8f' });
+  // DocLink's: a popup of its print tab, Chrome showing the PDF it saved (and the "(1)" twin of a later run), a tab that popup opened
+  create({ id: 20, openerTabId: 7, url: `${BASE}/ireps/supply/pdfdocs/112026/1/viewNitPdf_1.pdf` });
+  create({ id: 21, url: 'file:///C:/Users/tester/Downloads/DocLink/HOSUR/Tender_G1/NIT_and_Supporting_Documents/viewNitPdf_1.pdf' });
+  create({ id: 22, url: 'file:///C:/Users/tester/Downloads/DocLink/HOSUR/Tender_G1/NIT_and_Supporting_Documents/viewNitPdf_1%20(1).pdf' });
+  create({ id: 23, openerTabId: 20, url: 'about:blank' });
+  await sleepMs(0);
+  stop();
+  assert.deepEqual(removed.sort((a, b) => a - b), [20, 21, 22, 23]);
+});
+
+// ---- L11: the name Chrome actually used
+test('L11: a file of an earlier run is kept; the new one is recorded under the name Chrome gave it (names and folders asked for are unchanged)', async () => {
+  mk({ tenders: [T({})] });
+  const first = (await run('29263265', { only: ['tenderPdf'] })).categories.tenderPdf.files[0];
+  const second = (await run('29263265', { only: ['tenderPdf'] })).categories.tenderPdf.files[0];
+  assert.deepEqual(savedNames(), Array(2).fill('DocLink/HOSUR/Tender_29263265/NIT_and_Supporting_Documents/viewNitPdf_5569207.pdf'), 'the same name and folder asked for, as before');
+  assert.deepEqual([first.fileName, first.relPath, first.requestedPath], ['viewNitPdf_5569207.pdf', 'NIT_and_Supporting_Documents/viewNitPdf_5569207.pdf', undefined]);
+  assert.deepEqual([second.fileName, second.relPath, second.requestedPath], ['viewNitPdf_5569207 (1).pdf', 'NIT_and_Supporting_Documents/viewNitPdf_5569207 (1).pdf', 'NIT_and_Supporting_Documents/viewNitPdf_5569207.pdf']);
+});
+
+// ---- L12: tests that can fail, storage, network retry
+test('L12: the NIT, corrigendum and letter jobs never request a tabulation, even when the tender row and Closed Tenders show both', async () => {
+  const today = dmy(NOW());
+  mk({
+    tenders: [futureT({ no: 'J1', nitId: '61', oid: '610', offer: true, attachments: att('j1'), corrigenda: [{ id: '7', cn: '1', date: `${today} 09:00` }] })],
+    closed: [closed('J1', { nitId: '61', oid: '610', closing: new Date(NOW() - 2 * D) })],
+    messages: [nitMsg('J1'), { date: today, subject: 'Issue of Corrigendum towards STORES/X RLY, Tender no: J1' }],
+    inbox: { MyNegotiation: [{ no: 'J1', oid: '610', letter: '71', date: new Date(NOW()) }], MyCounterOffer: [{ no: 'J1', oid: '610', letter: '73', date: new Date(NOW()) }], MyAdvanceAcceptanceLetter: [{ no: 'J1', oid: '610', letter: '72', date: new Date(NOW()) }] },
+    letterAsPdf: true,
+  });
+  await autoRun();
+  await jobs.downloadLettersByDate();
+  await jobs.downloadTodaysCorrigenda();
+  await jobs.downloadNewNits();
+  const names = savedNames().map((n) => n.replace('DocLink/HOSUR/Tender_J1/', ''));
+  for (const want of ['NIT_and_Supporting_Documents/viewNitPdf_61.pdf', 'NIT_and_Supporting_Documents/j1.pdf', 'My_Offer/My_Offer_J1.pdf', 'Corrigenda/Corrigendum_01_J1.pdf', 'Negotiation/Negotiation_J1_71.pdf', 'Counter_Offers/Counter_Offer_J1_73.pdf', 'Advance_Acceptance_LOA/LOA_J1.pdf']) {
+    assert.ok(names.includes(want), `the jobs ran: ${want} missing\n${names.join('\n')}`);
+  }
+  const tabulation = (l) => (l.path === '/epsn/tbo/commTboPdfAction.do' && !/^offer$/i.test(l.query.pdfType || l.body.pdfType || '')) || /-TAB-|tabulation/i.test(l.path) || l.body.status === 'MyBidsClosed' || l.body.listType === 'MyBidsClosed';
+  assert.deepEqual(server.log.filter(tabulation).map((l) => `${l.method} ${l.path}`), []);
+  assert.ok(!server.excludedHit);
+});
+test('L12: no password / cookie / token is stored - every tender file is checked, including the ones that write storage, and so is what the jobs store', async () => {
+  const fs = await import('node:fs');
+  const dir = new URL('../', import.meta.url);
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.js'));
+  assert.ok(['tender-ledger.js', 'tender-pending.js', 'tender-jobs.js', 'tender-auto.js', 'tender-ecm.js', 'tender-print.js'].every((f) => files.includes(f)), files.join(','));
+  const storageUsers = [];
+  for (const f of files) {
+    const src = fs.readFileSync(new URL(f, dir), 'utf8');
+    assert.ok(!/localStorage|sessionStorage|document\.cookie|chrome\.cookies/.test(src), `${f} reads cookies or web storage`);
+    if (/chrome\??\.storage|storage\.(?:get|set|remove)\(/.test(src)) storageUsers.push(f);
+  }
+  // the ledger is the only writer of extension storage; tender-ecm.js only reads the Save to choice
+  assert.deepEqual(storageUsers.sort(), ['tender-ecm.js', 'tender-ledger.js']);
+  assert.ok(!/\.set\(/.test(fs.readFileSync(new URL('tender-ecm.js', dir), 'utf8')));
+  // what the jobs store, from pages that carry a Struts token, a session id and a password field
+  const today = dmy(NOW());
+  mk({
+    tenders: [futureT({ no: 'K1', nitId: '81', oid: '810', offer: true, attachments: att('k1'), corrigenda: [{ id: '8', cn: '1', date: `${today} 09:00` }] })],
+    messages: [nitMsg('K1')], closed: [closed('K1', { nitId: '81', oid: '810', closing: new Date(2026, 9, 20) })],
+    inbox: { MyNegotiation: [{ no: 'K1', oid: '810', letter: '91', date: new Date(NOW()) }], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [{ no: 'K1', oid: '810', letter: '92', date: new Date(NOW()) }] },
+    letterAsPdf: true,
+  });
+  const orig = server.handle.bind(server);
+  const SECRET = '<input type="hidden" name="org.apache.struts.taglib.html.TOKEN" value="SECRETTOKEN0a1b2c3d"><input type="password" name="password" value="SECRETPASSWORD"><a href="/epsn/x.do;jsessionid=SECRETSESSION">x</a>';
+  server.handle = async (m, u, b) => {
+    const r = await orig(m, u, b);
+    if (!/html/.test(r.type)) return r;
+    return { ...r, bytes: enc8(new TextDecoder().decode(r.bytes).replace(/<\/form>/i, `${SECRET}</form>`).replace(/<\/body>/i, `${SECRET}</body>`)) };
+  };
+  await autoRun();
+  await auto.runLetterType({ status: 'MyNegotiation', from: TODAY(), to: TODAY() });
+  await auto.runLetterType({ status: 'MyAdvanceAcceptanceLetter', from: TODAY(), to: TODAY() });
+  await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  assert.ok(server.log.some((l) => l.body['org.apache.struts.taglib.html.TOKEN'] === 'SECRETTOKEN0a1b2c3d'), 'the token was on the pages (and sent back with the forms, as IREPS needs)');
+  const stored = JSON.stringify(store);
+  assert.ok(ledgerOf() && Object.keys(ledgerOf().manifests).length > 0, 'the jobs stored their records');
+  assert.doesNotMatch(stored, /SECRET|JSESSIONID|password|cookie|struts/i);
+});
+test('L12: a GET that cannot reach IREPS is tried again (1s, then 3s); a POST is not', async () => {
+  core.fetchSettings.netRetryMs = [5, 5];
+  mk({ tenders: [T({})], inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [{ no: '29263265', oid: '107200478', letter: '1461928', date: daysAgo(5) }] }, letterAsPdf: true });
+  const shim = globalThis.fetch;
+  const tries = {};
+  globalThis.fetch = (url, init = {}) => {
+    const p = new URL(String(url).replace('https://ext.invalid/', `${BASE}/`)).pathname;
+    tries[p] = (tries[p] || 0) + 1;
+    if (/viewNitPdf_|publishLOALetter/.test(p) && tries[p] === 1) return Promise.reject(new TypeError('Failed to fetch'));
+    return shim(url, init);
+  };
+  try {
+    const c = (await run('29263265', { only: ['tenderPdf', 'loa'] })).categories;
+    assert.equal(c.tenderPdf.status, 'DOWNLOADED', 'the GET was tried again');
+    assert.equal(tries['/ireps/supply/pdfdocs/112026/107200478/viewNitPdf_5569207.pdf'], 2);
+    assert.equal(c.loa.status, 'FAILED', 'the POST was not repeated');
+    assert.equal(tries['/epsn/supply/tds/publishLOALetter.do'], 1);
+    assert.match(c.loa.files[0].error, /could not reach/);
+  } finally {
+    globalThis.fetch = shim;
+    core.fetchSettings.netRetryMs = [1000, 3000];
+  }
 });

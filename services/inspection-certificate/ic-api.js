@@ -34,7 +34,7 @@
  * (test/mock/switch-target.mjs) applies here as well.
  */
 
-import { IREPS_CONFIG, IREPS_ERROR, IrepsError, requestIreps, parseIrepsDate } from "../ireps-api.js";
+import { IREPS_CONFIG, IREPS_ERROR, IrepsError, requestIreps, parseIrepsDate, rewrapTransportError } from "../ireps-api.js";
 import { IC_FORM_FIELDS, IC_CALL_TYPE, IC_STATUS, IC_STATUS_SELECTED_LABEL, ALL_INSPECTION_AGENCIES, ALL_STAGES } from "./ic-form.js";
 
 /** Shared configuration. Keep every Inspection Call List URL / constant here. */
@@ -58,14 +58,6 @@ export const IC_ERROR = Object.freeze({
   DOWNLOAD_FAILED: "IREPS_IC_DOWNLOAD_FAILED",
   INVALID_PDF: "IREPS_IC_INVALID_PDF"
 });
-
-/** Re-label a transport failure (IREPS_REQUEST_FAILED) with a step code. */
-function rewrapTransportError(error, code, message) {
-  if (error instanceof IrepsError && error.code === IREPS_ERROR.REQUEST_FAILED) {
-    return new IrepsError(code, message, { status: error.status, reason: error.reason, detail: error.detail, cause: error });
-  }
-  return error;
-}
 
 /**
  * POST /epsn/tpi/vendorInspectionCallList.do with callType=I&status=I, exactly
@@ -210,6 +202,21 @@ export function extractIcPageCount(html) {
 }
 
 /**
+ * The number of records IREPS says the search found: the page's hidden totalRecords field, else its
+ * "Total Records: N" line (both are on the real results page). null when the page carries neither.
+ * @param {string} html
+ * @returns {number|null}
+ */
+export function extractIcTotalRecords(html) {
+  const source = String(html || "");
+  const input = /<input\b[^>]*\bname\s*=\s*["']?totalRecords["']?[^>]*>/i.exec(source);
+  const value = input && /\bvalue\s*=\s*["']?(\d+)/i.exec(input[0]);
+  if (value) return Number(value[1]);
+  const text = /Total\s+Records\s*:\s*(\d+)/i.exec(source.replace(/<[^>]+>/g, " "));
+  return text ? Number(text[1]) : null;
+}
+
+/**
  * POST a built request to vendorInspectionCallList.do.
  * @param {{ body: string }} request
  * @param {{ fetch?: typeof fetch }} [deps]
@@ -220,15 +227,6 @@ export async function submitIcSearch(request, deps = {}) {
     return await requestIreps({ path: IC_CONFIG.endpoint, method: "POST", body: request.body }, deps);
   } catch (error) {
     throw rewrapTransportError(error, IC_ERROR.SEARCH_FAILED, "IC search request to IREPS failed");
-  }
-}
-
-/** Is this absolute URL on the configured IREPS origin? (mirrors search-po-api.js) */
-export function isIrepsOriginUrl(url, baseUrl = IREPS_CONFIG.baseUrl) {
-  try {
-    return new URL(url).origin === new URL(baseUrl).origin;
-  } catch {
-    return false;
   }
 }
 

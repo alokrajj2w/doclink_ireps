@@ -227,6 +227,47 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
     eq(found.certificates.length, 0);
   });
 
+  await test("searchInspectionCertificates (H3): a results page DocLink does not recognise is an error, never '0 ICs'", async () => {
+    const po = "27253922100240";
+    const parse = (html, o) => parseIcSearchResults(html, po, o);
+    // IREPS answered with the form but no result table and no notice (a layout change): not "nothing found"
+    const noTable = `<html><body><form name="inspectionCallForm" action="/epsn/tpi/vendorInspectionCallList.do"><input type="hidden" name="org.apache.struts.taglib.html.TOKEN" value="T2"></form></body></html>`;
+    const a = fakeIc({ listPage, onSearch: (b, t, respond) => respond(noTable) });
+    await rejects(searchInspectionCertificates(po, { fetch: a.fetchImpl, parseHtml: parse, noTokenRetry: true }), IC_ERROR.PARSE_FAILED);
+    // IREPS says it found 4, but none of the rows could be read (columns changed): an error, not 0
+    const unreadable = resultsPage.replace(/<!-- IC rows from here -->[\s\S]*<!-- IC rows up to here -->/, "<!-- IC rows from here --><tr><td>?</td><td>?</td><td>?</td><td>?</td><td>?</td><td>?</td><td>?</td></tr><!-- IC rows up to here -->");
+    const b = fakeIc({ listPage, onSearch: (x, t, respond) => respond(unreadable) });
+    await rejects(searchInspectionCertificates(po, { fetch: b.fetchImpl, parseHtml: parse }), IC_ERROR.PARSE_FAILED);
+    // what IREPS really sends for nothing found still counts as nothing found: Total Records: 0, or a "no records" notice
+    const zero = noTable.replace("</form>", '<input type="hidden" name="totalRecords" value="0" id="totalRecords"></form><b>Total Records: 0</b>');
+    const c = fakeIc({ listPage, onSearch: (x, t, respond) => respond(zero) });
+    eq((await searchInspectionCertificates(po, { fetch: c.fetchImpl, parseHtml: parse })).count, 0);
+    const notice = noTable.replace("</body>", "<p>No Record Found</p></body>");
+    const d = fakeIc({ listPage, onSearch: (x, t, respond) => respond(notice) });
+    eq((await searchInspectionCertificates(po, { fetch: d.fetchImpl, parseHtml: parse })).count, 0);
+  });
+
+  await test("searchInspectionCertificates (M10): one PO's ICs on several result pages are all found, page by page", async () => {
+    const ids = ["6038184070", "3778184071", "9012184072", "4523184073"];
+    const total = (html) => html.replace('value="4" id="totalRecords"', 'value="8" id="totalRecords"').replace("Total Records: 4", "Total Records: 8");
+    const page1 = total(resultsPage).replace("</body>", `<a href="#" onclick="return navigate('2')">2</a></body>`);
+    let page2 = total(resultsPage);
+    for (const id of ids) page2 = page2.split(id).join(id.slice(0, -2) + "9" + id.slice(-1));
+    const pagesAsked = [];
+    const { fetchImpl } = fakeIc({
+      listPage,
+      onSearch: (b, t, respond, n, params) => {
+        pagesAsked.push(params.get("pageNo"));
+        return respond(params.get("pageNo") === "2" ? page2 : page1);
+      }
+    });
+    const found = await searchInspectionCertificates("27253922100240", { fetch: fetchImpl, parseHtml });
+    eq(pagesAsked.join(","), "1,2", "page 2 is read after page 1");
+    eq(found.count, 8, "every IC of the PO, not only page 1's");
+    eq(new Set(found.certificates.map((c) => c.callId)).size, 8);
+    eq(found.certificates.map((c) => c.index).join(","), "1,2,3,4,5,6,7,8", "numbered across pages");
+  });
+
   await test("searchInspectionCertificates: login page, HTTP errors, missing token map to IC codes", async () => {
     await rejects(searchInspectionCertificates("27253922100240", { fetch: async () => new Response(loginPage, { status: 200 }), parseHtml }), IC_ERROR.SESSION_EXPIRED);
     await rejects(searchInspectionCertificates("27253922100240", { fetch: async () => new Response("err", { status: 500 }), parseHtml }), IC_ERROR.LIST_PAGE_FAILED);
@@ -237,6 +278,27 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
     const noToken = listPage.replace(/<input type="hidden" name="org\.apache\.struts\.taglib\.html\.TOKEN"[^>]*>/, "");
     const noTokenIreps = fakeIc({ listPage: noToken, onSearch: (b, t, respond) => respond(resultsPage) });
     await rejects(searchInspectionCertificates("27253922100240", { fetch: noTokenIreps.fetchImpl, parseHtml }), IC_ERROR.TOKEN_NOT_FOUND);
+  });
+
+  await test("searchInspectionCertificates: a consumed Struts token (IREPS 'Invalid Token' page) is retried once with a fresh page and token", async () => {
+    const invalidToken = "<html><head><title>Error</title></head><body><h2>Invalid Token</h2><p>The form was already submitted.</p></body></html>";
+    let searches = 0;
+    const { fetchImpl, calls } = fakeIc({ listPage, onSearch: (b, t, respond) => respond(++searches === 1 ? invalidToken : resultsPage) });
+    const found = await searchInspectionCertificates("27253922100240", { fetch: fetchImpl, parseHtml });
+    eq(found.count, 4, "the retry finds the ICs");
+    eq(calls.length, 4, "list page, search, fresh list page, search");
+    eq(calls[1].body, EXPECTED_IC_BODY("TOKEN-1"));
+    eq(calls[3].body, EXPECTED_IC_BODY("TOKEN-2"), "the retry uses the fresh token, never the consumed one");
+  });
+
+  await test("searchInspectionCertificates: the token retry happens once only, and never after a session expiry", async () => {
+    const invalidToken = "<html><body><h2>Invalid Token</h2></body></html>";
+    const always = fakeIc({ listPage, onSearch: (b, t, respond) => respond(invalidToken) });
+    await rejects(searchInspectionCertificates("27253922100240", { fetch: always.fetchImpl, parseHtml }), IC_ERROR.RESULTS_INVALID);
+    eq(always.calls.length, 4, "one retry, then the failure is reported");
+    const expired = fakeIc({ listPage, onSearch: (b, t, respond) => respond(loginPage) });
+    await rejects(searchInspectionCertificates("27253922100240", { fetch: expired.fetchImpl, parseHtml }), IC_ERROR.SESSION_EXPIRED);
+    eq(expired.calls.length, 2, "an expired session is not retried");
   });
 
   await test("IC file names: IC_<PO>_<POSR>_<CALLID>.pdf grouped under Downloads/DocLink/IREPS/IC/<PO>/", () => {
@@ -316,7 +378,11 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
   });
 
   await test("downloadInspectionCertificates: a PO with zero ICs succeeds with an empty download batch", async () => {
-    const emptyResults = resultsPage.replace(/<!-- IC rows from here -->[\s\S]*<!-- IC rows up to here -->/, "");
+    // as IREPS answers it: no rows, and the page says Total Records: 0
+    const emptyResults = resultsPage
+      .replace(/<!-- IC rows from here -->[\s\S]*<!-- IC rows up to here -->/, "")
+      .replace('value="4" id="totalRecords"', 'value="0" id="totalRecords"')
+      .replace("Total Records: 4", "Total Records: 0");
     const { fetchImpl } = fakeIc({ listPage, onSearch: (b, t, respond) => respond(emptyResults) });
     const result = await downloadInspectionCertificates("00000000000000", { fetch: fetchImpl, parseHtml: (html, o) => parseIcSearchResults(html, "00000000000000", o) });
     eq(result.success, true);

@@ -32,7 +32,8 @@
  */
 
 import { IrepsError } from "../ireps-api.js";
-import { isIrepsLoginPage, SESSION_EXPIRED_MARKERS } from "../session-service.js";
+import { withIrepsFormLock } from "../ireps-form-lock.js";
+import { isIrepsLoginPage, isNoRecordsPage, SESSION_EXPIRED_MARKERS } from "../session-service.js";
 import { logger } from "../../utils/logger.js";
 import {
   SEARCH_PO_CONFIG,
@@ -143,7 +144,12 @@ function assertPage(page, notRecognisedCode) {
  * @param {SearchIrepsDocumentsDeps} deps
  * @returns {Promise<SearchIrepsDocumentsResult>}
  */
-export async function searchIrepsDocuments(options = {}, deps = {}) {
+export function searchIrepsDocuments(options = {}, deps = {}) {
+  // the form load, the search and the result pages share one Struts token: no other IREPS search in between (M2)
+  return withIrepsFormLock(() => searchIrepsDocumentsLocked(options, deps));
+}
+
+async function searchIrepsDocumentsLocked(options, deps) {
   if (typeof deps.parseHtml !== "function") throw new Error("searchIrepsDocuments requires deps.parseHtml");
   const { criteria, ...searchOptions } = options;
   const documentType = documentTypeFor(criteria);
@@ -221,6 +227,7 @@ export async function searchIrepsDocuments(options = {}, deps = {}) {
   progress(SEARCH_PO_FLOW_STAGES.PARSING);
   const filter = describeSearchPoFilter(request, form.railways);
   const firstPage = await parsePage(results, deps, criteria, 1, CODES);
+  const firstPageSaysEmpty = isNoRecordsPage(results.html);
   results = null;
 
   const records = [...firstPage.records];
@@ -242,13 +249,20 @@ export async function searchIrepsDocuments(options = {}, deps = {}) {
     if (message) {
       throw new IrepsError(CODES.RESULTS_INVALID, `IREPS reported: ${message}`, { detail: `IREPS reported: ${message.slice(0, 160)}` });
     }
+    // no result table and no IREPS message: the page was not recognised (a layout change), which is
+    // not the same as "nothing found" - say so instead of reporting 0 documents
+    if (!firstPageSaysEmpty) {
+      throw new IrepsError(CODES.RESULTS_INVALID, `${documentType.shortLabel} results page not recognised: no result table and no IREPS message`, {
+        detail: "the results page had no result table and no IREPS message"
+      });
+    }
   } else if (firstPage.rowCount > 0 && firstPage.recordCount === 0) {
     throw new IrepsError(CODES.PARSE_FAILED, `${firstPage.rowCount} ${documentType.shortLabel} rows found but none could be read`);
   }
 
   // Step 5: further server-side pages. Every page is fetched or the whole
   // search fails - a partial list is never returned silently.
-  if (prefetched.size > 0) {
+  const readFurtherPages = async () => {
     for (let pageNo = 2; pageNo <= pageCount; pageNo++) {
       progress(SEARCH_PO_FLOW_STAGES.PAGING, `${pageNo}/${pageCount}`);
       const response = await (prefetched.get(pageNo) || fetchPage(pageNo));
@@ -269,7 +283,25 @@ export async function searchIrepsDocuments(options = {}, deps = {}) {
       warnings.push(...parsed.warnings);
       pagesFetched++;
     }
+  };
+  if (prefetched.size > 0) {
+    try {
+      await readFurtherPages();
+    } finally {
+      // a failed page ends the search: page requests still waiting to start are not sent
+      limit.cancel();
+    }
     if (pagination.maxPage > pageCount) warnings.push(`Only the first ${pageCount} of ${pagination.maxPage} result pages were fetched (safety limit).`);
+  }
+  // IREPS's own count ("Total N result(s)", or count= in the page links): fewer records read than it
+  // reports is said out loud, never returned as a complete list without a word
+  let incomplete = null;
+  const reported = pagination.reportedTotal ?? pagination.totalCount;
+  if (reported !== null && reported !== undefined && records.length < reported && pagination.maxPage <= pageCount) {
+    const missing = `IREPS reported ${reported} ${documentType.shortLabel} result(s) but ${records.length} were read`;
+    warnings.push(`${missing}; some may be missing from this download.`);
+    incomplete = missing;
+    logger.warn(`[DocLink][${criteria}] ${missing}`, { pages: pagesFetched, pageCount });
   }
   mark("done");
   logger.info(`[DocLink][${criteria}] timings (ms): ${JSON.stringify({
@@ -303,17 +335,21 @@ export async function searchIrepsDocuments(options = {}, deps = {}) {
       pagesFetched,
       pageCount,
       totalCount: pagination.totalCount
-    }
+    },
+    // set when fewer records were read than IREPS reported (the same text is in `warnings`)
+    incomplete
   };
 }
 
 /**
- * Run at most `max` of the queued tasks at a time.
+ * Run at most `max` of the queued tasks at a time. `limit.cancel()` drops the tasks that have not
+ * started (they reject; the ones running finish on their own). Exported for the tests.
  * @param {number} max
- * @returns {<T>(task: () => Promise<T>) => Promise<T>}
+ * @returns {(<T>(task: () => Promise<T>) => Promise<T>) & { cancel: () => void }}
  */
-function createLimiter(max) {
+export function createLimiter(max) {
   let active = 0;
+  let cancelled = false;
   const queue = [];
   const next = () => {
     if (active >= max || queue.length === 0) return;
@@ -324,11 +360,17 @@ function createLimiter(max) {
       next();
     });
   };
-  return (task) =>
+  const limit = (task) =>
     new Promise((resolve, reject) => {
+      if (cancelled) return reject(new Error("cancelled: the search already ended"));
       queue.push({ task, resolve, reject });
       next();
     });
+  limit.cancel = () => {
+    cancelled = true;
+    for (const waiting of queue.splice(0)) waiting.reject(new Error("cancelled: the search already ended"));
+  };
+  return limit;
 }
 
 async function parsePage(response, deps, criteria, startIndex, CODES) {

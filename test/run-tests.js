@@ -31,6 +31,10 @@ import { sanitiseFragment, escapeHtml } from "../utils/sanitizer.js";
 import { buildBillStatusFilename, buildBillStatusExportFilename, buildBillStatusExportDownloadPath } from "../utils/filename.js";
 import { redact } from "../utils/logger.js";
 import { describeError } from "../utils/messages.js";
+import { readConfigFiles } from "../utils/config.js";
+import { downloadBytes, DownloadError } from "../services/download-service.js";
+import { applyDownloadLogConfig, isDownloadLogEnabled } from "../services/download-log.js";
+import { applyEcmConfig, ECM_CONFIG } from "../services/ecm-config.js";
 import { runCrnTests } from "./crn-tests.js";
 import { runRnoteTests } from "./rnote-tests.js";
 import { runMaTests } from "./ma-tests.js";
@@ -41,18 +45,35 @@ import { runReconTests } from "./recon-tests.js";
 import { runEcmTests } from "./ecm-tests.js";
 import { runEcmDirectTests } from "./ecm-direct-tests.js";
 import { runDownloadLogTests } from "./download-log-tests.js";
+import { runExportSaveTests } from "./export-save-tests.js";
 import { runReconAuthTests } from "./recon-auth-tests.js";
 import { runBillUploadTests } from "./bill-upload-tests.js";
+import { runSanitizerTests } from "./sanitizer-tests.js";
 import { compileMatchPatterns, compileMatchPattern, classifyTabUrl, TAB_SCOPE } from "../utils/url-scope.js";
 
 const results = [];
 const list = document.getElementById("results");
 
+/** A test that has not settled after this long fails, so one hanging test can't stop the summary. */
+const TEST_TIMEOUT_MS = 10000;
+
+/**
+ * run-tests.html?only=ecm,ecm-direct runs only those suites ("core" = the tests in this file;
+ * the others are named where they are called below). npm test -- browser --only=ecm,ecm-direct
+ */
+const ONLY = new Set((new URLSearchParams(location.search).get("only") || "").split(",").map((s) => s.trim()).filter(Boolean));
+let currentSuite = "core";
+
 function test(name, fn) {
-  return Promise.resolve()
-    .then(fn)
+  if (ONLY.size && !ONLY.has(currentSuite)) return Promise.resolve();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${TEST_TIMEOUT_MS} ms`)), TEST_TIMEOUT_MS);
+  });
+  return Promise.race([Promise.resolve().then(fn), timeout])
     .then(() => results.push({ name, ok: true }))
-    .catch((error) => results.push({ name, ok: false, error: error && error.stack ? error.stack : String(error) }));
+    .catch((error) => results.push({ name, ok: false, error: error && error.stack ? error.stack : String(error) }))
+    .finally(() => clearTimeout(timer));
 }
 
 function assert(cond, message) {
@@ -691,12 +712,20 @@ await test("error catalogue maps IREPS codes to user messages", () => {
 
 /* ---------------------------------------------------------- config.json */
 
-await test("loadIrepsConfig: target mock/real, explicit baseUrl override, custom mock port, safe fallback on error, cached until forced", async () => {
+await test("loadIrepsConfig: target mock/real, explicit baseUrl override, custom mock port, config.local.json override, safe fallback on error, cached until forced", async () => {
   const realFetch = globalThis.fetch;
   const realChrome = globalThis.chrome;
   let served = null;
+  let servedLocal = null; // config.local.json; null = the file is absent
   globalThis.chrome = { runtime: { getURL: (p) => `file://fake/${p}` } };
-  globalThis.fetch = async () => ({ json: async () => served });
+  const stub = async (url) => {
+    if (String(url).endsWith("config.local.json")) {
+      if (!servedLocal) throw new TypeError("Failed to fetch");
+      return { ok: true, json: async () => servedLocal };
+    }
+    return { ok: true, json: async () => served };
+  };
+  globalThis.fetch = stub;
   try {
     served = { target: "mock" };
     await loadIrepsConfig({ force: true });
@@ -720,9 +749,18 @@ await test("loadIrepsConfig: target mock/real, explicit baseUrl override, custom
     eq(IREPS_CONFIG.baseUrl, "http://localhost:7000");
     eq(IREPS_CONFIG.portals.mock, "http://localhost:7000", "portals follow config.json, not a built-in list");
 
+    served = { target: "real" };
+    servedLocal = { target: "mock" };
+    await loadIrepsConfig({ force: true });
+    eq(IREPS_CONFIG.target, "mock", "config.local.json overrides config.json's target");
+    eq(IREPS_CONFIG.baseUrl, "http://localhost:8765");
+    servedLocal = null;
+
+    served = { target: "mock", mockBaseUrl: "http://localhost:7000" };
+    await loadIrepsConfig({ force: true });
     let fetchCalls = 0;
-    globalThis.fetch = async () => {
-      fetchCalls++;
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith("config.json")) fetchCalls++;
       throw new Error("network down");
     };
     await loadIrepsConfig({ force: true });
@@ -733,12 +771,101 @@ await test("loadIrepsConfig: target mock/real, explicit baseUrl override, custom
     eq(fetchCalls, 1, "without force, an already-loaded config is not re-fetched");
   } finally {
     served = { target: "mock" };
-    globalThis.fetch = async () => ({ json: async () => served });
+    servedLocal = null;
+    globalThis.fetch = stub;
     await loadIrepsConfig({ force: true }); // restore the mock default (via the stub) before undoing it, so every other test sees the real default
     globalThis.fetch = realFetch;
     globalThis.chrome = realChrome;
     eq(IREPS_CONFIG.baseUrl, "http://localhost:8765");
   }
+});
+
+await test("config (L8): a broken config.local.json is reported and ignored, not silently missing; the files are read once until forced", async () => {
+  const realFetch = globalThis.fetch;
+  const realChrome = globalThis.chrome;
+  const reads = { base: 0, local: 0 };
+  let local = "broken";
+  globalThis.chrome = { runtime: { getURL: (p) => `file://fake/${p}` } };
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("config.local.json")) {
+      reads.local++;
+      if (local === "missing") throw new TypeError("Failed to fetch");
+      if (local === "broken") return new Response('{ "ecm": { "clientSecret": "x" ', { status: 200 });
+      return new Response(JSON.stringify(local), { status: 200 });
+    }
+    reads.base++;
+    return new Response(JSON.stringify({ target: "real", downloadLog: { enabled: true } }), { status: 200 });
+  };
+  try {
+    const broken = await readConfigFiles({ force: true });
+    eq(broken.local, null, "a broken local file is not applied");
+    eq(broken.config.target, "real", "config.json still applies");
+    await readConfigFiles();
+    await readConfigFiles();
+    eq(reads.base, 1, "read once for every loader of the page");
+    local = { target: "mock" };
+    const again = await readConfigFiles({ force: true });
+    eq(reads.base, 2, "force reads again");
+    eq(again.config.target, "mock", "config.local.json over config.json");
+    local = "missing";
+    eq((await readConfigFiles({ force: true })).local, null);
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.chrome = realChrome;
+    await readConfigFiles({ force: true }); // the test page has no config.json: nothing is kept for later tests
+  }
+});
+
+await test("config (L8): \"downloadLog\": false turns the log off like { enabled: false }; anything else leaves it on", () => {
+  try {
+    applyDownloadLogConfig({ downloadLog: false });
+    eq(isDownloadLogEnabled(), false);
+    applyDownloadLogConfig({ downloadLog: { enabled: "false" } });
+    eq(isDownloadLogEnabled(), false);
+    applyDownloadLogConfig({ downloadLog: { enabled: false } });
+    eq(isDownloadLogEnabled(), false);
+    applyDownloadLogConfig({ downloadLog: { enabled: true } });
+    eq(isDownloadLogEnabled(), true);
+    applyDownloadLogConfig({});
+    eq(isDownloadLogEnabled(), true, "on unless turned off (as shipped)");
+    applyEcmConfig({ ecm: { env: "prd" } });
+    eq(ECM_CONFIG.env, "TEST", "an unknown ecm.env still means TEST (now with a warning in the log)");
+    applyEcmConfig({ ecm: { env: "prod" } });
+    eq(ECM_CONFIG.env, "PROD");
+  } finally {
+    // as the page starts: the log on (no config.json here), the ECM settings at their defaults
+    applyDownloadLogConfig({});
+    applyEcmConfig({});
+  }
+});
+
+await test("download (L4): a download Chrome never confirms is a failure, never 'saved'; a confirmed one gives Chrome's file name", async () => {
+  const realChrome = globalThis.chrome;
+  const item = { id: 41, state: "in_progress", filename: "C:/Users/x/Downloads/DocLink/a (1).xlsx" };
+  globalThis.chrome = {
+    runtime: {},
+    downloads: { download: async () => 41, search: async () => [{ ...item }], onChanged: { addListener: () => {}, removeListener: () => {} } }
+  };
+  try {
+    let thrown = null;
+    try {
+      await downloadBytes(new Uint8Array([1, 2]), { path: "DocLink/a.xlsx", confirm: { warnAfterMs: 10, giveUpAfterMs: 50 } });
+    } catch (error) {
+      thrown = error;
+    }
+    assert(thrown instanceof DownloadError, `an unconfirmed download fails (got ${thrown})`);
+    item.state = "complete";
+    const done = await downloadBytes(new Uint8Array([1, 2]), { path: "DocLink/a.xlsx", confirm: { warnAfterMs: 10, giveUpAfterMs: 5000 } });
+    eq(done.filename, "a (1).xlsx", "the name Chrome actually used");
+    eq(done.downloadId, 41);
+  } finally {
+    globalThis.chrome = realChrome;
+  }
+});
+
+await test("messages (L3): $& and $1 in a detail are shown as written, not expanded by String.replace", () => {
+  const d = describeError("RECON_SIGNIN_UNAVAILABLE", { detail: "a $& b $1 c $$" });
+  assert(d.message.includes("a $& b $1 c $$"), d.message);
 });
 
 /* ------------------------------------------------------------- utilities */
@@ -760,6 +887,36 @@ await test("logger redacts cookies, session ids and Struts tokens", () => {
   eq(obj.cookie, "[REDACTED]");
   eq(obj.nested.token, "[REDACTED]");
   eq(obj.nested.size, 5);
+  const flags = redact({ sessionExpired: true, tokenFound: false, sessionId: "abc", token: 123456 });
+  eq(flags.sessionExpired, true, "a boolean flag under a sensitive-looking key stays readable");
+  eq(flags.tokenFound, false);
+  eq(flags.sessionId, "[REDACTED]");
+  eq(flags.token, "[REDACTED]", "numbers are still redacted (a security key can be numeric)");
+});
+
+await test("logger (M5): ECM secrets, JSON tokens, API keys and the Struts token field are redacted; document keys stay readable", () => {
+  const cases = [
+    ["client_id=doclink&client_secret=S3CR3T&grant_type=client_credentials", "S3CR3T"],
+    ['{"access_token":"eyJhbGc.x.y","expires_in":300}', "eyJhbGc"],
+    ['{"token": "abc123", "ok": true}', "abc123"],
+    ['{"clientSecret":"CS-1"}', "CS-1"],
+    ["x-api-key: K123", "K123"],
+    ["?apikey=ZZ9&x=1", "ZZ9"],
+    ['<input type="hidden" name="org.apache.struts.taglib.html.TOKEN" value="deadbeef">', "deadbeef"],
+    ["<input value='cafe42' type=hidden name=org.apache.struts.taglib.html.TOKEN>", "cafe42"],
+    ["refresh_token=RT1", "RT1"],
+    ["Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"]
+  ];
+  for (const [text, secret] of cases) assert(!redact(text).includes(secret), `${text} -> ${redact(text)}`);
+  eq(redact('{"expires_in":300}'), '{"expires_in":300}', "harmless JSON untouched");
+  eq(redact("the ECM secret is missing"), "the ECM secret is missing", "words in a sentence are not values");
+  const obj = redact({ downloadKey: "po:27253922100240", doc_key: "ic:1|2|3", poKey: "6581067", keys: ["po:1"], clientSecret: "x", accessToken: "y", "x-api-key": "z", sessionId: "s", key: "k", code: "IREPS_SESSION_EXPIRED" });
+  eq(obj.downloadKey, "po:27253922100240", "a document key is not a secret");
+  eq(obj.doc_key, "ic:1|2|3");
+  eq(obj.poKey, "6581067");
+  eq(obj.keys[0], "po:1");
+  eq(obj.code, "IREPS_SESSION_EXPIRED", "an error code stays readable");
+  for (const k of ["clientSecret", "accessToken", "x-api-key", "sessionId", "key"]) eq(obj[k], "[REDACTED]", k);
 });
 
 await test("filename format", () => {
@@ -916,18 +1073,34 @@ await test("PDF generation: long recovery details wrap and cards split across pa
 
 /* ------------------------------------------------------------------- CRN */
 
+currentSuite = "crn";
 await runCrnTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
+currentSuite = "rnote";
 await runRnoteTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
+currentSuite = "ma";
 await runMaTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
+currentSuite = "po";
 await runPoTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
+currentSuite = "ic";
 await runIcTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
+currentSuite = "recon";
 await runReconTests({ test, assert, eq });
+currentSuite = "ecm";
 await runEcmTests({ test, assert, eq });
+currentSuite = "ecm-direct";
 await runEcmDirectTests({ test, assert, eq });
+currentSuite = "download-log";
 await runDownloadLogTests({ test, assert, eq });
+currentSuite = "export-save";
+await runExportSaveTests({ test, assert, eq });
+currentSuite = "recon-auth";
 await runReconAuthTests({ test, assert, eq });
+currentSuite = "batch";
 await runBatchTests({ test, assert, eq, rejects, fixture, FAKE_TOKEN });
+currentSuite = "bill-upload";
 await runBillUploadTests({ test, assert, eq, rejects, fixture });
+currentSuite = "sanitizer";
+await runSanitizerTests({ test, assert, eq });
 
 /* ---------------------------------------------------------------- report */
 

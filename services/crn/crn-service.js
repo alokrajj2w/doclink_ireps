@@ -11,12 +11,11 @@
  */
 
 import { SEARCH_PO_CRITERIA, errorCodesFor } from "../search-po/search-po-api.js";
-import { searchIrepsDocuments, validateSearchPoSession, SEARCH_PO_FLOW_STAGES } from "../search-po/search-po-service.js";
+import { searchIrepsDocuments, validateSearchPoSession } from "../search-po/search-po-service.js";
 import { parseCrnSearchResults } from "./crn-parser.js";
 
 /** Controlled error codes for the CRN flow (mapped to UI text in utils/messages.js). */
 export const CRN_ERROR = errorCodesFor(SEARCH_PO_CRITERIA.CRN);
-export const CRN_FLOW_STAGES = SEARCH_PO_FLOW_STAGES;
 export const validateCrnSession = validateSearchPoSession;
 
 /**

@@ -38,6 +38,7 @@ import {
 import { validateIrepsSession } from "./session-service.js";
 import { extractBillStatusForm, publicFormInfo } from "./ireps-form.js";
 import { logger } from "../utils/logger.js";
+import { withIrepsFormLock } from "./ireps-form-lock.js";
 
 /**
  * @typedef {Object} FetchBillStatusDeps
@@ -68,7 +69,12 @@ import { logger } from "../utils/logger.js";
  * @param {FetchBillStatusDeps} deps
  * @returns {Promise<BillStatusFetchResult>}
  */
-export async function fetchBillStatus(options = {}, deps = {}) {
+export function fetchBillStatus(options = {}, deps = {}) {
+  // the form load and the search share one Struts token: no other IREPS search in between (M2)
+  return withIrepsFormLock(() => fetchBillStatusLocked(options, deps));
+}
+
+async function fetchBillStatusLocked(options, deps) {
   if (typeof deps.parseHtml !== "function") throw new Error("fetchBillStatus requires deps.parseHtml");
   const progress = typeof deps.onProgress === "function" ? deps.onProgress : () => {};
   const requestDeps = { fetch: deps.fetch };

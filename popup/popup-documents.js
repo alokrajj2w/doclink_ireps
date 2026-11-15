@@ -24,11 +24,13 @@
  * locked while it is picked.
  */
 
-import { MESSAGE_TYPES, DOCUMENT_STAGES, documentStageLabel, describeError } from "../utils/messages.js";
+import { MESSAGE_TYPES, DOCUMENT_STAGES, documentStageLabel, describeError, asDescribedError } from "../utils/messages.js";
 import { EXPORT_FORMATS } from "../services/search-po/search-po-export.js";
 import { SEARCH_PO_DOCUMENT_TYPES, SEARCH_PO_CRITERIA } from "../services/search-po/search-po-api.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
 import { describeSkip } from "../services/download-log.js";
+import { toIrepsDate } from "../utils/dates.js";
+import { fillSelect } from "./popup-common.js";
 
 const ALL_RAILWAYS = "-1";
 /** The document types that have a card here (PO and MA have their own views). */
@@ -51,12 +53,6 @@ const cards = new Map();
 /** Railway list from the IREPS PO Search page, shared by both cards. */
 let railways = null;
 let railwaysLoading = null;
-
-/** "2026-08-01" (input[type=date]) -> "01/08/2026" (IREPS). */
-function toIrepsDate(isoDate) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate || "");
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
-}
 
 function formatLabel(value) {
   return (EXPORT_FORMATS.find((f) => f.value === value) || EXPORT_FORMATS[0]).label;
@@ -175,17 +171,7 @@ class DocumentCard {
 
   /** Fill the railway list from the IREPS PO Search form (values come from the page, never hard-coded). */
   setRailways(list) {
-    const select = this.el.rly;
-    const current = select.value;
-    select.replaceChildren();
-    for (const r of list) {
-      const option = document.createElement("option");
-      option.value = r.value;
-      option.textContent = r.label;
-      select.append(option);
-    }
-    select.value = list.some((r) => r.value === current) ? current : ALL_RAILWAYS;
-    this.updateSummary();
+    if (fillSelect(this.el.rly, list, ALL_RAILWAYS)) this.updateSummary();
   }
 
   setBusy(busy, text) {
@@ -254,7 +240,7 @@ class DocumentCard {
   }
 
   renderError(error) {
-    const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN");
+    const described = asDescribedError(error);
     const el = this.el;
     el.progress.hidden = true;
     this.setBusy(false);

@@ -5,6 +5,7 @@
 
 import { TenderError, SESSION_MSG, log, getBaseUrl, irepsFetch, isLoginResponse, parseHtml } from './tender-core.js';
 import { HOME_PATH, accountFromHomeDocument } from '../utils/ireps-account.js';
+import { ensureDownloadSignIn } from './tender-ecm.js';
 
 // The parsing is shared with the service worker (MA / PO / IC uploads to the ECM need the unit too).
 export { HOME_PATH, ACCOUNT_UNITS, parseWelcomeText, secondaryAccountIds } from '../utils/ireps-account.js';
@@ -49,4 +50,21 @@ export async function assertSameAccount(start, { base } = {}) {
     throw new TenderError('ACCOUNT_CHANGED', 'The active IREPS account changed during the download. Please confirm your account and retry.');
   }
   return now;
+}
+
+/**
+ * The start of every tender / correspondence run: the Recon sign-in (every download is logged
+ * for the signed-in user), the IREPS origin, and a live, verified IREPS account. An expired
+ * session or an account that cannot be verified stops the run before anything is fetched.
+ * @returns {Promise<{ base: string, account: object, folderLabel: string }>}
+ */
+export async function startTenderJob({ onProgress = () => {}, onAccount = () => {} } = {}) {
+  await ensureDownloadSignIn();
+  const base = await getBaseUrl();
+  onProgress('Verifying IREPS account...');
+  const account = await getActiveIrepsAccountContext({ base });
+  onAccount(account);
+  if (!account.authenticated) throw new TenderError('SESSION_EXPIRED', SESSION_MSG);
+  if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
+  return { base, account, folderLabel: accountFolderLabel(account) };
 }

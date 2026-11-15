@@ -10,14 +10,14 @@
  * popup never re-asks for it. Today the PO number is typed manually
  * (getManualPoNumber() below); later it can come from a configured source
  * without any other change here, since the service worker only ever
- * receives a bare PO number string (services/po-ic-service.js).
+ * receives a bare PO number string.
  *
  * Each download runs in the service worker (continues if the popup closes)
  * and is a thin view over PO_DOWNLOAD / IC_DOWNLOAD / GET_PO_STATE /
  * GET_IC_STATE, exactly like the CRN/R-NOTE and MA views.
  */
 
-import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
+import { MESSAGE_TYPES, describeError, asDescribedError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
 import { describeSkip } from "../services/download-log.js";
 
@@ -120,7 +120,7 @@ function renderPoComplete(result) {
 }
 
 function renderPoError(error) {
-  const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN", { detail: error && error.detail, status: error && error.status });
+  const described = asDescribedError(error);
   resetPoResults();
   setPoBusy(false);
   ctx.setConnectionForError(described);
@@ -221,7 +221,7 @@ function renderIcComplete(message, count, downloads) {
 }
 
 function renderIcError(error) {
-  const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN", { detail: error && error.detail, status: error && error.status });
+  const described = asDescribedError(error);
   resetIcResults();
   setIcBusy(false);
   ctx.setConnectionForError(described);

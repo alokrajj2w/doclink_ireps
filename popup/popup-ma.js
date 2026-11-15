@@ -14,6 +14,8 @@
 import { MESSAGE_TYPES, MA_STAGES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
 import { describeSkip, skipChipText } from "../services/download-log.js";
+import { toIrepsDate, localIsoDate } from "../utils/dates.js";
+import { fillSelect } from "./popup-common.js";
 
 const $ = (id) => document.getElementById(id);
 const ALL_RAILWAYS = "-1";
@@ -73,17 +75,6 @@ function bindElements() {
 /* Options                                                                    */
 /* -------------------------------------------------------------------------- */
 
-/** "2026-09-21" (input[type=date]) -> "21/09/2026" (IREPS). */
-function toIrepsDate(isoDate) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate || "");
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
-}
-
-function todayIso() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
 function dateMode() {
   const checked = el.dateModes.find((r) => r.checked);
   return checked ? checked.value : "date";
@@ -115,17 +106,7 @@ function syncDateRows() {
 }
 
 function populateRailways(railways) {
-  if (!Array.isArray(railways) || railways.length === 0) return;
-  const current = el.rly.value;
-  el.rly.replaceChildren();
-  for (const r of railways) {
-    const option = document.createElement("option");
-    option.value = r.value;
-    option.textContent = r.label;
-    el.rly.append(option);
-  }
-  el.rly.value = railways.some((r) => r.value === current) ? current : ALL_RAILWAYS;
-  syncDateRows();
+  if (fillSelect(el.rly, railways, ALL_RAILWAYS)) syncDateRows();
 }
 
 function setSearchBusy(busy, label) {
@@ -412,7 +393,7 @@ async function loadForm(force = false) {
 
 async function openView() {
   ctx.showView("ma");
-  if (!el.date.value) el.date.value = todayIso();
+  if (!el.date.value) el.date.value = localIsoDate();
   syncDateRows();
   const state = await refreshState();
   if (!state || state.status === "idle" || state.status === "error") await loadForm(false);
@@ -478,7 +459,7 @@ export function refreshMaDestination() {
 export function initMa(context) {
   ctx = context;
   bindElements();
-  el.date.value = todayIso();
+  el.date.value = localIsoDate();
   el.btnOpen.addEventListener("click", openView);
   el.btnBack.addEventListener("click", () => ctx.showView("main"));
   el.form.addEventListener("submit", startSearch);
@@ -555,7 +536,7 @@ export async function restoreMa() {
   if (!state || state.status === "idle") return false;
   if (state.status === "searching" || state.status === "downloading") {
     ctx.showView("ma");
-    if (!el.date.value) el.date.value = todayIso();
+    if (!el.date.value) el.date.value = localIsoDate();
     syncDateRows();
     render(state);
     return true;

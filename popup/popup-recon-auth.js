@@ -5,7 +5,11 @@
  * download run needs it, Local or ECM / S3: downloads are recorded for the signed-in user.
  * Starting a run asks the Recon Engine who is signed in (GET /api/auth/me); when nobody is,
  * the "Sign in to Recon Engine" page covers the panel until the user signs in (password
- * or Okta) or cancels, and the run does not start.
+ * or Okta) or cancels, and the run does not start. When the Recon Engine cannot be reached
+ * at all (down, or no network path to it), as opposed to nobody being signed in, the page
+ * also offers "Download without the Recon Engine": the log must never block a run, so that
+ * run saves locally without the already-downloaded check, and its records wait in the
+ * queue until the Recon Engine is back (services/download-log.js).
  *
  * With the log off only "Save to: ECM / S3" needs it (and, when config.json "ecmBackendAws"
  * is false, only for Bill Status, CRN and R-NOTE: ECM documents then go straight to the
@@ -19,7 +23,7 @@
 import { describeError } from "../utils/messages.js";
 import { SAVE_DESTINATION, RECON_CONFIG, loadReconConfig } from "../services/recon-service.js";
 import { loadEcmConfig, isDirectEcm } from "../services/ecm-config.js";
-import { loadDownloadLogConfig, isDownloadLogEnabled } from "../services/download-log.js";
+import { loadDownloadLogConfig, isDownloadLogEnabled, setDownloadLogUser, flushDownloadLog } from "../services/download-log.js";
 import { reconWhoAmI, reconSignIn, reconSignOut, reconOktaSignIn, reconProviders, oktaRedirectUri, ReconAuthError, RECON_AUTH_ERROR, RECON_SIGN_IN_EVENT } from "../services/recon-auth.js";
 import { logger } from "../utils/logger.js";
 
@@ -29,8 +33,11 @@ let el = null;
 let ctx = null;
 /** @type {{ signedIn: boolean, user?: object, reason?: string } | null} */
 let status = null;
-/** The pending ensureSignedIn() waiting for the page: { resolve, required } */
+/** The pending ensureSignedIn() calls waiting for the page: { waiters: [{ resolve, allowOffline }], required, allowOffline } */
 let waiting = null;
+
+/** ensureReconSignedIn() answer when the Recon Engine is unreachable and the user chose to download without it. */
+export const RECON_OFFLINE = "offline";
 
 function setPill(state, text) {
   el.pill.dataset.state = state;
@@ -89,11 +96,17 @@ function openPage() {
   // a run that needs the sign-in whatever Save to says can only be cancelled, not moved to Local
   const required = Boolean(waiting && waiting.required) || ctx.getDestination() !== SAVE_DESTINATION.RECON;
   el.btnUseLocal.textContent = signedIn ? "Back" : required ? "Cancel" : "Use Local instead";
+  renderOfflineChoice();
   el.intro.textContent = isDownloadLogEnabled() ? INTRO_LOGGED : INTRO_ECM;
   if (!signedIn) refreshOkta();
   el.view.hidden = false;
   document.body.dataset.reconLogin = "on";
   if (!signedIn) (el.email.value ? el.password : el.email).focus();
+}
+
+/** "Download without the Recon Engine": only while it is unreachable and the waiting run allows it. */
+function renderOfflineChoice() {
+  el.btnOffline.hidden = !(waiting && waiting.allowOffline && status && !status.signedIn && status.reason === "UNAVAILABLE");
 }
 
 function closePage() {
@@ -102,12 +115,13 @@ function closePage() {
   el.password.value = "";
 }
 
-function settle(signedIn) {
+/** Close the page and answer every waiting run: true (signed in), false, or RECON_OFFLINE (only to runs that allow it). */
+function settle(answer) {
   closePage();
   if (waiting) {
-    const { resolve } = waiting;
+    const { waiters } = waiting;
     waiting = null;
-    resolve(signedIn);
+    for (const w of waiters) w.resolve(answer === RECON_OFFLINE && !w.allowOffline ? false : answer);
   }
 }
 
@@ -120,10 +134,13 @@ export function currentReconUser() {
 export async function refreshReconStatus() {
   try {
     status = await reconWhoAmI();
+    // the download log stamps this user on the records this panel queues (a definite answer only)
+    setDownloadLogUser(status.signedIn ? status.user : null);
   } catch (error) {
     status = { signedIn: false, reason: error instanceof ReconAuthError && error.code === RECON_AUTH_ERROR.NOT_CONFIGURED ? "NOT_CONFIGURED" : "UNAVAILABLE" };
   }
   renderPill();
+  if (el && !el.view.hidden) renderOfflineChoice();
   return status;
 }
 
@@ -134,27 +151,27 @@ const INTRO_LOGGED = "Needed to download: DocLink records each download for the 
  * Before a run: resolves true when someone is signed in to the Recon Engine (asking on the
  * sign-in page if needed), false when the user cancelled or chose Local. Without `always`
  * it is only asked under Save to: ECM / S3 (always true while Save to is Local); with it
- * (the download log) whatever Save to says.
- * @param {{ always?: boolean }} [options]
+ * (the download log) whatever Save to says. With `allowOffline` (a download run under the
+ * log) it can also resolve RECON_OFFLINE: the Recon Engine is unreachable and the user chose
+ * to download without it.
+ * @param {{ always?: boolean, allowOffline?: boolean }} [options]
+ * @returns {Promise<boolean|string>}
  */
-export async function ensureReconSignedIn({ always = false } = {}) {
+export async function ensureReconSignedIn({ always = false, allowOffline = false } = {}) {
   if (!always && ctx.getDestination() !== SAVE_DESTINATION.RECON) return true;
   const current = await refreshReconStatus();
   if (current.signedIn) return true;
   if (waiting) {
     waiting.required = waiting.required || always;
-    return new Promise((resolve) => waiting.also.push(resolve));
+    return new Promise((resolve) => {
+      waiting.waiters.push({ resolve, allowOffline });
+      // the offline choice is offered only while every waiting run accepts it
+      waiting.allowOffline = waiting.allowOffline && allowOffline;
+      renderOfflineChoice();
+    });
   }
   return new Promise((resolve) => {
-    const also = [];
-    waiting = {
-      also,
-      required: always,
-      resolve: (value) => {
-        resolve(value);
-        for (const r of also) r(value);
-      }
-    };
+    waiting = { waiters: [{ resolve, allowOffline }], required: always, allowOffline };
     openPage();
     if (current.reason === "UNAVAILABLE") showError(describeError("RECON_SIGNIN_UNAVAILABLE", { detail: "check that it is running" }));
     if (current.reason === "NOT_CONFIGURED") showError(describeError("RECON_NOT_CONFIGURED", { detail: "reconBaseUrl or host_permissions" }));
@@ -168,6 +185,7 @@ async function onSignIn(event) {
   try {
     const user = await reconSignIn(el.email.value, el.password.value);
     status = { signedIn: true, user };
+    setDownloadLogUser(user);
     renderPill();
     settle(true);
   } catch (error) {
@@ -184,6 +202,7 @@ async function onOkta() {
   try {
     const user = await reconOktaSignIn();
     status = { signedIn: true, user };
+    setDownloadLogUser(user);
     renderPill();
     settle(true);
   } catch (error) {
@@ -195,6 +214,8 @@ async function onOkta() {
 }
 
 async function onSignOut() {
+  // records this panel queued go out under the user who saved them, before the session ends
+  await flushDownloadLog();
   try {
     await reconSignOut();
   } catch (error) {
@@ -202,6 +223,7 @@ async function onSignOut() {
     return;
   }
   status = { signedIn: false, reason: "NOT_AUTHENTICATED" };
+  setDownloadLogUser(null);
   renderPill();
   openPage();
 }
@@ -257,6 +279,7 @@ export function initReconAuth(context) {
     btnOkta: $("btn-recon-okta"),
     error: $("recon-login-error"),
     btnUseLocal: $("btn-recon-use-local"),
+    btnOffline: $("btn-recon-offline"),
     btnSignOut: $("btn-recon-sign-out"),
     oktaSetup: $("recon-okta-setup"),
     oktaRedirect: $("recon-okta-redirect"),
@@ -265,12 +288,16 @@ export function initReconAuth(context) {
   el.form.addEventListener("submit", onSignIn);
   el.btnOkta.addEventListener("click", onOkta);
   el.btnUseLocal.addEventListener("click", onUseLocal);
+  el.btnOffline.addEventListener("click", () => {
+    logger.warn("Recon Engine unreachable: the user chose to download without it (saved locally; download records queued until it is back)");
+    settle(RECON_OFFLINE);
+  });
   el.btnSignOut.addEventListener("click", onSignOut);
   el.btnCopyRedirect.addEventListener("click", () => navigator.clipboard.writeText(el.oktaRedirect.textContent).catch(() => {}));
   // The tender view (a separate script) asks through this event before an ECM run.
   document.addEventListener(RECON_SIGN_IN_EVENT, (event) => {
     event.preventDefault();
-    ensureReconSignedIn({ always: Boolean(event.detail.always) }).then(event.detail.resolve);
+    ensureReconSignedIn({ always: Boolean(event.detail.always), allowOffline: Boolean(event.detail.allowOffline) }).then(event.detail.resolve);
   });
   el.pill.addEventListener("click", () => {
     if (status && status.signedIn) openPage();

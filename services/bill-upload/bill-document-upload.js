@@ -21,7 +21,6 @@ import { IrepsError } from "../ireps-api.js";
 import { BILL_ERROR, postBill, orderedBody, parseDocumentList } from "./bill-upload-api.js";
 
 export const UPLOAD_DOCUMENT_ENDPOINT = "/epsn/ct/uploadBillDocuments.do";
-export const SAVE_FILE_ENDPOINT = "/cgi-bin/save.php";
 
 /** The signer refuses 8 MB or more (CRISPKI: OriginalByteLength >= 8388608). */
 export const MAX_SIGN_BYTES = 8388608;

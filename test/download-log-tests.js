@@ -9,7 +9,8 @@
 
 import {
   downloadKey, downloadRecord, savedDestination, runDestination, checkDownloaded, logDownload, flushDownloadLog,
-  preflightDownloads, applyDownloadLogConfig, configureDownloadLog, describeSkip, listDownloads, exportFingerprint, DOC_TYPE_LABEL, SKIP_REASON, LOG_DESTINATION
+  preflightDownloads, applyDownloadLogConfig, configureDownloadLog, describeSkip, listDownloads, exportFingerprint, DOC_TYPE_LABEL, SKIP_REASON, LOG_DESTINATION,
+  setDownloadLogUser
 } from "../services/download-log.js";
 import { findInEcm, ECM_KIND } from "../services/ecm-service.js";
 import { resetEcmDirectState } from "../services/ecm-direct.js";
@@ -128,18 +129,119 @@ export async function runDownloadLogTests({ test, assert, eq }) {
     eq(storage.data[queueKey].length, 2, "nothing lost while signed out");
 
     const fetch = fakeRecon();
+    const posts = () => fetch.calls.filter((c) => c.url.endsWith("/api/doclink/downloads"));
     const sent = await flushDownloadLog({ fetch });
     eq(sent.posted, 2);
     eq(storage.data[queueKey].length, 0);
-    eq(fetch.calls.length, 1);
-    eq(fetch.calls[0].body.records.map((r) => r.doc_key).join(), "po:A,po:B");
+    eq(posts().length, 1);
+    assert(fetch.calls.some((c) => c.url.endsWith("/api/auth/me")), "a flush first asks who is signed in (M18)");
+    eq(posts()[0].body.records.map((r) => r.doc_key).join(), "po:A,po:B");
+    eq(JSON.stringify(Object.keys(posts()[0].body.records[0]).sort()), JSON.stringify(["destination", "doc_key", "doc_type", "filename"]), "the queue's own fields (qid, user) are not sent");
+    const callsBefore = fetch.calls.length;
     eq((await flushDownloadLog({ fetch })).posted, 0, "an empty queue posts nothing");
-    eq(fetch.calls.length, 1);
+    eq(fetch.calls.length, callsBefore, "and asks nothing");
 
     applyDownloadLogConfig({ downloadLog: { enabled: false } });
     await logDownload(downloadRecord({ docType: "po", key: "po:C" }, { filename: "c.pdf" }));
     eq(storage.data[queueKey].length, 0, "the log off: nothing queued");
     applyDownloadLogConfig({});
+    configureDownloadLog({ storage: memoryStorage(), context: "sw" });
+  });
+
+  await test("download log (M17): a batch the Recon Engine refuses is split; only the refused record is set aside, the rest are sent", async () => {
+    const storage = memoryStorage();
+    configureDownloadLog({ storage, context: "test" });
+    for (const k of ["A", "B", "BAD", "C", "D"]) await logDownload(downloadRecord({ docType: "po", key: `po:${k}` }, { filename: `${k}.pdf` }));
+    const accepted = [];
+    const fetch = async (url, init = {}) => {
+      if (String(url).endsWith("/api/auth/me")) return json(404, {});
+      const body = JSON.parse(init.body);
+      if (body.records.some((r) => r.doc_key === "po:BAD")) return json(422, { detail: { error: "INVALID", detail: "doc_key" } });
+      accepted.push(...body.records.map((r) => r.doc_key));
+      return json(201, { logged: body.records.length });
+    };
+    const result = await flushDownloadLog({ fetch });
+    eq(result.posted, 4);
+    eq(result.refused, 1);
+    eq(result.pending, 0);
+    eq(accepted.sort().join(), "po:A,po:B,po:C,po:D", "every good record sent exactly once");
+    eq(storage.data["doclink.downloadLog.queue.test"].length, 0, "nothing left to block the next flush");
+    const aside = storage.data["doclink.downloadLog.rejected"];
+    eq(aside.length, 1);
+    eq(aside[0].record.doc_key, "po:BAD");
+    eq(aside[0].status, 422);
+    // a 5xx is not a refusal: everything stays queued
+    await logDownload(downloadRecord({ docType: "po", key: "po:E" }, { filename: "E.pdf" }));
+    const down = await flushDownloadLog({ fetch: fakeRecon({ status: 503 }) });
+    eq(down.posted, 0);
+    eq(down.pending, 1);
+    eq(storage.data["doclink.downloadLog.rejected"].length, 1, "a server error never sets records aside");
+    configureDownloadLog({ storage: memoryStorage(), context: "sw" });
+  });
+
+  await test("download log (M18): a record belongs to the Recon user who saved it; a flush sends only the signed-in user's", async () => {
+    const storage = memoryStorage();
+    configureDownloadLog({ storage, context: "test" });
+    setDownloadLogUser({ id: 1, email: "a@x.test" });
+    await logDownload(downloadRecord({ docType: "po", key: "po:BY-A" }, { filename: "a.pdf" }));
+    setDownloadLogUser({ id: 2, email: "b@x.test" });
+    await logDownload(downloadRecord({ docType: "po", key: "po:BY-B" }, { filename: "b.pdf" }));
+    setDownloadLogUser(null);
+    await logDownload(downloadRecord({ docType: "po", key: "po:NOBODY" }, { filename: "n.pdf" }));
+    const as = (id) => {
+      const fn = fakeRecon();
+      const sent = [];
+      const wrapped = async (url, init = {}) => {
+        if (String(url).endsWith("/api/auth/me")) return json(200, { id, email: `${id}@x.test`, name: String(id), roles: [] });
+        if (String(url).endsWith("/api/doclink/downloads")) sent.push(...JSON.parse(init.body).records.map((r) => r.doc_key));
+        return fn(url, init);
+      };
+      wrapped.sent = sent;
+      return wrapped;
+    };
+    const b = as(2);
+    const first = await flushDownloadLog({ fetch: b });
+    eq(b.sent.sort().join(), "po:BY-B,po:NOBODY", "user 2 gets their own record and the one with no known user");
+    eq(first.pending, 1, "user 1's record waits");
+    const a = as(1);
+    await flushDownloadLog({ fetch: a });
+    eq(a.sent.join(), "po:BY-A", "sent once user 1 is signed in");
+    eq(storage.data["doclink.downloadLog.queue.test"].length, 0);
+    // signed out: nothing is sent, nothing lost
+    setDownloadLogUser({ id: 3 });
+    await logDownload(downloadRecord({ docType: "po", key: "po:C" }, { filename: "c.pdf" }));
+    const out = await flushDownloadLog({ fetch: fakeRecon({ status: 401 }) });
+    eq(out.code, "RECON_AUTH_REQUIRED");
+    eq(storage.data["doclink.downloadLog.queue.test"].length, 1);
+    setDownloadLogUser(null);
+    configureDownloadLog({ storage: memoryStorage(), context: "sw" });
+  });
+
+  await test("download log (M17): parallel saves never lose a record; a full queue drops the oldest and counts them", async () => {
+    const storage = memoryStorage();
+    configureDownloadLog({ storage, context: "test", maxQueue: 5 });
+    await Promise.all(Array.from({ length: 4 }, (_, i) => logDownload(downloadRecord({ docType: "po", key: `po:P${i}` }, { filename: `${i}.pdf` }))));
+    eq(storage.data["doclink.downloadLog.queue.test"].length, 4, "four parallel saves, four records");
+    for (let i = 4; i < 8; i++) await logDownload(downloadRecord({ docType: "po", key: `po:P${i}` }, { filename: `${i}.pdf` }));
+    const q = storage.data["doclink.downloadLog.queue.test"];
+    eq(q.length, 5);
+    eq(q[0].doc_key, "po:P3", "the oldest went first");
+    eq(storage.data["doclink.downloadLog.dropped"].count, 3, "and are counted, not dropped silently");
+    configureDownloadLog({ storage: memoryStorage(), context: "sw", maxQueue: 0 });
+  });
+
+  await test("download log (M17): records queued by an older DocLink (no queue id) are sent exactly once", async () => {
+    const storage = memoryStorage();
+    storage.data["doclink.downloadLog.queue.test"] = [
+      { doc_type: "po", doc_key: "po:OLD1", filename: "1.pdf", destination: "local" },
+      { doc_type: "po", doc_key: "po:OLD2", filename: "2.pdf", destination: "local" }
+    ];
+    configureDownloadLog({ storage, context: "test" });
+    const fetch = fakeRecon();
+    eq((await flushDownloadLog({ fetch })).posted, 2);
+    eq((await flushDownloadLog({ fetch })).posted, 0);
+    eq(fetch.calls.filter((c) => c.url.endsWith("/api/doclink/downloads")).length, 1);
+    eq(storage.data["doclink.downloadLog.queue.test"].length, 0);
     configureDownloadLog({ storage: memoryStorage(), context: "sw" });
   });
 

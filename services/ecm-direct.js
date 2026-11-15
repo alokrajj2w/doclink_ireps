@@ -4,7 +4,7 @@
  * gateway's backend/ECM/ecm_client (client.py, auth.py, service.save_document), following
  * "ECM_API_DOC" and "TSG India Doculink ECM specifications.xlsx":
  *
- *   POST {domain}/nuxeo/oauth2/token?grant_type=client_credentials&...   bearer token
+ *   POST {domain}/nuxeo/oauth2/token?grant_type=client_credentials&...   bearer token (see requestToken)
  *   GET  {domain}/nuxeo/api/v1/id/{folderUid}                             the folder exists (once)
  *   GET  {domain}/nuxeo/api/v1/search/lang/NXQL/execute?query=...         search (NXQL)
  *   POST {domain}/nuxeo/api/v1/upload                                     open a batch
@@ -25,28 +25,45 @@
  * Grouped kinds (NIT, LOA, Result: one document per tender) are direct-only, see
  * addToTenderDocument.
  *
+ * Every request has one deadline (ECM_CONFIG.timeoutMs) over its headers and its body
+ * (utils/http.js fetchWithDeadline). A file read the ECM fails for a passing reason (5xx, 408,
+ * 429, no answer, a timeout) is tried again; a file is called damaged, and dropped or trashed,
+ * only on proof (probeFile, checkFile), never because of a passing fault.
+ *
+ * What DocLink sends to the ECM is kept as it was (decided 2026-11-15: the ECM is a third-party
+ * system nobody can test against now): the same requests, fields and headers; the only new
+ * requests are read-only GETs (a file read again, a whole file read to prove damage, a search
+ * after a tender's document is created). The token request is the one ECM_API_DOC shows (requestToken).
+ *
  * The bearer token is kept in this JS context's memory until shortly before it expires
  * (the service worker and the side panel each fetch their own); it is never stored or
  * logged, and neither is the client secret. A 401 drops it and retries the call once.
  */
 
 import { logger } from "../utils/logger.js";
+import { fetchWithDeadline, DeadlineError } from "../utils/http.js";
 import { ECM_CONFIG, loadEcmConfig, ecmDirectProblem } from "./ecm-config.js";
 import { DOC_TYPE, TYPE_PROPERTY, ECM_FIELDS, ECM_KINDS, ECM_SITES, routeSite, renderTitle } from "./ecm-catalog.js";
-import { EcmError, ECM_ERROR, ecmFields } from "./ecm-service.js";
+import { EcmError, ECM_ERROR, ecmFields, ecmErrorCode, isTransientStatus } from "./ecm-service.js";
 import { manifestHostPermissions } from "./recon-service.js";
 
 const API = "/nuxeo/api/v1";
+const TOKEN_PATH = "/nuxeo/oauth2/token";
 const TOKEN_REFRESH_MARGIN_S = 60;
 const TOKEN_TTL_FALLBACK_S = 3600;
+/** A file read that fails for a passing reason is made this often in all, after these pauses. */
+const READ_ATTEMPTS = 3;
+const READ_RETRY_DELAYS_MS = [1000, 3000];
 const NAME_UNSAFE = /[/\\\x00-\x1f]+/g;
 
 let token = null; // { key, value, expiresAt }; key = domain + client id, so a config change drops it
+const plainHttpWarned = new Set(); // ECM origins already warned about (http://)
 const folderUids = new Map(); // domain + path -> folder uid (folder uids never change)
 
-/** Forget the cached token and folder uids (tests). */
+/** Forget the cached token, the plain-http warnings and the folder uids (tests). */
 export function resetEcmDirectState() {
   token = null;
+  plainHttpWarned.clear();
   folderUids.clear();
 }
 
@@ -93,31 +110,37 @@ async function connection(deps = {}) {
   await loadEcmConfig();
   const problem = ecmDirectProblem(deps.hostPermissions || manifestHostPermissions());
   if (problem) throw new EcmError(ECM_ERROR.NOT_CONFIGURED, { detail: problem });
-  return { fetch: deps.fetch || ((...args) => globalThis.fetch(...args)) };
+  return {
+    fetch: deps.fetch || ((...args) => globalThis.fetch(...args)),
+    // the pauses before a file read is made again (tests pass [0, 0])
+    retryDelaysMs: Array.isArray(deps.retryDelaysMs) ? deps.retryDelaysMs : READ_RETRY_DELAYS_MS
+  };
 }
 
-async function readJson(response) {
+/** The JSON in a binary answer (the error page of a file request), or null. */
+function jsonIn(buffer) {
+  if (!buffer || !buffer.byteLength) return null;
   try {
-    return await response.json();
+    return JSON.parse(new TextDecoder().decode(buffer));
   } catch {
     return null;
   }
 }
 
-/** One HTTP request to the ECM with the timeout; network failure -> ECM_UNAVAILABLE. */
-async function send(conn, method, path, { headers = {}, body } = {}) {
-  const fetchImpl = conn.fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ECM_CONFIG.timeoutMs);
+/**
+ * One HTTP request to the ECM, its answer read inside one deadline (ECM_CONFIG.timeoutMs) that covers
+ * the headers and the body (utils/http.js). `read`: "json" (null when the body is not JSON),
+ * "arrayBuffer" or "none". A request that cannot be made or finished in time -> ECM_UNAVAILABLE.
+ * @returns {Promise<{ response: Response, body: any }>}
+ */
+async function send(conn, method, path, { headers = {}, body, read = "json" } = {}) {
   try {
-    return await fetchImpl(`${ECM_CONFIG.domain}${path}`, { method, headers, body, credentials: "omit", signal: controller.signal });
+    return await fetchWithDeadline(`${ECM_CONFIG.domain}${path}`, { method, headers, body, credentials: "omit" }, { timeoutMs: ECM_CONFIG.timeoutMs, fetch: conn.fetch, read });
   } catch (error) {
-    const timedOut = error && error.name === "AbortError";
-    // never log `path`: the token request carries the client secret in its query string
+    const timedOut = error instanceof DeadlineError || (error && error.name === "TimeoutError");
+    // never log `path`: the token request carries the client secret in its URL
     logger.warn(`ECM unreachable (${method})`, { error: error && error.message });
-    throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: timedOut ? `no response within ${Math.round(ECM_CONFIG.timeoutMs / 1000)} seconds` : `could not reach ${new URL(ECM_CONFIG.domain).origin}` });
-  } finally {
-    clearTimeout(timer);
+    throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: timedOut ? error.message : `could not reach ${new URL(ECM_CONFIG.domain).origin}` });
   }
 }
 
@@ -125,9 +148,8 @@ async function send(conn, method, path, { headers = {}, body } = {}) {
 async function bearer(conn) {
   const key = `${ECM_CONFIG.domain}|${ECM_CONFIG.clientId}`;
   if (token && token.key === key && Date.now() < token.expiresAt) return token.value;
-  const query = new URLSearchParams({ grant_type: "client_credentials", client_id: ECM_CONFIG.clientId, client_secret: ECM_CONFIG.clientSecret });
-  const response = await send(conn, "POST", `/nuxeo/oauth2/token?${query}`);
-  const body = await readJson(response);
+  warnIfPlainHttp();
+  const { response, body } = await requestToken(conn);
   if (response.status === 400 || response.status === 401 || response.status === 403) {
     throw new EcmError(ECM_ERROR.NOT_CONFIGURED, { status: response.status, detail: "the ECM refused the client id / secret" });
   }
@@ -140,11 +162,31 @@ async function bearer(conn) {
   return token.value;
 }
 
+/**
+ * The token request (OAuth 2.0 client-credentials grant), exactly as ECM_API_DOC shows it and as
+ * DocLink has always sent it: the client id and secret in the URL's query. Server and proxy logs
+ * keep URLs (review H10). Moving them into the form body (RFC 6749 section 2.3.1) is a code change
+ * to make once the ECM team confirms the token endpoint accepts it; there is no setting for it.
+ * @returns {Promise<{ response: Response, body: any }>}
+ */
+async function requestToken(conn) {
+  const credentials = new URLSearchParams({ grant_type: "client_credentials", client_id: ECM_CONFIG.clientId, client_secret: ECM_CONFIG.clientSecret });
+  return send(conn, "POST", `${TOKEN_PATH}?${credentials}`);
+}
+
+/** A warning, once per ECM, when its address is plain http:// (allowed: the TEST ECM is http). */
+function warnIfPlainHttp() {
+  const url = new URL(ECM_CONFIG.domain);
+  if (url.protocol !== "http:" || plainHttpWarned.has(url.origin)) return;
+  plainHttpWarned.add(url.origin);
+  logger.warn(`The ECM address ${url.origin} is plain http://: the client credentials, the token and every document cross the network unencrypted. Use an https:// ECM address, or the Recon Engine gateway, in production.`);
+}
+
 /** An authenticated request to a full path; on 401 the token is dropped and the call retried once. */
-async function authed(conn, method, fullPath, { headers = {}, body } = {}) {
+async function authed(conn, method, fullPath, { headers = {}, body, read } = {}) {
   for (let attempt = 1; ; attempt += 1) {
-    const response = await send(conn, method, fullPath, { headers: { Authorization: `Bearer ${await bearer(conn)}`, ...headers }, body });
-    if (response.status !== 401 || attempt === 2) return response;
+    const answer = await send(conn, method, fullPath, { headers: { Authorization: `Bearer ${await bearer(conn)}`, ...headers }, body, read });
+    if (answer.response.status !== 401 || attempt === 2) return answer;
     logger.warn("ECM returned 401; fetching a new token and retrying once");
     token = null;
   }
@@ -155,7 +197,7 @@ function call(conn, method, path, options) {
   return authed(conn, method, `${API}${path}`, options);
 }
 
-/** A non-2xx answer as an EcmError: 4xx -> ECM_REJECTED (the reason kept), else ECM_UNAVAILABLE. */
+/** A non-2xx answer as an EcmError: a definite 4xx refusal -> ECM_REJECTED (the reason kept), a passing fault -> ECM_UNAVAILABLE. */
 function httpError(response, body, what) {
   const status = response.status;
   const message = body && typeof body.message === "string" ? body.message : "";
@@ -163,12 +205,11 @@ function httpError(response, body, what) {
     return new EcmError(ECM_ERROR.REJECTED, { status, detail: `the ECM denied access (HTTP ${status})${message ? `: ${message}` : ""}` });
   }
   const detail = `${what}: HTTP ${status}${message ? ` - ${message}` : ""}`;
-  return new EcmError(status >= 400 && status < 500 ? ECM_ERROR.REJECTED : ECM_ERROR.UNAVAILABLE, { status, detail });
+  return new EcmError(ecmErrorCode(status), { status, detail });
 }
 
 async function callJson(conn, method, path, options) {
-  const response = await call(conn, method, path, options);
-  const body = await readJson(response);
+  const { response, body } = await call(conn, method, path, options);
   if (!response.ok) throw httpError(response, body, `${method} ${path.split("?")[0]}`);
   if (!body || typeof body !== "object") throw new EcmError(ECM_ERROR.UNAVAILABLE, { status: response.status, detail: `${method} ${path.split("?")[0]}: unexpected answer` });
   return body;
@@ -210,18 +251,20 @@ export async function searchEcm(nxql, options = {}, deps = {}) {
 export async function callEcmAutomation(operation, params, deps = {}) {
   const conn = await connection(deps);
   const path = `/nuxeo/site/api/v1/automation/${encodeURIComponent(operation)}`;
-  const response = await authed(conn, "POST", path, {
+  // read as bytes inside the deadline: whether it is JSON or a blob is known only from the answer
+  const { response, body: buffer } = await authed(conn, "POST", path, {
     headers: { "Content-Type": "application/json+nxrequest", Accept: "application/json, */*" },
-    body: JSON.stringify({ params: params || {} })
+    body: JSON.stringify({ params: params || {} }),
+    read: "arrayBuffer"
   });
   const contentType = response.headers.get("content-type") || "";
   if (/json/i.test(contentType)) {
-    const body = await readJson(response);
+    const body = jsonIn(buffer);
     if (!response.ok) throw httpError(response, body, `automation ${operation}`);
     return body;
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
   if (!response.ok) throw httpError(response, null, `automation ${operation}`);
+  const bytes = new Uint8Array(buffer || new ArrayBuffer(0));
   // Nuxeo answers 204 when the operation returns nothing
   if (bytes.length === 0) return null;
   return { bytes, contentType };
@@ -233,8 +276,8 @@ export async function callEcmAutomation(operation, params, deps = {}) {
  */
 export async function fetchEcmBlob(uid, deps = {}) {
   const conn = await connection(deps);
-  const response = await call(conn, "GET", `/id/${encodeURIComponent(uid)}/@blob/file:content`);
-  if (!response.ok) throw httpError(response, await readJson(response), "GET document file");
+  const { response, body: buffer } = await call(conn, "GET", `/id/${encodeURIComponent(uid)}/@blob/file:content`, { read: "arrayBuffer" });
+  if (!response.ok) throw httpError(response, jsonIn(buffer), "GET document file");
   const disposition = response.headers.get("content-disposition") || "";
   const named = /filename\*=UTF-8''([^;]+)/i.exec(disposition) || /filename="?([^";]+)"?/i.exec(disposition);
   let filename = null;
@@ -245,12 +288,7 @@ export async function fetchEcmBlob(uid, deps = {}) {
       filename = named[1];
     }
   }
-  return { bytes: new Uint8Array(await response.arrayBuffer()), contentType: response.headers.get("content-type") || "", filename };
-}
-
-/** Documents of a kind in a site, e.g. findEcmDocuments({ site: "hosur", kind: "poCopy", filters: { customer_po_number: "PO-1" } }). */
-export async function findEcmDocuments({ site, kind, filters, limit = 200 }, deps = {}) {
-  return searchEcm(buildEcmQuery({ site, kind, filters }), { limit }, deps);
+  return { bytes: new Uint8Array(buffer || new ArrayBuffer(0)), contentType: response.headers.get("content-type") || "", filename };
 }
 
 /**
@@ -266,9 +304,8 @@ async function folderUid(conn, site, location) {
   if (folderUids.has(cacheKey)) return folderUids.get(cacheKey);
   let uid;
   if (known) {
-    const response = await call(conn, "GET", `/id/${encodeURIComponent(known)}`, { headers: { Properties: "dublincore" } });
-    const body = await readJson(response);
-    if (response.status >= 500) throw httpError(response, body, `GET /id/${known}`);
+    const { response, body } = await call(conn, "GET", `/id/${encodeURIComponent(known)}`, { headers: { Properties: "dublincore" } });
+    if (isTransientStatus(response.status)) throw httpError(response, body, `GET /id/${known}`);
     if (!response.ok || !body || body.uid !== known) {
       const message = body && typeof body.message === "string" ? ` - ${body.message}` : "";
       throw new EcmError(ECM_ERROR.REJECTED, { status: response.status, detail: `the ${site.name} ${location} folder ${path} (uid ${known}) cannot be opened on the ECM: HTTP ${response.status}${message}` });
@@ -340,6 +377,7 @@ function saved(entry, site, deduplicated) {
 }
 
 const reject = (detail) => new EcmError(ECM_ERROR.REJECTED, { detail });
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A document's file record at `xpath`: "file:content" (the main file) or "files:files/<n>/file" (an attachment). */
 function fileAt(props, xpath) {
@@ -348,16 +386,94 @@ function fileAt(props, xpath) {
   return match ? ((props["files:files"] || [])[Number(match[1])] || {}).file || null : null;
 }
 
-/** The whole file at `xpath`, or null when the ECM does not serve all `length` bytes of it. */
-async function readFile(conn, uid, xpath, length) {
-  const response = await call(conn, "GET", `/id/${encodeURIComponent(uid)}/@blob/${xpath}`);
-  try {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (response.ok && bytes.length === length) return bytes;
-  } catch {
-    // the ECM dropped the connection mid-file
+/**
+ * GET one file of a document, whole or (`from`) from that byte on, read inside the deadline. A
+ * passing fault (5xx, 408, 429, no answer, a timeout, a body that broke off) is tried again,
+ * READ_ATTEMPTS in all; the last answer is returned as it came.
+ * @returns {Promise<{ status: number|null, ok: boolean, bytes: Uint8Array|null, failure: string|null, attempts: number }>}
+ *          status null: no complete answer (`failure` says why)
+ */
+async function getFile(conn, uid, xpath, { from } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    let read;
+    try {
+      const headers = from === undefined ? {} : { Range: `bytes=${from}-` };
+      const { response, body } = await call(conn, "GET", `/id/${encodeURIComponent(uid)}/@blob/${xpath}`, { headers, read: "arrayBuffer" });
+      read = { status: response.status, ok: response.ok, bytes: new Uint8Array(body || new ArrayBuffer(0)), failure: null, attempts: attempt };
+    } catch (error) {
+      // anything but "no complete answer" (refused credentials, a bug) is no passing fault
+      if (!(error instanceof EcmError) || error.code !== ECM_ERROR.UNAVAILABLE) throw error;
+      read = { status: null, ok: false, bytes: null, failure: error.detail || "no answer", attempts: attempt };
+    }
+    if (attempt >= READ_ATTEMPTS || !(read.status === null || isTransientStatus(read.status))) return read;
+    logger.warn(`ECM: reading ${xpath} of document ${uid} failed (${read.status === null ? read.failure : `HTTP ${read.status}`}); trying again`);
+    await sleep(conn.retryDelaysMs[attempt - 1] ?? 0);
   }
-  return null;
+}
+
+/**
+ * Read a document's file in full and say what the ECM serves of it:
+ *   ok          all `length` bytes its record gives (`bytes`: the file)
+ *   damaged     proven: a success answer with fewer bytes (an empty or short body), or 404 for the file
+ *   unreadable  no proof either way: a passing fault that did not pass, another refusal, or more bytes
+ *               than the record says. Nothing is dropped or trashed on this.
+ * @returns {Promise<{ state: "ok"|"damaged"|"unreadable", why: string, bytes?: Uint8Array }>}
+ */
+async function probeFile(conn, uid, xpath, length) {
+  const read = await getFile(conn, uid, xpath);
+  if (read.ok && read.bytes.length === length) return { state: "ok", why: "", bytes: read.bytes };
+  if (read.ok && read.bytes.length < length) return { state: "damaged", why: `the ECM serves ${read.bytes.length} of its ${length} bytes` };
+  if (read.status === 404) return { state: "damaged", why: "the ECM has no such file (HTTP 404)" };
+  const tries = read.attempts > 1 ? `, ${read.attempts} attempts` : "";
+  if (read.status === null) return { state: "unreadable", why: `${read.failure}${tries}` };
+  return { state: "unreadable", why: read.ok ? `the ECM serves ${read.bytes.length} bytes, its record says ${length}` : `HTTP ${read.status}${tries}` };
+}
+
+/**
+ * Can the ECM serve a document's file to its end? Its last byte is read (a ranged GET, cheap); only
+ * when that fails is the whole file read, which alone can prove damage (probeFile).
+ *   ok           it can (or the whole file reads, whatever the ranged read said)
+ *   damaged      proven: the record has no file, or probeFile says damaged
+ *   suspect      its end cannot be read (an HTTP error, e.g. the TEST ECM's 500 past a damaged file's
+ *                real end) and the whole file could not be read either: likely damaged, not proven
+ *   unreachable  no answer to the ranged read (network, timeout)
+ * The ECM re-saves IC / PO / MA PDFs while creating them; when that goes wrong the record keeps the
+ * uploaded length while the stored file is shorter, and every download of it breaks off ("Failed to
+ * skip in stream" past the real end).
+ * @returns {Promise<{ verdict: "ok"|"damaged"|"suspect"|"unreachable", why: string }>}
+ */
+async function checkFile(conn, uid, xpath = "file:content") {
+  const doc = await callJson(conn, "GET", `/id/${encodeURIComponent(uid)}`, { headers: { Properties: "file,files" } });
+  const length = Number((fileAt(doc.properties || {}, xpath) || {}).length);
+  if (!(length > 0)) return { verdict: "damaged", why: `it has no file${xpath === "file:content" ? "" : ` at ${xpath}`}` };
+  const end = await getFile(conn, uid, xpath, { from: length - 1 });
+  const served = end.bytes ? end.bytes.length : -1;
+  // the one byte asked for (the TEST ECM answers it with 200, not 206), or the whole file when ranges are not honoured
+  if (end.ok && (served === 1 || served === length)) return { verdict: "ok", why: "" };
+  if (end.status === null) return { verdict: "unreachable", why: end.failure };
+  // a damaged file's end is an HTTP 500 error page on the TEST ECM, but so is a passing fault: only the whole file can tell
+  const whole = await probeFile(conn, uid, xpath, length);
+  if (whole.state === "ok") return { verdict: "ok", why: "" };
+  const said = end.ok ? `${served} bytes for its last byte` : `HTTP ${end.status}`;
+  return {
+    verdict: whole.state === "damaged" ? "damaged" : "suspect",
+    why: `the record says ${length} bytes but the file cannot be read to its end (${said}; ${whole.state === "damaged" ? whole.why : `the whole file: ${whole.why}`})`
+  };
+}
+
+/**
+ * Throws unless the ECM can serve the document's file in full (checkFile): ECM_FILE_DAMAGED, so the
+ * caller saves the file locally instead of calling it stored (`proven` set when checkFile proved the
+ * damage), or ECM_UNAVAILABLE when the ECM did not answer.
+ */
+async function assertFileReadable(conn, uid, filename, xpath = "file:content") {
+  const check = await checkFile(conn, uid, xpath);
+  if (check.verdict === "ok") return;
+  if (check.verdict === "unreachable") throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: `document ${uid}: ${filename} could not be read back (${check.why})` });
+  logger.warn(`ECM cannot serve ${filename} in full`, { uid, xpath, verdict: check.verdict, detail: check.why });
+  const error = new EcmError(ECM_ERROR.DAMAGED, { detail: `document ${uid}: ${check.why}` });
+  error.proven = check.verdict === "damaged";
+  throw error;
 }
 
 /** Upload files into one new batch (file i = "upload-fileId" i) and return the batch id. */
@@ -387,35 +503,9 @@ export function oldFileName(name, taken = []) {
 }
 
 /**
- * Can the ECM serve the document's file in full? Its last byte is read back (a ranged GET).
- * The ECM re-saves IC / PO / MA PDFs while creating them; when that goes wrong the record
- * keeps the uploaded length while the stored file is shorter, and every download of it
- * breaks off ("Failed to skip in stream" past the real end). Such a document is reported
- * as ECM_FILE_DAMAGED, so the caller saves it locally instead of calling it stored.
- */
-async function assertFileReadable(conn, uid, filename, xpath = "file:content") {
-  const doc = await callJson(conn, "GET", `/id/${encodeURIComponent(uid)}`, { headers: { Properties: "file,files" } });
-  const length = Number((fileAt(doc.properties || {}, xpath) || {}).length);
-  const damaged = (detail) => new EcmError(ECM_ERROR.DAMAGED, { detail: `document ${uid}: ${detail}` });
-  if (!(length > 0)) throw damaged(`it has no file${xpath === "file:content" ? "" : ` at ${xpath}`}`);
-  const response = await call(conn, "GET", `/id/${encodeURIComponent(uid)}/@blob/${xpath}`, { headers: { Range: `bytes=${length - 1}-` } });
-  let served = -1;
-  try {
-    served = (await response.arrayBuffer()).byteLength;
-  } catch {
-    // the ECM dropped the connection mid-file
-  }
-  // the one byte asked for (the TEST ECM answers it with 200, not 206), or the whole file when
-  // ranges are not honoured; a damaged file is an HTTP 500 error page
-  if (response.ok && (served === 1 || served === length)) return;
-  logger.warn(`ECM cannot serve ${filename} in full`, { uid, length, status: response.status, served });
-  throw damaged(`the record says ${length} bytes but the file cannot be read to its end (HTTP ${response.status})`);
-}
-
-/**
  * Move a document to the ECM trash (Nuxeo's Document.Trash; not in ECM_API_DOC). It is not
- * deleted: the ECM team can restore it. Used only for damaged copies: DocLink's own new one, or
- * a further damaged copy of a document downloaded again.
+ * deleted: the ECM team can restore it. Used only for copies proven damaged: DocLink's own new
+ * one, or a further copy of a document downloaded again.
  */
 async function trashDocument(conn, uid) {
   const body = await callJson(conn, "POST", `/id/${encodeURIComponent(uid)}/@op/Document.Trash`, {
@@ -429,11 +519,15 @@ async function trashDocument(conn, uid) {
  * Download again into an existing document (uid): the new PDF becomes its main file, under the
  * main file's current name (the ECM renames files when it creates a document, e.g.
  * <PO>_MODIFICATIONADVISE.pdf). The old main file is
- *   - kept as an attachment (files:files) named <name>_old.pdf when the ECM can serve it in full,
- *   - dropped when it is damaged (confirmed by the ranged read of assertFileReadable).
+ *   - kept as an attachment (files:files) named <name>_old.pdf when the ECM serves it in full,
+ *   - dropped only when it is proven damaged: the whole file comes back shorter than its record or
+ *     not at all (probeFile), and its end cannot be read either (checkFile, the check made before
+ *     any drop). A read that fails for a passing reason is made again; a file that still cannot be
+ *     read leaves the document unchanged (ECM_UNAVAILABLE), so a passing ECM fault never costs the
+ *     old PDF.
  * A list property is replaced as a whole, so attachments already there are read and sent again;
- * one that cannot be read leaves the document unchanged (ECM_UNAVAILABLE). Title and metadata
- * are not touched.
+ * one that cannot be read leaves the document unchanged too. Title and metadata are not touched.
+ * The update is sent without a change token (no optimistic locking), as it always was.
  */
 async function replaceInDocument(conn, uid, { bytes, filename, mimeType }) {
   const current = await callJson(conn, "GET", `/id/${encodeURIComponent(uid)}`, { headers: { Properties: "file,files" } });
@@ -442,25 +536,30 @@ async function replaceInDocument(conn, uid, { bytes, filename, mimeType }) {
   const name = (main && main.name) || filename;
   const unchanged = (detail) => new EcmError(ECM_ERROR.UNAVAILABLE, { detail: `document ${uid}: ${detail}; the document was not changed` });
 
-  const old = main && Number(main.length) > 0 ? await readFile(conn, uid, "file:content", Number(main.length)) : null;
+  let old = null;
   let oldDamaged = false;
-  if (main && !old) {
-    // only a file the ECM really cannot serve is dropped; anything else stops the replace
-    try {
-      await assertFileReadable(conn, uid, name);
-    } catch (error) {
-      if (!(error instanceof EcmError && error.code === ECM_ERROR.DAMAGED)) throw error;
+  if (main) {
+    const length = Number(main.length);
+    const probe = length > 0 ? await probeFile(conn, uid, "file:content", length) : { state: "damaged", why: "its record has no length" };
+    if (probe.state === "ok") {
+      old = probe.bytes;
+    } else {
+      const check = probe.state === "damaged" ? await checkFile(conn, uid) : null;
+      if (!check || check.verdict !== "damaged") {
+        const end = check ? `; ${check.verdict === "ok" ? "yet its last byte reads" : check.why}` : "";
+        throw unchanged(`its current file ${name} could not be read (${probe.why}${end})`);
+      }
       oldDamaged = true;
+      logger.warn(`ECM: the current file ${name} of document ${uid} is damaged (${check.why}); the new PDF replaces it`);
     }
-    if (!oldDamaged) throw unchanged(`its current file ${name} could not be read`);
   }
   const kept = [];
   for (const [i, entry] of (props["files:files"] || []).entries()) {
     const file = entry && entry.file;
     if (!file) continue;
-    const content = await readFile(conn, uid, `files:files/${i}/file`, Number(file.length));
-    if (!content) throw unchanged(`its attachment ${file.name} could not be read`);
-    kept.push({ name: file.name, mimeType: file["mime-type"] || "application/octet-stream", bytes: content });
+    const probe = await probeFile(conn, uid, `files:files/${i}/file`, Number(file.length));
+    if (probe.state !== "ok") throw unchanged(`its attachment ${file.name} could not be read (${probe.why})`);
+    kept.push({ name: file.name, mimeType: file["mime-type"] || "application/octet-stream", bytes: probe.bytes });
   }
   const oldFile = old ? oldFileName(name, kept.map((k) => k.name)) : null;
   const files = [{ name, mimeType, bytes }, ...kept, ...(old ? [{ name: oldFile, mimeType: main["mime-type"] || mimeType, bytes: old }] : [])];
@@ -487,18 +586,18 @@ async function replaceInDocument(conn, uid, { bytes, filename, mimeType }) {
  * Upload one document straight to the ECM folder of the account's unit.
  * Same input and answer as ecm-service uploadToEcm (it dispatches here in direct mode).
  *
- * A new document the ECM damaged is moved to the trash (DocLink's own copy), and the error is
- * ECM_FILE_DAMAGED: the caller saves the file locally.
+ * A new document the ECM damaged is ECM_FILE_DAMAGED: the caller saves the file locally, and
+ * DocLink's own copy is moved to the trash when the damage is proven.
  *
  * `replace` (uids of the copies already in the folder, from findInFolder, when the user chose
  * to download them again): no new document; the first copy gets the new PDF
- * (replaceInDocument: a healthy old PDF is kept in it as <name>_old.pdf, a damaged one is
- * dropped). Any further copy the ECM damaged goes to the trash; healthy ones are left alone.
+ * (replaceInDocument: a healthy old PDF is kept in it as <name>_old.pdf, one proven damaged is
+ * dropped). Any further copy proven damaged goes to the trash; the others are left alone.
  *
  * @param {{ kind: string, bytes: Uint8Array, filename: string, title?: string, fields?: object,
  *           account: { irepsAccountId?: string|null, operatingUnit?: string|null }, mimeType?: string,
  *           replace?: string[] }} doc
- * @param {{ fetch?: typeof fetch, hostPermissions?: string[] }} [deps]
+ * @param {{ fetch?: typeof fetch, hostPermissions?: string[], retryDelaysMs?: number[] }} [deps]
  * @returns {Promise<{ uid: string, path: string|null, title: string|null, site: string, deduplicated: boolean,
  *           replaced?: { oldFile: string|null, oldDamaged: boolean, oldFileReadable: boolean|null, trashed: string[] } }>}
  *          replaced (a replace only): the old PDF's name in the document (null: it was damaged and dropped),
@@ -545,8 +644,12 @@ export async function uploadToNuxeo(doc, deps = {}) {
     const done = await replaceInDocument(conn, target, { bytes: doc.bytes, filename, mimeType });
     const trashed = [];
     for (const uid of others) {
-      const damaged = await assertFileReadable(conn, uid, filename).then(() => false, (error) => error instanceof EcmError && error.code === ECM_ERROR.DAMAGED);
-      if (!damaged) continue;
+      // only a copy proven damaged goes to the trash; one the ECM cannot be asked about now stays
+      const check = await checkFile(conn, uid).catch((error) => ({ verdict: "unreachable", why: (error && (error.detail || error.message)) || "" }));
+      if (check.verdict !== "damaged") {
+        if (check.verdict !== "ok") logger.warn(`ECM: copy ${uid} could not be checked (${check.why}); it is left alone`);
+        continue;
+      }
       await trashDocument(conn, uid).then(() => trashed.push(uid), (error) => logger.warn(`Could not move the damaged copy ${uid} to the ECM trash`, { detail: error && error.detail }));
     }
     logger.info(`ECM: ${filename} replaced the PDF of document ${target}`, { oldFile: done.oldFile, oldDamaged: done.oldDamaged, trashed });
@@ -566,8 +669,9 @@ export async function uploadToNuxeo(doc, deps = {}) {
 }
 
 /**
- * A new document in `parent` with the file as its main file, read back in full. A copy the ECM
- * damaged is moved to the trash (DocLink's own copy) and ECM_FILE_DAMAGED is thrown.
+ * A new document in `parent` with the file as its main file, read back in full. When the ECM
+ * cannot serve it, ECM_FILE_DAMAGED is thrown (the caller saves the file locally), and DocLink's
+ * own copy is moved to the trash if its damage is proven; never because of a passing fault.
  */
 async function createDocument(conn, { kind, parent, title, filename, mimeType, bytes, values }) {
   const batchId = await uploadBatch(conn, [{ name: filename, mimeType, bytes }]);
@@ -583,7 +687,7 @@ async function createDocument(conn, { kind, parent, title, filename, mimeType, b
     await assertFileReadable(conn, created.uid, filename);
   } catch (error) {
     // DocLink's own broken copy is not left in the folder (the file is saved locally instead)
-    if (error instanceof EcmError && error.code === ECM_ERROR.DAMAGED) {
+    if (error instanceof EcmError && error.code === ECM_ERROR.DAMAGED && error.proven) {
       await trashDocument(conn, created.uid).catch((e) => logger.warn(`Could not move the damaged copy ${created.uid} to the ECM trash`, { detail: e && e.detail }));
     }
     throw error;
@@ -597,18 +701,22 @@ async function createDocument(conn, { kind, parent, title, filename, mimeType, b
  * appended to its attachments (files:files) by Nuxeo's Blob.AttachOnDocument, which adds one
  * file without re-sending the others. A file already in it under the same name is not added
  * again (deduplicated). Metadata the document lacks (a tender date) is filled in, never changed.
- * Uploads are serialised by ecm-service.js uploadToEcm, so two PDFs of a tender never race to
- * create two documents.
+ * Uploads are serialised by ecm-service.js uploadToEcm across this browser's panels and its
+ * service worker, so two PDFs of a tender never race to create two documents there. Another
+ * user can still create the tender's document at the same moment: after creating it, DocLink
+ * searches again (read-only) and warns when an older one exists, as later PDFs go to the oldest.
  *
  * An attachment the ECM damaged stays in the document (removing one means re-sending the
  * others) and ECM_FILE_DAMAGED is thrown, so the caller saves the PDF locally; the same happens
  * on the next run, as the damaged attachment is found by name.
  */
 async function addToTenderDocument(conn, { kind, parent, siteKey, title, filename, mimeType, bytes, values }) {
-  const [group] = await search(conn, groupDocumentQuery({ kind, folderUid: parent, title, values }), { limit: 1 });
+  const query = groupDocumentQuery({ kind, folderUid: parent, title, values });
+  const [group] = await search(conn, query, { limit: 1 });
   if (!group) {
     const created = await createDocument(conn, { kind, parent, title, filename, mimeType, bytes, values });
     logger.info(`ECM stored ${filename} as the new document ${title}`, { kind, site: siteKey, uid: created.uid });
+    await warnIfCreatedTwice(conn, query, created, { title, filename });
     return saved(created, siteKey, false);
   }
   const uid = group.uid;
@@ -621,12 +729,13 @@ async function addToTenderDocument(conn, { kind, parent, siteKey, title, filenam
   }
 
   const batchId = await uploadBatch(conn, [{ name: filename, mimeType, bytes }]);
-  const attached = await call(conn, "POST", `/upload/${encodeURIComponent(batchId)}/0/execute/Blob.AttachOnDocument`, {
+  const { response: attached, body: answer } = await call(conn, "POST", `/upload/${encodeURIComponent(batchId)}/0/execute/Blob.AttachOnDocument`, {
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ params: { document: uid, xpath: "files:files", save: true } })
+    body: JSON.stringify({ params: { document: uid, xpath: "files:files", save: true } }),
+    // the answer is the attached file itself: read only so that the deadline covers the whole exchange
+    read: "arrayBuffer"
   });
-  // the answer is the attached file itself, so only its status is read
-  if (!attached.ok) throw httpError(attached, await readJson(attached), `Blob.AttachOnDocument ${uid}`);
+  if (!attached.ok) throw httpError(attached, jsonIn(answer), `Blob.AttachOnDocument ${uid}`);
 
   const lacking = Object.entries(values).filter(([key]) => props[ECM_FIELDS[key]] === undefined || props[ECM_FIELDS[key]] === null || props[ECM_FIELDS[key]] === "");
   if (lacking.length) {
@@ -643,6 +752,24 @@ async function addToTenderDocument(conn, { kind, parent, siteKey, title, filenam
   await assertFileReadable(conn, uid, filename, xpath);
   logger.info(`ECM added ${filename} to ${title}`, { kind, site: siteKey, uid, xpath });
   return saved(group, siteKey, false);
+}
+
+/**
+ * After DocLink created a tender's document: the same lookup again (read-only). When its first,
+ * oldest answer is another document, someone else created the tender's document at the same
+ * moment; later PDFs of the tender go to that older one and DocLink's stays as it is, so the ECM
+ * team is told to merge them. Nothing is moved or trashed. A failed lookup is only logged.
+ */
+async function warnIfCreatedTwice(conn, query, created, { title, filename }) {
+  let oldest;
+  try {
+    [oldest] = await search(conn, query, { limit: 1 });
+  } catch (error) {
+    logger.warn(`ECM: could not check whether ${title} exists twice`, { detail: error && (error.detail || error.message) });
+    return;
+  }
+  if (!oldest || oldest.uid === created.uid) return;
+  logger.warn(`ECM: ${title} exists twice: ${oldest.uid} (older, created at the same moment by someone else) and DocLink's ${created.uid}, which holds ${filename}. Later PDFs of this tender go to ${oldest.uid}; ask the ECM team to merge the two.`);
 }
 
 const IN_CHUNK = 100; // values per "IN (...)" in findInFolder

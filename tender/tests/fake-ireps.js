@@ -70,12 +70,19 @@ export const msgBody = (m) => m.body ?? (/corrigendum/i.test(m.subject)
   ? `Dear Sir/Madam,<br><br>A corrigendum has been issued on ${m.date} towards X, ${/Tender\s*no.*$/i.exec(m.subject)?.[0] || ''}. Please login into IREPS.`
   : `Dear Sir/Madam, <br><br>Your attention is invited towards X, ${/Tender\s*Number.*$/i.exec(m.subject)?.[0]?.replace('Number', 'No.') || ''} due on 12-Nov-2026 14:00 IST for <i>'${m.title || 'Some item'}'</i>.<br><br>Thanks`);
 
+/**
+ * The search form IREPS draws on every vendor inbox page (vendorInboxLink.do: My Messages, the Post Tenders
+ * lists, Closed Tenders), with or without rows - as in the captures of 22 and 29 Oct 2026.
+ */
+export const schFormFields = (listType) => `<input type="text" name="tenderNo" value="" id="tenderNumber"><input type="text" name="startDate" value="11/07/2026" readonly><input type="text" name="endDate" value="09/10/2026" readonly>
+<input type="hidden" name="pageNo" id="pageNo"><input type="hidden" name="listType" id="listType" value="${listType}"><input type="hidden" name="raStatus" value="-1">`;
+
 export function inboxMessages(msgs, pageNo = 1, pageSize = 100) {
   const pages = Math.max(1, Math.ceil(msgs.length / pageSize));
   const slice = msgs.slice((pageNo - 1) * pageSize, pageNo * pageSize);
   const rows = slice.map((m) => `<tr><td><b>${m.date} 10:00</b></td><td>EPS Admin</td><td><A HREF="#" onclick=postRequest('/epsn/admin/myMessages/ViewMessageDetailAction.do?oid=${1000 + msgs.indexOf(m)}') title="${m.subject}" class="linkStyle"><B>${m.subject.slice(0, 30)}....</B></a></td><td><a title="View Message" onclick=postRequest('/epsn/admin/myMessages/ViewMessageDetailAction.do?oid=${1000 + msgs.indexOf(m)}')>v</a></td></tr>`).join('');
   const links = Array.from({ length: pages }, (_, i) => `<a href="#" onClick="return menuexpand('MyMsg',${i + 1})">${i + 1}</a>`).join('&nbsp;');
-  return html(`<form id="schForm"><strong>Total Messages:</strong>${msgs.length}&nbsp;&nbsp;<table><tr><td>Sent Date/Time</td><td>From</td><td>Subject</td><td>Action</td></tr>${rows}</table><table><tr><td align="right">${links}</td></tr></table></form>`, 'Folder Details');
+  return html(`<form name="buyerInboxLinkForm" method="post" action="/epsn/vendorInboxLink.do" id="schForm">${schFormFields('MyMsg')}<strong>Total Messages:</strong>${msgs.length}&nbsp;&nbsp;<table><tr><td>Sent Date/Time</td><td>From</td><td>Subject</td><td>Action</td></tr>${rows}</table><table><tr><td align="right">${links}</td></tr></table></form>`, 'Folder Details');
 }
 
 export function messageDetail(m, idx) {
@@ -114,11 +121,10 @@ function home()
 
 export function inboxForm() {
   return html(`<form name="buyerInboxLinkForm" method="post" action="/epsn/vendorInboxLink.do">
-<input type="text" name="tenderNo" value="" id="tenderNumber"><input type="text" name="startDate" value="11/07/2026" readonly><input type="text" name="endDate" value="09/10/2026" readonly>
-<input type="hidden" name="pageNo" id="pageNo"><input type="hidden" name="listType" id="listType" value="MyNegotiation"><input type="hidden" name="raStatus" value="-1"></form>`, 'Folder Details');
+${schFormFields('MyNegotiation')}</form>`, 'Folder Details');
 }
 
-const LOA_SCRIPT = `<script>
+export const LOA_SCRIPT = `<script>
 function loaLetterViewActivity(url,docId){
 	var docType = "11";
 	var getAjaxData = '/epsn/supply/tds/ajxdata.do';
@@ -127,23 +133,40 @@ function loaLetterViewActivity(url,docId){
 }
 </script>`;
 
-export function inboxRows(status, tenderNo, rows, { more = false } = {}) {
+/**
+ * A Post Tenders list page. loaScript: the LOA list's own script (default LOA_SCRIPT; '' = none, or a changed one).
+ * live: the layout of the captured lists (22 Oct 2026, "Response LOI.txt"): IREPS's header row (left unclosed, as
+ * IREPS sends it) with "Dept/Rly. Unit" first, and each row's unit ("DAHOD / WESTERN RLY", row.unit) in that column.
+ */
+export function inboxRows(status, tenderNo, rows, { more = false, loaScript = LOA_SCRIPT, live = false } = {}) {
   const trs = rows.map((r) => {
     let action = '';
     if (status === 'MyNegotiation') action = `<a title="Nego Bid Process" onclick=postRequest('/epsn/supply/tds/negoBid.do?nitOId=${r.oid}')>n</a><a title="View Negotiation Letters" class="linkStyle"href="#" onclick=postRequestNewWindow('/epsn/supply/tds/publishIndiNegotiationLetter.do?nitOId=${r.oid}&negoLetterId=${r.letter}&opValue=ViewPublishedLetter','toolbar=0,width=775')>v</a>`;
     if (status === 'MyCounterOffer') action = `<a title="Counter Offer Response Page" class="linkStyle"href="#" onclick=postRequest('/epsn/supply/tds/coResponse.do?oid=${r.oid}&nitId=${r.nitId || 1}&coBidId=2&tdId=3&letterId=${r.letter}&responseDate=14/09/2026&tdVersion=1')>r</a><a title="View Counter Offer Letters" class="linkStyle"href="#" onclick=postRequestNewWindow('/epsn/supply/tds/publishCounterOfferLetter.do?Action=ViewPublishedLetter&responseDate=14/09/2026&nitOId=${r.oid}&tdId=3&tdVersion=1&bidid=2&bidderAccId=${r.bidder || '833'}&letterId=${r.letter}&signId=9${r.letter}','toolbar=0')>v</a>`;
-    if (status === 'MyAdvanceAcceptanceLetter') action = `<a title="View LOA Letter" class="linkStyle"href="#" onclick=loaLetterViewActivity('/supply/tds/publishLOALetter.do?Action=ViewPublishedLetter&nitOId=${r.oid}&tdId=3&letterId=${r.letter}&tdVersion=1&bidid=2&bidderAccId=${r.bidder || '833'}&signId=9${r.letter}','${r.letter}')>v</a>`;
+    if (status === 'MyAdvanceAcceptanceLetter') action = `<a title="View LOA Letter" class="linkStyle"href="#" onclick=loaLetterViewActivity('/supply/tds/publishLOALetter.do?Action=ViewPublishedLetter&nitOId=${r.oid}&tdId=3&letterId=${r.letter}&tdVersion=1&bidid=2&bidderAccId=${r.bidder || '833'}&signId=9${r.letter}'${r.noDocId ? '' : `,'${r.letter}'`})>v</a>`;
     const d = r.date; const stamp = `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()} 17:40&nbsp;(${r.letter})`;
-    return `<tr><td>${r.no === tenderNo ? '' : ''}Dept / RLY</td><td><a class="linkStyle" title="To View NIT Click the NIT No" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=9${r.letter}')>${r.no}</a></td><td>${stamp}</td><td>${action}</td></tr>`;
+    const nit = `<a class="linkStyle" title="To View NIT Click the NIT No" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=9${r.letter}')>${r.no}</a>`;
+    if (live) return `<tr> <td width="15%" style="color: black">${r.unit || 'STORES / WESTERN RLY'}</td><td width="15%">${nit}</td> <td width="35%" style= "padding:5px; color: black;">${r.title || 'Some item'} </td> <td width="35%" style= "padding:5px; color: black;" nowrap="nowrap">${stamp}</td><td>Published</td><td align="center">${action}</td></tr>`;
+    return `<tr><td>${r.no === tenderNo ? '' : ''}Dept / RLY</td><td>${nit}</td><td>${stamp}</td><td>${action}</td></tr>`;
   }).join('');
-  return html(`<form><table><tr><td>Tender No</td><td>Dept</td><td>Action</td></tr>${trs}</table>${more ? '<a href="#" onclick="gotoPage(2)">Next</a>' : ''}</form>${status === 'MyAdvanceAcceptanceLetter' ? LOA_SCRIPT : ''}`, 'Folder Details');
+  const head = live
+    ? '<table width="100%" class="nit_summary" border="0" cellpadding="0" cellspacing="0" border="1"><tr><td colspan="5">&nbsp;</td></tr> <tr bgcolor="#E9E9EF"> <td width="15%" style="color: black"><strong>Dept/Rly. Unit</strong></td> <td width="15%" style="color: black"><strong>Tender No. </strong></td> <td width="30%" style="color: black"><strong>Tender Title</strong></td> <td width="35%" style="color: black"><strong>Letter Date (LetterId)</strong></td> <td width="15%" style="color: black"><strong>LOA Status</strong></td> <td width="20%" align="center" style="color: black"><strong>Actions</strong></td> '
+    : '<table><tr><td>Tender No</td><td>Dept</td><td>Action</td></tr>';
+  return html(`<form name="buyerInboxLinkForm" method="post" action="/epsn/vendorInboxLink.do" id="schForm">${schFormFields(status)}${head}${trs}</table>${more ? '<a href="#" onclick="gotoPage(2)">Next</a>' : ''}</form>${status === 'MyAdvanceAcceptanceLetter' ? loaScript : ''}`, 'Folder Details');
 }
+
+/** The heading IREPS shows on every Tender Related Correspondence page (list and details). */
+const CORRES_HEADING = '<table><tr><td class="formLabel">Tender Related Correspondence</td></tr></table>';
+/** The Tender Related Correspondence list with an empty Pending table. */
+export const corresList = () => html(`${CORRES_HEADING}<table><tr><td class="cvap-block-heading"><b>Correspondence - Pending</b></td></tr></table><table><thead><tr><th>Dept/Rly</th><th>Tender No.</th><th>Status</th><th>Action</th></tr></thead><tbody></tbody></table>`, 'Tender Related Correspondence');
+/** A tender's correspondence page without any letter. */
+export const corresEmpty = () => html(`${CORRES_HEADING}<table><tr><td>Tender No</td></tr></table>`, 'Tender Related Correspondence');
 
 export function corresPage(c) {
   const rows = c.letters.map((l) => `<tr><td class="dataText">${l.no} dated : ${l.date || '11/09/2026'}</td><td class="dataText">${l.subject}</td><td>12/09/2026</td><td>
 <a href="#" onclick="viewPublishedLtr('${c.nitOid}', '${l.corresId}', '${l.id}');" title="View Published Letter"><img src="v.png"></a>
 <a href="#" class="linkStyle" onclick="postRequest('/epsn/corres/vendor/vendorCorresSubmitReply.do?nitOid=${c.nitOid}&corresId=${l.corresId}&letterId=${l.id}&bidId=9')"><img title="Submit Response"></a></td></tr>`).join('');
-  return html(`<table><tr><td class="formLabel">Tender No</td><td class="dataText">
+  return html(`${CORRES_HEADING}<table><tr><td class="formLabel">Tender No</td><td class="dataText">
  ${c.tenderNo}
 </td><td class="formLabel">Closing Date</td><td>09/09/2026</td></tr></table>
 <table><tr><td>Letter No &amp; date</td><td>Subject</td><td>Last date</td><td>Action</td></tr>${rows}</table>
@@ -194,8 +217,8 @@ ${rows.map(row).join('\n')}
 
 /** Letter responses: print-ready HTML wrapper (default) or a direct PDF. */
 export const letterHtml = (label, extra = '') => html(`<div><h2>${label}</h2><table><tr><td>Letter No</td><td>306789</td></tr><tr><td>Date</td><td>11/09/2026</td></tr></table><p>Please note the revised terms and conditions apply to the above tender in all respects.</p>${extra}</div>`, label);
-/** A corrigendum page with its attached documents linked (c.attached = ['Revised_Spec.pdf', ...]). */
-export const corrigendumPage = (c) => letterHtml(`Corrigendum ${c.cn}`, (c.attached || []).map((f) => `<p>Attached Document: <a href="/ireps/upload/corrigendum/${c.id}/${f}" target="_blank">${f}</a></p>`).join(''));
+/** A corrigendum page with its attached documents linked (c.attached = ['Revised_Spec.pdf', ...]; c.extra: more markup). */
+export const corrigendumPage = (c) => letterHtml(`Corrigendum ${c.cn}`, (c.attached || []).map((f) => `<p>Attached Document: <a href="/ireps/upload/corrigendum/${c.id}/${f}" target="_blank">${f}</a></p>`).join('') + (c.extra || ''));
 
 /**
  * Tabulation answers that are not the PDF itself (commTboPdfAction.do opens in a popup, so no HAR has the real one):
@@ -335,6 +358,8 @@ export class FakeIreps {
     if (p === '/epsn/tbo/showTabulation.do') return method === 'POST' && body.get('oid') ? pdf('tabform' + body.get('oid')) : ok(html('<h1>Error</h1> missing'));
     if (p.startsWith('/ireps/upload/loa/')) { this.loaAttachmentHit = true; return pdf('loa-attachment'); }
     if (p.startsWith('/ireps/upload/co/')) { this.coAttachmentHit = true; return pdf('co-attachment'); }
+    if (p.startsWith('/ireps/upload/nego/')) { this.negoHits = [...(this.negoHits || []), p]; return pdf('nego-file' + p); }
+    if (p.startsWith('/ireps/upload/corres/')) { this.corresHits = [...(this.corresHits || []), p]; return pdf('corres-file' + p); }
 
     if (p === '/epsn/vendorInboxLink.do') {
       const status = body.get('status') || q.get('status');
@@ -365,9 +390,11 @@ export class FakeIreps {
       const rows = (this.s.inbox[status] || []).filter((r) => !want || r.no === want)
         .sort((a, b) => (a.live ? 0 : 1) - (b.live ? 0 : 1) || b.date - a.date);
       const pages = this.s.inboxPages[status];
-      if (pages) return ok(inboxRows(status, want, rows.filter((r) => (r.page || 1) === pageNo), { more: pageNo < pages }));
+      const loaScript = this.s.loaScript ?? LOA_SCRIPT;
+      const live = !!this.s.liveInbox;
+      if (pages) return ok(inboxRows(status, want, rows.filter((r) => (r.page || 1) === pageNo), { more: pageNo < pages, loaScript, live }));
       const per = this.s.inboxPageSize;
-      return ok(inboxRows(status, want, rows.slice((pageNo - 1) * per, pageNo * per), { more: pageNo * per < rows.length }));
+      return ok(inboxRows(status, want, rows.slice((pageNo - 1) * per, pageNo * per), { more: pageNo * per < rows.length, loaScript, live }));
     }
 
     const letterPaths = ['/epsn/supply/tds/publishIndiNegotiationLetter.do', '/epsn/supply/tds/publishCounterOfferLetter.do', '/epsn/supply/tds/publishLOALetter.do', '/epsn/corres/rly/viewpubIndltr.do'];
@@ -375,7 +402,11 @@ export class FakeIreps {
       if (method !== 'POST') return { status: 405, type: 'text/html', bytes: html('POST only') };
       if (p.endsWith('publishLOALetter.do') && !this.loaAcked) return ok(html('<h1>Not viewed</h1> You have not acknowledged the letter first, error occurred'));
       const id = body.get('negoLetterId') || body.get('letterId') || body.get('letterID');
-      const extra = p.endsWith('publishLOALetter.do') ? this.s.loaExtra : p.endsWith('publishCounterOfferLetter.do') ? this.s.coExtra : '';
+      // s.letterBody: { '<letter page>.do': (id) => '<body html>' } - a letter page of another shape (a viewer page)
+      const custom = this.s.letterBody?.[p.split('/').pop()];
+      if (custom) return ok(html(custom(id), 'Letter'));
+      const extra = p.endsWith('publishLOALetter.do') ? this.s.loaExtra : p.endsWith('publishCounterOfferLetter.do') ? this.s.coExtra
+        : p.endsWith('publishIndiNegotiationLetter.do') ? this.s.negoExtra : p.endsWith('viewpubIndltr.do') ? this.s.corresExtra : '';
       return this.s.letterAsPdf ? pdf('letter' + id) : ok(letterHtml('Letter ' + id, extra || ''));
     }
     if (p === '/epsn/supply/tds/ajxdata.do') {
@@ -387,10 +418,10 @@ export class FakeIreps {
       const m = (this.s.messages || [])[idx];
       return m ? ok(messageDetail(m, idx)) : ok(html('no such message'));
     }
-    if (p === '/epsn/corres/vendorRelatedCorrespondence.do') return ok(html('<table><tr><td>Tender No</td></tr></table>'));
+    if (p === '/epsn/corres/vendorRelatedCorrespondence.do') return ok(corresList());
     if (p === '/epsn/corres/vendorCorrespondencePendingReply.do') {
       const c = this.s.corres[body.get('nitOid')];
-      return ok(c ? corresPage(c) : html('<table><tr><td>Tender No</td></tr></table>', 'Tender Related Correspondence'));
+      return ok(c ? corresPage(c) : corresEmpty());
     }
     return { status: 404, type: 'text/html', bytes: html('not found') };
   }
@@ -400,29 +431,43 @@ export class FakeIreps {
  * A fake chrome.debugger + chrome.tabs answering like the DevTools protocol (tender-print.js):
  * navigate -> the page request pauses -> fulfilled -> load -> printToPDF returns a PDF.
  *   attachError: attach throws (blocked by policy); cancel: the user cancels the "started debugging" bar.
+ *   pageRequests: what the letter's page then asks for, [{ method, url, postData, resourceType }] (each pauses
+ *     as Fetch.requestPaused, requestId p1, p2 ...); hang: the page never finishes loading.
+ * Closing the tab while attached ends the session (onDetach 'target_closed'), as Chrome does.
  */
-export function fakeChromeDebugger(chrome, { attachError = null, cancel = false } = {}) {
+export function fakeChromeDebugger(chrome, { attachError = null, cancel = false, pageRequests = [], hang = false } = {}) {
   const onEvent = new Set();
   const onDetach = new Set();
   const calls = [];
   const tabs = { created: 0, removed: [] };
+  let attached = false;
   const fire = (set, ...args) => setTimeout(() => set.forEach((f) => f({ tabId: 7 }, ...args)), 0);
-  chrome.tabs = { create: async () => { tabs.created++; return { id: 7 }; }, remove: async (id) => { tabs.removed.push(id); } };
+  chrome.tabs = {
+    create: async () => { tabs.created++; return { id: 7 }; },
+    remove: async (id) => { tabs.removed.push(id); if (attached) { attached = false; fire(onDetach, 'target_closed'); } },
+  };
   chrome.debugger = {
     onEvent: { addListener: (f) => onEvent.add(f), removeListener: (f) => onEvent.delete(f) },
     onDetach: { addListener: (f) => onDetach.add(f), removeListener: (f) => onDetach.delete(f) },
-    attach: async () => { if (attachError) throw new Error(attachError); calls.push(['attach']); },
-    detach: async () => { calls.push(['detach']); },
+    attach: async () => { if (attachError) throw new Error(attachError); attached = true; calls.push(['attach']); },
+    detach: async () => { attached = false; calls.push(['detach']); },
     sendCommand: async (target, method, params) => {
       calls.push([method, params]);
       if (method === 'Page.navigate') {
-        if (cancel) fire(onDetach, 'canceled_by_user');
-        else fire(onEvent, 'Fetch.requestPaused', { requestId: 'r1', request: { url: params.url } });
+        if (cancel) { attached = false; fire(onDetach, 'canceled_by_user'); }
+        else fire(onEvent, 'Fetch.requestPaused', { requestId: 'r1', frameId: 'main', resourceType: 'Document', request: { url: params.url, method: 'GET' } });
+        return { frameId: 'main' };
       }
-      if (method === 'Fetch.fulfillRequest') fire(onEvent, 'Page.loadEventFired', {});
+      if (method === 'Fetch.fulfillRequest') {
+        pageRequests.forEach((r, i) => fire(onEvent, 'Fetch.requestPaused', { requestId: `p${i + 1}`, frameId: r.frameId || 'main', resourceType: r.resourceType || 'XHR', request: { url: r.url, method: r.method || 'GET', ...(r.postData ? { postData: r.postData } : {}) } }));
+        if (!hang) fire(onEvent, 'Page.loadEventFired', {});
+      }
       if (method === 'Page.printToPDF') return { data: Buffer.from(PDF('chrome-print')).toString('base64') };
       return {};
     },
   };
-  return { calls, tabs, cmd: (m) => calls.find((c) => c[0] === m)?.[1] };
+  /** what became of a paused request: 'continued' | 'failed' | undefined */
+  const outcome = (requestId) => (calls.some((c) => c[0] === 'Fetch.failRequest' && c[1].requestId === requestId) ? 'failed'
+    : calls.some((c) => c[0] === 'Fetch.continueRequest' && c[1].requestId === requestId) ? 'continued' : undefined);
+  return { calls, tabs, cmd: (m) => calls.find((c) => c[0] === m)?.[1], outcome };
 }

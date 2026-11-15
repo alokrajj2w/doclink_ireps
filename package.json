@@ -1,13 +1,20 @@
 {
   "name": "doclink",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/run-tests.mjs",
+    "lint": "eslint .",
+    "verify": "npm run lint && npm test && npm run build"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0",
-    "javascript-obfuscator": "^4.1.1",
-    "jsdom": "^31.0.0"
+    "@eslint/js": "10.0.1",
+    "esbuild": "0.25.12",
+    "eslint": "10.14.0",
+    "globals": "17.14.0",
+    "javascript-obfuscator": "4.2.2",
+    "jsdom": "31.0.0"
   }
 }

@@ -1,9 +1,12 @@
 // "Download Tender Documents" view: account panel + automatic discovery from My Messages.
 import { runAutomatic, runLetterType, runTabulations } from './tender-auto.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
-import { SESSION_MSG, getLogTail } from './tender-core.js';
+import { SESSION_MSG, log } from './tender-core.js';
+import { renderAccountPanel, refreshAccountPanel, wireCopyDiagnostics, wireViewLifecycle, guardTabs } from './view-common.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
 import { describeSkip } from '../services/download-log.js';
+import { claimPanelRun, releasePanelRun, isPanelBusy, PANEL_BUSY_MSG } from './run-lock.js';
+import { localIsoDate } from '../utils/dates.js';
 
 const $ = (id) => document.getElementById(id);
 const main = $('view-main');
@@ -11,16 +14,14 @@ const view = $('view-tender');
 const gate = $('view-gate');
 
 let running = false;
-let lastIds = [];
 
-const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const fromIso = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 
 function show(open) {
   view.hidden = !open;
   if (open) {
     main.hidden = true;
-    if (!$('auto-from').value) { $('auto-from').value = iso(new Date()); $('auto-to').value = iso(new Date()); }
+    if (!$('auto-from').value) { $('auto-from').value = localIsoDate(new Date()); $('auto-to').value = localIsoDate(new Date()); }
     refreshAccount();
   } else if (gate.hidden) main.hidden = false;
 }
@@ -28,6 +29,7 @@ function show(open) {
 /** Disable every download button while a run goes; the clicked one shows the spinner. */
 function setBusy(busy, button) {
   running = busy;
+  if (busy) claimPanelRun('tender'); else releasePanelRun('tender');
   $('btn-auto-run').disabled = busy;
   $('btn-auto-retry').disabled = busy;
   document.querySelectorAll('[data-status],[data-tabulation]').forEach((b) => { b.disabled = busy; });
@@ -38,29 +40,10 @@ function setBusy(busy, button) {
 // ---------------------------------------------------------------- account panel
 
 /** Render a detected (or failed) account context. Nothing here is assumed: every value is from IREPS. */
-export function renderAccount(a) {
-  const ok = !!(a && a.authenticated && a.verified);
-  $('acc-connection').textContent = a ? (a.authenticated ? 'Connected' : 'Not connected') : 'Not connected';
-  $('acc-company').textContent = ok || a?.companyName ? a.companyName : '—';
-  $('acc-unit').textContent = ok ? a.operatingUnit || 'Not stated' : '—';
-  $('acc-id').textContent = ok || a?.irepsAccountId ? a.irepsAccountId : '—';
-  $('acc-status').textContent = ok ? 'Verified' : 'Account not verified';
-  $('acc-status').className = ok ? 'tender-ok' : 'tender-bad';
-  const w = $('acc-warning');
-  w.textContent = ok ? '' : a && !a.authenticated ? SESSION_MSG : ACCOUNT_UNVERIFIED_MSG;
-  w.hidden = ok;
-}
+const renderAccount = (a) => renderAccountPanel('', a);
 
 async function refreshAccount() {
-  if (running) return;
-  $('acc-connection').textContent = 'Checking…';
-  $('acc-status').textContent = 'Checking…';
-  try {
-    renderAccount(await getActiveIrepsAccountContext());
-  } catch (e) {
-    console.error('[DocLink][Account] check failed:', e.message);
-    renderAccount(null);
-  }
+  if (!running) await refreshAccountPanel('');
 }
 
 // ---------------------------------------------------------------- rendering
@@ -133,12 +116,13 @@ function renderResult(r) {
   $('tender-result-tender').textContent = `Dates ${r.range.from} - ${r.range.to}: ${r.messages.relevant} NIT/corrigendum message(s) of ${r.messages.scanned}, ${r.messages.pagesRead} page(s) read`;
   $('tender-result-totals').textContent = `Downloaded: ${r.summary.downloaded}   Failed tenders: ${r.summary.failed}   Needs review: ${r.summary.needsReview}${r.messages.truncated ? '   (page limit reached - narrow the date range)' : ''}`;
   $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/';
-  lastIds = [];
   $('btn-tender-show').hidden = true;
   $('tender-result').hidden = false;
-  $('btn-auto-retry').hidden = !(r.summary.failed || r.tenders.some((t) => t.status === 'FAILED'));
-  if (r.aborted) {
-    $('tender-error-message').textContent = `Stopped early: ${r.aborted.message}`;
+  $('btn-auto-retry').hidden = !(r.summary.failed || r.tenders.some((t) => t.status === 'FAILED') || r.messages.incomplete);
+  // My Messages not read to its end (H4): the messages after it were not looked at
+  const problems = [r.aborted ? `Stopped early: ${r.aborted.message}` : '', r.messages.incomplete ? `My Messages was not read to the end: ${r.messages.incomplete}` : ''].filter(Boolean);
+  if (problems.length) {
+    $('tender-error-message').textContent = problems.join('\n');
     $('tender-error').hidden = false;
   }
 }
@@ -152,7 +136,8 @@ function renderLetterResult(status, r) {
   const l = r.letters;
   const n = l.summary?.newLetters || 0;
   const err = l.listErrors?.[status];
-  body.append(li(`${name} letters (by Letter Date)`, err ? 'failed' : n ? `${n} downloaded` : 'none for these dates', err ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', err || ''));
+  const warn = l.listWarnings?.[status]; // rows of the list DocLink could not read (shown, never silently skipped)
+  body.append(li(`${name} letters (by Letter Date)`, err ? 'failed' : n ? `${n} downloaded` : 'none for these dates', err || warn ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', err || warn || ''));
   for (const t of l.tenders) {
     const parts = Object.entries(t.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
     body.append(li(`  ${t.tenderNo}`, t.error ? 'failed' : parts.join(' · '), t.error ? 'tender-bad' : 'tender-ok', '', t.error || Object.values(t.categories).map(reasons).filter(Boolean).join('\n')));
@@ -192,8 +177,10 @@ function renderTabulationResult(pdfType, r) {
   $('btn-tender-show').hidden = true;
   $('tender-result').hidden = false;
   $('btn-auto-retry').hidden = true;
-  if (t.aborted) {
-    $('tender-error-message').textContent = `Stopped early: ${t.aborted.message}`;
+  // Closed Tenders not read to its end (H4): tenders on the part not read were not looked at
+  const problems = [t.aborted ? `Stopped early: ${t.aborted.message}` : '', t.incomplete ? `Closed Tenders was not read to the end: ${t.incomplete}` : ''].filter(Boolean);
+  if (problems.length) {
+    $('tender-error-message').textContent = problems.join('\n');
     $('tender-error').hidden = false;
   }
 }
@@ -204,6 +191,11 @@ async function runByDate(what, task, render, button) {
   $('tender-error').hidden = true;
   $('tender-result').hidden = true;
   $('auto-discovered').hidden = true;
+  if (isPanelBusy('tender')) {
+    $('tender-error-message').textContent = PANEL_BUSY_MSG;
+    $('tender-error').hidden = false;
+    return;
+  }
   let from;
   let to;
   try {
@@ -227,7 +219,7 @@ async function runByDate(what, task, render, button) {
   } catch (e) {
     $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('tender-error').hidden = false;
-    console.error(`[DocLink][Tender] ${what} failed:`, e.code || '', e.message);
+    log('Tender', `${what} failed: ${e.code || ''} ${e.message}`, 'error');
   } finally {
     stopGuard();
     $('tender-progress').hidden = true;
@@ -239,34 +231,7 @@ const runLetters = (status, button) => runByDate('letters', (o) => runLetterType
 const runTabulationType = (pdfType, button) => runByDate('tabulations', (o) => runTabulations({ pdfType, ...o }), (r) => renderTabulationResult(pdfType, r), button);
 
 // ---------------------------------------------------------------- keep the user on the IREPS tab while downloading
-
-/**
- * While a download run is going, a tab that Chrome opens for a saved file (PDF viewer, file:// or blob: page,
- * the downloads page) is closed again and the IREPS tab the run started on is brought back, so DocLink
- * stays on the IREPS portal. Pages the user opens themselves (normal http/https sites) are left alone.
- */
-function guardTabs() {
-  let origin = null;
-  const strays = (url) => /^(blob:|file:|filesystem:|data:|chrome:\/\/downloads)/i.test(url || '') || /\.pdf([?#]|$)/i.test(url || '');
-  chrome.tabs.query({ active: true, currentWindow: true }).then(([t]) => { origin = t || null; }).catch(() => {});
-  const restore = () => { if (origin) chrome.tabs.update(origin.id, { active: true }).catch(() => {}); };
-  const check = (tab) => {
-    if (!tab || origin === null || tab.id === origin.id) return;
-    if (strays(tab.url) || strays(tab.pendingUrl)) chrome.tabs.remove(tab.id).then(restore).catch(() => {});
-  };
-  const onCreated = (tab) => check(tab);
-  const onUpdated = (_id, change, tab) => { if (change.url || change.status) check(tab); };
-  // a downloaded file's tab can take focus before its URL is known: look again as soon as it becomes the active tab
-  const onActivated = ({ tabId }) => { if (origin && tabId !== origin.id) chrome.tabs.get(tabId).then(check).catch(() => {}); };
-  chrome.tabs.onCreated.addListener(onCreated);
-  chrome.tabs.onUpdated.addListener(onUpdated);
-  chrome.tabs.onActivated.addListener(onActivated);
-  return () => {
-    chrome.tabs.onActivated.removeListener(onActivated);
-    chrome.tabs.onCreated.removeListener(onCreated);
-    chrome.tabs.onUpdated.removeListener(onUpdated);
-  };
-}
+// guardTabs (view-common.js): during a run only the tabs DocLink's own work opened are closed (M23)
 
 // ---------------------------------------------------------------- run
 
@@ -275,6 +240,11 @@ async function run() {
   $('tender-error').hidden = true;
   $('tender-result').hidden = true;
   $('auto-discovered').hidden = true;
+  if (isPanelBusy('tender')) {
+    $('tender-error-message').textContent = PANEL_BUSY_MSG;
+    $('tender-error').hidden = false;
+    return;
+  }
   let from;
   let to;
   try {
@@ -301,7 +271,7 @@ async function run() {
     $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('tender-error').hidden = false;
     if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') renderAccount(await getActiveIrepsAccountContext().catch(() => null));
-    console.error('[DocLink][Tender] run failed:', e.code || '', e.message);
+    log('Tender', `run failed: ${e.code || ''} ${e.message}`, 'error');
   } finally {
     stopGuard();
     $('tender-progress').hidden = true;
@@ -316,22 +286,7 @@ document.querySelectorAll('[data-status]').forEach((b) => b.addEventListener('cl
 document.querySelectorAll('[data-tabulation]').forEach((b) => b.addEventListener('click', () => runTabulationType(b.dataset.tabulation, b)));
 $('btn-auto-retry').addEventListener('click', run); // already-downloaded documents are skipped via the ledger
 $('btn-account-refresh').addEventListener('click', refreshAccount);
-$('btn-copy-diag').addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(getLogTail() || '(no log yet)');
-    $('btn-copy-diag').textContent = 'Copied';
-  } catch {
-    $('btn-copy-diag').textContent = 'Copy failed';
-  }
-  setTimeout(() => ($('btn-copy-diag').textContent = 'Copy diagnostics'), 1500);
-});
+wireCopyDiagnostics($('btn-copy-diag'));
 
-// The user may switch IREPS accounts in another tab: re-detect whenever the panel regains focus.
-const refreshIfVisible = () => !view.hidden && !running && refreshAccount();
-window.addEventListener('focus', refreshIfVisible);
-document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && refreshIfVisible());
-
-// If DocLink's "go to IREPS" gate takes over, keep this view out of the way.
-new MutationObserver(() => {
-  if (!gate.hidden) view.hidden = true;
-}).observe(gate, { attributes: true, attributeFilter: ['hidden'] });
+// Re-detect the account when the panel comes back into view; step aside for the "go to IREPS" gate.
+wireViewLifecycle({ view, gate, isRunning: () => running, refresh: refreshAccount });

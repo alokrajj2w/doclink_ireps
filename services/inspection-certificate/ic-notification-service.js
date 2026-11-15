@@ -21,18 +21,16 @@
  */
 
 import { IrepsError, IREPS_ERROR } from "../ireps-api.js";
-import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
-import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
+import { BATCH_ITEM_STATUS, countItemStatuses, downloadStateItems } from "../batch-download.js";
 import { fetchNotifications, selectIcNotifications, NOTIFICATION_ERROR } from "../notifications/notification-service.js";
 import { withRetry } from "../batch-utils.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
-import { loadIcListPage, submitIcSearch, buildIcSearchRequest, buildIcPageRequest, extractIcPageCount, IC_ERROR } from "./ic-api.js";
-import { extractIcForm } from "./ic-form.js";
-import { validateIcSession } from "./ic-service.js";
+import { buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
+import { runIcSearch } from "./ic-search.js";
 import { parseIcSearchResults, icNumberFromUrl } from "./ic-parser.js";
-import { ECM_KIND } from "../ecm-service.js";
+import { icFiling } from "./ic-service.js";
 
-export const IC_NOTIF_STATUS = Object.freeze({ ...DOCUMENT_DOWNLOAD_STATUS, SKIPPED: "skipped", DUPLICATE: "duplicate" });
+export const IC_NOTIF_STATUS = Object.freeze({ ...BATCH_ITEM_STATUS, DUPLICATE: "duplicate" });
 
 /** Per-notification outcome. */
 export const NOTIFICATION_OUTCOME = Object.freeze({
@@ -79,38 +77,21 @@ export function matchIcRows(records, { poNo, poSerial, refId }) {
 export async function findIcRows(target, deps = {}) {
   const parseHtml = deps.parseHtml || ((html, options) => parseIcSearchResults(html, target.poNo, options));
   const retry = (task) => withRetry(task, { attempts: 3, sleep: deps.sleep, delayMs: deps.retryDelayMs });
-  const requestDeps = { fetch: deps.fetch };
 
   const attempt = async (widen) => {
-    const listPage = await retry(() => loadIcListPage(requestDeps));
-    const listVerdict = validateIcSession(listPage.html, listPage);
-    if (!listVerdict.authenticated) throw new IrepsError(listVerdict.code, listVerdict.reason || "IREPS session is not active", { status: listVerdict.status });
-    const form = extractIcForm(listPage.html);
-    if (!form.token) throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "Struts token not found on the Inspection Call List page");
-
-    let request = buildIcSearchRequest(form, target.poNo, { poSerial: target.poSerial, ...(widen ? { dateFrom: IC_WIDE_FROM, dateFromIC: IC_WIDE_FROM } : {}) });
     const records = [];
-    let pages = 0;
-    let pageNo = 1;
-    for (;;) {
-      const results = await retry(() => submitIcSearch(request, requestDeps));
-      const verdict = validateIcSession(results.html, results, IC_ERROR.RESULTS_INVALID);
-      if (!verdict.authenticated) throw new IrepsError(verdict.code, verdict.reason || "IREPS response not recognised", { status: verdict.status });
-      let parsed;
-      try {
-        parsed = await parseHtml(results.html, { sourceUrl: results.url || null, poNo: target.poNo });
-      } catch (error) {
-        throw new IrepsError(IC_ERROR.PARSE_FAILED, "IC results HTML could not be parsed", { cause: error });
-      }
-      if (!parsed || !Array.isArray(parsed.records)) throw new IrepsError(IC_ERROR.PARSE_FAILED, "Parser returned no result");
-      records.push(...parsed.records);
-      pages++;
-      // Re-read the page count each time: the portal only prints ~10 page links at once.
-      if (pageNo >= extractIcPageCount(results.html) || pages >= MAX_PAGES) break;
-      pageNo++;
-      const next = extractIcForm(results.html);
-      request = buildIcPageRequest(request, next.token, pageNo);
-    }
+    const { pages } = await runIcSearch(
+      {
+        buildRequest: (form) => buildIcSearchRequest(form, target.poNo, { poSerial: target.poSerial, ...(widen ? { dateFrom: IC_WIDE_FROM, dateFromIC: IC_WIDE_FROM } : {}) }),
+        parseHtml,
+        parseOptions: { poNo: target.poNo },
+        maxPages: MAX_PAGES,
+        onPage: (parsed) => {
+          records.push(...parsed.records);
+        }
+      },
+      { fetch: deps.fetch, retry }
+    );
     return { records, pages };
   };
 
@@ -135,35 +116,14 @@ export async function findIcRows(target, deps = {}) {
 function summarise(state) {
   const c = state.counts;
   const items = state.items;
-  const n = (s) => items.filter((i) => i.status === s).length;
   const noteCount = (o) => state.notifications.filter((x) => x.outcome === o).length;
   c.matchedRecords = items.length + c.duplicates;
-  c.downloaded = n(IC_NOTIF_STATUS.COMPLETED);
-  c.failed = n(IC_NOTIF_STATUS.FAILED);
-  c.skipped = n(IC_NOTIF_STATUS.SKIPPED);
-  c.alreadyDownloaded = items.filter((i) => i.status === IC_NOTIF_STATUS.SKIPPED && i.skip).length;
-  c.inProgress = n(IC_NOTIF_STATUS.QUEUED) + n(IC_NOTIF_STATUS.DOWNLOADING);
+  countItemStatuses(state);
   c.unparsed = noteCount(NOTIFICATION_OUTCOME.UNPARSED);
   c.notFound = noteCount(NOTIFICATION_OUTCOME.NOT_FOUND);
   c.searchErrors = noteCount(NOTIFICATION_OUTCOME.ERROR) + noteCount(NOTIFICATION_OUTCOME.SESSION_EXPIRED);
   c.noLink = noteCount(NOTIFICATION_OUTCOME.NO_LINK);
   return state;
-}
-
-function applySnapshot(state, snapshot) {
-  const byId = new Map(snapshot.items.map((s) => [s.id, s]));
-  for (const item of state.items) {
-    const s = byId.get(item.id);
-    if (!s) continue;
-    item.status = s.status;
-    item.filename = s.filename;
-    item.downloadId = s.downloadId;
-    item.ecm = s.ecm || null;
-    item.error = s.error;
-    item.skip = s.skip || null;
-  }
-  if (snapshot.sessionExpired) state.sessionExpired = true;
-  if (snapshot.warnings && snapshot.warnings.length) state.warnings = [...new Set([...(state.warnings || []), ...snapshot.warnings])];
 }
 
 /** The public error info stored on state objects (no stack, no cause). */
@@ -259,33 +219,8 @@ async function lookupNotification(state, note, deps) {
 async function downloadQueued(state, deps) {
   const queued = state.items.filter((i) => i.status === IC_NOTIF_STATUS.QUEUED);
   if (queued.length === 0) return;
-  const notify = () => typeof deps.onUpdate === "function" && deps.onUpdate(summarise(state));
-  const batch = await downloadIrepsDocuments(
-    // `ecm` says how the IC is filed under Save to: ECM / S3 (ignored by a local save)
-    queued.map((i) => ({
-      id: i.id,
-      url: i.url,
-      path: i.path,
-      label: i.label,
-      ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: i.icNumber, customer_po_number: i.poNo, ic_date: i.icDate } },
-      log: logInfo(LOG_DOC_TYPE.IC, downloadKey.ic({ poNo: i.poNo, poSerial: i.poSerial, callId: i.callId, icNumber: i.icNumber }))
-    })),
-    {
-      fetch: deps.fetch,
-      saveFile: deps.saveFile,
-      preflight: deps.preflight,
-      onSaved: deps.onSaved,
-      concurrency: deps.concurrency,
-      retries: deps.retries ?? 2,
-      retryDelayMs: deps.retryDelayMs,
-      codes: DOWNLOAD_CODES,
-      onProgress: (snapshot) => {
-        applySnapshot(state, snapshot);
-        notify();
-      }
-    }
-  );
-  applySnapshot(state, batch);
+  // several rounds per run: a session expiry seen in an earlier round stays reported
+  await downloadStateItems(state, queued, deps, { filing: icFiling, codes: DOWNLOAD_CODES, summarise, stickySessionExpired: true });
 }
 
 /**

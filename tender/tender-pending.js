@@ -6,21 +6,23 @@
 //   POST /epsn/corres/vendorCorrespondencePendingReply.do     (form: nitOid)
 //   POST /epsn/corres/rly/viewpubIndltr.do                    (form: nitOid, letterID, corresId)
 //   GET/POST the attachment links found in a published letter
-// vendorCorresSubmitReply.do (and anything that looks like a write action) is refused in pcFetch().
+// vendorCorresSubmitReply.do (and anything that looks like a write action) is refused by the request guard
+// every tender / correspondence request passes (tender-core.js requestRefusal).
 //
 // Every identifier is read from the live responses; nothing from a captured session is baked in.
 // Under "Save to: ECM / S3" the letters and attachments go to the unit's ECM folder as crp (storeFile).
 
 import {
-  TenderError, SESSION_MSG, log, norm, getBaseUrl, absUrl, irepsFetch, assertSession, parseHtml,
+  TenderError, SESSION_MSG, log, norm, absUrl, irepsFetch, assertSession, parseHtml,
   elementActions, parseCalls, qparam, toRequest, requestKey, sniffKind, extensionFor,
   resolveIrepsDocument, looksLikeErrorPage, htmlToLines, wrapLines, buildPdf, isPdfBytes,
-  createSaver, safeSegment,
+  createSaver, safeSegment, CORRES_LIST_PATH, CORRES_REPLY_PATH, CORRES_VIEW_FALLBACK_PATH, inlineScripts,
+  assertAllowedRequest, isCorrespondencePage, pageNotRecognised,
 } from './tender-core.js';
-import { getActiveIrepsAccountContext, accountFolderLabel, assertSameAccount, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
+import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { openLedger } from './tender-ledger.js';
-import { inferRoute } from './tender-workflows.js';
-import { ensureDownloadSignIn, tenderEcmSink, ecmDocumentFor } from './tender-ecm.js';
+import { inferRoute, publicAccount } from './tender-workflows.js';
+import { tenderEcmSink, ecmDocumentFor } from './tender-ecm.js';
 import { printPageToPdf } from './tender-print.js';
 import { contentDispositionName, urlFileName, sourceFileName } from '../utils/filename.js';
 import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE } from '../services/download-log.js';
@@ -29,9 +31,9 @@ import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_
 const logPending = (entry, role, { filename, ecm }) =>
   logDownload(downloadRecord({ docType: TENDER_DOC_TYPE.PENDING_CORRESPONDENCE, key: downloadKey.pending(entry.key, role) }, { filename, ecm }));
 
-export const LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
-export const REPLY_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
-export const VIEW_FALLBACK_PATH = '/epsn/corres/rly/viewpubIndltr.do';
+export const LIST_PATH = CORRES_LIST_PATH;
+export const REPLY_PATH = CORRES_REPLY_PATH;
+export const VIEW_FALLBACK_PATH = CORRES_VIEW_FALLBACK_PATH;
 const MANIFEST_KEY = 'pending-correspondence';
 
 export const STATUS = {
@@ -42,28 +44,17 @@ export const NO_LETTERS_REASON = 'NO_PENDING_LETTERS_AT_DOWNLOAD_TIME';
 
 // ---------------------------------------------------------------- read-only guard
 
-const ALLOWED_PATHS = /\/(?:vendorRelatedCorrespondence|vendorCorrespondencePendingReply|viewpubIndltr)\.do$/i;
-// Action-style names only (saveX.do, X_submit.do, deleteX.do ...): a view such as viewUploadedDoc.do or a file called
-// Submission_List.pdf is not a write action.
-const WRITE_LIKE = /(?:^|[a-z0-9])(?:[Ss]ubmit|[Ss]ave|[Uu]pload|[Dd]elete|[Rr]emove|[Aa]pprove|[Aa]rchive|[Ww]ithdraw|[Uu]pdate|[Ii]nsert|[Ss]ign)(?=[A-Z_.]|$)/;
-
-/** Throws BLOCKED for anything that is not a read/view/download request. */
-export function assertReadOnly(url) {
-  let p;
-  try {
-    p = new URL(url, 'https://x.invalid/').pathname;
-  } catch {
-    throw new TenderError('BLOCKED', 'Malformed request refused.');
-  }
-  if (/SubmitReply/i.test(p)) throw new TenderError('BLOCKED', 'Submitting a correspondence reply is never done by DocLink.');
-  if (ALLOWED_PATHS.test(p)) return;
-  const last = p.split('/').pop() || '';
-  if (/\.(?:do|jsp|action)$/i.test(last) && WRITE_LIKE.test(last)) throw new TenderError('BLOCKED', `Refused a request that looks like a write action (${p.split('/').pop()}).`);
+/**
+ * Throws BLOCKED (EXCLUDED for an out-of-scope tabulation) for anything that is not a read / view / download
+ * request: the one request guard of tender/ (tender-core.js requestRefusal), which irepsFetch also applies
+ * to every request it sends. Used here to leave refused links out before anything is requested.
+ */
+export function assertReadOnly(url, { method = 'GET', form = null } = {}) {
+  assertAllowedRequest({ method, url, body: form });
 }
 
-/** irepsFetch behind the read-only guard. */
+/** irepsFetch, which checks every request against the guard (kept as the correspondence requests' name). */
 export async function pcFetch(base, ref, opts = {}) {
-  assertReadOnly(absUrl(base, ref, opts.relativeTo));
   return irepsFetch(base, ref, opts);
 }
 
@@ -96,10 +87,8 @@ export async function withRetry(fn, { tries = 3, delays = [800, 2500], sleep = d
 
 const lc = (s) => norm(s).toLowerCase();
 
-/** True for the Tender Related Correspondence pages (list and details). */
-export function isCorrespondencePage(doc) {
-  return /Tender\s+Related\s+Correspondence/i.test(norm(doc.body?.textContent || ''));
-}
+/** True for the Tender Related Correspondence pages (list and details); shared with the tender flow. */
+export { isCorrespondencePage };
 
 function columnMap(table, spec) {
   const head = table.tHead?.rows[0] || [...table.rows].find((r) => r.querySelector('th')) || table.rows[0];
@@ -121,6 +110,8 @@ const LIST_COLS = {
  * Parse the list page. The Pending table is found by its SECTION HEADING ("Correspondence - Pending"),
  * never by table position, and only rows whose own Status says Pending are returned.
  *   -> { rows[], skipped[], sections[], pendingSectionFound }
+ * pendingSectionFound false: the page has no Pending table DocLink recognises, so it says nothing about
+ * what is pending (the run stops with an error, never "no correspondence").
  */
 export function parsePendingList(html) {
   const doc = typeof html === 'string' ? parseHtml(html) : html;
@@ -180,12 +171,13 @@ function labelValue(doc, re) {
   return { text: '', title: '' };
 }
 
-const inlineScripts = (doc) => [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join('\n');
 
 /**
  * Parse a pending-replies page. Only the table under the heading "Pending Replies" is read (Lapsed and
  * Previous Replies tables on the same page are ignored).
  *   -> { tender:{tenderNo,closingDate,railway,tenderTitle}, letters[], unparsedRows[], pendingSectionFound, scripts }
+ * pendingSectionFound false: no Pending Replies table DocLink recognises (the record fails; it is never
+ * "no pending letters", which only an empty Pending Replies table - IREPS's "No record found" - means).
  */
 export function parsePendingReplies(html) {
   const doc = typeof html === 'string' ? parseHtml(html) : html;
@@ -419,9 +411,12 @@ export const letterKey = (accountId, l) => `${accountId}|${l.nitOid}|${l.corresI
  * Save one file of a letter. Under "Save to: ECM / S3" (ecm = tenderEcmSink) it goes to the unit's ECM
  * Tenders folder as "Correspondence Reply pending" (crp), titled "<tender no> - CRP - <title>"; when the
  * ECM does not take it, it is saved to Downloads as before. -> { saved (local save or null), ecm }
+ * It carries the tender date (client request, 13 Nov 2026): the "Closing Date" next to the tender number on
+ * the correspondence page, which is the TENDER's closing date (the letter itself quotes it: "Ref: Tender No.
+ * 86256328 closing date 15/07/2025 11:00"; the letter's own deadline is "Last date for submission of reply").
  */
 async function storeFile({ saver, ecm, rec, letter }, name, bytes, title, contentType = '') {
-  const doc = ecm && ecmDocumentFor('CORRESPONDENCE', { id: letter.letterId, meta: { title } }, { tenderNo: rec.tenderNo });
+  const doc = ecm && ecmDocumentFor('CORRESPONDENCE', { id: letter.letterId, meta: { title } }, { tenderNo: rec.tenderNo, closingDate: rec.closingDate || '' });
   if (!doc) return { saved: await saver.save('', name, bytes), ecm: null };
   const mimeType = /\.pdf$/i.test(name) ? 'application/pdf' : contentType || 'application/octet-stream';
   const r = await ecm.save({ ...doc, bytes, filename: name, mimeType }, () => saver.save('', name, bytes));
@@ -474,6 +469,24 @@ async function verifySaved(saved, bytes, role) {
 
 const blank = () => ({ records: {}, letters: {} });
 
+/** How long, and how many, letters the correspondence record remembers (M21: the ledger must not grow without end). */
+export const STATE_LIMITS = { keepMs: 400 * 86400000, maxLetters: 2000 };
+
+/**
+ * Forget the records and letters not seen in a run for STATE_LIMITS.keepMs, and beyond the newest
+ * STATE_LIMITS.maxLetters letters. A letter IREPS still shows as pending is seen (seenAt) on every run, so
+ * only letters long gone from the Pending list go; one that came back would simply be downloaded again.
+ */
+export function pruneCorrespondenceState(state, now = Date.now(), limits = STATE_LIMITS) {
+  const cutoff = now - limits.keepMs;
+  const at = (iso) => Date.parse(iso || '') || 0;
+  for (const l of Object.values(state.letters)) if (!l.seenAt) l.seenAt = l.downloadedAt || new Date(now).toISOString(); // older records had none
+  const letters = Object.entries(state.letters).filter(([, l]) => at(l.seenAt) >= cutoff).sort((a, b) => at(b[1].seenAt) - at(a[1].seenAt));
+  state.letters = Object.fromEntries(letters.slice(0, limits.maxLetters));
+  state.records = Object.fromEntries(Object.entries(state.records).filter(([, r]) => !r.updatedAt || at(r.updatedAt) >= cutoff));
+  return state;
+}
+
 function summarize(state, run) {
   const letters = Object.values(state.letters).filter((l) => run.has(l.key));
   const records = Object.values(state.records).filter((r) => run.has(r.nitOid));
@@ -494,7 +507,6 @@ function summarize(state, run) {
 }
 
 const publicLetter = ({ key, req, ...l }) => ({ ...l, key: undefined, files: l.files.map(({ downloadId, ...f }) => f) });
-const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, companyName: a.companyName, operatingUnit: a.operatingUnit });
 
 /**
  * Download every letter currently shown as pending.
@@ -504,18 +516,12 @@ const publicAccount = (a) => ({ irepsAccountId: a.irepsAccountId, companyName: a
  * Callbacks: onProgress(text), onAccount(account), onEvent({type:'records'|'record'|'letter'|'summary', ...}).
  */
 export async function downloadPendingCorrespondence({ mode = 'all', force = false, onProgress = () => {}, onAccount = () => {}, onEvent = () => {}, sleep = defaultSleep, pace = 200 } = {}) {
-  await ensureDownloadSignIn(); // Recon sign-in: every download is logged for the signed-in user
-  const base = await getBaseUrl();
-  onProgress('Verifying IREPS account...');
-  const account = await getActiveIrepsAccountContext({ base });
-  onAccount(account);
-  if (!account.authenticated) throw new TenderError('SESSION_EXPIRED', SESSION_MSG);
-  if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
-  const folderLabel = accountFolderLabel(account);
+  const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
   const ledger = await openLedger(account.irepsAccountId);
   const state = ledger.manifest(MANIFEST_KEY) || blank();
   state.records ||= {};
   state.letters ||= {};
+  pruneCorrespondenceState(state);
   const run = new Set(); // keys / nitOids touched by THIS run
   const jobSaver = createSaver({ accountLabel: folderLabel, subPath: ['Correspondence', 'Pending'], conflict: 'overwrite' });
   // Save to: ECM / S3 -> the unit's ECM folder (Recon sign-in when through the gateway); Local -> null
@@ -547,6 +553,10 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   const list = parsePendingList(listRes.text());
   skipped = list.skipped;
   log('Pending', `Sections: ${list.sections.join(' | ') || '(none)'}; pending rows: ${list.rows.length}; skipped rows: ${list.skipped.length}`);
+  // "No correspondence found" only when IREPS's own Pending table says so (H4)
+  if (!list.pendingSectionFound) {
+    throw pageNotRecognised(`Tender Related Correspondence has no "Correspondence - Pending" table DocLink can read (sections: ${list.sections.join(', ') || 'none'})`, null);
+  }
 
   const tenderCount = new Map();
   for (const r of list.rows) tenderCount.set(lc(r.tenderNo), (tenderCount.get(lc(r.tenderNo)) || 0) + 1);
@@ -608,6 +618,17 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
       rec.closingDate = page.tender.closingDate || rec.closingDate;
       rec.lettersPending = page.letters.length;
       rec.letterKeys = [];
+      if (!page.pendingSectionFound) {
+        // not IREPS saying "no pending letters": a page DocLink cannot read (H4); retried by "Retry failed"
+        rec.status = STATUS.FAILED;
+        rec.code = 'PAGE';
+        rec.error = pageNotRecognised(`the correspondence page of tender ${rec.tenderNo} has no "Pending Replies" table DocLink can read`, null).message;
+        log('Pending', `${rec.tenderNo}: no Pending Replies table recognised; nothing downloaded`, 'warn');
+        emitRecord(rec);
+        await persist();
+        emitSummary();
+        continue;
+      }
       if (!page.letters.length && !page.unparsedRows.length) {
         rec.status = STATUS.NO_PENDING_LETTERS;
         rec.reason = NO_LETTERS_REASON;
@@ -627,7 +648,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
         const entry = {
           key, accountId: account.irepsAccountId, tenderNo: rec.tenderNo, ...l, nitOid: l.nitOid,
           status: STATUS.PENDING, error: '', code: '', unavailable: false, files: prev?.files || [], attachmentsComplete: prev?.attachmentsComplete || false,
-          sourceAction: '', alreadyDownloaded: false, downloadedAt: prev?.downloadedAt || '',
+          sourceAction: '', alreadyDownloaded: false, downloadedAt: prev?.downloadedAt || '', seenAt: new Date().toISOString(),
         };
         if (l.nitOid !== rec.nitOid) {
           entry.status = STATUS.NEEDS_REVIEW;
@@ -641,7 +662,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
       }
       page.unparsedRows.forEach((u, i) => {
         const key = `${account.irepsAccountId}|${rec.nitOid}|unparsed${i}`;
-        state.letters[key] = { key, accountId: account.irepsAccountId, tenderNo: rec.tenderNo, nitOid: rec.nitOid, corresId: u.corresId || '', letterId: u.letterId || '', letterNo: u.letterNo || u.text || '', letterDate: u.letterDate || '', subject: u.subject || '', replyDeadline: u.replyDeadline || '', status: STATUS.NEEDS_REVIEW, error: u.reason, code: 'UNPARSED', unavailable: false, files: [], attachmentsComplete: false, sourceAction: '', downloadedAt: '' };
+        state.letters[key] = { key, accountId: account.irepsAccountId, tenderNo: rec.tenderNo, nitOid: rec.nitOid, corresId: u.corresId || '', letterId: u.letterId || '', letterNo: u.letterNo || u.text || '', letterDate: u.letterDate || '', subject: u.subject || '', replyDeadline: u.replyDeadline || '', status: STATUS.NEEDS_REVIEW, error: u.reason, code: 'UNPARSED', unavailable: false, files: [], attachmentsComplete: false, sourceAction: '', downloadedAt: '', seenAt: new Date().toISOString() };
         run.add(key);
         rec.letterKeys.push(key);
         emitLetter(state.letters[key]);

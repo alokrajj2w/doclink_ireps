@@ -29,6 +29,29 @@ const PORTAL_NAMES = { mock: "mock IREPS portal", real: "real IREPS portal", cus
  *   onActive runs every time the panel's tab becomes the configured portal.
  */
 
+/**
+ * The tab this panel document was opened for: the service worker opens each tab's panel as
+ * popup.html?tabId=<id> (sidePanel.setOptions). null for a panel without it. Stays the same while
+ * the user looks at another tab, unlike the active tab.
+ */
+export function panelOwnTabId() {
+  try {
+    const id = Number(new URLSearchParams(location.search).get("tabId"));
+    return Number.isInteger(id) && id >= 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a tab still exists (Chrome can replace a tab's id, e.g. typing a URL on the New Tab page). */
+export async function tabExists(tabId) {
+  try {
+    return Boolean(await chrome.tabs.get(tabId));
+  } catch {
+    return false;
+  }
+}
+
 /** The panel's tab right now: the active tab of the panel's window (see initGate). */
 export async function currentPanelTabId() {
   try {
@@ -81,9 +104,12 @@ export async function initGate(ctx) {
       el.btnOpen.textContent = `Open the ${portalName}`;
     } else if (scope.scope === TAB_SCOPE.MISCONFIGURED) {
       el.title.textContent = "DocLink configuration error";
-      el.text.textContent =
-        `config.json points DocLink at ${scope.portalUrl}, but manifest.json does not allow that site (host_permissions). ` +
-        "Fix the URL in config.json, then reload DocLink in chrome://extensions.";
+      // no portal at all: config.json could not be read or has no valid "target" (DocLink fails closed, never guesses the mock)
+      el.text.textContent = scope.portalUrl
+        ? `config.json points DocLink at ${scope.portalUrl}, but manifest.json does not allow that site (host_permissions). ` +
+          "Fix the URL in config.json, then reload DocLink in chrome://extensions."
+        : 'config.json could not be read, or its "target" is not "real" or "mock", so DocLink does not know which IREPS portal to use and sends nothing. ' +
+          "Fix config.json, then reload DocLink in chrome://extensions.";
       el.steps.hidden = true;
       el.btnOpen.hidden = true;
       el.portal.textContent = "";

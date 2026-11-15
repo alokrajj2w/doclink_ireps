@@ -1,0 +1,530 @@
+<!--
+  MOCK of the IREPS "Bill Data Entry" page (POST /epsn/ct/fetchPODetails.do), screens 5-9 of
+  "BILL SUBMISSION-Screen shot of IREPS.docx". Filled in and served by mock-bill-upload.mjs.
+
+  Control ids and request field names follow the captured page (stock HAR #55) where DocLink or
+  the bill flow depends on them. services/bill-upload/bill-form.js reads this page, so keep:
+    - saveBillHeader(): the single-quoted literals before "success:" and the companyName literal
+    - frmVals, checkPaymentTerms(), bankAccountNo, ifscCode, supplierGSTIN, payingRlySelect,
+      stateOfSupply, rlyGSTINFinal
+  The calculations are a small re-implementation for testing, not the portal's billFunctions.js.
+
+  Opened with a billRegNo (DRAFT below), the page shows that saved bill in its boxes. This is how
+  to see what DocLink sent: DocLink posts the values to the same endpoints and never types here.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bill Data Entry</title>
+<script src="/ireps/js/jquery.1.11.1.js"></script>
+<script src="/ireps/js/works/postRequest.js"></script>
+{{shellStyle}}
+<style>
+  .band { background: #0099cc; color: #fff; font-weight: bold; font-style: italic; padding: 7px 8px; }
+  .band.center { text-align: center; }
+  .panel { background: #f4f8f6; border: 1px solid #5a8a7a; border-top: 0; padding: 6px 8px; }
+  table.form { width: 100%; border-collapse: collapse; }
+  table.form td { padding: 5px 6px; vertical-align: middle; }
+  table.form td.label { font-weight: bold; }
+  input[type=text], select, textarea { font: inherit; padding: 2px 3px; border: 1px solid #777; background: #fff; box-sizing: border-box; }
+  table.form input[type=text] { width: 100%; max-width: 150px; }
+  select, textarea { max-width: 100%; }
+  input:disabled, select:disabled, textarea:disabled { background: #e9ecec; color: #555; border-color: #bbb; }
+  .red { color: #d00000; }
+  .blue { color: #0000c8; }
+  .billbtn { padding: 5px 22px; font: inherit; font-weight: bold; background: #e6e6e6; border: 1px solid #333; cursor: pointer; margin: 8px 4px 8px 0; }
+  .billbtn:disabled { color: #999; border-color: #aaa; cursor: default; }
+  .docs { width: 100%; border-collapse: collapse; background: #fff; }
+  .docs th, .docs td { border: 1px solid #555; padding: 3px 6px; text-align: center; }
+  .docs th { font-weight: bold; background: #eef3f1; }
+  .mock-filled { outline: 2px solid #2e8b57 !important; background: #e6f8ec !important; color: #111 !important; }
+  .mock-panel { border: 2px solid #2e8b57; background: #e6f8ec; padding: 8px 12px; margin: 8px 0; }
+  .mock-panel.bad { border-color: #c0392b; background: #fdecea; }
+  #signer { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center; z-index: 10; }
+  #signerBox { background: #fff; width: 560px; max-width: 94vw; border: 1px solid #555; padding: 14px 16px; box-shadow: 0 6px 24px rgba(0,0,0,.4); }
+  #signerBox h3 { margin: 0 0 8px; font-size: 14px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+{{mockStrip}}
+{{portalHeader}}
+<div class="page">
+{{poHeader}}
+{{checkPanel}}
+
+<form name="supplierBillForm" method="post" action="/epsn/ct/fetchPODetails.do" onsubmit="return false;">
+  <input type="hidden" name="organization" value="01">
+  <input type="hidden" name="department" value="19">
+  <input type="hidden" name="unit" value="{{unit}}">
+  <input type="hidden" id="billRegNo" name="billRegNo" value="0">
+
+  <div class="band center">Bill Header (All Amounts are in Rs.)<br><br>Supplier Bill</div>
+  <div class="panel">
+    <table class="form">
+      <tr><td colspan="3"><b>IREPS Bill Reg No:</b> <span id="billRegNoText"></span></td></tr>
+      <tr><td>Vendor Name: {{companyName}}</td><td><b>Vendor Code in PO:</b> :{{vendor}}</td><td><b>Logged in IREPS Account ID:</b> {{vendor}}</td></tr>
+      <tr><td colspan="3"><b>Vendor Address</b> &nbsp; {{vendorAddress}}</td></tr>
+    </table>
+  </div>
+  <div class="panel">
+    <table class="form">
+      <tr><td class="label" style="width:30%">Taxes Applicable</td>
+        <td><label><input type="radio" name="gstFlag" id="gstApplicable" value="Y" checked> GST</label></td>
+        <td><label><input type="radio" name="gstFlag" id="gstNotApplicable" value="N"> ED/ST (Non-GST)</label></td></tr>
+      <tr><td class="label">Invoice Type</td>
+        <td><label><input type="radio" name="invoiceType" id="invoiceTypeI" value="I" checked> Tax Invoice</label></td>
+        <td><label><input type="radio" name="invoiceType" id="invoiceTypeD" value="D"> Debit Note</label></td></tr>
+      <tr><td>Stock or Non-Stock:</td>
+        <td><label><input type="radio" name="stockNonstock" id="stockRadio" value="S" checked onchange="loadPoSr()"> Stock</label></td>
+        <td><label><input type="radio" name="stockNonstock" id="nonStockRadio" value="N" onchange="loadPoSr()"> Non-Stock</label></td></tr>
+      <tr><td colspan="3">Tax Invoice / HSN:
+        <label><input type="radio" name="multiInvoiceFlag" id="multiInvoiceN" value="N" checked> Single Tax Invoice &amp; Single HSN in a Receipt</label> &nbsp;
+        <label><input type="radio" name="multiInvoiceFlag" id="multiInvoiceY" value="Y" disabled> Multiple Tax Invoices &amp; HSN in a Receipt</label> &nbsp;
+        <label><input type="radio" name="multiInvoiceFlag" id="multiInvoiceT" value="T" disabled> Single Tax Invoice &amp; Multiple HSN in a Receipt</label></td></tr>
+      <tr><td class="label">Select Paying Railway</td>
+        <td colspan="2"><select name="payingRly" id="payingRlySelect" style="width:300px" onchange="populatePayAuthList();"><option value="-1">Select</option>
+          <option value="{{rly}}" selected="selected">{{railwayName}}</option></select></td></tr>
+      <tr><td class="label">Select Paying Authority</td>
+        <td colspan="2"><select name="payingAuthority" id="payingAuthority" style="width:300px" onchange="loadPoSr()"></select></td></tr>
+    </table>
+  </div>
+  <div class="band">Submit Bill Header Details</div>
+  <div class="panel">
+    <table class="form">
+      <tr><td class="label">PVC</td><td>Not Applicable</td><td class="label">SVC</td><td colspan="3">Applicable</td></tr>
+      <tr><td class="label">Tax Invoice No.</td><td><input type="text" name="invoiceNo" id="invoiceNo" maxlength="16"></td>
+        <td class="label">Tax Invoice Date</td><td><input type="text" name="invoiceDate" id="invoiceDate" maxlength="10" placeholder="dd/mm/yyyy"></td>
+        <td class="label">Invoice Amount</td><td><input type="text" name="invoiceAmt" id="invoiceAmtTxt" maxlength="12"></td></tr>
+      <tr><td colspan="6" class="red" style="text-align:right">(Sum of amounts of all invoices in multi-invoice case)</td></tr>
+      <tr><td class="label">Payment %</td><td><input type="text" id="paymentPercent" maxlength="3"></td>
+        <td class="label">Payment Type</td><td colspan="3"><select name="paymentType" id="paymentType"><option value="-1">Select</option><option value="F">Final</option><option value="A">Advance</option></select></td></tr>
+      <tr><td class="label">Bank Account No</td><td><input type="text" name="bankAccountNo" id="bankAccountNo" value="{{bankAccountNo}}" maxlength="18" disabled="disabled"></td>
+        <td class="label">IFSC Code</td><td colspan="3"><input type="text" name="ifscCode" id="ifscCode" value="{{ifscCode}}" maxlength="11" disabled="disabled"></td></tr>
+      <tr><td class="label">Under Reverse Charge</td><td><label><input type="radio" name="reverseChargeFlag" id="reverseCharge" value="Y"> Yes</label> &nbsp; <label><input type="radio" name="reverseChargeFlag" id="noReverseCharge" value="N" checked> No</label></td>
+        <td class="label">Whether under composition scheme</td><td colspan="3"><label><input type="radio" name="compositeFlag" id="composite" value="Y"> Yes</label> &nbsp; <label><input type="radio" name="compositeFlag" id="notComposite" value="N" checked> No</label></td></tr>
+      <tr><td class="label">Supplier GSTIN Registered</td><td colspan="5"><label><input type="radio" name="gstRegFlag" id="gstRegd" value="Y" checked> Yes</label> &nbsp; <label><input type="radio" name="gstRegFlag" id="gstNotRegd" value="N"> No</label></td></tr>
+      <tr><td class="label">Supplier GSTIN</td><td><select name="supplierGSTIN" id="supplierGSTIN" onchange="selectSupplierState();"><option value="-1">Select</option>{{supplierGstinOptions}}</select></td>
+        <td colspan="4" class="red" id="gstinStatus"></td></tr>
+      <tr><td class="label">Supplier State</td><td colspan="5"><select name="supplierState" id="supplierState" disabled="disabled"><option value="-1">Select</option>{{stateOptions}}</select></td></tr>
+      <tr><td class="label">State for Place of Supply</td><td><select name="stateOfSupply" id="stateOfSupply"><option value="-1">Select</option>{{stateOptions}}</select></td>
+        <td class="label">Place of Supply</td><td colspan="3"><input type="text" name="placeOfSupply" id="placeOfSupply" maxlength="20"></td></tr>
+      <tr><td class="label">Bill Description(Remarks)<span class="red">(upto 200 characters)</span></td>
+        <td colspan="5"><textarea id="billDesc" rows="2" cols="80" maxlength="200"></textarea></td></tr>
+    </table>
+  </div>
+  <input type="button" name="saveButton" id="saveHeaderButton" class="billbtn" value="Save Bill Header" onclick="saveBillHeader();">
+
+  <div id="poSrBlock" class="hidden">
+    <p class="red">PO Sr(s) listed are based on the basis of the paying authority selected while creating the bill header. If any PO Sr. is missing,<br>please create a new bill header and select the other paying authority from the drop-down menu.</p>
+    <b>Select PO Sr</b> <select name="poSrNo" id="poSrNo" onchange="fetchItemDetails();"><option value="-1">Select</option></select>
+  </div>
+
+  <div id="itemBlock" class="hidden">
+    <div class="band" style="margin-top:10px">Billing Details</div>
+    <div class="panel">
+      <table class="form">
+        <tr><td class="label">PL No.</td><td id="plNo"></td><td class="label">Item</td><td colspan="3" id="itemDesc"></td></tr>
+        <tr><td class="label">Qty Ordered</td><td id="qtyOrdered"></td><td class="label">Delivery Date</td><td id="deliveryDate"></td><td class="label">Consignee</td><td id="consigneeName"></td></tr>
+        <tr><td class="label">R-Note / RO No.</td><td><select id="roNo" onchange="populateRODetails();"><option value="-1">Select</option></select></td>
+          <td class="label">RO Date</td><td><input type="text" id="roDate" disabled></td>
+          <td class="label">RO Qty</td><td><input type="text" id="roQty" disabled></td></tr>
+        <tr><td class="label">RO/CRN Qty Billed</td><td><input type="text" name="roQtyBilled" id="roQtyBilled" maxlength="12" onchange="calculateTotalExpense();"></td>
+          <td class="label">DRR No.</td><td><input type="text" id="drrNumber" disabled></td>
+          <td class="label">R-Note No. / Date</td><td><input type="text" id="rNoteNumber" disabled size="12"> <input type="text" id="rNoteDate" disabled size="10"></td></tr>
+        <tr><td colspan="6"><b>RNote Qty Breakup (R-Note No : R-Note Qty comma separated):</b> <span id="rnoteQtyBreakupSpan"></span></td></tr>
+        <tr><td>RLY GSTIN</td><td colspan="5"><select name="rlyGSTIN" id="rlyGSTINFinal" class="rlyGSTINSelCls" style="width:300px"><option value="-1">Select</option>{{railwayGstinOptions}}</select>
+          <span class="blue">The selected GSTIN is a Non-IRFC GSTIN. You can scroll down and select an IRFC GSTIN if required.</span></td></tr>
+        <tr><td>Inspection Agency</td><td colspan="5" id="inspectionAgency"></td></tr>
+        <tr><td class="label">Basic PO Rate/Unit</td><td><input type="text" id="poRate" disabled></td>
+          <td class="label">PVC on PO Rate/Unit</td><td><input type="text" id="pvcOnPoRate" value="0" disabled></td>
+          <td class="label">Basic Bill Rate/Unit with Disc,PVC</td><td><input type="text" id="basicBillRate" disabled></td></tr>
+        <tr><td class="label">Discount Rate</td><td><input type="text" id="disRate" value="0" disabled></td>
+          <td class="label">Packing Rate</td><td><input type="text" id="pkgRate" value="0" disabled></td>
+          <td class="label">Forwarding Rate</td><td><input type="text" id="fwdRate" value="0" disabled></td></tr>
+        <tr><td class="label">Freight Rate</td><td><input type="text" id="frtRate" value="0" disabled></td>
+          <td class="label">Other Charge(1)Rate</td><td><input type="text" id="oth1Rate" value="0" disabled></td>
+          <td class="label">Other Charge(2)Rate</td><td><input type="text" id="oth2Rate" value="0" disabled></td></tr>
+      </table>
+    </div>
+    <div class="panel">
+      <table class="form">
+        <tr><td class="label">GST Category</td><td><select name="gstCategory" id="gstCategory"><option value="0">Regular GST (As per payment %)</option><option value="1">NIL Rated</option><option value="2">Non-GST Item</option><option value="3">Exempted</option><option value="5">Full GST (100%)</option></select></td>
+          <td class="label">HSN Code</td><td><input type="text" name="hsnCode" id="hsnCode" maxlength="8"></td>
+          <td class="label">ITC Admissible</td><td><label><input type="radio" name="itcFlagFinal" id="itcY" value="Y"> Yes</label> &nbsp; <label><input type="radio" name="itcFlagFinal" id="itcN" value="N" checked> No</label></td></tr>
+        <tr><td class="label">CGST Rate(%)</td><td><select id="cgstRate" onchange="calculateTotalExpense();"><option value="0">Select</option>{{cgstOptions}}</select></td>
+          <td class="label">CGST Amount</td><td><input type="text" id="cgstAmount" value="0" disabled></td>
+          <td class="label">IGST Rate(%)</td><td><select id="igstRate" onchange="calculateTotalExpense();"><option value="0">Select</option>{{igstOptions}}</select></td></tr>
+        <tr><td class="label">SGST Rate(%)</td><td><input type="text" id="sgstRate" value="0" disabled></td>
+          <td class="label">SGST Amount</td><td><input type="text" id="sgstAmount" value="0" disabled></td>
+          <td class="label">IGST Amount</td><td><input type="text" id="igstAmount" value="0" disabled></td></tr>
+        <tr><td class="label">UTGST Rate(%)</td><td><input type="text" id="utgstRate" value="0" disabled></td>
+          <td class="label">UTGST Amount</td><td><input type="text" id="utgstAmount" value="0" disabled></td>
+          <td class="label">Cess Rate(%)</td><td><input type="text" id="cessRate" value="0" disabled></td></tr>
+      </table>
+    </div>
+    <div class="panel">
+      <table class="form">
+        <tr><td class="label">Item Value in this PO Sr</td><td><input type="text" id="itemValue" disabled></td>
+          <td class="label">Already Passed Amount against this PO Sr</td><td><input type="text" id="passedAmount" disabled></td>
+          <td class="label">Max Claim</td><td><input type="text" id="maxClaim" disabled></td></tr>
+        <tr><td colspan="3"></td>
+          <td class="label">Item-wise claim by vendor</td><td colspan="2"><input type="text" id="itemWiseClaimFinal" onchange="calculateTotalExpense();"></td></tr>
+        <tr><td class="label">Taxable Amount</td><td><input type="text" id="taxableAmount" disabled></td>
+          <td class="label">Tax Amount</td><td><input type="text" id="taxAmount" disabled></td>
+          <td class="label">Total Billed Amount</td><td><input type="text" id="totalBilled" disabled></td></tr>
+      </table>
+    </div>
+    <input type="button" id="saveItemButton" class="billbtn" value="Save" onclick="saveDtls();">
+  </div>
+
+  <div id="docBlock" class="hidden">
+    <div class="band">Upload Documents</div>
+    <div class="panel"><b>Description of the document</b><span class="red">*</span> &nbsp; <input type="text" id="fileDesc" size="40" maxlength="100"> &nbsp; <input type="button" class="billbtn" style="margin:0" value="Select File" onclick="openSigner();"></div>
+    <div class="band">Uploaded Documents</div>
+    <table class="docs"><thead><tr><th>Sr. No.</th><th>Filename</th><th>File Description</th><th>Uploaded On</th><th>Uploaded By</th><th>Delete</th></tr></thead><tbody id="docRows"></tbody></table>
+    <input type="button" id="moreBtn" class="billbtn" value="Add More" disabled>
+    <input type="button" name="generateBillButton" class="billbtn" value="Generate Preview" onclick="generateBill();">
+  </div>
+</form>
+</div>
+
+<div id="signer"><div id="signerBox">
+  <h3>IREPSSigner (MOCK)</h3>
+  <p class="red" style="margin:0 0 8px">Simulation. No real signing app, certificate or PIN is used. Never enter a real DSC PIN in this mock.</p>
+  <p style="margin:0 0 6px"><b>File to sign:</b> <input type="file" id="signerFile" accept=".pdf,application/pdf"></p>
+  <p style="margin:0 0 6px"><b>Certificate:</b> MOCK USER (simulated)</p>
+  <p class="red" id="signerError" style="min-height:1.2em;margin:0 0 8px"></p>
+  <input type="button" class="billbtn" style="margin:0 6px 0 0" value="Sign" onclick="signAndUpload();">
+  <input type="button" class="billbtn" style="margin:0" value="Cancel" onclick="closeSigner();">
+</div></div>
+
+<script type="application/json" id="draftData">{{draftJson}}</script>
+<script type="text/javascript">
+var frmVals = ["{{rly}}","{{poKey}}","{{poNumber}}","{{poDate}}","Not Applicable",":{{vendor}}"];
+var DRAFT = JSON.parse(document.getElementById("draftData").textContent);
+var PAY_AUTHS = [];
+var currentBillRegNo = "";
+var currentDispatchNo = "";
+var ROW_SEP = "<>";
+
+function money(n) { return (Math.round((n + Number.EPSILON) * 100) / 100).toFixed(2); }
+function val(id) { return $.trim($("#" + id).val() || ""); }
+function radio(name) { return $("input[name=" + name + "]:checked").val(); }
+function post(url, data, done) {
+  $.ajax({ type: "POST", url: url, dataType: "text", headers: { "X-Mock-Screen": "1" }, data: data, success: done,
+    error: function (x) { alert("Request failed: " + x.status); } });
+}
+function selectedAuth() {
+  var v = $("#payingAuthority").val() || "";
+  for (var i = 0; i < PAY_AUTHS.length; i++) if (PAY_AUTHS[i].value === v) return PAY_AUTHS[i];
+  return { value: "", code: "", ipasAUCode: "" };
+}
+
+function populatePayAuthList(after) {
+  post("/epsn/ct/populatePayAuthList.do", { payingRly: $("#payingRlySelect").val(), poKey: frmVals[1] }, function (r) {
+    var f = r.split("^^"), html = "";
+    PAY_AUTHS = [];
+    for (var i = 1; i + 1 < f.length; i += 2) {
+      var parts = f[i + 1].split("-");
+      PAY_AUTHS.push({ value: f[i], code: f[i].split("-")[0], ipasAUCode: parts.length >= 2 ? parts[parts.length - 2] : "" });
+      html += "<option value='" + f[i] + "'>" + f[i + 1] + "</option>";
+    }
+    $("#payingAuthority").html(html);
+    if (after) after();
+  });
+}
+
+function selectSupplierState() {
+  var gstin = $("#supplierGSTIN").val();
+  if (gstin === "-1") { $("#gstinStatus").text(""); $("#supplierState").val("-1"); return; }
+  $("#supplierState").val(gstin.slice(0, 2));
+  post("/epsn/common/getAjaxData.do", { gstNo: gstin }, function (r) { $("#gstinStatus").text(r.split("^")[2] || r.split("^")[1] || ""); });
+}
+
+function loadPoSr(after) {
+  var auth = selectedAuth();
+  if (!auth.code) return;
+  post("/epsn/ct/populatePOSrList.do", { rly: frmVals[0], poNumber: frmVals[2], payingAuthorityCode: auth.code, billType: "S", billRegNo: "null", stockNonstock: radio("stockNonstock"), payingRly: $("#payingRlySelect").val() }, function (r) {
+    var f = r.split("^^").slice(1), html = "<option value='-1'>Select</option>";
+    for (var i = 0; i < f.length; i++) html += "<option value='" + f[i] + "'>" + f[i] + "</option>";
+    $("#poSrNo").html(html);
+    if (after) after(f);
+  });
+}
+
+function validateHeader() {
+  var no = val("invoiceNo");
+  if (!no) return "Please enter Tax Invoice No!";
+  if (!/^[A-Za-z0-9\-\/]+$/.test(no)) return "Only - and / are allowed as special characters in Invoice No!";
+  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(val("invoiceDate"))) return "Please enter Tax Invoice Date as dd/mm/yyyy!";
+  if (!(Number(val("invoiceAmtTxt")) > 0)) return "Please enter Invoice Amount!";
+  var pct = val("paymentPercent");
+  if (!/^\d+$/.test(pct) || Number(pct) > 100) return "Payment % must be a whole number up to 100!";
+  if ($("#paymentType").val() === "-1") return "Please select Payment Type!";
+  if ($("#supplierGSTIN").val() === "-1") return "Please select Supplier GSTIN!";
+  if ($("#stateOfSupply").val() === "-1") return "Please select State for Place of Supply!";
+  if (!val("placeOfSupply")) return "Please enter Place of Supply!";
+  if (!val("billDesc")) return "Please enter Bill Description!";
+  return null;
+}
+
+function checkPaymentTerms(){
+	var advancePercent = parseInt( '0');
+	var finalPercent =parseInt( '0');
+}
+
+function saveBillHeader() {
+  var problem = validateHeader();
+  if (problem) { alert(problem); return; }
+  var companyName = '{{companyName}}', address = '/epsn' + '/ct/saveBillHeader.do', auth = selectedAuth();
+  loadPoSr(function (srs) {
+    if (!srs.length) { alert("No PO Sr found. Please select the correct option for Stock-NonStock and Bill Paying Authority"); return; }
+    if (!confirm("Bill header once saved is not editable. Please check carefully before submitting!")) return;
+    $.ajax({
+      type: "POST",
+      url: address,
+      dataType: 'text',
+      headers: { "X-Mock-Screen": "1" },
+      data: {
+        invoiceAmount: val("invoiceAmtTxt"), invoiceType: radio("invoiceType"), payingRly: $("#payingRlySelect").val(), stockNonstock: radio("stockNonstock"),
+        fuelNonFuel: "N", multiInvoiceFlag: radio("multiInvoiceFlag"), invoiceCount: "1",
+        billType:'S',
+        spmBillRegNo:'null',
+        organization:'01',
+        department:'19',
+        unit:'{{unit}}',
+        rly:'{{rly}}',
+        poKey:'{{poKey}}',
+        poNumber:'{{poNumber}}',
+        poDate:'{{poDate}}',
+        companyName: companyName,
+        pvc:'N',
+        svcFlag:'Y',
+        gstFlag: radio("gstFlag"), gstRegFlag: radio("gstRegFlag"), reverseChargeFlag: radio("reverseChargeFlag"), compositeFlag: radio("compositeFlag"),
+        supplierGSTIN: $("#supplierGSTIN").val(),
+        vendorCode:':{{vendor}}',
+        payingAuthorityCode: auth.code, invoiceNo: val("invoiceNo"), invoiceDate: val("invoiceDate"), paymentType: $("#paymentType").val(), paymentPercent: val("paymentPercent"),
+        bankAccountNo: $("#bankAccountNo").val(), ifscCode: $("#ifscCode").val(), billDescription: val("billDesc"), placeOfSupply: val("placeOfSupply"),
+        stateOfSupply: $("#stateOfSupply").val(), supplierState: $("#supplierGSTIN").val().slice(0, 2), ipasAUCode: auth.ipasAUCode,
+        nitOid:'{{nitOid}}',
+        supplementaryBillType: "",
+        paymentCode:'000000',
+        additionalPayment: "", totalAmount: "", rcvIdStr: "", rcvRefundClaimAmtStr: "", rrlNoStr: "", rrlDateStr: "", rrlValueStr: "", totalBalanceAmtWraDouble: "0"
+      },
+      success: function (result) {
+        var f = result.split("^^");
+        if (f[0] !== "success") { alert(result); return; }
+        currentBillRegNo = f[1];
+        alert("Data saved successfully!");
+        lockHeader();
+        $("#poSrBlock").removeClass("hidden");
+      }
+    });
+  });
+}
+
+function lockHeader() {
+  $("#billRegNo").val(currentBillRegNo);
+  $("#billRegNoText").text(currentBillRegNo);
+  $("input[name=gstFlag],input[name=invoiceType],input[name=stockNonstock],input[name=multiInvoiceFlag],input[name=reverseChargeFlag],input[name=compositeFlag],input[name=gstRegFlag]").prop("disabled", true);
+  $("#payingRlySelect,#payingAuthority,#invoiceNo,#invoiceDate,#invoiceAmtTxt,#paymentPercent,#paymentType,#supplierGSTIN,#stateOfSupply,#placeOfSupply,#billDesc").prop("disabled", true);
+  $("#saveHeaderButton").addClass("hidden");
+}
+
+function fetchItemDetails() {
+  var poSr = $("#poSrNo").val();
+  if (poSr === "-1") return;
+  post("/epsn/ct/fetchPOItemDetails.do", { poSrNo: poSr, rly: frmVals[0], poKey: frmVals[1], poNumber: frmVals[2], billNo: val("invoiceNo"), paymentType: $("#paymentType").val(), billRegNo: currentBillRegNo, gstFlag: "Y", payingRly: $("#payingRlySelect").val(), billType: "S", spmBillRegNo: "null" }, function (r) {
+    var blocks = r.split("@#$%");
+    if (blocks[0] !== "success") { alert(r); return; }
+    var item = blocks[1].split("^^"), rates = blocks[3].split("^^"), consignee = blocks[5].split("^^");
+    window.ITEM = { billItemSrNo: item[9], unitCode: item[8], unit: item[7], allocation: item[4], consigneeCode: consignee[1], consigneeName: consignee[2], gstRate: rates[5] };
+    $("#plNo").text(item[1]); $("#itemDesc").text(item[2]); $("#deliveryDate").text(item[3]); $("#qtyOrdered").text(item[5] + " " + item[7]);
+    $("#poRate,#basicBillRate").val(item[6]);
+    $("#consigneeName").text(consignee[2]);
+    $("#inspectionAgency").text($.trim(blocks[6]));
+    var gst = /GST#\s*([0-9A-Z]{15})/.exec(consignee[2] || "");
+    if (gst) $("#rlyGSTINFinal").val(gst[1]);
+    var interState = $("#supplierGSTIN").val().slice(0, 2) !== $("#stateOfSupply").val();
+    $("#igstRate").prop("disabled", !interState);
+    $("#cgstRate").prop("disabled", interState);
+    $("#itemBlock").removeClass("hidden");
+    post("/epsn/ct/populateROList.do", { rly: frmVals[0], poNumber: frmVals[2], poSrNo: poSr, billType: "S", billRegNo: "null", payingRly: $("#payingRlySelect").val() }, function (ro) {
+      var f = ro.split("^^").slice(2), html = "<option value='-1'>Select</option>";
+      for (var i = 0; i < f.length; i++) html += "<option value='" + f[i] + "'>" + f[i] + "</option>";
+      $("#roNo").html(html);
+    });
+  });
+}
+
+function populateRODetails() {
+  var roNo = $("#roNo").val();
+  if (roNo === "-1") return;
+  post("/epsn/ct/populateRODetails.do", { rly: frmVals[0], poNumber: frmVals[2], poSrNo: $("#poSrNo").val(), roNo: roNo, billType: "S", paymentPercent: val("paymentPercent"), payingRly: $("#payingRlySelect").val() }, function (r) {
+    var f = r.split("^^").slice(1);
+    if (r.split("^^")[0] !== "success") { alert(r); return; }
+    window.RO = { url: f[14] };
+    $("#roDate").val(f[0]); $("#roQty,#roQtyBilled").val(f[1]); $("#drrNumber").val(f[2]); $("#rNoteNumber").val(f[4]); $("#rNoteDate").val(f[5]);
+    $("#rnoteQtyBreakupSpan").text(f[7]); $("#itemValue").val(f[11]); $("#passedAmount").val(f[12]); $("#maxClaim").val(f[13]);
+    var inv = Math.round(Number(val("invoiceAmtTxt")));
+    if (inv > Math.round(Number(f[13]))) $("#maxClaim").val(val("invoiceAmtTxt"));
+    calculateTotalExpense();
+  });
+}
+
+function calculateTotalExpense() {
+  var taxable = Number(val("basicBillRate")) * Number(val("roQtyBilled")) * Number(val("paymentPercent")) / 100;
+  var igstR = Number($("#igstRate").val()) || 0, cgstR = Number($("#cgstRate").val()) || 0;
+  var ut = ["35", "04", "26", "25", "31"].indexOf($("#stateOfSupply").val()) >= 0;
+  $("#sgstRate").val(ut ? 0 : cgstR); $("#utgstRate").val(ut ? cgstR : 0);
+  var igst = taxable * igstR / 100, cgst = taxable * cgstR / 100;
+  $("#igstAmount").val(money(igst)); $("#cgstAmount").val(money(cgst)); $("#sgstAmount").val(money(ut ? 0 : cgst)); $("#utgstAmount").val(money(ut ? cgst : 0));
+  var tax = igst + cgst * 2;
+  $("#taxableAmount").val(money(taxable)); $("#taxAmount").val(money(tax));
+  $("#totalBilled").val(val("itemWiseClaimFinal") ? money(Number(val("itemWiseClaimFinal"))) : money(taxable + tax));
+}
+
+function saveDtls() {
+  if ($("#roNo").val() === "-1") { alert("Please select the R-Note / RO No.!"); return; }
+  if (!(Number(val("roQtyBilled")) > 0)) { alert("Please enter RO/CRN Qty Billed!"); return; }
+  if (Number(val("roQtyBilled")) > Number(val("roQty"))) { alert("RO/CRN Qty Billed cannot exceed the RO Qty!"); return; }
+  if ($("#rlyGSTINFinal").val() === "-1") { alert("Please select RLY GSTIN!"); return; }
+  if (!/^\d{1,8}$/.test(val("hsnCode"))) { alert("HSN Code must be digits only, up to 8!"); return; }
+  if (!(Number($("#igstRate").val()) > 0 || Number($("#cgstRate").val()) > 0)) { alert("Please select the GST rate!"); return; }
+  var claim = Number(val("itemWiseClaimFinal")), max = Number(val("maxClaim"));
+  if (!(claim > 0)) { alert("Please enter Item Wise Claim by vendor"); return; }
+  if (claim > max) { alert("Please enter a claim amount not exceeding " + max); return; }
+  calculateTotalExpense();
+  post("/epsn/ct/saveBillDetails.do", {
+    billType: "S", gstFlag: "Y", rly: frmVals[0], poKey: frmVals[1], poNumber: frmVals[2], poDate: frmVals[3], billRegNo: currentBillRegNo, paymentType: $("#paymentType").val(), poSrNo: $("#poSrNo").val(),
+    invoiceNo: val("invoiceNo"), invoiceDate: val("invoiceDate"), billItemSrNo: window.ITEM.billItemSrNo, plNo: $("#plNo").text(), description: $("#itemDesc").text(), consigneeCode: window.ITEM.consigneeCode, unitCode: window.ITEM.unitCode,
+    poRate: val("poRate"), netBasicRate: val("basicBillRate"), paymentPercent: val("paymentPercent"), expenseAmount: val("taxableAmount"), basicAmount: val("taxAmount"), totalAmount: money(claim), amountClaimed: "0",
+    gstCategory: $("#gstCategory").val(), hsnCode: val("hsnCode"), igstRate: $("#igstRate").val(), cgstRate: $("#cgstRate").val(), sgstRate: val("sgstRate"), utgstRate: val("utgstRate"),
+    igstAmount: val("igstAmount"), cgstAmount: val("cgstAmount"), sgstAmount: val("sgstAmount"), utgstAmount: val("utgstAmount"), itcFlagFinal: radio("itcFlagFinal"),
+    drrNumber: val("drrNumber"), roNo: $("#roNo").val(), roDate: val("roDate"), roQty: val("roQty"), roQtyBilled: val("roQtyBilled"), inspectionAgency: $("#inspectionAgency").text(), rlyGSTIN: $("#rlyGSTINFinal").val(),
+    passedAmount: val("passedAmount"), maxClaim: val("maxClaim"), rNoteNumber: val("rNoteNumber"), rNoteDate: val("rNoteDate"), rnUrl: (window.RO && window.RO.url) || ""
+  }, function (r) {
+    var f = r.split("^^");
+    if (f[0] !== "success") { alert(r); return; }
+    currentDispatchNo = f[1];
+    alert("Details saved successfully!");
+    lockItem();
+    renderDocs(f.slice(4).join("^^"));
+  });
+}
+
+function lockItem() {
+  $("#poSrNo,#roNo,#roQtyBilled,#rlyGSTINFinal,#gstCategory,#hsnCode,#igstRate,#cgstRate,#itemWiseClaimFinal,input[name=itcFlagFinal]").prop("disabled", true);
+  $("#saveItemButton").prop("disabled", true);
+  $("#docBlock").removeClass("hidden");
+}
+
+function renderDocs(text) {
+  var rows = String(text || "").split(ROW_SEP).slice(1), tbody = $("#docRows").empty(), n = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var c = rows[i].split("#");
+    if (c.length < 3 || !c[0]) continue;
+    n++;
+    var tr = $("<tr/>");
+    tr.append($("<td/>").text(n), $("<td/>").text(c[0]), $("<td/>").text(c[2]), $("<td/>").text(c[3]), $("<td/>").text(c[4]));
+    var del = $("<td/>");
+    if (c[2].indexOf("SYSTEM UPLOAD") < 0) del.append($("<a href='#' style='color:#c00'>Delete</a>").attr("data-id", c[5]).click(function (e) { e.preventDefault(); deleteDoc($(this).attr("data-id")); }));
+    tr.append(del);
+    tbody.append(tr);
+  }
+}
+
+function deleteDoc(id) {
+  post("/epsn/ct/deleteBillDocument.do", { billRegNo: currentBillRegNo, id: id }, function (r) { renderDocs(r); });
+}
+
+function openSigner() {
+  if (!val("fileDesc")) { alert("Please enter the Description of the document!"); return; }
+  $("#signerError").text(""); $("#signerFile").val("");
+  $("#signer").css("display", "flex");
+}
+function closeSigner() { $("#signer").hide(); }
+
+function signAndUpload() {
+  var file = document.getElementById("signerFile").files[0];
+  if (!file) { $("#signerError").text("Please browse and choose the PDF file."); return; }
+  if (file.size >= 8 * 1024 * 1024) { $("#signerError").text("Please upload file below 8 MB in size"); return; }
+  var now = new Date(), mm = String(now.getMonth() + 1).padStart(2, "0"), dir = "ireps/upload/billDocuments/" + mm + now.getFullYear() + "/" + currentBillRegNo + "/" + currentDispatchNo;
+  var form = new FormData();
+  form.append("app_name", "ireps"); form.append("request_from", ""); form.append("relative_dir", dir); form.append("isBid", "N"); form.append("upfilename", "upFile");
+  form.append("savename", ""); form.append("docSize", ""); form.append("pdfName", file.name); form.append("upFile", file, file.name);
+  $("#signerError").text("Uploading...");
+  fetch("/cgi-bin/save.php", { method: "POST", body: form, credentials: "include" }).then(function (x) { return x.text(); }).then(function (t) {
+    var m = /OK~([^~<]+)~(\d+)/.exec(t);
+    if (!m) { $("#signerError").text(t.replace(/<[^>]+>/g, " ").trim() || "Upload failed"); return; }
+    post("/epsn/ct/uploadBillDocuments.do", { billRegNo: currentBillRegNo, dispatchNo: currentDispatchNo, vendorCode: frmVals[5], fileName: file.name, filePath: m[1], fileDesc: val("fileDesc"), spmBillRegNo: "null", supplementaryBillType: "" }, function (r) {
+      if (r.indexOf("OK#") !== 0) { $("#signerError").text(r); return; }
+      renderDocs(r);
+      $("#fileDesc").val("");
+      closeSigner();
+    });
+  });
+}
+
+function generateBill() {
+  postRequest("/epsn/ct/generateBillPreview.do?billRegNo=" + currentBillRegNo, "_blank");
+}
+
+/* A saved bill: put what IREPS holds into the boxes. Green means DocLink sent this value. */
+function mark(id, field) {
+  if (DRAFT.createdBy === "DocLink") $("#" + id).addClass("mock-filled").attr("title", "DocLink sent this as " + field);
+}
+function fill(id, field, value) {
+  $("#" + id).val(value);
+  mark(id, field);
+}
+function showDraft() {
+  var h = DRAFT.header, i = DRAFT.item;
+  currentBillRegNo = DRAFT.billRegNo;
+  currentDispatchNo = DRAFT.dispatchNo || "";
+  $("#" + (h.stockNonstock === "N" ? "nonStockRadio" : "stockRadio")).prop("checked", true);
+  populatePayAuthList(function () {
+    for (var k = 0; k < PAY_AUTHS.length; k++) if (PAY_AUTHS[k].code === h.payingAuthorityCode) $("#payingAuthority").val(PAY_AUTHS[k].value);
+    mark("payingAuthority", "payingAuthorityCode");
+    loadPoSr(function () {
+      lockHeader();
+      $("#poSrBlock").removeClass("hidden");
+      if (!i) return;
+      $("#poSrNo").val(i.poSrNo); mark("poSrNo", "poSrNo");
+      showDraftItem(i);
+    });
+  });
+  fill("invoiceNo", "invoiceNo", h.invoiceNo); fill("invoiceDate", "invoiceDate", h.invoiceDate); fill("invoiceAmtTxt", "invoiceAmount", h.invoiceAmount);
+  fill("paymentPercent", "paymentPercent", h.paymentPercent); fill("paymentType", "paymentType", h.paymentType);
+  fill("supplierGSTIN", "supplierGSTIN", h.supplierGSTIN); fill("supplierState", "supplierState", h.supplierState);
+  fill("stateOfSupply", "stateOfSupply", h.stateOfSupply); fill("placeOfSupply", "placeOfSupply", h.placeOfSupply); fill("billDesc", "billDescription", h.billDescription);
+  $("#gstinStatus").text(DRAFT.gstinStatus || "");
+}
+function showDraftItem(i) {
+  $("#itemBlock").removeClass("hidden");
+  var d = DRAFT.itemInfo || {};
+  $("#plNo").text(i.plNo || ""); $("#itemDesc").text(i.description || ""); $("#deliveryDate").text(i.deliveryDate || ""); $("#qtyOrdered").text(d.qtyOrdered || "");
+  $("#consigneeName").text(d.consigneeName || ""); $("#inspectionAgency").text(i.inspectionAgency || "");
+  if (DRAFT.createdBy === "DocLink") $("#inspectionAgency").addClass("mock-filled").attr("title", "DocLink sent this as inspectionAgency");
+  $("#roNo").html("<option value='" + i.roNo + "'>" + i.roNo + "</option>"); mark("roNo", "roNo");
+  fill("roDate", "roDate", i.roDate); fill("roQty", "roQty", i.roQty); fill("roQtyBilled", "roQtyBilled", i.roQtyBilled); fill("drrNumber", "drrNumber", i.drrNumber);
+  fill("rNoteNumber", "rNoteNumber", i.rNoteNumber); fill("rNoteDate", "rNoteDate", i.rNoteDate); fill("rlyGSTINFinal", "rlyGSTIN", i.rlyGSTIN);
+  fill("poRate", "poRate", i.poRate); fill("basicBillRate", "netBasicRate", i.netBasicRate); fill("gstCategory", "gstCategory", i.gstCategory); fill("hsnCode", "hsnCode", i.hsnCode);
+  fill("igstRate", "igstRate", i.igstRate); fill("cgstRate", "cgstRate", i.cgstRate); fill("sgstRate", "sgstRate", i.sgstRate); fill("utgstRate", "utgstRate", i.utgstRate);
+  fill("igstAmount", "igstAmount", i.igstAmount); fill("cgstAmount", "cgstAmount", i.cgstAmount); fill("sgstAmount", "sgstAmount", i.sgstAmount); fill("utgstAmount", "utgstAmount", i.utgstAmount);
+  fill("passedAmount", "passedAmount", i.passedAmount); fill("maxClaim", "maxClaim", i.maxClaim); fill("itemValue", "maxClaim", d.itemValue || "");
+  fill("itemWiseClaimFinal", "totalAmount", i.totalAmount); fill("taxableAmount", "expenseAmount", i.expenseAmount); fill("taxAmount", "basicAmount", i.basicAmount); fill("totalBilled", "totalAmount", i.totalAmount);
+  $("#rnoteQtyBreakupSpan").text(d.breakup || "");
+  lockItem();
+  renderDocs(DRAFT.documentsText);
+}
+
+$(function () {
+  if (DRAFT) showDraft();
+  else populatePayAuthList(function () { loadPoSr(); });
+});
+</script>
+</body>
+</html>

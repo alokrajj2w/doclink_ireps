@@ -7,18 +7,20 @@
  * job continues even if the popup is closed.
  */
 
-import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError } from "../utils/messages.js";
+import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError, asDescribedError } from "../utils/messages.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
 import { loadEcmConfig, isDirectEcm } from "../services/ecm-config.js";
 import { loadDownloadLogConfig, configureDownloadLog, describeSkip, DOWNLOAD_LOG_ERROR } from "../services/download-log.js";
 import { initRedownload } from "./popup-redownload.js";
 import { formatFriendlyDateTime } from "../utils/filename.js";
+import { toIrepsDate } from "../utils/dates.js";
+import { fillSelect } from "./popup-common.js";
 import { initDocuments, handleDocumentMessage, restoreDocuments, refreshDocumentsDestination } from "./popup-documents.js";
 import { initMa, handleMaMessage, restoreMa, refreshMaDestination } from "./popup-ma.js";
 import { initPoIc, handlePoIcMessage, restorePoIc, refreshPoIcDestination } from "./popup-po-ic.js";
 import { initBatch, handleBatchMessage, restoreBatch, refreshBatchDestination } from "./popup-po-ic-batch.js";
-import { initGate, currentPanelTabId } from "./popup-gate.js";
-import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser } from "./popup-recon-auth.js";
+import { initGate, currentPanelTabId, panelOwnTabId, tabExists } from "./popup-gate.js";
+import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser, RECON_OFFLINE } from "./popup-recon-auth.js";
 import { initDownloads } from "./popup-downloads.js";
 import { initBillUpload, handleBillUploadMessage, restoreBillUpload } from "./popup-bill-upload.js";
 import { logger, mirrorLogToConsole, installConsoleHelpers } from "../utils/logger.js";
@@ -131,10 +133,16 @@ async function send(type, payload = {}) {
   // Login 2 (Recon Engine) before a run; login 1 (IREPS) is checked by the run itself.
   if (RUN_TYPES.has(type)) {
     if (await loadDownloadLogConfig()) {
-      // every download is logged for the signed-in user (services/download-log.js): no sign-in, no run
-      if (!(await ensureReconSignedIn({ always: true }))) {
+      // every download is logged for the signed-in user (services/download-log.js): no sign-in, no run,
+      // unless the Recon Engine is unreachable and the user chose to download without it (the log never blocks a run)
+      const signIn = await ensureReconSignedIn({ always: true, allowOffline: true });
+      if (!signIn) {
         logger.info(`Panel action not started (no Recon sign-in): ${type}`);
         return { started: false, error: describeError(DOWNLOAD_LOG_ERROR.SIGN_IN_REQUIRED) };
+      }
+      if (signIn === RECON_OFFLINE && payloadDestination(payload) === SAVE_DESTINATION.RECON && (await needsReconSignIn(type))) {
+        // S3 exports and gateway ECM uploads need the Recon Engine itself: this run saves locally
+        payload = toLocal(payload);
       }
     } else if (payloadDestination(payload) === SAVE_DESTINATION.RECON && (await needsReconSignIn(type)) && !(await ensureReconSignedIn())) {
       payload = toLocal(payload);
@@ -204,6 +212,10 @@ function showView(name) {
   el.saveTo.hidden = name === "login" || name === "upload" || name === "downloads";
   el.viewPoIcBatch.hidden = name !== "po-ic-batch";
   el.viewDownloads.hidden = name !== "downloads";
+  // the tender / correspondence views (tender/*-ui.js) are opened outside showView; any view
+  // shown here replaces them, so two views are never visible at once
+  $("view-tender").hidden = true;
+  $("view-pending").hidden = true;
   $("btn-downloads-open").setAttribute("aria-pressed", String(name === "downloads"));
 }
 
@@ -334,7 +346,7 @@ function renderComplete(summary) {
 }
 
 function renderError(error) {
-  const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN");
+  const described = asDescribedError(error);
   el.progress.hidden = true;
   setButtonBusy(false);
   refreshMeta();
@@ -371,12 +383,6 @@ async function refreshMeta() {
 /* -------------------------------------------------------------------------- */
 /* Search options                                                             */
 /* -------------------------------------------------------------------------- */
-
-/** "2026-08-01" (input[type=date]) -> "01/08/2026" (IREPS). */
-function toIrepsDate(isoDate) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate || "");
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
-}
 
 function selectedDestination() {
   const checked = el.optDestination.find((r) => r.checked);
@@ -455,17 +461,7 @@ function updateOptionsSummary() {
 
 /** Fill the zone list from the IREPS form (values come from the page, never hard-coded). */
 function populateZones(zones) {
-  if (!Array.isArray(zones) || zones.length === 0) return;
-  const current = el.optZone.value;
-  el.optZone.replaceChildren();
-  for (const zone of zones) {
-    const option = document.createElement("option");
-    option.value = zone.value;
-    option.textContent = zone.label;
-    el.optZone.append(option);
-  }
-  el.optZone.value = zones.some((z) => z.value === current) ? current : ALL_ZONES;
-  updateOptionsSummary();
+  if (fillSelect(el.optZone, zones, ALL_ZONES)) updateOptionsSummary();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -596,7 +592,7 @@ async function onIrepsTabActive() {
   initReconAuth({ getDestination: selectedDestination, setDestination });
   // tender downloads run in this panel: their download-log queue is the panel's own
   configureDownloadLog({ context: "panel" });
-  initRedownload({ currentTabId: currentPanelTabId });
+  initRedownload({ currentTabId: currentPanelTabId, ownTabId: panelOwnTabId, tabExists });
   await restoreDestination();
   // with the download log on, every run needs the Recon sign-in: show who is signed in
   if (selectedDestination() === SAVE_DESTINATION.RECON || (await loadDownloadLogConfig())) refreshReconStatus();

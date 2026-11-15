@@ -1,7 +1,7 @@
 # DocLink — IREPS Document Automation (Chrome Extension, Manifest V3)
 
 DocLink is a Chrome extension for users of the Indian Railways IREPS portal.
-Version 1.2.0 implements the downloads below. One **Save to: Local |
+Version 1.5.0 implements the downloads below. One **Save to: Local |
 ECM / S3** switch at the top of the panel applies to every download. Local saves
 under `Downloads/DocLink/`. ECM / S3 sends Bill Status, CRN and R-NOTE to the
 Recon Engine, which stores them in S3 and loads them into reconciliation, and
@@ -21,12 +21,12 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
   DocLink's equivalent of the portal's "Export to Excel" button, but with
   every row, not only the visible page. Both share one PO Search layer;
   only the search criteria, the result parser, the export columns and the
-  file name differ. See section 12.
+  file name differ. See section 13.
 * **Download IREPS MA Copies** (new in 1.1.0): runs the same PO Search for
   Modification Advices (`searchCriteria=MA`), lists the MAs of a chosen MA
   date (default: today), and downloads their actual MA PDF copies from the
   "View/Download MA" links into `Downloads/DocLink/IREPS/MA/<date>/`. See
-  section 13.
+  section 14.
 * **Download Tender Documents** (`tender/`): reads the active IREPS account
   from the home page, scans **My Messages** for NIT / corrigendum messages in
   a From-To date range, and downloads each tender's NIT, attachments,
@@ -109,7 +109,7 @@ corrected, reconciled or inferred.
 
 | Layer | File | Responsibility |
 |---|---|---|
-| UI | `popup/popup.html`, `popup.css`, `popup.js` | Rendered in Chrome's side panel (docked right, full height; the toolbar icon toggles it). Each tab has its own DocLink panel: Chrome hides it when you switch to another tab and restores it, as it was, when you return; tabs where you never opened it show nothing. DocLink's tools appear only while the panel's tab is on the portal `config.json` targets (mock on `localhost:8765`, or `www.ireps.gov.in`). Opened on any other page, it shows a "Go to IREPS and log in" page (its Open IREPS button loads IREPS in that same tab), the other portal gets a "switch target" hint, and a config URL missing from `host_permissions` is reported as a configuration error. No IREPS request is made from a non-IREPS tab. Rule: `utils/url-scope.js`, view: `popup/popup-gate.js`. Download cards (Bill Status, CRN), connection indicator, progress, results, login-required view, upload placeholder |
+| UI | `popup/popup.html`, `popup.css`, `popup.js` | Rendered in Chrome's side panel (docked right, full height; the toolbar icon toggles it). Each tab has its own DocLink panel: Chrome hides it when you switch to another tab and restores it, as it was, when you return; tabs where you never opened it show nothing. DocLink's tools appear only while the panel's tab is on the portal `config.json` targets (mock on `localhost:8765`, or `www.ireps.gov.in`). Opened on any other page, it shows a "Go to IREPS and log in" page (its Open IREPS button loads IREPS in that same tab), the other portal gets a "switch target" hint, and a config URL missing from `host_permissions` is reported as a configuration error. No IREPS request is made from a non-IREPS tab. Rule: `utils/url-scope.js`, view: `popup/popup-gate.js`. Download cards (Bill Status, CRN), connection indicator, progress, results, login-required view, the *Upload* card (Upload Bill to IREPS, section 20) |
 | Logging | `utils/logger.js` | Redacted, time-stamped log of every step, request, download and error from the service worker, panel and parser; last 1000 entries stored and mirrored into the side panel's console (Inspect). `doclinkLog.dump() / download() / clear()` in that console. See TESTING.md, "The DocLink log" |
 | UI (PO Search) | `popup/popup-documents.js` | CRN and R-NOTE cards on the main screen, each like the Bill Status card: Search options (Last 180 Days / Select Date / PO No., Railway, file format), Download, progress and errors in the card, result in the bottom panel |
 | Orchestration | `background/service-worker.js` | Runs the workflow, tracks job state, relays progress to the popup |
@@ -155,61 +155,69 @@ Reopening the popup restores the current or last state via `GET_JOB_STATE`.
 ## 3. Folder structure
 
 ```
-doclink-extension/
-├── manifest.json
+doclink/
+├── manifest.json  config.json  (config.local.json: gitignored overrides, never packaged)
 ├── background/
-│   ├── service-worker.js
-│   ├── offscreen.html
-│   └── offscreen.js
-├── popup/
-│   ├── popup.html
-│   ├── popup.css
-│   ├── popup.js
-│   ├── popup-documents.js
-│   ├── popup-ma.js
-│   └── popup-recon-auth.js   Recon Engine sign-in page + RECON pill (login 2)
+│   ├── service-worker.js      job orchestration, message router (handlers keyed by MESSAGE_TYPES)
+│   ├── offscreen.html / offscreen.js   DOMParser for the worker (one answer() per parse request)
+│   ├── bill-upload-job.js     Upload Bill to IREPS: the worker job (BILL_UPLOAD_* messages, state)
+│   ├── bill-tab-request.js    injected into the IREPS tab: bill calls, IREPS signer, save.php
+│   ├── keep-alive.js          holdWorker: keeps the service worker running while a job runs
+├── popup/                     the side panel
+│   ├── popup.html  popup.css  popup.js
+│   ├── popup-common.js        fillSelect (shared by the views)
+│   ├── popup-gate.js          which view a tab gets (IREPS mock / real / other)
+│   ├── popup-documents.js  popup-ma.js  popup-po-ic.js  popup-po-ic-batch.js  popup-downloads.js
+│   ├── popup-redownload.js    "download again?" prompt
+│   ├── popup-bill-upload.js   Upload Bill to IREPS view (section 20)
+│   └── popup-recon-auth.js    Recon Engine sign-in page + RECON pill (login 2)
+├── tender/                    Download Tender Documents + Correspondence (run in the side panel)
+│   ├── tender-ui.js  pending-ui.js  view-common.js  run-lock.js  tender.css
+│   ├── tender-core.js         fetch wrapper, errors, read-only guard, IREPS paths, text-PDF fallback, log
+│   ├── tender-print.js        page-view letters printed to PDF by Chrome (chrome.debugger)
+│   ├── tender-account.js      active account + startTenderJob
+│   ├── tender-workflows.js  tender-auto.js  tender-jobs.js  tender-pending.js
+│   ├── tender-search.js  tender-messages.js  tender-ledger.js  tender-ecm.js
+│   └── tests/                 node:test suites + FakeIreps (jsdom: a devDependency, npm install)
 ├── services/
-│   ├── search-po/
-│   │   ├── search-po-api.js  search-po-form.js  search-po-table.js  search-po-service.js  search-po-export.js  document-downloader.js
-│   ├── crn/
-│   │   ├── crn-parser.js  crn-export.js  crn-service.js
-│   ├── rnote/
-│   │   ├── rnote-parser.js  rnote-export.js  rnote-service.js
-│   ├── ma/
-│   │   ├── ma-parser.js  ma-service.js
-│   ├── ireps-api.js
-│   ├── ireps-form.js
-│   ├── bill-status-service.js
-│   ├── session-service.js
-│   ├── bill-parser.js
-│   ├── recon-service.js
-│   ├── recon-auth.js         Recon Engine sign-in: password + Okta (login 2)
-│   ├── ecm-service.js
-│   ├── pdf-service.js
-│   ├── download-service.js
-│   └── upload-service.js
-├── pages/
-│   ├── preview.html
-│   ├── preview.js
-│   └── preview.css
+│   ├── search-po/             PO Search core: api, form, table, service, export, document-downloader
+│   ├── bill-upload/           Upload Bill to IREPS (section 20): bill-upload-api, bill-form, bill-rules,
+│   │                          bill-upload-service, bill-upload-store, ecm-invoice, invoice-file,
+│   │                          tab-transport, bill-document-upload
+│   ├── crn/  rnote/  ma/  po/ per-type parser / export / service (po/: po-date-service.js)
+│   ├── inspection-certificate/  ic-api, ic-form, ic-parser, ic-search (runIcSearch), ic-service,
+│   │                          ic-date-service, ic-notification-service
+│   ├── notifications/         IREPS main-page notifications (IC issued)
+│   ├── batch-download.js      download/state/retry half shared by the batch workflows
+│   ├── batch-utils.js         transient-failure retry, DD/MM/YYYY ranges, readDateSelection
+│   ├── ireps-form-lock.js     withIrepsFormLock: one IREPS form sequence (token) at a time
+│   ├── export-save-service.js export -> Downloads or Recon Engine, with the download-log check
+│   ├── ireps-api.js  ireps-form.js  session-service.js  bill-status-service.js  bill-parser.js  bill-status-export.js
+│   ├── recon-service.js  recon-auth.js   Recon Engine (S3) + sign-in (login 2)
+│   ├── ecm-service.js  ecm-direct.js  ecm-config.js  ecm-catalog.js   ECM (gateway or Nuxeo)
+│   ├── download-log.js        what was downloaded, per user and destination
+│   ├── pdf-service.js  download-service.js
 ├── utils/
-│   ├── logger.js
-│   ├── sanitizer.js
-│   ├── filename.js
-│   ├── messages.js
-│   ├── xlsx-writer.js
-│   └── zip-writer.js
-├── assets/
-│   ├── icon16.png  icon32.png  icon48.png  icon128.png
-├── test/
-│   ├── run-tests.html / run-tests.js      (browser test-suite)
-│   ├── make-sample-pdf.mjs                (Node: writes a sample PDF)
-│   ├── crn-tests.js  rnote-tests.js  ma-tests.js  (CRN / R-NOTE / MA browser tests, run by run-tests.js)
-│   ├── mock/                              (mock IREPS server + target switch)
-│   └── fixtures/                          (real-layout page, legacy table, login, expired, no-records,
-│                                           crn-search-page, crn-results-page, crn-no-records,
-│                                           rnote-results-page (assumed layout), ma-results-page HTML)
-└── README.md
+│   ├── config.js              config.json + config.local.json (the only reader)
+│   ├── dates.js               panel date helpers (local time)
+│   ├── logger.js  messages.js (error catalogue, describeError)  sanitizer.js  filename.js
+│   ├── url-scope.js  ireps-account.js  xlsx-writer.js  zip-writer.js
+│   ├── http.js                fetchWithDeadline (Recon Engine, ECM, download log)
+├── pages/                     preview.html / preview.js / preview.css
+├── assets/                    icon16/32/48/128.png, logo.png
+├── scripts/build.mjs          shareable build (dist/doclink + zip)
+├── scripts/run-tests.mjs      npm test: every suite, on any OS
+├── eslint.config.js           npm run lint
+└── test/
+    ├── run-tests.html / run-tests.js   browser suite (imports every *-tests.js)
+    ├── *-tests.js             crn, rnote, ma, po, ic, batch, recon, recon-auth, ecm, ecm-direct,
+    │                          download-log, export-save, bill-upload, sanitizer
+    ├── node/                  node:test suites (npm test -- node)
+    ├── make-sample-pdf.mjs
+    ├── mock/                  mock IREPS server (http://localhost:8765) + target switch; bill upload:
+    │                          mock-bill-upload.mjs, mock-bill-screens.mjs + bill-entry-page.html
+    │                          (test hub /mock/bill/), bill-flow-check.mjs, sample_upload.json, sample.pdf
+    └── fixtures/              captured / invented IREPS pages
 ```
 
 ---
@@ -220,14 +228,15 @@ doclink-extension/
 |---|---|
 | `downloads` | Save the Bill Status workbook (.xlsx) into `Downloads/DocLink/IREPS/`, the CRN / R-NOTE exports (.xlsx/.csv) into `Downloads/DocLink/IREPS/CRN/` and `.../RNOTE/`, and the MA copies into `.../MA/<date>/`, and open the folder |
 | `storage` | `chrome.storage.local` for non-sensitive metadata (last download time, filename, record count); `chrome.storage.session` (memory only) for job state and the last parsed result used by the preview |
-| `tabs` | Open IREPS / the preview page in a new tab |
+| `unlimitedStorage` | Lifts the 10 MB limit of `chrome.storage.local`, so the tender ledger (what was downloaded, per tender) keeps growing instead of silently no longer being saved |
+| `tabs` | Read the active tab's URL so the side panel can tell IREPS (mock or real) from any other site and show the right view (`popup/popup-gate.js`); opening IREPS / the preview page itself needs no permission |
 | `offscreen` | Create an invisible offscreen document so the parser can use `DOMParser`; MV3 service workers have no DOM |
 | `identity` | Only for **Sign in with Okta** to the Recon Engine (section 17): `chrome.identity.launchWebAuthFlow` opens the Okta sign-in window and returns to `https://<extension id>.chromiumapp.org/okta` |
 | `scripting` | Only for **Upload Bill to IREPS**: the supplier bill calls (`/epsn/ct/*`) are sent from inside the user's IREPS tab (`services/bill-upload/tab-transport.js`), so they leave from the portal's own origin like the bill page's own requests. Nothing is injected into other sites |
 | `debugger` | Only for **published letters and corrigenda** (LOA, Negotiation, Counter Offer, Correspondence, Corrigendum - in Download Tender Documents and Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning |
-| host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both declared permanently) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
-
-| host `http://localhost:8000/*` (the Recon Engine; replace/add the deployed Recon URL) | Only for **Save to: ECM / S3**: the Recon Engine sign-in (section 17) and the uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
+| host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both in `manifest.json`; a production build keeps only the real portal, section 9) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
+| host `http://localhost:8000/*` and `https://wabtec.reconalpha-staging.joulestowatts.com/*` (the Recon Engine, local and staging; add the deployed Recon URL; a production build drops the localhost one) | The Recon Engine sign-in (section 17), the download log (section 18) and the **Save to: ECM / S3** uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
+| host `http://wctsrvecmtstsn1.wabtec.com:8080/*` (the ECM test server) | Only for **Save to: ECM / S3** with `"ecmBackendAws": false`: DocLink calls the ECM (Nuxeo) directly. Must match `config.json` `ecm.domain`. A production build keeps it and warns that it is plain HTTP |
 
 Not requested: `cookies`, `<all_urls>`, `history`, `bookmarks`, `webRequest`.
 The extension never reads cookie values.
@@ -436,7 +445,7 @@ generation) and **Print / Save as PDF**.
 1. Open `chrome://extensions`
 2. Enable **Developer mode**
 3. Click **Load unpacked**
-4. Select the `doclink-extension/` folder
+4. Select the repository folder (the one with `manifest.json`)
 5. Login to IREPS at https://www.ireps.gov.in/ with your normal security key
 6. Open DocLink from the toolbar
 7. Click **Download Bill Status**
@@ -447,21 +456,53 @@ Requires Chrome 116 or newer (offscreen documents + `chrome.runtime.getContexts`
 
 `scripts/build.mjs` produces a protected copy of the extension for sharing.
 Each JS entry point (`background/service-worker.js`, `background/offscreen.js`,
-`popup/popup.js`, `pages/preview.js`, `tender/tender-ui.js`) is bundled with
-its imports, minified and obfuscated; HTML, CSS, `assets/`, `manifest.json`
-and `config.json are copied as-is. Tests, `scripts/` and the readable
-`services/` / `utils/` sources are not included. The source tree is never
-modified.
+`pages/preview.js`) is bundled with its imports, minified and obfuscated. The
+three side-panel scripts (`popup/popup.js`, `tender/tender-ui.js`,
+`tender/pending-ui.js`) load into the same page, so they are bundled together
+with code splitting: the modules they share (download log, print queue,
+diagnostics log) are emitted once under `chunks/`, exactly as when DocLink is
+loaded unpacked. HTML, CSS, `assets/` and `config.json` are copied as-is;
+`manifest.json` gets the build's `host_permissions` and `version_name`. Tests,
+`scripts/`, `config.local.json` and the readable `services/` / `utils/` sources
+are not included. The source tree is never modified.
 
-Requirements: Node.js 18+, and the `zip` command (preinstalled on macOS).
+There are two kinds of build:
+
+| | `npm run build` (production) | `npm run build -- --allow-mock` (test build) |
+|---|---|---|
+| `config.json` `"target"` | must be `"real"` | anything |
+| A `config.json` URL DocLink uses (IREPS, `reconBaseUrl`, `reconAppUrl`, `ecm.domain` in direct mode) on this PC (`localhost`, `127.0.0.1`) | stops the build | allowed |
+| `host_permissions` of the built manifest | those of `manifest.json` without `localhost` and the mock portal; the build stops if what is left does not cover a URL DocLink sends requests to, and warns about a plain-HTTP one (the ECM test server) | as in `manifest.json`, so the copy can be pointed at the mock portal and a local Recon Engine |
+
+Every build also:
+
+* stops when `config.json` holds what looks like a real credential (a secret
+  such as `ecm.clientSecret`, a password, an API or private key, an access or
+  refresh token, of 8 characters or more; the shipped `"abc"` placeholders
+  pass). Real credentials belong in `config.local.json`, which is never
+  packaged;
+* warns when ECM documents would go straight to the ECM
+  (`"ecmBackendAws": false`) with placeholder client credentials;
+* logs from `info` up (DocLink loaded unpacked logs from `debug`;
+  `-- --log-level=debug` makes a build that does too);
+* stamps the git commit into the built manifest's `version_name`, which
+  `chrome://extensions` shows (`1.5.0 (97185b8)`; `-dirty` when the tree had
+  uncommitted changes, `test build` for `--allow-mock`), and into
+  `build-info.json`;
+* obfuscates with a fixed seed: the same sources and `package-lock.json` give
+  the same files.
+
+Requirements: Node.js 22.22+ or 24.15+ (the test tools need it),
+and the `zip` command (preinstalled on macOS and Linux;
+on Windows any `zip.exe` on the PATH).
 
 ```bash
-# 1. Install the build tools (esbuild + javascript-obfuscator) - once
+# 1. Install the build and test tools (esbuild, javascript-obfuscator, ESLint, jsdom) - once
 npm install
 
 # 2. Before building:
 #    - config.json  -> "target": "real" for users ("mock" only for local testing)
-#    - manifest.json -> raise "version" for a new release (e.g. "1.2.0");
+#    - manifest.json and package.json -> raise "version" for a new release (e.g. "1.5.0");
 #      Chrome accepts 1-4 dot-separated numbers
 
 # 3. Build
@@ -471,12 +512,13 @@ npm run build
 Output:
 
 ```
-dist/doclink/                  unpacked build (load this in Chrome to check it)
-dist/doclink-<version>.zip     the file to share, named from manifest.json "version"
+dist/doclink/                                unpacked build (load this in Chrome to check it)
+dist/doclink/build-info.json                 version, commit, kind of build, target, log level
+dist/doclink-<version>-<YYYYMMDD-HHMMSS>.zip  the file to share ("version" from manifest.json)
 ```
 
-`npm run build` deletes and recreates `dist/` every run; `dist/` is
-git-ignored and should not be edited by hand.
+`npm run build` deletes and recreates `dist/doclink/` every run; earlier zips
+in `dist/` are kept. `dist/` is git-ignored and should not be edited by hand.
 
 The recipient unzips the file, opens `chrome://extensions`, enables
 **Developer mode**, clicks **Load unpacked** and selects the unzipped
@@ -489,23 +531,34 @@ click the reload icon on the DocLink card.
 
 ### Automated tests (no extension APIs required)
 
+The commands work on Windows, macOS and Linux. `npm install` once first
+(jsdom, ESLint and the build tools are devDependencies, never shipped in the
+extension).
+
 ```bash
-# Browser suite — parser, session detection, sanitiser, logger redaction, PDF writer
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --headless=new --allow-file-access-from-files --virtual-time-budget=20000 \
-  --dump-dom "file://$PWD/test/run-tests.html" | grep -o 'DOCLINK_TESTS[^<]*'
-# → DOCLINK_TESTS 43/43 passed
+# Every suite: the browser suite in headless Chrome (parsers, flows with a fake IREPS, sanitiser,
+# logger redaction, writers, ECM, download log, ...), the tender / correspondence / panel
+# node:test suites, and the bill-flow check (its own mock on port 8799). Exit code 0 = all passed.
+npm test
+npm test -- browser                    # → DOCLINK_TESTS <n>/<n> passed
+npm test -- browser --only=po,ic       # only some browser suites (names in test/run-tests.js; "core" = run-tests.js itself)
+npm test -- node                       # → NODE_TESTS <n>/<n> passed
+npm test -- bill                       # → BILL_FLOW_CHECK passed
+
+npm run lint                           # ESLint (eslint.config.js): undefined names, duplicate keys, unreachable code, ...
+npm run verify                         # lint + every test + the production build: run it before every pull request
+
+# One node:test file, or one test by name
+node --test tender/tests/run-tests.mjs
+node --test --test-name-pattern="ECM direct" tender/tests/run-tests.mjs
 
 # Sample PDF for visual inspection
-node test/make-sample-pdf.mjs /tmp/sample.pdf
-
-# Tender documents (node:test + a fake IREPS; needs jsdom, which is not a
-# dependency of the extension - point JSDOM_ROOT at any folder with it installed)
-JSDOM_ROOT=/path/to/dir-with-node_modules node --test tender/tests/run-tests.mjs
+node test/make-sample-pdf.mjs sample.pdf
 ```
 
-You can also open `test/run-tests.html` in Chrome started with
-`--allow-file-access-from-files`.
+Chrome is found at its usual install path (or set `CHROME_PATH`); each run uses
+a throwaway Chrome profile. You can also open `test/run-tests.html` in Chrome
+started with `--allow-file-access-from-files`.
 
 ### Testing without access to IREPS (mock portal)
 
@@ -532,10 +585,11 @@ node test/mock/mock-ireps-server.mjs        # terminal 1, http://localhost:8765
 # set "target": "real" in config.json before real use (or: node test/mock/switch-target.mjs real)
 ```
 
-Both origins are always declared in `manifest.json`, so `config.json`'s
+Both origins are declared in `manifest.json`, so `config.json`'s
 `"target"` field is the only thing that ever needs to change to switch
 between the mock and the real portal - editing it by hand and reloading the
-extension works exactly like running `switch-target.mjs`.
+extension works exactly like running `switch-target.mjs`. (A production build
+keeps only the real portal; a `--allow-mock` build keeps both, section 9.)
 
 ### Manual acceptance tests
 
@@ -566,9 +620,13 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
   cookie jar; DocLink never reads it. The Okta client secret is never in the
   extension: the Recon backend exchanges Okta's code. The Struts TOKEN is held in memory only for the duration of one
   request. The logger (`utils/logger.js`) additionally redacts anything that
-  looks like `Cookie:`, `JSESSIONID=`, `Authorization:`, `TOKEN=` or passwords.
+  looks like `Cookie:`, `JSESSIONID=`, `Authorization:`, a token (also in JSON
+  and the Struts token field of a page), a client secret, an API key or a password.
 * Network calls are restricted to `IREPS_CONFIG.baseUrl`; `buildIrepsUrl`
-  refuses any other origin.
+  refuses any other origin. When `config.json` cannot be read, or has no
+  valid `"target"` (`"mock"` or `"real"`), there is no IREPS URL at all:
+  nothing is sent (`IREPS_NOT_CONFIGURED`) and the panel shows "DocLink
+  configuration error", never the mock portal in its place.
 * IREPS HTML is parsed in an offscreen document into a detached DOM and
   never inserted into an extension page. Popup and preview build their DOM
   from structured data with `textContent`.
@@ -579,7 +637,9 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
 
 ---
 
-## 12. Assumptions
+## 12. Assumptions and known limitations
+
+### Assumptions
 
 * `POST /epsn/admin/viewBills.do` with an empty body returns the Bill Status
   page with a fresh Struts token for an authenticated session (as captured).
@@ -598,7 +658,7 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
   `declarativeNetRequest` header rule would be the next step.
 * Times in filenames and the PDF are the user's local time.
 
-## 13. Known limitations
+### Known limitations
 
 * Standard PDF fonts cover Latin-1 only. `₹` is rendered as "Rs.", typographic
   dashes/quotes as ASCII, and other scripts (e.g. Devanagari) as "?". The
@@ -610,7 +670,7 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
 * Save to ECM / S3 needs the Recon Engine sign-in (section 17). Okta sign-in
   works only once DocLink's redirect is registered in the Okta app.
 
-## 14. Upload (Phase 2)
+### Upload (Phase 2)
 
 The Phase 2 placeholder (`services/upload-service.js`, the Source / Document /
 Type form) is replaced by **Upload Bill to IREPS**, section 20. Scheduled runs
@@ -619,7 +679,7 @@ and automatic login stay out of scope. Saving IREPS exports to the Recon Engine
 
 ---
 
-## 12. PO Search downloads: CRN and R-NOTE
+## 13. PO Search downloads: CRN and R-NOTE
 
 CRN and R-NOTE are two document types of the same IREPS *PO Search*
 workflow, which is separate from Bill Status and never touches `viewBills.do`:
@@ -866,10 +926,10 @@ or tokens.
 
 ---
 
-## 13. MA copies download (Modification Advice)
+## 14. MA copies download (Modification Advice)
 
 MA is the third document type on the PO Search page (`searchCriteria=MA`)
-and reuses the whole shared layer of section 12. The difference is what is
+and reuses the whole shared layer of section 13. The difference is what is
 downloaded: not the result table, but the **MA PDF copies** that IREPS links
 from each row, grouped by MA date.
 
@@ -892,7 +952,7 @@ Downloads/DocLink/IREPS/MA/<YYYY-MM-DD of the MA date>/<IREPS file name, e.g. 07
 
 ### The captured MA request
 
-Identical to the CRN request of section 12 with `searchCriteria=MA`. The
+Identical to the CRN request of section 13 with `searchCriteria=MA`. The
 capture shows the portal paginating MA server-side at `recordsPerPage=20`
 (1,838 results, 92 pages of `postRequest(...)` links) **and** accepting
 `recordsPerPage=2000` with all 1,838 rows in one response. DocLink therefore
@@ -943,7 +1003,7 @@ gives none, because MA numbers repeat across POs. Files are grouped in a folder 
 
 | Code | When |
 |---|---|
-| `IREPS_MA_SEARCH_FAILED` / `IREPS_MA_RESULTS_INVALID` / `IREPS_MA_PARSE_FAILED` | as for CRN (section 12) |
+| `IREPS_MA_SEARCH_FAILED` / `IREPS_MA_RESULTS_INVALID` / `IREPS_MA_PARSE_FAILED` | as for CRN (section 13) |
 | `IREPS_MA_NOT_FOUND` | no MA matched the date selection (the message says how many IREPS returned) |
 | `IREPS_MA_LINK_NOT_FOUND` | the row has no "View/Download MA" link, or it points outside IREPS |
 | `IREPS_MA_DOWNLOAD_FAILED` | network error, HTTP ≠ 2xx, or Chrome could not save the file |
@@ -987,7 +1047,7 @@ sign-in required* with a **Sign in to Recon** button.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `reconBaseUrl` | `http://localhost:8000` | Recon Engine API origin. Its origin must also be in `manifest.json` `host_permissions` - add the deployed Recon URL there |
+| `reconBaseUrl` | none (unset: `RECON_NOT_CONFIGURED`) | Recon Engine API origin. Its origin must also be in `manifest.json` `host_permissions` - add the deployed Recon URL there |
 | `reconCustomerId` | `default` | Recon customer key the files are filed under |
 | `reconAppUrl` | `reconBaseUrl` | The Recon Engine web app (e.g. the Vite dev UI on `:5173`); no longer needed for sign-in |
 | `okta` | see section 17 | Okta sign-in to the Recon Engine: `enabled`, `issuer`, `clientId`, `redirectPath` |
@@ -1026,7 +1086,7 @@ settings, sign-in cookie and host permission as section 15:
 | Corrigendum | `extension` | same | `<tender no> - Extension - <corrigendum no>`; a document attached to it `<tender no> - Extension - <corrigendum no> - Attachment <n>` |
 | Negotiation letter | `nbsp` | same | `<tender no> - NBSP - <letter id>` |
 | Counter offer | `co` | same | `<tender no> - CO - <letter id>` |
-| LOA (Advance Acceptance Letter) | `loi` | same | **one document per tender**, `<tender no> - LOA`: every letter in it, as `LOA_<tender no>_<letter id>.pdf` (a printed page, so DocLink names it) |
+| LOA (Advance Acceptance Letter) | `loi` | same, plus `loi_number`, `loi_date` | **one document per tender**, `<tender no> - LOA`: every letter in it, as `LOA_<tender no>_<letter id>.pdf` (a printed page, so DocLink names it) |
 | Correspondence | `crp` | same | `<tender no> - CRP - <subject>` |
 | Financial Tabulation | `tenderResult` (ECM "Tender Result") | same | **one document per tender**, `<tender no> - Result` |
 | Commercial Tabulation | `vct` | same | `<tender no> - Commercial Tabulation` |
@@ -1061,9 +1121,41 @@ one new attachments go into.
 `InvoiceCertificateSchema` lacks answers HTTP 400 "No such property". `tenderDate`,
 `loiNumber` and `loiDate` were missing on 26/10/2026 and were there on 03/11/2026
 (`GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema`). Tender documents now
-carry `tenderDate` (the IREPS closing date); DocLink does not read the LOI number /
-date yet. Map any new property in `services/ecm-catalog.js` `ECM_FIELDS` and list it
-in the kinds; the gateway's `document_kinds.toml` must match.
+carry `tenderDate` (the IREPS closing date). Map any new property in
+`services/ecm-catalog.js` `ECM_FIELDS` and list it in the kinds; the gateway's
+`document_kinds.toml` must match.
+
+**The fields the client asked for on 13/11/2026.** DocLink sends them since version 1.5.0, with
+no setting to switch them.
+- **LOA.** `loi_number` is the number IREPS prints on the letter, `<Dept> / <Tender No> / <LetterId>`
+  (e.g. `DAHOD / 61265711C / 1503282`). DocLink builds it from the LOA list row:
+  - the department part of "Dept/Rly. Unit" (`DAHOD / WESTERN RLY`);
+  - the tender number;
+  - the id in "Letter Date (LetterId)".
+
+  `loi_date` is that row's Letter Date. DocLink sends both or neither: a row without a readable
+  "Dept/Rly. Unit" sends neither. The `<T> - LOA` document keeps the values of the letter that
+  created it, because later letters only fill in what it lacks.
+- **Correspondence.** `tender_date` is the "Closing Date" next to the tender number on the Tender
+  Related Correspondence page, which is the tender's closing date. The letter quotes it ("Ref:
+  Tender No. 86256328 closing date 15/07/2025 11:00"); the letter's own deadline is "Last date for
+  submission of reply".
+
+**Where the tender date comes from.**
+
+| Document | Source of the tender date |
+|---|---|
+| NIT and corrigendum | The tender search row's "Due Date/Time"; when the search gives none, the NIT message's "due on" date. |
+| Financial and Commercial Tabulation | The Closed Tenders row's "Closing Date/Time". |
+| Negotiation, Counter Offer and LOA | A tender search by tender number, once per tender in a run. |
+
+Railways reuse tender numbers: 10263703 is both a N F RLY and an EAST CENTRAL RLY tender. When
+the search shows a number more than once, DocLink takes:
+- the row on the letter's own railway (from the list's "Dept/Rly. Unit");
+- in automatic mode, the row due on the NIT message's date.
+
+A hint that fits no row leaves the choice as before (the row with the most actions). This adds no
+request.
 
 The title is `<document number> - <code>`, the codes of the spec's row 4
 (API: "Example Title - IC", "- PO", "- MA", "- NIT", ...; "- LOA" and "- Result"
@@ -1123,7 +1215,8 @@ for the Recon sign-in in direct mode.
 
   Reload DocLink after editing either file. The secret and the token are never logged or
   stored. A built extension has no `config.local.json`, so in direct mode it reports
-  "ECM not configured" and saves locally.
+  "ECM not configured" and saves locally. The build stops if `config.json` itself holds
+  a real-looking secret (8 characters or more; section 9).
 * **`env`** picks the folders:
 
   | env | Site | `ecm:ancestorId` | Folders |
@@ -1144,11 +1237,23 @@ for the Recon sign-in in direct mode.
   folders open at their catalog paths.
 * **Host permission.** The `ecm.domain` origin must be in `manifest.json`
   `host_permissions`. `http://wctsrvecmtstsn1.wabtec.com:8080/*` is already there. The
-  server is on the Wabtec network.
+  server is on the Wabtec network. The address is plain `http://`, so DocLink logs a
+  warning once (it does not block).
+* **Token request.** DocLink gets its token as it always has: the client id and secret
+  are in the token request's URL, as ECM_API_DOC shows. Sending them in the request body
+  instead, so that URL logs never hold the secret, is a code change for when the ECM team
+  confirms the token endpoint accepts it (review H10).
+* **One upload at a time, everywhere.** Uploads already ran one at a time within each part
+  of DocLink. A Web Lock (`doclink.ecm.upload`) now also makes the service worker and every
+  side panel take turns.
+* **Duplicate tender documents.** After DocLink creates a tender's grouped document (NIT,
+  LOA, Result), it repeats the same read-only lookup. If an older copy exists (another
+  user or PC created one at the same time), it logs a warning. Nothing is merged or
+  trashed.
 * **Finding what was stored.** Use the spreadsheet's query, with straight quotes:
   `SELECT * FROM Document WHERE InvoiceCertificateSchema:type = 'poCopy' AND ecm:ancestorId = '<site id>'`.
-  `buildEcmQuery()` / `findEcmDocuments()` in `services/ecm-direct.js` build and run it,
-  optionally filtered by `customer_po_number`, `ic_number`, `tender_number`, and so on.
+  `buildEcmQuery()` in `services/ecm-direct.js` builds it (optionally filtered by
+  `customer_po_number`, `ic_number`, `tender_number`, and so on) and `searchEcm()` runs it.
 
 Tests: `test/ecm-direct-tests.js` (browser suite) and the "ECM direct:" test in
 `tender/tests/run-tests.mjs`.
@@ -1258,14 +1363,17 @@ name) is updated in place (`PUT /id/{uid}`), its title and metadata untouched.
 - **Old PDF intact:** it stays in the document as an attachment named
   `<name>_old.pdf` (`_old_2`, ... when taken). Attachments already there are
   kept (they are read and sent again: the ECM replaces the list as a whole).
-- **Old PDF damaged** (the ECM cannot serve it in full): it is dropped.
-- If a file of the document cannot be read for another reason, nothing is
-  changed and the PDF is saved locally (`ECM_UNAVAILABLE`); if the ECM damages
-  the new PDF, it is saved locally too (`ECM_FILE_DAMAGED`), the old one still
-  being in the document as `_old`.
-- When the check found several copies, the first gets the new PDF; any other
-  copy the ECM damaged goes to the **ECM trash** (Nuxeo `Document.Trash`,
-  restorable), healthy ones are left alone.
+- **Old PDF damaged** (the ECM cannot serve it in full): it is dropped. "Damaged"
+  needs proof: the last-byte read fails AND a read of the whole file comes back
+  short or missing (404).
+- A **temporary ECM error** on those reads (5xx, 408, 429, network, timeout) is
+  retried up to 3 times. If it does not clear, nothing is changed and the PDF is
+  saved locally (`ECM_UNAVAILABLE`). A healthy old PDF is never dropped because
+  of a passing error. If the ECM damages the new PDF, it is saved locally too
+  (`ECM_FILE_DAMAGED`), the old one still being in the document as `_old`.
+- When the check found several copies, the first gets the new PDF. Any other
+  copy that is proven damaged goes to the **ECM trash** (Nuxeo `Document.Trash`,
+  restorable); healthy ones are left alone.
 
 The row reads `Saved to ECM (Hosur): new PDF in the existing document; the old
 one is kept in it as <name>_old.pdf` (or `(the damaged one was removed)`).
@@ -1404,7 +1512,95 @@ Tender No. (Bid Id), Tender Title and Closing Date/Time
   "techno") is allowed, and only inside a `commercialTabulation` response.
   Anywhere else `TECH-TAB` stays blocked.
 
-## Correspondence Downloads (`tender/tender-pending.js`, `tender/pending-ui.js`)
+---
+
+## 20. Upload Bill to IREPS (bill upload)
+
+Bills an ECM invoice against an IREPS receipt, up to the point where IREPS needs
+the user's digital signature. The study behind it - every call, field, source
+and open question - is `upload.md`; this section is how DocLink implements it.
+Started by hand from the side panel (**Bill** on the main view's *Upload* card).
+
+```
+1 Receipt    PO number -> R-NOTE + CRN search (searchPO.do, read-only)
+             -> receipts with a "Bill Claim" link (rly, poKey); others greyed out with the reason
+2 Invoice    ECM RetrieveInvoiceData {customerPO, customerPOSrNo, invoiceQuantity}
+             (exactly one match, not "Sent to Doculink") - or from a JSON file the user picks
+             (same columns, same match) - or typed by hand
+             -> checked before any IREPS call: number, date, amount, HSN code of 4 to 8 digits
+3 Prepare    read-only IREPS calls in the IREPS tab: fetchPODetails.do (bill page), populatePayAuthList,
+             populatePOSrList, getAjaxData (GSTIN), populateROList, populateRODetails
+             -> every header value with its source + checks; the user may correct supplier GSTIN,
+                state / place of supply and bill description (re-checked)
+4 Create     only with no error, warnings read and the values confirmed:
+             saveBillHeader.do (creates the DRAFT bill - the header cannot be edited afterwards)
+             -> fetchPOItemDetails / populateROList / populateRODetails -> amounts computed like the
+                bill page -> item checks -> saveBillDetails.do
+5 Documents  the invoice's ECM documents (per-type NXQL by invoice no. / PO no., newest per type),
+             checked (PDF, < 8 MB) and saved to Downloads/DocLink/IREPS/BillUpload/<invoice>/,
+             each with the description to type in IREPS
+5b Upload    once the item is saved (IREPS needs the dispatch no.), one PDF < 8 MB at a time with
+             its description (min. 5 characters): IREPS signer on the user's PC (wss://127.0.0.1:2175;
+             the user selects the DSC and enters the PIN) -> the signature must be from the DSC
+             registered in IREPS (certThumbprint) -> /cgi-bin/save.php -> uploadBillDocuments.do,
+             all from the IREPS tab -> the documents now on the bill
+Then in IREPS (manual): open the draft bill, attach any document not uploaded from DocLink
+(each signed in the IREPS signer), Generate Preview, Sign & Submit with DSC + PIN.
+```
+
+| File | Role |
+|---|---|
+| `services/bill-upload/bill-upload-api.js` | The `/epsn/ct/*` calls: request bodies in the captured field order (`orderedBody` refuses a missing or extra field), the bill page's AJAX headers, parsers for the `^^` / `@#$%` answers; anything not starting with `success` is IREPS refusing, its text kept as the reason |
+| `services/bill-upload/bill-form.js` | Reads the bill page (regex, no DOM): the `saveBillHeader()` script literals (`nitOid`, `poKey`, `unit`, ...), company, prefilled bank / IFSC, the supplier GSTIN / paying railway / railway GSTIN / state options, PO payment terms |
+| `services/bill-upload/bill-rules.js` | Pure rules: `buildHeader`, `buildItem`, `computeAmounts`, GST split (IGST vs CGST + SGST / UTGST from the header states), state codes, the supplier-GSTIN-by-division and state-of-supply derivations, every check |
+| `services/bill-upload/invoice-file.js` | The JSON-file invoice source: `parseInvoiceFile` (a list, `{ "invoices": [...] }` or one invoice, in ECM's column names; at most 1 MB / 500 invoices), `invoiceFromFile` (the receipt's invoice by PO + PO Sr + quantity, numbers compared by value). The file is picked in the panel at run time, never bundled, so it works in the built extension. Sample: `test/mock/sample_upload.json` |
+| `services/bill-upload/ecm-invoice.js` | `retrieveInvoice` (answer read defensively - its format is not documented yet), `manualInvoice`, the bill document types with their IREPS descriptions, document search and fetch |
+| `services/bill-upload/bill-upload-service.js` | The steps above (`findBillableReceipts`, `prepareBill`, `reviewBill`, `createDraftBill`, `saveItem`, `collectBillDocuments`) |
+| `services/bill-upload/bill-upload-store.js` | Per receipt, what DocLink already wrote (bill reg no., dispatch no.; identifiers only) in `chrome.storage.local`: a receipt is never billed twice, also after a restart |
+| `services/bill-upload/tab-transport.js` | A `fetch` that runs in the panel's IREPS tab (`chrome.scripting`) for the bill calls; `tabSignPdf` / `tabSaveFile` for step 5b |
+| `services/bill-upload/bill-document-upload.js` | Step 5b (`uploadBillDocument`): the signer request and its frames (as IREPS' CRISPKI.js sends them), the signer's answer, the thumbprint check, `save.php` and `uploadBillDocuments.do` |
+| `background/bill-tab-request.js` | Injected into the IREPS tab (isolated world, versioned): sends the bill calls from the portal's own origin, talks to the IREPS signer, stores the signed PDF with `save.php` |
+| `background/bill-upload-job.js` | Service-worker job: `BILL_UPLOAD_*` messages, one step at a time, state in `chrome.storage.session`, `BILL_UPLOAD_UPDATE` to the panel |
+| `popup/popup-bill-upload.js` | The view |
+
+Safety rules: Prepare never writes. The invoice is checked before anything is
+sent to IREPS, whatever its source (ECM, JSON file, typed): invoice number, date,
+amount, and an HSN code of 4 to 8 digits. A bad one (an HSN such as "12") stops
+Prepare with `BILL_INVOICE_INVALID`, before a draft bill exists. Create needs the
+confirmation tick, refuses while any check is an error, and needs the warnings
+ticked as read. A failure after the header was saved keeps the draft bill's
+number on screen (item can be retried, or finished / deleted in IREPS). A receipt
+with a DocLink bill, or one IREPS already shows a bill for, cannot be billed
+again. **Start fresh** (a new bill for a receipt DocLink already billed) forgets
+only DocLink's record: the old draft's bill number stays on screen with where to
+find it (the PO's *Bills for Pay* tab), as it is still in IREPS, and the new
+bill's last steps remind the user to delete it. *Finish in IREPS* is built from
+the documents' real states: documents already on the bill are not asked for
+again, the files DocLink saved are named, and a needed document DocLink has no
+file for is listed with the description to type. The IREPS-tab script is
+injected once per tab, and again only when the page was reloaded.
+
+What DocLink derives because the ECM does not carry it yet (upload.md section 8,
+to be confirmed by the business): supplier GSTIN from ECM `division`
+(`WABHSR` -> 33AAGCS8525B1ZL, `WABRTK` -> 06AAGCS8525B1ZI), state of supply from
+ECM `gstinRecipient` (else the consignee address), place of supply from
+`supplyPlace`. All three are shown with their source and can be corrected.
+
+Not supported yet (stopped by a check): advance / part payment, PVC, POs with
+discount / packing / freight / other charges, several paying authorities,
+several receipts per PO Sr without a match, multi-invoice bills. Not verified on
+the live portal: the ECM `RetrieveInvoiceData` answer (no response captured) and
+re-opening a DocLink-created draft in IREPS to attach the documents (IREPS
+offers "View / Sign & Submit Draft Supplier Bill" from the R-NOTE / CRN row).
+The mock portal serves the flow up to the saved item, including the ECM calls, plus a test hub
+with the bill screens at http://localhost:8765/mock/bill/ (TESTING.md C9);
+`node test/mock/bill-flow-check.mjs` runs the bill code against every test receipt. The mock
+does not serve step 5b (`save.php`, `uploadBillDocuments.do`), and signing needs the real
+IREPS signer.
+
+---
+
+## 21. Correspondence Downloads (`tender/tender-pending.js`, `tender/pending-ui.js`)
 
 Main screen -> **Correspondence Downloads** -> **Download All Correspondence**.
 No tender / correspondence / letter ids are typed in; all are read from the live responses.
@@ -1423,13 +1619,13 @@ Request sequence (all in the signed-in browser session, `credentials: include`):
 Output: `Downloads/DocLink/<verified unit>/Correspondence/Pending/<TenderNo>/Correspondence_<LetterNo>_<dd-mm-yyyy>_<Subject>.pdf` (a letter IREPS serves as a PDF keeps its IREPS name), attachments under their IREPS name (`<name>_<LetterNo>` when another file of the tender's folder has it), and `Downloads/DocLink/<unit>/Correspondence/Pending/download_manifest.json`.
 Under **Save to: ECM / S3** each letter and attachment goes to the unit's ECM Tenders folder instead, as `crp` with the tender number, titled `<tender no> - CRP - <letter no> - <subject>` (attachments: `<tender no> - CRP - <letter no> - Attachment - <file name>`), with the same Recon sign-in and the same local fallback as the tender documents (section 16). Each letter row shows where it went. When Chrome cannot print a letter, its original `.html` page stays in Downloads.
 Dedupe key: `accountId|nitOid|corresId|letterId` (stored in `chrome.storage.local`, no secrets). **Retry failed** and a repeated run skip letters already saved; tick "Download again" to force.
-Requests are sequential, with bounded retry/backoff on 5xx/429/network errors; a session expiry stops the job and marks the rest `SESSION_EXPIRED`.
+Requests are sequential. A GET that cannot reach IREPS (a network failure) is retried after 1 s and 3 s; a POST is never retried, so nothing is ever sent twice. A session expiry stops the job and marks the rest `SESSION_EXPIRED`. A list page DocLink does not recognise (no "Pending Replies" table, an HTTP error) is an error, never "no letters".
 
 Unverified against the live portal: the exact response of `viewpubIndltr.do` (it is not in the supplied HAR) and the markup of its attachment links.
 
 ---
 
-## Batch downloads (PO by date, IC by date, IC from notifications)
+## 22. Batch downloads (PO by date, IC by date, IC from notifications)
 
 All three live in the side panel under **Download PO / IC → "Download POs / ICs by date, or ICs from notifications"**.
 They are download-only (no inspection call is submitted, approved, withdrawn or revalidated).
@@ -1484,67 +1680,3 @@ network / timeout / HTTP 5xx only. An expired session is never retried.
 * Notifications beyond what `getMyActivitesData` returns (no other notification endpoint is called).
 * The IC Date search with PO No. empty. The captured list page (no PO, portal defaults) lists every PO's ICs and has
   the IC Date From / To fields, but a submitted search with only the IC dates set is not in a capture.
-
----
-
-## 20. Upload Bill to IREPS (bill upload)
-
-Bills an ECM invoice against an IREPS receipt, up to the point where IREPS needs
-the user's digital signature. The study behind it - every call, field, source
-and open question - is `upload.md`; this section is how DocLink implements it.
-Started by hand from the side panel (**Upload Bill** on the main view).
-
-```
-1 Receipt    PO number -> R-NOTE + CRN search (searchPO.do, read-only)
-             -> receipts with a "Bill Claim" link (rly, poKey); others greyed out with the reason
-2 Invoice    ECM RetrieveInvoiceData {customerPO, customerPOSrNo, invoiceQuantity}
-             (exactly one match, not "Sent to Doculink") - or from a JSON file the user picks
-             (same columns, same match) - or typed by hand
-3 Prepare    read-only IREPS calls in the IREPS tab: fetchPODetails.do (bill page), populatePayAuthList,
-             populatePOSrList, getAjaxData (GSTIN), populateROList, populateRODetails
-             -> every header value with its source + checks; the user may correct supplier GSTIN,
-                state / place of supply and bill description (re-checked)
-4 Create     only with no error, warnings read and the values confirmed:
-             saveBillHeader.do (creates the DRAFT bill - the header cannot be edited afterwards)
-             -> fetchPOItemDetails / populateROList / populateRODetails -> amounts computed like the
-                bill page -> item checks -> saveBillDetails.do
-5 Documents  the invoice's ECM documents (per-type NXQL by invoice no. / PO no., newest per type),
-             checked (PDF, < 8 MB) and saved to Downloads/DocLink/IREPS/BillUpload/<invoice>/,
-             each with the description to type in IREPS
-Then in IREPS (manual): open the draft bill, attach the documents (each signed in the IREPS
-signer), Generate Preview, Sign & Submit with DSC + PIN.
-```
-
-| File | Role |
-|---|---|
-| `services/bill-upload/bill-upload-api.js` | The `/epsn/ct/*` calls: request bodies in the captured field order (`orderedBody` refuses a missing or extra field), the bill page's AJAX headers, parsers for the `^^` / `@#$%` answers; anything not starting with `success` is IREPS refusing, its text kept as the reason |
-| `services/bill-upload/bill-form.js` | Reads the bill page (regex, no DOM): the `saveBillHeader()` script literals (`nitOid`, `poKey`, `unit`, ...), company, prefilled bank / IFSC, the supplier GSTIN / paying railway / railway GSTIN / state options, PO payment terms |
-| `services/bill-upload/bill-rules.js` | Pure rules: `buildHeader`, `buildItem`, `computeAmounts`, GST split (IGST vs CGST + SGST / UTGST from the header states), state codes, the supplier-GSTIN-by-division and state-of-supply derivations, every check |
-| `services/bill-upload/invoice-file.js` | The JSON-file invoice source: `parseInvoiceFile` (a list, `{ "invoices": [...] }` or one invoice, in ECM's column names; at most 1 MB / 500 invoices), `invoiceFromFile` (the receipt's invoice by PO + PO Sr + quantity, numbers compared by value). The file is picked in the panel at run time, never bundled, so it works in the built extension. Sample: `test/mock/sample_upload.json` |
-| `services/bill-upload/ecm-invoice.js` | `retrieveInvoice` (answer read defensively - its format is not documented yet), `manualInvoice`, the bill document types with their IREPS descriptions, document search and fetch |
-| `services/bill-upload/bill-upload-service.js` | The steps above (`findBillableReceipts`, `prepareBill`, `reviewBill`, `createDraftBill`, `saveItem`, `collectBillDocuments`) |
-| `services/bill-upload/bill-upload-store.js` | Per receipt, what DocLink already wrote (bill reg no., dispatch no.; identifiers only) in `chrome.storage.local`: a receipt is never billed twice, also after a restart |
-| `services/bill-upload/tab-transport.js` | A `fetch` that runs in the panel's IREPS tab (`chrome.scripting`) for the bill calls |
-| `background/bill-upload-job.js` | Service-worker job: `BILL_UPLOAD_*` messages, one step at a time, state in `chrome.storage.session`, `BILL_UPLOAD_UPDATE` to the panel |
-| `popup/popup-bill-upload.js` | The view |
-
-Safety rules: Prepare never writes. Create needs the confirmation tick, refuses
-while any check is an error, and needs the warnings ticked as read. A failure
-after the header was saved keeps the draft bill's number on screen (item can be
-retried, or finished / deleted in IREPS). A receipt with a DocLink bill, or one
-IREPS already shows a bill for, cannot be billed again.
-
-What DocLink derives because the ECM does not carry it yet (upload.md section 8,
-to be confirmed by the business): supplier GSTIN from ECM `division`
-(`WABHSR` -> 33AAGCS8525B1ZL, `WABRTK` -> 06AAGCS8525B1ZI), state of supply from
-ECM `gstinRecipient` (else the consignee address), place of supply from
-`supplyPlace`. All three are shown with their source and can be corrected.
-
-Not supported yet (stopped by a check): advance / part payment, PVC, POs with
-discount / packing / freight / other charges, several paying authorities,
-several receipts per PO Sr without a match, multi-invoice bills. Not verified on
-the live portal: the ECM `RetrieveInvoiceData` answer (no response captured) and
-re-opening a DocLink-created draft in IREPS to attach the documents (IREPS
-offers "View / Sign & Submit Draft Supplier Bill" from the R-NOTE / CRN row).
-The mock portal serves the whole flow, including the ECM calls (TESTING.md C9).
-

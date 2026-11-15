@@ -5,7 +5,8 @@
  * the values before anything is written:
  *
  *   1. findBillableReceipts()  R-NOTE and CRN search (read-only) -> receipts with a Bill Claim link
- *   2. retrieveInvoice()       ECM RetrieveInvoiceData (ecm-invoice.js), or manualInvoice()
+ *   2. invoiceForReceipt()     ECM RetrieveInvoiceData (ecm-invoice.js), a picked JSON file
+ *                              (invoice-file.js) or manualInvoice(), checked the same way
  *   3. prepareBill()           read-only IREPS calls: bill page, paying authority, PO Sr list,
  *                              GSTIN check, receipt list + details -> every header value with its
  *                              source and the checks (nothing is written)
@@ -46,8 +47,9 @@ import {
   saveBillDetails
 } from "./bill-upload-api.js";
 import { hasBillForm, parseBillForm } from "./bill-form.js";
-import { buildHeader, buildItem, precheckReceipt, quantityOf, deriveSupplierGstin } from "./bill-rules.js";
-import { BILL_DOCUMENTS, MAX_DOCUMENT_BYTES, findBillDocuments, fetchBillDocument } from "./ecm-invoice.js";
+import { buildHeader, buildItem, precheckReceipt, quantityOf, deriveSupplierGstin, hsnCheck } from "./bill-rules.js";
+import { BILL_DOCUMENTS, MAX_DOCUMENT_BYTES, findBillDocuments, fetchBillDocument, retrieveInvoice, manualInvoice } from "./ecm-invoice.js";
+import { invoiceFromFile, receiptInvoiceKey } from "./invoice-file.js";
 
 export const BILL_UPLOAD_SUBFOLDER = "DocLink/IREPS/BillUpload";
 
@@ -148,6 +150,54 @@ export async function findBillableReceipts({ poNo } = {}, deps = {}) {
     receipts,
     warnings: warnings.map((w) => `${w.label} search failed: ${(w.error && (w.error.detail || w.error.message)) || "error"}`)
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* 2. Invoice                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Stops an invoice that lacks what every bill needs (number, date, amount, HSN code), or whose
+ * HSN code IREPS does not take, before IREPS is read or written. The HSN only goes into the
+ * item, which is saved after the draft bill exists, so a bad one found there would leave the
+ * draft behind (review M25).
+ * @param {object} invoice
+ * @param {string} [where]  "in ECM" / "in <file name>"; empty for an invoice the user typed
+ */
+export function requireInvoiceFields(invoice, where = "") {
+  const missing = [];
+  if (!invoice.invoiceNumber) missing.push("invoice number");
+  if (!invoice.invoiceDate) missing.push("invoice date");
+  if (!invoice.amount) missing.push("invoice amount");
+  if (!invoice.hsn) missing.push("HSN code");
+  if (missing.length) {
+    throw new IrepsError(BILL_ERROR.INVOICE_INVALID, "invoice incomplete", { detail: where ? `Invoice ${invoice.invoiceNumber} ${where} has no ${missing.join(", ")}.` : `Enter the ${missing.join(", ")}.` });
+  }
+  const hsn = hsnCheck(invoice);
+  if (hsn) throw new IrepsError(BILL_ERROR.INVOICE_INVALID, "invoice HSN code not accepted", { detail: where ? `Invoice ${invoice.invoiceNumber} ${where}: ${hsn.text}` : hsn.text });
+}
+
+/**
+ * The receipt's invoice from ECM, from the JSON file the user picked, or as typed; every source
+ * goes through requireInvoiceFields.
+ * @param {{ receipt: object, mode?: "ecm"|"file"|"manual", fields?: object, file?: { name: string, records: object[] }|null }} input
+ * @param {{ retrieveInvoice?: (key: object) => Promise<object> }} [deps]  the ECM lookup (tests inject one)
+ * @returns {Promise<object>} the invoice, normalised like an ECM one (ecm-invoice.js)
+ */
+export async function invoiceForReceipt({ receipt, mode = "ecm", fields = {}, file = null }, deps = {}) {
+  if (mode === "manual") {
+    const invoice = manualInvoice(fields || {});
+    requireInvoiceFields(invoice);
+    return invoice;
+  }
+  if (mode === "file") {
+    const invoice = invoiceFromFile(file, receiptInvoiceKey(receipt));
+    requireInvoiceFields(invoice, `in ${file.name}`);
+    return invoice;
+  }
+  const invoice = await (deps.retrieveInvoice || retrieveInvoice)(receiptInvoiceKey(receipt));
+  requireInvoiceFields(invoice, "in ECM");
+  return invoice;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -272,13 +322,18 @@ export async function reviewBill(context, overrides = {}, deps = {}) {
 /**
  * "Start fresh" for a receipt DocLink already created a bill for: forgets DocLink's record of
  * that bill so a new draft can be created, and re-checks the header. Writes nothing to IREPS -
- * the earlier draft bill stays there until the user deletes it (PO's Bills for Pay).
+ * the earlier draft bill stays there until the user deletes it (PO's Bills for Pay). DocLink
+ * no longer tracks it after this, so its number is kept in `forgottenBills` for the panel to
+ * say where it is (review M26).
  * @returns {Promise<{ forgotten: object|null, context: object }>}
  */
 export async function forgetBill(context, deps = {}) {
   const forgotten = await deps.store.remove(context.receipt.key);
   if (forgotten) logger.info(`Bill upload: forgot bill ${forgotten.billRegNo} for this receipt (start fresh)`, { po: context.receipt.poNo, poSr: context.receipt.poSr });
-  const next = { ...context, existing: null, billRegNo: null, headerSaved: null, item: null, dispatchNo: null, documentsOnBill: null };
+  const left = forgotten || context.existing;
+  const forgottenBills = [...(context.forgottenBills || [])];
+  if (left && left.billRegNo && !forgottenBills.some((b) => b.billRegNo === left.billRegNo)) forgottenBills.push({ billRegNo: left.billRegNo, status: left.status || null });
+  const next = { ...context, existing: null, billRegNo: null, headerSaved: null, item: null, dispatchNo: null, documentsOnBill: null, forgottenBills };
   next.header = assembleHeader(next, deps.today);
   return { forgotten, context: next };
 }

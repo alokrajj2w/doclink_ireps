@@ -97,8 +97,12 @@ export function stateCodeOf(text) {
   return null;
 }
 
-/** dd/mm/yyyy from "2026-08-18 00:00:00.000", "2026-08-18T..", "18/08/2026", "18-08-2026", "18-Aug-2026" or epoch ms. */
-export function toIrepsDate(value) {
+/**
+ * An ECM invoice date as IREPS writes it, dd/mm/yyyy, from "2026-08-18 00:00:00.000", "2026-08-18T..", "18/08/2026",
+ * "18-08-2026", "18-Aug-2026" or epoch ms; null when it is not a real calendar date. (The panel's date inputs use
+ * utils/dates.js toIrepsDate, which takes only an <input type="date"> value.)
+ */
+export function invoiceDateToIreps(value) {
   if (value === null || value === undefined || value === "") return null;
   const pad = (n) => String(n).padStart(2, "0");
   const valid = (y, m, d) => {
@@ -188,6 +192,23 @@ export function paymentPercentFrom(paymentTerm) {
 const err = (text) => ({ level: "error", text });
 const warn = (text) => ({ level: "warning", text });
 
+/** The invoice's HSN code as the item sends it (spaces removed). */
+export function invoiceHsn(invoice) {
+  return String(invoice.hsn || "").replace(/\s+/g, "");
+}
+
+/**
+ * The HSN check (IREPS takes 4 to 8 digits). The HSN only goes into the item, but the item is
+ * saved after the draft bill exists, so the header runs this check too: a bad HSN found only at
+ * the item would leave the draft behind in IREPS (review M25).
+ * @returns {{ level: "error", text: string }|null}
+ */
+export function hsnCheck(invoice) {
+  const hsn = invoiceHsn(invoice);
+  if (/^\d+$/.test(hsn) && hsn.length >= LIMITS.hsnMin && hsn.length <= LIMITS.hsnMax) return null;
+  return err(`HSN code "${invoice.hsn ?? ""}" must be 4 to 8 digits.`);
+}
+
 /**
  * The header of the bill (saveBillHeader.do).
  *
@@ -216,13 +237,15 @@ export function buildHeader({ receipt, invoice, form, payAuths, stockNonstock, g
   const invoiceNo = String(invoice.invoiceNumber || "").trim();
   if (!invoiceNo) checks.push(err("The invoice has no invoice number."));
   else if (invoiceNo.length > LIMITS.invoiceNo || !/^[A-Za-z0-9\-/]+$/.test(invoiceNo)) checks.push(err(`Invoice number "${invoiceNo}" is not accepted by IREPS (at most 16 characters; letters, digits, - and / only).`));
-  const invoiceDate = toIrepsDate(invoice.invoiceDate);
+  const invoiceDate = invoiceDateToIreps(invoice.invoiceDate);
   if (!invoiceDate) checks.push(err(`Invoice date "${invoice.invoiceDate ?? ""}" is not a date.`));
   else if (irepsDateValue(invoiceDate) > Date.UTC(today.getFullYear(), today.getMonth(), today.getDate())) checks.push(err(`Invoice date ${invoiceDate} is in the future.`));
   const amount = parseAmount(invoice.amount);
   if (!(amount > 0)) checks.push(err(`Invoice amount "${invoice.amount ?? ""}" is not a positive amount.`));
   const invoiceAmount = amount > 0 ? formatInvoiceAmount(round2(amount)) : "";
   if (invoiceAmount.length > LIMITS.invoiceAmount) checks.push(err("Invoice amount is longer than IREPS accepts (12 characters)."));
+  const hsnError = hsnCheck(invoice);
+  if (hsnError) checks.push(hsnError);
 
   // payment
   const percent = paymentPercentFrom(invoice.paymentTerm);
@@ -423,8 +446,9 @@ export function buildItem({ header, billRegNo, receipt, invoice, item, roNo, ro,
   const headerInvoiceAmount = parseAmount(header.invoiceAmount);
   const maxClaimSent = Number.isFinite(headerInvoiceAmount) && Number.isFinite(maxClaim) && Math.round(headerInvoiceAmount) > Math.round(maxClaim) ? String(headerInvoiceAmount) : ro.maxClaim;
 
-  const hsn = String(invoice.hsn || "").replace(/\s+/g, "");
-  if (!/^\d+$/.test(hsn) || hsn.length < LIMITS.hsnMin || hsn.length > LIMITS.hsnMax) checks.push(err(`HSN code "${invoice.hsn ?? ""}" must be 4 to 8 digits.`));
+  const hsn = invoiceHsn(invoice);
+  const hsnError = hsnCheck(invoice);
+  if (hsnError) checks.push(hsnError);
 
   const rlyGSTIN = item.consigneeGstin || "";
   if (!rlyGSTIN) checks.push(err("IREPS returned no consignee GSTIN for the railway GSTIN."));

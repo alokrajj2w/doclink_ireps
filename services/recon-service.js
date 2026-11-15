@@ -33,7 +33,9 @@
  */
 
 import { logger } from "../utils/logger.js";
+import { readConfigFiles } from "../utils/config.js";
 import { compileMatchPatterns } from "../utils/url-scope.js";
+import { fetchWithDeadline, DeadlineError } from "../utils/http.js";
 
 /** doc_type values the Recon Engine's POST /api/documents accepts. */
 export const RECON_DOC_TYPE = Object.freeze({
@@ -131,16 +133,17 @@ export function applyReconConfig(config) {
 }
 
 /**
- * Read the Recon settings from config.json (the same hand-edited file as the
- * IREPS target). Safe to call repeatedly; a no-op after the first load
+ * Read the Recon settings from config.json / config.local.json (utils/config.js;
+ * the same hand-edited files as the IREPS target). Safe to call repeatedly; a no-op after the first load
  * unless `force` is passed. On any error the current settings are kept.
  * @param {{ force?: boolean }} [options]
  */
 export async function loadReconConfig({ force = false } = {}) {
   if (configLoaded && !force) return RECON_CONFIG;
   try {
-    const url = typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL("config.json") : "./config.json";
-    applyReconConfig(await (await fetch(url, { cache: "no-store" })).json());
+    const files = await readConfigFiles({ force });
+    if (!files) throw new Error("config.json could not be read");
+    applyReconConfig(files.config);
     logger.info(`Recon config loaded: ${currentBaseUrl || "(no reconBaseUrl)"}, customer=${currentCustomerId}`);
   } catch (error) {
     logger.warn("Could not load the Recon settings from config.json", error);
@@ -216,27 +219,17 @@ export async function uploadToRecon(file, deps = {}) {
   form.append("file", new Blob([file.bytes], { type: file.mimeType || "application/octet-stream" }), file.filename);
 
   const endpoint = `${baseUrl}/api/documents`;
-  const fetchImpl = deps.fetch || globalThis.fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), RECON_CONFIG.timeoutMs);
   logger.info(`Uploading ${file.filename} to the Recon Engine`, { docType: file.docType, bytes: file.bytes.length, customer: RECON_CONFIG.customerId });
 
   let response;
+  let body;
   try {
-    response = await fetchImpl(endpoint, { method: "POST", body: form, credentials: "include", signal: controller.signal });
+    // one deadline for the upload's answer, headers and body
+    ({ response, body } = await fetchWithDeadline(endpoint, { method: "POST", body: form, credentials: "include" }, { timeoutMs: RECON_CONFIG.timeoutMs, fetch: deps.fetch }));
   } catch (error) {
-    const timedOut = error && error.name === "AbortError";
+    const timedOut = error instanceof DeadlineError;
     logger.warn("Recon Engine unreachable", error);
-    throw new ReconError(RECON_ERROR.UNAVAILABLE, { detail: timedOut ? "no response within 2 minutes" : `could not reach ${new URL(baseUrl).origin}` });
-  } finally {
-    clearTimeout(timer);
-  }
-
-  let body = null;
-  try {
-    body = await response.json();
-  } catch {
-    body = null;
+    throw new ReconError(RECON_ERROR.UNAVAILABLE, { detail: timedOut ? error.message : `could not reach ${new URL(baseUrl).origin}` });
   }
 
   if (response.status === 401) throw new ReconError(RECON_ERROR.AUTH_REQUIRED, { status: 401 });
@@ -244,6 +237,8 @@ export async function uploadToRecon(file, deps = {}) {
     // The file is stored before it is parsed, so it is in S3 but not loaded.
     throw new ReconError(RECON_ERROR.NOT_INGESTED, { status: 422, detail: apiErrorDetail(body) || "the Recon Engine could not read the file" });
   }
+  // a 5xx is the Recon Engine (or the proxy in front of it) failing, not a refusal of the file: "try again" (L9)
+  if (response.status >= 500) throw new ReconError(RECON_ERROR.UNAVAILABLE, { status: response.status, detail: apiErrorDetail(body) || `HTTP ${response.status}` });
   if (!response.ok || !body) {
     throw new ReconError(RECON_ERROR.REJECTED, { status: response.status, detail: apiErrorDetail(body) || `HTTP ${response.status}` });
   }

@@ -96,8 +96,11 @@ export async function runReconTests({ test, assert, eq }) {
     const error = await rejectsRecon(uploadToRecon(FILE, { fetch, hostPermissions: HOSTS }), RECON_ERROR.REJECTED);
     eq(error.status, 400, "status");
     eq(error.detail, "customer 'x' has no active 'crn' source", "detail");
+    // a 5xx (here a proxy's HTML page) is the Recon Engine being unavailable, not a refusal of the file (L9)
     const html = fakeFetch(() => new Response("<html>bad gateway</html>", { status: 502 }));
-    eq((await rejectsRecon(uploadToRecon(FILE, { fetch: html, hostPermissions: HOSTS }), RECON_ERROR.REJECTED)).detail, "HTTP 502", "non-JSON body");
+    const down = await rejectsRecon(uploadToRecon(FILE, { fetch: html, hostPermissions: HOSTS }), RECON_ERROR.UNAVAILABLE);
+    eq(down.detail, "HTTP 502", "non-JSON body");
+    eq(down.status, 502);
   });
 
   await test("Recon upload: unreachable Recon Engine", async () => {

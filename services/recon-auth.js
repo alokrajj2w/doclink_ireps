@@ -29,6 +29,7 @@
 
 import { logger } from "../utils/logger.js";
 import { RECON_CONFIG, loadReconConfig, reconConfigProblem, manifestHostPermissions, apiErrorDetail } from "./recon-service.js";
+import { fetchWithDeadline, DeadlineError } from "../utils/http.js";
 
 /** Error codes; each has an entry in utils/messages.js ERROR_CATALOG. */
 export const RECON_AUTH_ERROR = Object.freeze({
@@ -68,14 +69,16 @@ export const RECON_SIGN_IN_EVENT = "doclink:ensure-recon-sign-in";
  * From panel code that cannot reach popup-recon-auth.js directly (the tender view is
  * bundled separately): resolves true when the user is signed in to the Recon Engine
  * or signs in now, false when they chose Local or cancelled. `always`: ask whatever Save to
- * says (the download log). True when no sign-in page answers (no panel, or the tests), so
- * the upload itself reports a missing sign-in.
- * @param {{ always?: boolean }} [options]
+ * says (the download log). `allowOffline`: when the Recon Engine is unreachable the user may
+ * download without it, answered "offline" (popup-recon-auth.js RECON_OFFLINE). True when no
+ * sign-in page answers (no panel, or the tests), so the upload itself reports a missing sign-in.
+ * @param {{ always?: boolean, allowOffline?: boolean }} [options]
+ * @returns {Promise<boolean|string>}
  */
-export function confirmReconSignIn({ always = false } = {}) {
+export function confirmReconSignIn({ always = false, allowOffline = false } = {}) {
   if (typeof document === "undefined" || typeof CustomEvent === "undefined") return Promise.resolve(true);
   return new Promise((resolve) => {
-    const event = new CustomEvent(RECON_SIGN_IN_EVENT, { detail: { resolve, always }, cancelable: true });
+    const event = new CustomEvent(RECON_SIGN_IN_EVENT, { detail: { resolve, always, allowOffline }, cancelable: true });
     if (document.dispatchEvent(event)) resolve(true);
   });
 }
@@ -109,26 +112,14 @@ async function call(path, init, deps) {
   const baseUrl = RECON_CONFIG.baseUrl;
   const problem = reconConfigProblem(baseUrl, deps.hostPermissions || manifestHostPermissions(), path.split("?")[0]);
   if (problem) throw new ReconAuthError(RECON_AUTH_ERROR.NOT_CONFIGURED, { detail: problem });
-  const fetchImpl = deps.fetch || globalThis.fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AUTH_TIMEOUT_MS);
-  let response;
   try {
-    response = await fetchImpl(`${baseUrl}${path}`, { ...init, credentials: "include", signal: controller.signal });
+    // one deadline for the headers and the body: a stalled answer must not freeze the panel
+    return await fetchWithDeadline(`${baseUrl}${path}`, { ...init, credentials: "include" }, { timeoutMs: AUTH_TIMEOUT_MS, fetch: deps.fetch });
   } catch (error) {
-    const timedOut = error && error.name === "AbortError";
+    const timedOut = error instanceof DeadlineError;
     logger.warn("Recon Engine unreachable for sign-in", { path: path.split("?")[0], timedOut });
-    throw new ReconAuthError(RECON_AUTH_ERROR.UNAVAILABLE, { detail: timedOut ? "no response within 30 seconds" : `could not reach ${new URL(baseUrl).origin}` });
-  } finally {
-    clearTimeout(timer);
+    throw new ReconAuthError(RECON_AUTH_ERROR.UNAVAILABLE, { detail: timedOut ? error.message : `could not reach ${new URL(baseUrl).origin}` });
   }
-  let body = null;
-  try {
-    body = await response.json();
-  } catch {
-    body = null;
-  }
-  return { response, body };
 }
 
 function errorCode(body) {

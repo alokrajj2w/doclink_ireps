@@ -5,12 +5,16 @@
 // theirs (runTabulations, by Closing Date), and correspondence comes from the Correspondence view.
 
 import { TenderError, log, norm } from './tender-core.js';
-import { searchTender } from './tender-search.js';
-import { runSteps, publicAccount, startTenderRun } from './tender-workflows.js';
+import { runSteps, publicAccount } from './tender-workflows.js';
 import { beginJob, dayRange, openTender, recordManifest, downloadLettersByDate, downloadTabulationsByDate } from './tender-jobs.js';
 import { scanMessages, readMessageDetail, dmyOf } from './tender-messages.js';
 
 const DAY = 86400000;
+
+/** What a NIT message brings: the tender PDF, its attached documents and My Offer. */
+const NIT_STEPS = ['tenderPdf', 'attachments', 'myOffer'];
+/** A category with nothing left to fetch: all downloaded, or nothing (more) there (already downloaded, none shown). */
+const succeeded = (c) => !!c && (c.status === 'DOWNLOADED' || c.status === 'NOT_AVAILABLE');
 
 /** Search windows around the tender's due date (IREPS ranges are <= 6 months), then "next 6 months". */
 export function windowsFor(dueDate, now = new Date()) {
@@ -79,7 +83,8 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
     if (!steps.length) { out.status = 'ALREADY_DOWNLOADED'; onEvent({ type: 'tender', ...out }); continue; }
     onProgress(`Tender ${t.tenderNo} (${i + 1}/${tenders.size})...`);
     try {
-      const run = await openTender(job, t.tenderNo, windowsFor(t.dueDate), onProgress);
+      // the message's due date picks this tender when another railway uses the same tender number
+      const run = await openTender(job, t.tenderNo, windowsFor(t.dueDate), onProgress, { dueDate: t.dueDate || null });
       run.ctx.dueDate = t.dueDate ? t.dueDate.toISOString() : '';
       run.dateRange = rangeSet;
       const { categories, aborted: ab } = await runSteps(run, steps, onProgress);
@@ -87,13 +92,17 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
       out.categories = categories;
       out.folder = `Downloads/${run.saver.root}/`;
       out.nitOid = run.ids.nitOid || '';
-      const nitOk = categories.tenderPdf?.status === 'DOWNLOADED';
-      if (nitOk) job.ledger.mark('nit', t.tenderNo);
+      // the NIT is done only when every one of its categories is (H7): a failed attachment or My Offer keeps the
+      // tender and its message open, so "Retry failed" fetches them (the ledger's docs bucket skips the rest)
+      const nitRan = steps.includes('tenderPdf');
+      const nitDone = nitRan ? NIT_STEPS.every((k) => succeeded(categories[k])) : job.ledger.has('nit', t.tenderNo);
+      if (nitRan && nitDone) job.ledger.mark('nit', t.tenderNo);
+      const corrDone = categories.corrigenda?.status === 'DOWNLOADED' || (categories.corrigenda?.status === 'NOT_AVAILABLE' && categories.corrigenda.alreadyDownloaded > 0);
       const failed = Object.values(categories).some((c) => c.status === 'FAILED' || c.status === 'PARTIAL');
       out.status = failed ? 'FAILED' : 'DOWNLOADED';
-      // a message is "done" once its documents are in; otherwise it is looked at again next time
+      // a message is "done" once all its documents are in; otherwise it is looked at again next time
       for (const m of t.messages) {
-        const done = m.kind === 'NIT' ? nitOk : ['DOWNLOADED'].includes(categories.corrigenda?.status);
+        const done = m.kind === 'NIT' ? nitDone : corrDone;
         if (done) job.ledger.mark('msgs', m.oid);
       }
       await recordManifest(job, run, categories, { range, sources: t.messages });
@@ -102,6 +111,8 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
       out.status = e.code === 'NOT_FOUND' ? 'NOT_FOUND' : 'FAILED';
       out.error = e.message;
     }
+    // after every tender (M21): a run cut short (panel closed, Chrome stopped) keeps what it did
+    await job.ledger.save();
     onEvent({ type: 'tender', ...out });
   }
 
@@ -110,7 +121,7 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
   return {
     account: publicAccount(job.account),
     range,
-    messages: { scanned: scan.rows.length, relevant: relevant.length, opened, pagesRead: scan.pagesRead, total: scan.total, truncated: scan.truncated },
+    messages: { scanned: scan.rows.length, relevant: relevant.length, opened, pagesRead: scan.pagesRead, total: scan.total, truncated: scan.truncated, incomplete: scan.incomplete || '' },
     tenders: results, review, aborted,
     summary: {
       downloaded: results.reduce((n, r) => n + sumDl(r.categories), 0),

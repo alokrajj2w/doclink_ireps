@@ -15,10 +15,12 @@
 import { runPoDateDownload, retryPoDateFailures, searchPosByDate, validatePoDateSelection, assignPoDatePaths, PO_ITEM_STATUS } from "../services/po/po-date-service.js";
 import { runIcNotificationDownload, retryIcNotificationFailures, buildIcManifest, matchIcRows, NOTIFICATION_OUTCOME } from "../services/inspection-certificate/ic-notification-service.js";
 import { runIcDateDownload, retryIcDateFailures } from "../services/inspection-certificate/ic-date-service.js";
+import { applyDownloadSnapshot, countItemStatuses, BATCH_ITEM_STATUS } from "../services/batch-download.js";
 import { parseNotificationResponse, selectIcNotifications, parseIcNotification, isIcIssuedNotification } from "../services/notifications/notification-service.js";
 import { splitDateRange, withRetry, isoToIrepsDate } from "../services/batch-utils.js";
 import { parseIrepsDate, IrepsError } from "../services/ireps-api.js";
 import { parsePoSearchResults } from "../services/po/po-parser.js";
+import { createLimiter } from "../services/search-po/search-po-service.js";
 import { parseIcSearchResults } from "../services/inspection-certificate/ic-parser.js";
 import { buildPoDateDownloadPath } from "../utils/filename.js";
 
@@ -58,13 +60,19 @@ function simulator({ searchPage, poPage, listPage, icPage, loginPage }, opts = {
     const span = (day(to) - day(from)) / DAY_MS;
     if (span > 180) return respond(poPage.replace(PO_ROWS_START, PO_ROWS_START + "").replace("Total 1 result(s)", "Selected Date Range should be within 180 days."), { status: 200 });
     if (pageNo === 1) state.poWindows.push({ from, to, span });
+    if (pageNo > 1) state.poPageRequests = (state.poPageRequests || 0) + 1;
+    // a result page that fails (HTTP 500), e.g. page 2 of 10
+    if (opts.failPage && pageNo === opts.failPage) return respond("<html><body><h1>HTTP Status 500</h1></body></html>", { status: 500 });
     let matches = (opts.pos || []).filter((r) => opts.ignoreDateFilter || (day(r.date) >= day(from) && day(r.date) <= day(to)));
     const total = matches.length;
     matches = matches.slice((pageNo - 1) * perPage, pageNo * perPage);
     const pages = Math.max(1, Math.ceil(total / perPage));
     const links = pages > 1 ? Array.from({ length: pages }, (_, k) => `<a href="#" onclick="postRequest('/epsn/searchPO.do?rly=-1&dateFrom=${from}&dateTo=${to}&pageNo=${k + 1}&searchRange=2&poNo=&count=${total}&recordsPerPage=${perPage}');">${k + 1}</a>`).join("&nbsp;") : "";
-    const head = poPage.slice(0, poPage.indexOf(PO_ROWS_START) + PO_ROWS_START.length).replace("Total 1 result(s)", `Total ${total} result(s)`);
+    // opts.reportExtra: IREPS says it found more than it lists
+    const head = poPage.slice(0, poPage.indexOf(PO_ROWS_START) + PO_ROWS_START.length).replace("Total 1 result(s)", `Total ${total + (opts.reportExtra || 0)} result(s)`);
     const tail = poPage.slice(poPage.indexOf(PO_ROWS_END));
+    // a results page DocLink cannot recognise: the form, but no result table and no IREPS message
+    if (opts.unrecognised) return respond(`<html><body><form name="searchPOForm" method="post" action="/epsn/searchPO.do"><input type="hidden" name="org.apache.struts.taglib.html.TOKEN" value="T"><input type="text" name="poNo"><input type="radio" name="searchRange" value="2"></form><div>layout changed</div></body></html>`);
     if (total === 0 && opts.emptyAsMessage) return respond(`<html><body><form name="searchPOForm" method="post" action="/epsn/searchPO.do"><input type="hidden" name="org.apache.struts.taglib.html.TOKEN" value="T"><input type="text" name="poNo"><input type="radio" name="searchRange" value="2"></form><span class="errorStyle">No Record Found</span></body></html>`);
     return respond(head + matches.map((r, i) => poRow(r, (pageNo - 1) * perPage + i + 1)).join("") + tail.replace("</body>", `<table><tr><td>${links}</td></tr></table></body>`));
   };
@@ -92,7 +100,11 @@ function simulator({ searchPage, poPage, listPage, icPage, loginPage }, opts = {
     const pages = Math.max(1, Math.ceil(total / pageSize));
     const pageRows = rows.slice((pageNo - 1) * pageSize, pageNo * pageSize);
     const links = Array.from({ length: pages }, (_, k) => `<td><a href="#" onClick="return navigate('${k + 1}')">${k + 1}</a></td>`).join("");
-    const head = icPage.slice(0, icPage.indexOf(IC_ROWS_START) + IC_ROWS_START.length);
+    // like the real page (and the mock portal): the hidden totalRecords and "Total Records: N" give the search's count
+    const head = icPage
+      .slice(0, icPage.indexOf(IC_ROWS_START) + IC_ROWS_START.length)
+      .replace(/(name="totalRecords" value=")\d+/, `$1${total}`)
+      .replace(/Total Records: \d+/, `Total Records: ${total}`);
     const tail = icPage.slice(icPage.indexOf(IC_ROWS_END));
     state.tokens++;
     const token = `RTOKEN-${state.tokens}`;
@@ -292,6 +304,79 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
       eq(files.length, 0);
       eq(state.phase, "complete");
     }
+  });
+
+  await test("PO date (H3): a results page DocLink does not recognise stops the run with an error; it is never an empty date window", async () => {
+    const sim = simulator(pages, { pos: mkPos(2, "07/10/2026"), unrecognised: true });
+    const { files, saveFile } = saved();
+    let thrown = null;
+    try {
+      await runPoDateDownload({ dateFrom: "07/10/2026", dateTo: "07/10/2026" }, { fetch: sim.fetchImpl, parseHtml: parsePoSearchResults, saveFile, ...ZERO, noTokenRetry: true });
+    } catch (error) {
+      thrown = error;
+    }
+    assert(thrown, "the run does not complete as '0 found'");
+    eq(thrown.code, "IREPS_PO_RESULTS_INVALID");
+    eq(files.length, 0);
+  });
+
+  await test("PO date (M12): the same PO number from two units is two documents in the download log; a one-unit PO keeps its plain key", async () => {
+    const pos = [
+      { poNo: "27253922100240", unit: "HQ/CR", date: "05/10/2026", link: "/ireps/etender/pdfdocs/MMIS/PO/2026/10/cr/27253922100240.pdf" },
+      { poNo: "27253922100240", unit: "HQ/NR", date: "05/10/2026", link: "/ireps/etender/pdfdocs/MMIS/PO/2026/10/nr/27253922100240.pdf" },
+      { poNo: "27253922100241", unit: "HQ/CR", date: "05/10/2026", link: "/ireps/etender/pdfdocs/MMIS/PO/2026/10/c.pdf" }
+    ];
+    const sim = simulator(pages, { pos });
+    const { files, saveFile } = saved();
+    let keys = null;
+    // the CR copy was downloaded before: only it is skipped, not the NR copy with the same number
+    const preflight = async (items) => {
+      keys = items.map((i) => i.log.key).sort();
+      const cr = items.find((i) => i.log.key.endsWith("|HQ/CR"));
+      return { skip: new Map([[cr.id, { reason: "already_downloaded" }]]), warnings: [] };
+    };
+    await runPoDateDownload({ dateFrom: "05/10/2026", dateTo: "05/10/2026" }, { fetch: sim.fetchImpl, parseHtml: parsePoSearchResults, saveFile, preflight, ...ZERO });
+    eq(keys.join(), "po:27253922100240|HQ/CR,po:27253922100240|HQ/NR,po:27253922100241");
+    eq(files.length, 2, "the NR copy and the other PO are downloaded");
+  });
+
+  await test("PO date (M7): fewer POs read than IREPS reports is a visible warning, not a silent complete list", async () => {
+    const sim = simulator(pages, { pos: mkPos(3, "07/10/2026"), reportExtra: 2 });
+    const { saveFile } = saved();
+    const state = await runPoDateDownload({ dateFrom: "07/10/2026", dateTo: "07/10/2026" }, { fetch: sim.fetchImpl, parseHtml: parsePoSearchResults, saveFile, ...ZERO });
+    eq(state.phase, "complete");
+    eq(state.counts.found, 3);
+    assert(state.warnings.some((w) => w.includes("IREPS reported 5") && w.includes("3 were read")), JSON.stringify(state.warnings));
+    const exact = simulator(pages, { pos: mkPos(3, "07/10/2026") });
+    const ok = await runPoDateDownload({ dateFrom: "07/10/2026", dateTo: "07/10/2026" }, { fetch: exact.fetchImpl, parseHtml: parsePoSearchResults, saveFile, ...ZERO });
+    eq(ok.warnings.length, 0, "a complete list has no warning");
+  });
+
+  await test("PO date (M7): a result page that fails ends the search with nothing saved; queued page requests are dropped", async () => {
+    const sim = simulator(pages, { pos: mkPos(200, "07/10/2026"), failPage: 2 });
+    const { files, saveFile } = saved();
+    let thrown = null;
+    try {
+      await runPoDateDownload({ dateFrom: "07/10/2026", dateTo: "07/10/2026" }, { fetch: sim.fetchImpl, parseHtml: parsePoSearchResults, saveFile, ...ZERO, retries: 0 });
+    } catch (error) {
+      thrown = error;
+    }
+    assert(thrown, "the search fails: a partial list is never used");
+    eq(files.length, 0);
+
+    // the page limiter itself: cancel() drops what has not started, lets the running task finish
+    const limit = createLimiter(1);
+    let release;
+    const started = [];
+    const first = limit(() => new Promise((r) => { started.push(1); release = r; }));
+    const second = limit(async () => started.push(2));
+    const third = limit(async () => started.push(3));
+    limit.cancel();
+    release("done");
+    eq(await first, "done", "the running request finishes");
+    const outcomes = await Promise.allSettled([second, third, limit(async () => started.push(4))]);
+    eq(outcomes.map((o) => o.status).join(), "rejected,rejected,rejected");
+    eq(started.join(), "1", "nothing queued or added after cancel() ran");
   });
 
   await test("PO date: rows outside the selected range are not downloaded even if IREPS returns them; true duplicates are counted once", async () => {
@@ -723,6 +808,26 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     ic("P1", "004", "C14", true, { icDate: "18/09/2026" }),
     ic("P2", "001", "C21", true, { icDate: "10/09/2026" })
   ];
+
+  await test("batch download state: a snapshot updates items and warnings; the session flag follows the snapshot unless sticky", () => {
+    const mk = () => ({ items: [{ id: "a", status: BATCH_ITEM_STATUS.QUEUED }, { id: "b", status: BATCH_ITEM_STATUS.SKIPPED, skip: { reason: "x" } }], counts: {}, warnings: ["w1"], sessionExpired: false });
+    const expired = { items: [{ id: "a", status: BATCH_ITEM_STATUS.FAILED, filename: null, error: { code: "E" } }], sessionExpired: true, warnings: ["w1", "w2"] };
+    const fine = { items: [{ id: "a", status: BATCH_ITEM_STATUS.COMPLETED, filename: "a.pdf", error: null }], sessionExpired: false };
+    const plain = mk();
+    applyDownloadSnapshot(plain, expired);
+    eq(plain.items[0].status, BATCH_ITEM_STATUS.FAILED);
+    eq(plain.warnings.join(","), "w1,w2", "warnings merged without duplicates");
+    eq(plain.sessionExpired, true);
+    applyDownloadSnapshot(plain, fine);
+    eq(plain.sessionExpired, false, "non-sticky: follows the latest snapshot");
+    const sticky = mk();
+    applyDownloadSnapshot(sticky, expired, { stickySessionExpired: true });
+    applyDownloadSnapshot(sticky, fine, { stickySessionExpired: true });
+    eq(sticky.sessionExpired, true, "sticky: an expiry seen earlier in the run stays reported");
+    eq(sticky.items[0].filename, "a.pdf");
+    const c = countItemStatuses(sticky).counts;
+    eq([c.downloaded, c.failed, c.skipped, c.alreadyDownloaded, c.inProgress].join(","), "1,0,1,1,0");
+  });
 
   await test("IC date: one search with PO No. empty and IC Date From / To set downloads EVERY IC issued in the range - all POs, all serials", async () => {
     const sim = simulator(pages, { icDateFilter: true, icRows: [...inRange, ic("P3", "001", "C31", true, { icDate: "09/09/2026" })] });

@@ -23,18 +23,16 @@
  * downloaded by either of them is recognised.
  */
 
-import { IrepsError, parseIrepsDate } from "../ireps-api.js";
-import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
-import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
-import { withRetry } from "../batch-utils.js";
+import { parseIrepsDate } from "../ireps-api.js";
+import { BATCH_ITEM_STATUS, countItemStatuses, downloadStateItems, retryFailedItems } from "../batch-download.js";
+import { withRetry, readDateSelection } from "../batch-utils.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
-import { loadIcListPage, submitIcSearch, buildIcDateSearchRequest, buildIcPageRequest, extractIcPageCount, IC_ERROR } from "./ic-api.js";
-import { extractIcForm } from "./ic-form.js";
-import { validateIcSession } from "./ic-service.js";
+import { buildIcDateSearchRequest, IC_ERROR } from "./ic-api.js";
+import { runIcSearch } from "./ic-search.js";
 import { parseIcSearchResults, icNumberFromUrl } from "./ic-parser.js";
-import { ECM_KIND } from "../ecm-service.js";
+import { icFiling } from "./ic-service.js";
 
-export const IC_DATE_STATUS = Object.freeze({ ...DOCUMENT_DOWNLOAD_STATUS, SKIPPED: "skipped" });
+export const IC_DATE_STATUS = BATCH_ITEM_STATUS;
 
 const DOWNLOAD_CODES = Object.freeze({
   LINK_NOT_FOUND: IC_ERROR.LINK_NOT_FOUND,
@@ -55,15 +53,8 @@ const IC_ISSUED_STATUS_RE = /ic\s*issued/i;
  * @param {string} dateTo   DD/MM/YYYY
  */
 export function validateIcDateSelection(dateFrom, dateTo) {
-  const fail = (detail) => new IrepsError(IC_ERROR.INVALID_REQUEST, detail, { detail });
-  const from = String(dateFrom || "").trim();
-  const to = String(dateTo || "").trim();
-  const dFrom = parseIrepsDate(from);
-  const dTo = parseIrepsDate(to);
-  if (!dFrom) throw fail("From Date must be a valid date in DD/MM/YYYY format.");
-  if (!dTo) throw fail("To Date must be a valid date in DD/MM/YYYY format.");
-  if (dFrom > dTo) throw fail("From Date must not be later than To Date.");
-  return { dateFrom: from, dateTo: to, from: dFrom.getTime(), to: dTo.getTime() };
+  const sel = readDateSelection(dateFrom, dateTo, IC_ERROR.INVALID_REQUEST);
+  return { dateFrom: sel.dateFrom, dateTo: sel.dateTo, from: sel.from.getTime(), to: sel.to.getTime() };
 }
 
 /**
@@ -78,68 +69,54 @@ export async function searchIcsByDate(options, deps = {}) {
   const sel = validateIcDateSelection(options.dateFrom, options.dateTo);
   const parseHtml = deps.parseHtml || ((html, opts) => parseIcSearchResults(html, null, opts));
   const retry = (task) => withRetry(task, { attempts: 3, sleep: deps.sleep, delayMs: deps.retryDelayMs });
-  const requestDeps = { fetch: deps.fetch };
   const stats = { pages: 0, scanned: 0, outOfRange: 0, notIssued: 0, duplicates: 0, stoppedEarly: false, pageLimit: false };
-
-  const listPage = await retry(() => loadIcListPage(requestDeps));
-  const listVerdict = validateIcSession(listPage.html, listPage);
-  if (!listVerdict.authenticated) throw new IrepsError(listVerdict.code, listVerdict.reason || "IREPS session is not active", { status: listVerdict.status });
-  const form = extractIcForm(listPage.html);
-  if (!form.token) throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "Struts token not found on the Inspection Call List page");
-
-  let request = buildIcDateSearchRequest(form, { dateFromIC: sel.dateFrom, dateToIC: sel.dateTo });
   const seen = new Set();
   const records = [];
-  let pageNo = 1;
   let oldPages = 0;
-  for (;;) {
-    const results = await retry(() => submitIcSearch(request, requestDeps));
-    const verdict = validateIcSession(results.html, results, IC_ERROR.RESULTS_INVALID);
-    if (!verdict.authenticated) throw new IrepsError(verdict.code, verdict.reason || "IREPS response not recognised", { status: verdict.status });
-    let parsed;
-    try {
-      parsed = await parseHtml(results.html, { sourceUrl: results.url || null, poNo: null });
-    } catch (error) {
-      throw new IrepsError(IC_ERROR.PARSE_FAILED, "IC results HTML could not be parsed", { cause: error });
-    }
-    if (!parsed || !Array.isArray(parsed.records)) throw new IrepsError(IC_ERROR.PARSE_FAILED, "Parser returned no result");
-    stats.pages++;
-    stats.scanned += parsed.records.length;
-    let reachedRange = false;
-    for (const r of parsed.records) {
-      const d = parseIrepsDate(r.icDate);
-      if (d && d.getTime() >= sel.from) reachedRange = true;
-      if (!d || d.getTime() < sel.from || d.getTime() > sel.to) {
-        stats.outOfRange++;
-        continue;
+
+  await runIcSearch(
+    {
+      buildRequest: (form) => buildIcDateSearchRequest(form, { dateFromIC: sel.dateFrom, dateToIC: sel.dateTo }),
+      parseHtml,
+      parseOptions: { poNo: null },
+      maxPages: MAX_IC_DATE_PAGES,
+      onPageLimit: () => {
+        stats.pageLimit = true;
+      },
+      onPage: (parsed, { pageNo, pageCount }) => {
+        stats.pages++;
+        stats.scanned += parsed.records.length;
+        let reachedRange = false;
+        for (const r of parsed.records) {
+          const d = parseIrepsDate(r.icDate);
+          if (d && d.getTime() >= sel.from) reachedRange = true;
+          if (!d || d.getTime() < sel.from || d.getTime() > sel.to) {
+            stats.outOfRange++;
+            continue;
+          }
+          if (!IC_ISSUED_STATUS_RE.test(r.callStatus || "")) {
+            stats.notIssued++;
+            continue;
+          }
+          const key = r.icPdfUrl || `${r.poNo}|${r.poSerial}|${r.callId}`;
+          if (seen.has(key)) {
+            stats.duplicates++;
+            continue;
+          }
+          seen.add(key);
+          records.push(r);
+        }
+        if (typeof deps.onPage === "function") deps.onPage({ pageNo, pages: pageCount, found: records.length });
+        oldPages = parsed.records.length && !reachedRange ? oldPages + 1 : 0;
+        if (oldPages >= OLD_PAGES_TO_STOP) {
+          stats.stoppedEarly = true;
+          return false;
+        }
+        return true;
       }
-      if (!IC_ISSUED_STATUS_RE.test(r.callStatus || "")) {
-        stats.notIssued++;
-        continue;
-      }
-      const key = r.icPdfUrl || `${r.poNo}|${r.poSerial}|${r.callId}`;
-      if (seen.has(key)) {
-        stats.duplicates++;
-        continue;
-      }
-      seen.add(key);
-      records.push(r);
-    }
-    if (typeof deps.onPage === "function") deps.onPage({ pageNo, pages: extractIcPageCount(results.html), found: records.length });
-    oldPages = parsed.records.length && !reachedRange ? oldPages + 1 : 0;
-    if (oldPages >= OLD_PAGES_TO_STOP) {
-      stats.stoppedEarly = true;
-      break;
-    }
-    // Re-read the page count each time: the portal only prints ~10 page links at once.
-    if (pageNo >= extractIcPageCount(results.html)) break;
-    if (stats.pages >= MAX_IC_DATE_PAGES) {
-      stats.pageLimit = true;
-      break;
-    }
-    pageNo++;
-    request = buildIcPageRequest(request, extractIcForm(results.html).token, pageNo);
-  }
+    },
+    { fetch: deps.fetch, retry }
+  );
   return { dateFrom: sel.dateFrom, dateTo: sel.dateTo, records, stats };
 }
 
@@ -173,64 +150,13 @@ export function icDateItems(records) {
 }
 
 function summarise(state) {
-  const count = (s) => state.items.filter((i) => i.status === s).length;
-  const c = state.counts;
-  c.found = state.items.length;
-  c.pos = new Set(state.items.map((i) => i.poNo)).size;
-  c.downloaded = count(IC_DATE_STATUS.COMPLETED);
-  c.failed = count(IC_DATE_STATUS.FAILED);
-  c.skipped = count(IC_DATE_STATUS.SKIPPED);
-  c.alreadyDownloaded = state.items.filter((i) => i.status === IC_DATE_STATUS.SKIPPED && i.skip).length;
-  c.inProgress = count(IC_DATE_STATUS.DOWNLOADING) + count(IC_DATE_STATUS.QUEUED);
+  countItemStatuses(state);
+  state.counts.found = state.items.length;
+  state.counts.pos = new Set(state.items.map((i) => i.poNo)).size;
   return state;
 }
 
-function applySnapshot(state, snapshot) {
-  const byId = new Map(snapshot.items.map((s) => [s.id, s]));
-  for (const item of state.items) {
-    const s = byId.get(item.id);
-    if (!s) continue;
-    item.status = s.status;
-    item.filename = s.filename;
-    item.downloadId = s.downloadId;
-    item.ecm = s.ecm || null;
-    item.error = s.error;
-    item.skip = s.skip || null;
-  }
-  state.sessionExpired = snapshot.sessionExpired === true;
-  if (snapshot.warnings && snapshot.warnings.length) state.warnings = [...new Set([...(state.warnings || []), ...snapshot.warnings])];
-}
-
-async function downloadItems(state, items, deps) {
-  const notify = () => typeof deps.onUpdate === "function" && deps.onUpdate(summarise(state));
-  const batch = await downloadIrepsDocuments(
-    // `ecm` says how the IC is filed under Save to: ECM / S3 (ignored by a local save)
-    items.map((i) => ({
-      id: i.id,
-      url: i.url,
-      path: i.path,
-      label: i.label,
-      ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: i.icNumber, customer_po_number: i.poNo, ic_date: i.icDate } },
-      log: logInfo(LOG_DOC_TYPE.IC, downloadKey.ic({ poNo: i.poNo, poSerial: i.poSerial, callId: i.callId, icNumber: i.icNumber }))
-    })),
-    {
-      fetch: deps.fetch,
-      saveFile: deps.saveFile,
-      preflight: deps.preflight,
-      onSaved: deps.onSaved,
-      concurrency: deps.concurrency,
-      retries: deps.retries ?? 2,
-      retryDelayMs: deps.retryDelayMs,
-      codes: DOWNLOAD_CODES,
-      onProgress: (snapshot) => {
-        applySnapshot(state, snapshot);
-        notify();
-      }
-    }
-  );
-  applySnapshot(state, batch);
-  summarise(state);
-}
+const downloadItems = (state, items, deps) => downloadStateItems(state, items, deps, { filing: icFiling, codes: DOWNLOAD_CODES, summarise });
 
 /**
  * Search then download. `deps.onUpdate(state)` receives the whole, current
@@ -283,18 +209,5 @@ export async function runIcDateDownload(options, deps = {}) {
  * @param {object} state a state returned by runIcDateDownload()
  */
 export async function retryIcDateFailures(state, deps = {}) {
-  const retry = state.items.filter((i) => i.status === IC_DATE_STATUS.FAILED && i.url);
-  if (retry.length === 0) return state;
-  for (const i of retry) {
-    i.status = IC_DATE_STATUS.QUEUED;
-    i.error = null;
-  }
-  state.phase = "downloading";
-  state.sessionExpired = false;
-  state.finishedAt = null;
-  await downloadItems(state, retry, deps);
-  state.phase = "complete";
-  state.finishedAt = new Date().toISOString();
-  if (typeof deps.onUpdate === "function") deps.onUpdate(summarise(state));
-  return state;
+  return retryFailedItems(state, deps, { download: downloadItems, summarise });
 }

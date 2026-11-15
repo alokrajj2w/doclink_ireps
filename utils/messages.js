@@ -169,6 +169,11 @@ export function documentStageLabel(stage, typeLabel) {
  * "IREPS returned HTTP 500"). `connection` drives the header indicator.
  */
 export const ERROR_CATALOG = Object.freeze({
+  IREPS_NOT_CONFIGURED: {
+    title: "IREPS not configured",
+    message: "DocLink has no usable IREPS address ({detail}). Check config.json (\"target\": \"real\" or \"mock\", and the portal URL) and manifest.json host_permissions, then reload DocLink. Nothing was sent.",
+    connection: "connected"
+  },
   IREPS_SESSION_EXPIRED: {
     title: "IREPS login required",
     message: "IREPS session expired. Please log in to IREPS and try again.",
@@ -476,6 +481,28 @@ export const ERROR_CATALOG = Object.freeze({
     message: "Please wait for the current CRN / R-NOTE download to finish."
   },
 
+  /* ------------------------------------------------------- Tender documents and correspondence (tender/) */
+  TENDER_PAGE_NOT_RECOGNISED: {
+    title: "IREPS page not recognised",
+    message: "IREPS answered with a page DocLink does not recognise ({detail}). DocLink did not take it as \"nothing found\": open the page in IREPS to check, then retry."
+  },
+  TENDER_LIST_FAILED: {
+    title: "IREPS list not read",
+    message: "IREPS did not return the list ({detail}). Documents on it may be missing from this download: retry it."
+  },
+  TENDER_SEARCH_INCOMPLETE: {
+    title: "Tender search incomplete",
+    message: "DocLink could not tell whether the tender is in IREPS ({detail}). Retry the download."
+  },
+  TENDER_REQUEST_BLOCKED: {
+    title: "Request refused",
+    message: "DocLink did not send this request to IREPS because it looks like an action that changes something in IREPS ({detail}). DocLink only reads and downloads."
+  },
+  TENDER_LOA_SCRIPT_UNREADABLE: {
+    title: "LOA not requested",
+    message: "DocLink could not read how IREPS's \"View LOA Letter\" link opens this letter ({detail}), so it did not tell IREPS the letter was viewed and did not request it. Open the LOA in IREPS, or retry later."
+  },
+
   /* ------------------------------------------------------- PO download */
   IREPS_PO_SEARCH_FAILED: {
     title: "Unable to search for the PO",
@@ -674,6 +701,10 @@ export const ERROR_CATALOG = Object.freeze({
     title: "Bill upload busy",
     message: "Please wait for the current bill step to finish."
   },
+  BILL_INTERRUPTED: {
+    title: "Bill step interrupted",
+    message: "Chrome stopped DocLink's background work during this step ({detail}), so it may not have finished. Before you repeat it, check the bill in IREPS (the PO's Bills for Pay tab), so that no second draft bill is created."
+  },
   BILL_NOT_PREPARED: {
     title: "Bill not prepared",
     message: "{detail}. Start again from the receipt."
@@ -698,6 +729,10 @@ export const ERROR_CATALOG = Object.freeze({
     title: "DocLink Needs a Reload",
     message: "DocLink's background service did not answer ({detail}). Open chrome://extensions, click the reload icon on the DocLink card, then retry."
   },
+  JOB_INTERRUPTED: {
+    title: "Download interrupted",
+    message: "Chrome stopped DocLink's background work while this run was in progress ({detail}), so it did not finish. Start it again: the files already saved are kept, and the download log recognises them."
+  },
   UNKNOWN: {
     title: "Something Went Wrong",
     message: "DocLink could not complete the download ({detail}). Please retry."
@@ -715,13 +750,23 @@ export function describeError(code, details = {}) {
   return {
     code: ERROR_CATALOG[code] ? code : "UNKNOWN",
     title: entry.title,
-    message: entry.message.replace("{detail}", detail),
+    // a function, so "$&" or "$1" in an IREPS / server text is kept as written, not expanded
+    message: entry.message.replace("{detail}", () => detail),
     loginRequired: entry.loginRequired === true,
     previewAvailable: entry.previewAvailable === true,
     notice: entry.notice === true,
     reconSignIn: entry.reconSignIn === true,
     connection: entry.connection || null
   };
+}
+
+/**
+ * An error as the panel shows it: an already described error (it has a title) as it is,
+ * otherwise a { code, detail, status } error (or nothing) through describeError.
+ */
+export function asDescribedError(error, fallbackCode = "UNKNOWN") {
+  if (error && error.title) return error;
+  return describeError((error && error.code) || fallbackCode, { detail: error && error.detail, status: error && error.status });
 }
 
 /** chrome.storage.local keys (non-sensitive metadata only). */

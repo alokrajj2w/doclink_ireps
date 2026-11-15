@@ -1,6 +1,6 @@
 /**
- * Small helpers shared by the two batch download workflows (PO by date,
- * IC from notifications): bounded retry for transient failures and
+ * Small helpers shared by the batch download workflows (PO by date, IC by
+ * date, IC from notifications): bounded retry for transient failures and
  * DD/MM/YYYY date arithmetic.
  */
 
@@ -88,4 +88,21 @@ export function splitDateRange(dateFrom, dateTo, maxSpanDays = MAX_DATE_RANGE_DA
     start = stop + DAY_MS;
   }
   return windows;
+}
+
+/**
+ * Read a From / To selection (DD/MM/YYYY, From not after To). Throws IrepsError(`code`)
+ * with the reason as its detail.
+ * @returns {{ dateFrom: string, dateTo: string, from: Date, to: Date }}
+ */
+export function readDateSelection(dateFrom, dateTo, code) {
+  const fail = (detail) => new IrepsError(code, detail, { detail });
+  const from = String(dateFrom || "").trim();
+  const to = String(dateTo || "").trim();
+  const dFrom = parseIrepsDate(from);
+  const dTo = parseIrepsDate(to);
+  if (!dFrom) throw fail("From Date must be a valid date in DD/MM/YYYY format.");
+  if (!dTo) throw fail("To Date must be a valid date in DD/MM/YYYY format.");
+  if (dFrom > dTo) throw fail("From Date must not be later than To Date.");
+  return { dateFrom: from, dateTo: to, from: dFrom, to: dTo };
 }

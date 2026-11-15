@@ -17,10 +17,19 @@
  * returns the rest to skip. Neither check ever blocks a run: when one cannot be made the
  * documents are simply downloaded.
  *
- * Saved files are queued in chrome.storage.local (one queue per context, so the service
- * worker and the panel never overwrite each other) and posted in batches shortly after;
- * a failed post keeps them queued for the next one, so the log survives a backend restart
- * or an expired sign-in.
+ * Saved files are queued in chrome.storage.local (one queue per context: "sw" for the service
+ * worker, "panel" for every side panel) and posted in batches shortly after; a failed post
+ * keeps them queued for the next one, so the log survives a backend restart or an expired
+ * sign-in. Every change to a queue runs under a Web Lock (navigator.locks, shared by all of
+ * the extension's pages and its worker), so several panels never overwrite each other's
+ * records, and one flush at a time posts a queue. A batch the backend refuses outright (HTTP
+ * 400 / 413 / 422) is split until the refused records are found; only those are set aside
+ * (doclink.downloadLog.rejected), so one bad record cannot block the log.
+ *
+ * Each queued record remembers the Recon user who was signed in when it was saved (the
+ * backend files a record under whoever is signed in when it is POSTED), and a flush posts
+ * only the records of the user signed in now, plus records whose user is not known. The
+ * others wait until their user signs in again.
  *
  * config.json "downloadLog": { "enabled": false } turns all of it off (and the required
  * Recon sign-in with it); config.local.json may override it.
@@ -28,8 +37,10 @@
 
 import { logger } from "../utils/logger.js";
 import { RECON_CONFIG, loadReconConfig, reconConfigProblem, manifestHostPermissions, apiErrorDetail } from "./recon-service.js";
-import { readConfigFiles } from "./ecm-config.js";
+import { readConfigFiles } from "../utils/config.js";
 import { findInEcm } from "./ecm-service.js";
+import { reconWhoAmI } from "./recon-auth.js";
+import { fetchWithDeadline, DeadlineError } from "../utils/http.js";
 
 /** Where a file went, as the backend records it. */
 export const LOG_DESTINATION = Object.freeze({ LOCAL: "local", ECM: "ecm", S3: "s3" });
@@ -69,6 +80,12 @@ export const DOWNLOAD_LOG_ERROR = Object.freeze({
 });
 
 const QUEUE_KEY_PREFIX = "doclink.downloadLog.queue.";
+const REJECTED_KEY = "doclink.downloadLog.rejected";
+const DROPPED_KEY = "doclink.downloadLog.dropped";
+const MAX_REJECTED = 1000;
+/** HTTP answers that refuse the records themselves: posting the same batch again can never work. */
+const REJECTED_STATUSES = new Set([400, 413, 422]);
+
 const MAX_RECORDS_PER_POST = 500;
 const MAX_KEYS_PER_CHECK = 1000;
 const MAX_QUEUE = 5000;
@@ -86,11 +103,14 @@ let storageOverride = null;
 let flushDelayMs = FLUSH_DELAY_MS;
 let fetchOverride = null;
 let hostPermissionsOverride = null;
+let maxQueue = MAX_QUEUE;
 
 /** Apply settings from a parsed (merged) config object; also used by the tests. */
 export function applyDownloadLogConfig(config) {
   const d = config && typeof config === "object" ? config.downloadLog : null;
-  enabled = !(d && typeof d === "object" && d.enabled === false);
+  // "downloadLog": false and { "enabled": false } (or "false") both turn it off; anything else leaves it on
+  const off = (v) => v === false || (typeof v === "string" && v.trim().toLowerCase() === "false");
+  enabled = !(off(d) || (d && typeof d === "object" && off(d.enabled)));
   configLoaded = true;
 }
 
@@ -98,7 +118,7 @@ export function applyDownloadLogConfig(config) {
 export async function loadDownloadLogConfig({ force = false } = {}) {
   if (configLoaded && !force) return enabled;
   try {
-    const files = await readConfigFiles();
+    const files = await readConfigFiles({ force });
     if (files) applyDownloadLogConfig(files.config);
   } catch (error) {
     logger.warn("Could not read the download log settings; it stays on", error);
@@ -115,8 +135,8 @@ export function isDownloadLogEnabled() {
 
 /**
  * Per-context wiring: `context` names this context's queue ("sw" for the service worker,
- * "panel" for the side panel); the tests also pass storage, fetch, hostPermissions and a
- * flush delay (0 = flush only when asked).
+ * "panel" for the side panel); the tests also pass storage, fetch, hostPermissions, a
+ * flush delay (0 = flush only when asked) and a smaller queue limit (maxQueue).
  */
 export function configureDownloadLog(options = {}) {
   if (options.context) context = options.context;
@@ -124,6 +144,7 @@ export function configureDownloadLog(options = {}) {
   if ("fetch" in options) fetchOverride = options.fetch;
   if ("hostPermissions" in options) hostPermissionsOverride = options.hostPermissions;
   if ("flushDelayMs" in options) flushDelayMs = options.flushDelayMs;
+  if ("maxQueue" in options) maxQueue = options.maxQueue || MAX_QUEUE;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -134,7 +155,8 @@ const t = (v) => String(v ?? "").trim();
 
 /** Stable keys: the document's own numbers, never the saved file name (it changes with " (1)"). */
 export const downloadKey = Object.freeze({
-  po: (poNo) => `po:${t(poNo)}`,
+  // the unit only when one run lists the same PO number for two railway units (two documents, one number)
+  po: (poNo, unit) => (t(unit) ? `po:${t(poNo)}|${t(unit)}` : `po:${t(poNo)}`),
   ic: ({ poNo, poSerial, callId, icNumber }) => `ic:${t(poNo)}|${t(poSerial)}|${t(callId || icNumber)}`,
   ma: (poNo, maNo) => `ma:${t(poNo)}|${t(maNo)}`,
   tender: (category, tenderNo, id) => `tender:${t(category)}|${t(tenderNo)}|${t(id)}`,
@@ -206,23 +228,16 @@ async function request(method, path, body, deps = {}) {
   const baseUrl = RECON_CONFIG.baseUrl;
   const problem = reconConfigProblem(baseUrl, deps.hostPermissions || hostPermissionsOverride || manifestHostPermissions(), path);
   if (problem) throw new DownloadLogError("RECON_NOT_CONFIGURED", { detail: problem });
-  const fetchImpl = deps.fetch || fetchOverride || ((...args) => globalThis.fetch(...args));
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const fetchImpl = deps.fetch || fetchOverride || undefined;
+  const init = method === "GET" ? { method } : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   let response;
+  let answer;
   try {
-    const init = method === "GET" ? { method } : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
-    response = await fetchImpl(`${baseUrl}${path}`, { ...init, credentials: "include", signal: controller.signal });
-  } catch {
-    throw new DownloadLogError(DOWNLOAD_LOG_ERROR.UNAVAILABLE, { detail: `could not reach ${new URL(baseUrl).origin}` });
-  } finally {
-    clearTimeout(timer);
-  }
-  let answer = null;
-  try {
-    answer = await response.json();
-  } catch {
-    answer = null;
+    // one deadline for the answer's headers and its body (a stalled body must not hold the queue)
+    ({ response, body: answer } = await fetchWithDeadline(`${baseUrl}${path}`, { ...init, credentials: "include" }, { timeoutMs: REQUEST_TIMEOUT_MS, fetch: fetchImpl }));
+  } catch (error) {
+    const detail = error instanceof DeadlineError ? error.message : `could not reach ${new URL(baseUrl).origin}`;
+    throw new DownloadLogError(DOWNLOAD_LOG_ERROR.UNAVAILABLE, { detail });
   }
   if (response.status === 401) throw new DownloadLogError("RECON_AUTH_REQUIRED", { status: 401 });
   if (response.status === 403) throw new DownloadLogError("FORBIDDEN", { status: 403, detail: apiErrorDetail(answer) || "not allowed" });
@@ -331,39 +346,142 @@ function storage() {
 }
 
 const queueKey = () => `${QUEUE_KEY_PREFIX}${context}`;
-let chain = Promise.resolve();
 let flushTimer = null;
 
-/** Run `fn` after every earlier queue operation of this context (read-modify-write safety). */
-function serial(fn) {
-  const next = chain.then(fn, fn);
-  chain = next.catch(() => {});
+/** How long a queue change waits for the lock before it goes ahead without it (a stuck page must not stop the log). */
+const QUEUE_LOCK_WAIT_MS = 30000;
+
+/** In-page ordering: what the lock falls back to outside the extension (tests, file:// pages) or when not granted. */
+const chains = new Map();
+
+function serialIn(name, fn) {
+  const next = (chains.get(name) || Promise.resolve()).then(fn, fn);
+  chains.set(name, next.catch(() => {}));
   return next;
 }
 
-async function readQueue() {
+/**
+ * Web Locks are shared by every page of the extension and its worker. Only used inside the
+ * extension: on a file:// page (the browser tests) a lock request is never answered.
+ */
+function webLocks() {
+  const inExtension = typeof location !== "undefined" && location.protocol === "chrome-extension:";
+  return inExtension && typeof navigator !== "undefined" && navigator.locks && typeof navigator.locks.request === "function" ? navigator.locks : null;
+}
+
+/**
+ * Run `fn` holding the lock `name`, so the panels (which share one queue) and the worker take
+ * turns. `waitMs`: give up waiting after that long and run in page order (0: wait as long as it takes).
+ */
+async function withLock(name, fn, { waitMs = 0 } = {}) {
+  const locks = webLocks();
+  if (locks) {
+    let ran = false;
+    try {
+      const options = waitMs ? { signal: AbortSignal.timeout(waitMs) } : {};
+      return await locks.request(name, options, () => {
+        ran = true;
+        return fn();
+      });
+    } catch (error) {
+      if (ran) throw error;
+      logger.warn(`Download log: lock ${name} not granted (${(error && error.name) || "error"}); going ahead in page order`);
+    }
+  }
+  return serialIn(name, fn);
+}
+
+const withQueue = (fn) => withLock(queueKey(), fn, { waitMs: QUEUE_LOCK_WAIT_MS });
+
+async function readKey(key) {
   try {
-    const stored = await storage().get(queueKey());
-    const q = stored && stored[queueKey()];
+    const stored = await storage().get(key);
+    const q = stored && stored[key];
     return Array.isArray(q) ? q : [];
   } catch {
     return [];
   }
 }
 
+const readQueue = () => readKey(queueKey());
+
 async function writeQueue(queue) {
   await storage().set({ [queueKey()]: queue });
 }
 
+/* The Recon user a record belongs to ---------------------------------------- */
+
+/** The Recon user seen last in this context: { id, email } (signed in) or null (signed out, or not known yet). */
+let knownUser = null;
+let userCheck = null;
+
+const whoAmIDeps = (deps = {}) => ({ fetch: deps.fetch || fetchOverride || undefined, hostPermissions: deps.hostPermissions || hostPermissionsOverride || undefined });
+
+/**
+ * Ask the Recon Engine who is signed in, and remember it as the owner of new records.
+ * @returns {Promise<{ id: *, email: string }|null|undefined>} the user; null when signed out; undefined when it cannot tell
+ */
+function refreshLogUser(deps = {}) {
+  if (userCheck) return userCheck;
+  userCheck = (async () => {
+    try {
+      const me = await (deps.whoAmI || reconWhoAmI)(whoAmIDeps(deps));
+      knownUser = me && me.signedIn && me.user ? { id: me.user.id, email: me.user.email || "" } : null;
+      return knownUser;
+    } catch {
+      // unreachable or no answer: the user seen last stays the owner of new records
+      return undefined;
+    } finally {
+      userCheck = null;
+    }
+  })();
+  return userCheck;
+}
+
+/**
+ * The panel's own sign-in check (popup-recon-auth.js) tells the log who is signed in, so a run
+ * started from the panel stamps the right user even before its first download-log request.
+ * @param {{ id: *, email?: string }|null} user  null: nobody is signed in
+ */
+export function setDownloadLogUser(user) {
+  knownUser = user && user.id !== undefined && user.id !== null ? { id: user.id, email: user.email || "" } : null;
+}
+
+/** The owner stamped on a record queued now: the Recon user seen last ({ id, email }), or null when not known. */
+function recordOwner() {
+  return knownUser ? { ...knownUser } : null;
+}
+
+/* Queue ------------------------------------------------------------------- */
+
+const newQueueId = () => (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
+/** The record as the backend takes it: without the queue's own fields. */
+const wireRecord = ({ qid, user, ...record }) => record;
+
 /** Queue one saved file for the log (no-op when the log is off). Never throws. */
 export async function logDownload(record) {
   if (!enabled || !record || !record.doc_key || !record.doc_type) return;
+  const queued = { ...record, qid: newQueueId(), user: recordOwner() };
   try {
-    await serial(async () => {
+    await withQueue(async () => {
       const queue = await readQueue();
-      queue.push(record);
-      // a backend that stays unreachable must not grow the queue without end: the oldest go first
-      await writeQueue(queue.slice(-MAX_QUEUE));
+      queue.push(queued);
+      const dropped = queue.length - maxQueue;
+      if (dropped > 0) {
+        // a backend that stays unreachable must not grow the queue without end: the oldest go first, said out loud
+        logger.warn(`Download log: the queue is full (${maxQueue} records waiting); the ${dropped} oldest record(s) were dropped and will not be logged`);
+        let total = dropped;
+        try {
+          const counted = await storage().get(DROPPED_KEY);
+          total += Number(counted && counted[DROPPED_KEY] && counted[DROPPED_KEY].count) || 0;
+        } catch {
+          // the count is only for support; the queue write below matters
+        }
+        await storage().set({ [queueKey()]: queue.slice(-maxQueue), [DROPPED_KEY]: { count: total, lastAt: new Date().toISOString() } });
+      } else {
+        await writeQueue(queue);
+      }
     });
   } catch (error) {
     logger.warn("Could not queue a download log record", error);
@@ -378,33 +496,94 @@ export async function logDownload(record) {
 }
 
 /**
- * Post the queued records (up to 500 per request). What the backend took leaves the queue;
- * on a failure the rest stays for the next flush. Never throws.
- * @returns {Promise<{ posted: number, pending: number, code?: string }>}
+ * Post records; a batch refused outright is split in two until each refused record stands
+ * alone. Stops at the first failure of any other kind (unreachable, signed out, 5xx).
+ * @returns {Promise<{ sent: object[], refused: { record: object, status: number, detail: string }[], error?: Error }>}
+ */
+async function postRecords(batch, deps) {
+  try {
+    await post("/api/doclink/downloads", { records: batch.map(wireRecord) }, deps);
+    return { sent: batch, refused: [] };
+  } catch (error) {
+    if (!(error instanceof DownloadLogError && REJECTED_STATUSES.has(error.status))) return { sent: [], refused: [], error };
+    if (batch.length === 1) return { sent: [], refused: [{ record: batch[0], status: error.status, detail: error.detail || "" }] };
+    const half = Math.ceil(batch.length / 2);
+    const first = await postRecords(batch.slice(0, half), deps);
+    if (first.error) return first;
+    const second = await postRecords(batch.slice(half), deps);
+    return { sent: [...first.sent, ...second.sent], refused: [...first.refused, ...second.refused], ...(second.error ? { error: second.error } : {}) };
+  }
+}
+
+/** Take posted and refused records out of the queue (by their queue id) and keep the refused ones aside. */
+async function settleQueue(sent, refused) {
+  const gone = new Set([...sent, ...refused.map((r) => r.record)].map((r) => r.qid));
+  await withQueue(async () => {
+    const queue = await readQueue();
+    await writeQueue(queue.filter((r) => !gone.has(r.qid)));
+    if (refused.length) {
+      const aside = await readKey(REJECTED_KEY);
+      const at = new Date().toISOString();
+      aside.push(...refused.map(({ record, status, detail }) => ({ record: wireRecord(record), status, detail, at })));
+      await storage().set({ [REJECTED_KEY]: aside.slice(-MAX_REJECTED) });
+    }
+  });
+}
+
+/**
+ * Post the queued records of the Recon user signed in now (up to 500 per request), plus those
+ * whose user is not known. What the backend took leaves the queue; on a failure the rest stays
+ * for the next flush; records the backend refuses outright are set aside. Never throws.
+ * @returns {Promise<{ posted: number, pending: number, refused?: number, code?: string }>}
  */
 export function flushDownloadLog(deps = {}) {
   if (flushTimer) {
     clearTimeout(flushTimer);
     flushTimer = null;
   }
-  return serial(async () => {
-    let queue = await readQueue();
-    let posted = 0;
-    while (queue.length) {
-      const batch = queue.slice(0, MAX_RECORDS_PER_POST);
-      try {
-        await post("/api/doclink/downloads", { records: batch }, deps);
-      } catch (error) {
-        const code = error instanceof DownloadLogError ? error.code : "UNKNOWN";
-        logger.warn(`Download log: ${queue.length} record(s) kept for later (${code})`, { status: error.status ?? null });
-        return { posted, pending: queue.length, code };
-      }
-      posted += batch.length;
-      queue = queue.slice(batch.length);
-      await writeQueue(queue);
+  // one flush of a queue at a time (in any context); the queue stays free for new records while a batch is posted
+  return withLock(`${queueKey()}.flush`, async () => {
+    let queue = await withQueue(async () => {
+      const q = await readQueue();
+      if (!q.some((r) => !r.qid)) return q;
+      // records queued by an older DocLink have no queue id: give them one (stored) so each leaves exactly once
+      const withIds = q.map((r) => (r.qid ? r : { ...r, qid: newQueueId() }));
+      await writeQueue(withIds);
+      return withIds;
+    });
+    if (!queue.length) return { posted: 0, pending: 0 };
+    const me = await refreshLogUser(deps);
+    if (me === null) {
+      logger.warn(`Download log: ${queue.length} record(s) kept for later (RECON_AUTH_REQUIRED)`);
+      return { posted: 0, pending: queue.length, code: "RECON_AUTH_REQUIRED" };
     }
+    // signed in: that user's records and the unowned ones; signed-in user not known (undefined): only the unowned
+    const sendable = (r) => !r.user || (me !== undefined && String(r.user.id) === String(me.id));
+    let posted = 0;
+    let refusedCount = 0;
+    for (;;) {
+      const batch = queue.filter(sendable).slice(0, MAX_RECORDS_PER_POST);
+      if (!batch.length) break;
+      const result = await postRecords(batch, deps);
+      if (result.sent.length || result.refused.length) await settleQueue(result.sent, result.refused);
+      posted += result.sent.length;
+      if (result.refused.length) {
+        refusedCount += result.refused.length;
+        logger.warn(`Download log: the Recon Engine refused ${result.refused.length} record(s); set aside, not retried`, { status: result.refused[0].status, detail: result.refused[0].detail || null });
+      }
+      if (result.error) {
+        const error = result.error;
+        const code = error instanceof DownloadLogError ? error.code : "UNKNOWN";
+        const pending = (await readQueue()).length;
+        logger.warn(`Download log: ${pending} record(s) kept for later (${code})`, { status: error.status ?? null });
+        return { posted, pending, code, ...(refusedCount ? { refused: refusedCount } : {}) };
+      }
+      queue = await readQueue();
+    }
+    const pending = queue.length;
     if (posted) logger.info(`Download log: ${posted} record(s) sent`);
-    return { posted, pending: 0 };
+    if (pending) logger.info(`Download log: ${pending} record(s) of another Recon user wait until that user signs in`);
+    return { posted, pending, ...(refusedCount ? { refused: refusedCount } : {}) };
   }).catch((error) => {
     logger.warn("Download log flush failed", error);
     return { posted: 0, pending: -1, code: "UNKNOWN" };
@@ -457,8 +636,10 @@ export async function preflightDownloads(items, { destination, account = null, a
   const logged = list.filter((i) => i.log && i.log.key);
   const toEcm = destination === LOG_DESTINATION.ECM;
   const kinds = toEcm ? [...new Set(list.filter((i) => i.ecm && i.ecm.kind).map((i) => i.ecm.kind))] : [];
-  const [checked, ...ecmChecks] = await Promise.all([
+  const [checked, , ...ecmChecks] = await Promise.all([
     checkDownloaded({ destination, keys: logged.map((i) => i.log.key) }, deps),
+    // who this run's records belong to (stamped on each queued record)
+    refreshLogUser(deps).catch(() => undefined),
     ...kinds.map((kind) => findInEcm({ kind, account, candidates: list.filter((i) => i.ecm && i.ecm.kind === kind).map((i) => ({ ref: i.id, fields: i.ecm.fields, title: i.ecm.title })) }, deps))
   ]);
   if (!checked.ok) warnings.push(checked.code === "RECON_AUTH_REQUIRED" ? "Download log: sign in to the Recon Engine to see what you already downloaded." : "Download log unavailable: already-downloaded files could not be checked.");

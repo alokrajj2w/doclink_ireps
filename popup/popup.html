@@ -179,6 +179,9 @@
           <button id="btn-recon-okta" class="btn btn-secondary" type="button">Sign in with Okta</button>
         </div>
         <p id="recon-login-error" class="form-message form-message-error" role="alert" hidden></p>
+        <!-- Shown only when the Recon Engine cannot be reached (not when signed out): the run saves
+             locally without the already-downloaded check; its records are sent once Recon is back. -->
+        <button id="btn-recon-offline" class="btn btn-secondary" type="button" hidden>Download without the Recon Engine</button>
         <button id="btn-recon-use-local" class="btn btn-link" type="button">Use Local instead</button>
         <button id="btn-recon-sign-out" class="btn btn-link" type="button" hidden>Sign out</button>
         <details class="recon-okta-setup" id="recon-okta-setup" hidden>

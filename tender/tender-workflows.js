@@ -10,20 +10,18 @@
 
 import {
   TenderError, SESSION_MSG, log, norm,
-  getBaseUrl, irepsFetch, assertSession, parseHtml, formParams, findForm,
+  irepsFetch, assertSession, parseHtml, formParams, findForm,
   elementActions, parseCalls, qparam, toRequest, requestKey, fetchDocument, fetchLinkedDocument, createSaver, safeSegment,
+  INBOX_PATH, CORRES_LIST_PATH, CORRES_REPLY_PATH, CORRES_VIEW_FALLBACK_PATH, dmyOf, inlineScripts,
+  isVendorInboxPage, isCorrespondencePage, pageNotRecognised, listFailed,
 } from './tender-core.js';
-import { getActiveIrepsAccountContext, assertSameAccount, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
+import { describeError } from '../utils/messages.js';
+import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { printPageToPdf } from './tender-print.js';
 import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
-import { ecmDocumentFor, ecmCheckDocumentFor, ecmFileName, tenderEcmSink, ensureDownloadSignIn, CATEGORY_ECM_KIND } from './tender-ecm.js';
+import { ecmDocumentFor, ecmCheckDocumentFor, ecmFileName, tenderEcmSink, CATEGORY_ECM_KIND } from './tender-ecm.js';
 import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
 
-const INBOX_PATH = '/epsn/vendorInboxLink.do';
-const DEFAULT_AJAX_PATH = '/epsn/supply/tds/ajxdata.do';
-const CORRES_PATH = '/epsn/corres/vendorCorrespondencePendingReply.do';
-const CORRES_LIST_PATH = '/epsn/corres/vendorRelatedCorrespondence.do';
-const CORRES_VIEW_FALLBACK = '/epsn/corres/rly/viewpubIndltr.do';
 const MAX_INBOX_PAGES = 15;
 /** A list scanned by date (letters, Closed Tenders) normally stops long before this (see OLD_PAGES_TO_STOP). */
 const MAX_LIST_PAGES = 60;
@@ -187,13 +185,16 @@ async function saveDocument(run, action, { fileName, bytes, contentType, id, met
     { filename: name, ecm, account: run.account }
   ));
   const { validation, ...rest } = extra;
-  return { fileName: name, relPath: saved ? saved.relPath : null, status: 'DOWNLOADED', id: id || '', downloadId: saved ? saved.downloadId : null, size, ...rest,
+  // fileName / relPath: the file as Chrome saved it (L11); requestedPath: the name asked for, when Chrome had to change it
+  return { fileName: name, relPath: saved ? saved.relPath : null, ...(saved?.requestedPath ? { requestedPath: saved.requestedPath } : {}), status: 'DOWNLOADED', id: id || '', downloadId: saved ? saved.downloadId : null, size, ...rest,
     title: meta?.title || '', docDate: meta?.docDate || '', downloadedAt: new Date().toISOString(),
     validation: { ...validation, bytes: size },
     ...(ecm ? { ecm } : {}) };
 }
 
-const LEDGER_BUCKET = { CORRIGENDA: 'corrigenda', NEGOTIATION: 'letters', COUNTER_OFFER: 'letters', LOA: 'letters', CORRESPONDENCE: 'letters', FINANCIAL_TABULATION: 'letters', COMMERCIAL_TABULATION: 'letters' };
+// docs: the NIT documents, one entry each, so a NIT whose attachment failed is run again for that attachment
+// alone (H7; NIT Documents re-opens the message until every NIT category succeeded)
+const LEDGER_BUCKET = { TENDER_PDF: 'docs', ATTACHMENTS: 'docs', MY_OFFER: 'docs', CORRIGENDA: 'corrigenda', NEGOTIATION: 'letters', COUNTER_OFFER: 'letters', LOA: 'letters', CORRESPONDENCE: 'letters', FINANCIAL_TABULATION: 'letters', COMMERCIAL_TABULATION: 'letters' };
 
 const ITEM_CONCURRENCY = 3;
 
@@ -236,7 +237,8 @@ async function checkAlreadyDownloaded(run, result, items, build) {
 async function downloadItems(run, result, items, build) {
   items = dedupeItems(items);
   const bucket = LEDGER_BUCKET[result.category];
-  const ledgerKey = (it) => `${result.category}|${run.ctx.tenderNo}|${it.id}`;
+  // a NIT document is told apart by its link too: two attachments can share one IREPS name
+  const ledgerKey = (it) => `${result.category}|${run.ctx.tenderNo}|${it.id}${bucket === 'docs' && it.req ? `|${pathOf(it.req.url)}` : ''}`;
   const logged = await checkAlreadyDownloaded(run, result, items, build);
   if (logged && logged.checked) {
     // the signed-in user's own download log decides (the ledger is still kept, below)
@@ -386,7 +388,6 @@ export function inferRoute(scriptText, fnName, argValues) {
   return { method, url };
 }
 
-const inlineScripts = (doc) => [...doc.querySelectorAll('script:not([src])')].map((s) => s.textContent).join('\n');
 
 // ---------------------------------------------------------------- NIT page (shared)
 
@@ -515,7 +516,8 @@ export function parseCorrigendumList(doc) {
 
 // ---------------------------------------------------------------- corrigendum notices in the message inbox
 
-export const todayStr = (d = new Date()) => `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}`;
+/** Today (or `d`) as dd/mm/yyyy. */
+export const todayStr = (d = new Date()) => dmyOf(d);
 
 /**
  * "Issue of Corrigendum towards <unit>, Tender no: <no>" messages in My Messages > Inbox sent on `dateStr`
@@ -525,7 +527,9 @@ export const todayStr = (d = new Date()) => `${pad2(d.getDate())}/${pad2(d.getMo
 /**
  * Read My Messages > Inbox (POST vendorInboxLink.do listType=MyMsg&pageNo=N, newest first) and return the
  * messages sent on any of `dates` (dd/mm/yyyy) whose subject `parse()` accepts.
- * Stops once a whole page is older than the earliest wanted date.
+ * Stops once a whole page is older than the earliest wanted date. A page IREPS fails to give (HTTP error),
+ * or one with no messages that is not the inbox, ends the scan as before, and the messages read so far are
+ * still returned - with `incomplete` (on the array) saying why the rest was not read (H4).
  */
 export async function scanInbox(run, dates, parse) {
   const wanted = new Set(dates);
@@ -536,9 +540,10 @@ export async function scanInbox(run, dates, parse) {
   for (let pageNo = 1; pageNo <= MAX_INBOX_PAGES; pageNo++) {
     const res = await irepsFetch(run.base, INBOX_PATH, { method: 'POST', form: { listType: 'MyMsg', pageNo: String(pageNo) } });
     assertSession(res);
-    if (res.status !== 200) break;
+    if (res.status !== 200) { out.incomplete = listFailed(`My Messages page ${pageNo}`, res.status).message; break; }
     const doc = parseHtml(res.text());
     const rows = [...doc.querySelectorAll('tr')].filter((tr) => !tr.querySelector('tr') && /^\d{2}\/\d{2}\/\d{4}/.test(norm(tr.firstElementChild?.textContent)));
+    if (!rows.length && !isVendorInboxPage(doc)) { out.incomplete = pageNotRecognised(`My Messages page ${pageNo}`, doc).message; break; }
     const sig = rows.map((r) => norm(r.textContent)).join('\n');
     if (!rows.length || sig === prevSig) break;
     prevSig = sig;
@@ -551,6 +556,7 @@ export async function scanInbox(run, dates, parse) {
     }
     if (rows.every((tr) => key(norm(tr.firstElementChild.textContent).slice(0, 10)) < earliest)) break;
   }
+  if (out.incomplete) log('Inbox', `My Messages not read to the end: ${out.incomplete}`, 'warn');
   return out;
 }
 
@@ -600,10 +606,14 @@ async function corrigenda(run) {
       log('Corrigendum', `Inbox notices dated today: ${notices.length}`);
       if (notices.length) {
         r.note = 'The inbox has a corrigendum notice for this tender dated today, but IREPS does not list a published corrigendum yet. Try again later.';
+      } else if (notices.incomplete) {
+        r.note = `IREPS lists no published corrigendum for this tender. DocLink could not read all of My Messages for a corrigendum notice dated today: ${notices.incomplete}`;
       }
     } catch (e) {
       if (e.code === 'SESSION_EXPIRED') throw e;
-      log('Corrigendum', `inbox notice check failed: ${e.message}`);
+      log('Corrigendum', `inbox notice check failed: ${e.message}`, 'warn');
+      // the list itself was read (no corrigendum published); say that today's notices could not be checked
+      r.note = `IREPS lists no published corrigendum for this tender. DocLink could not check My Messages for a corrigendum notice dated today: ${e.message}`;
     }
     return finalize(r);
   }
@@ -755,6 +765,7 @@ export async function scanClosedTenders(run, { from, to, tenderNo = '' }) {
   let undated = 0;
   let prevFirstSig = '';
   let datesIgnored = false;
+  let incomplete = '';
   for (const win of closingWindows(from, to)) {
     if (datesIgnored) break;
     let prevSig = '';
@@ -769,6 +780,8 @@ export async function scanClosedTenders(run, { from, to, tenderNo = '' }) {
       pages++;
       const doc = parseHtml(res.text());
       const found = parseClosedTenders(doc);
+      // no rows is "none closed" only on IREPS's own Closed Tenders page (H4): otherwise the scan is incomplete
+      if (!found.length && !isVendorInboxPage(doc)) incomplete = incomplete || pageNotRecognised(`Closed Tenders ${fmtDate(win.from)}..${fmtDate(win.to)} page ${pageNo}`, doc).message;
       const sig = found.map((r) => `${r.tenderNo}|${r.bidId}`).join(',');
       if (!found.length || sig === prevSig) break;
       if (pageNo === 1) {
@@ -798,7 +811,8 @@ export async function scanClosedTenders(run, { from, to, tenderNo = '' }) {
     }
   }
   log('Closed', `${rows.length} closed tender(s) closing ${fmtDate(fromDay)}..${fmtDate(toDay)} over ${pages} page(s), ${rows.filter((r) => r.links.financialTabulation || r.links.commercialTabulation).length} with a tabulation${outside ? `; ${outside} outside the dates skipped` : ''}${undated ? `; ${undated} without a readable closing date skipped` : ''}`);
-  return { rows, pages };
+  if (incomplete) log('Closed', `Closed Tenders not fully read: ${incomplete}`, 'warn');
+  return { rows, pages, incomplete };
 }
 
 /** This tender's Closed Tenders row (one scan per run, shared by both tabulation steps), or null. */
@@ -893,6 +907,8 @@ async function loadInboxForm(run, status, menuLink = 'PostTenders') {
     const f = findForm(gdoc, (x) => x.querySelector('[name=tenderNo]'));
     if (f) return { defaults: formParams(f), action: f.getAttribute('action') || INBOX_PATH, scripts: inlineScripts(gdoc), pageUrl: g.url };
   }
+  // the list pages are still asked for, as before; a page of them DocLink cannot read is reported there (H4)
+  log('Inbox', `${status}: the list's search form did not open; asking for the list without it`, 'warn');
   return { defaults: new URLSearchParams(), action: INBOX_PATH, scripts: '', pageUrl: '' };
 }
 
@@ -947,11 +963,15 @@ async function scanInboxRows(run, status) {
 
       const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined, wait: pageWait(run, status) });
       assertSession(res);
-      if (res.status !== 200) break;
+      // a page IREPS fails to give ends this range's pages as before, and is reported (H4): letters on it are missed
+      const where = `the ${LETTER_KINDS[status].page} list ${win.startDate}..${win.endDate} page ${pageNo}`;
+      if (res.status !== 200) { entry.incomplete ||= listFailed(where, res.status).message; break; }
       entry.pages++;
       const doc = parseHtml(res.text());
       entry.scripts += '\n' + inlineScripts(doc);
       const leaf = [...doc.querySelectorAll('tr')].filter((tr) => !tr.querySelector('tr') && tr.querySelector('a,[onclick]'));
+      // "no rows" is the list's own answer only on IREPS's list page itself
+      if (!leaf.length && !isVendorInboxPage(doc)) { entry.incomplete ||= pageNotRecognised(where, doc).message; break; }
       const sig = leaf.map((t) => norm(t.outerHTML)).join('\n'); // markup, so rows that differ only in link params still differ
       if (!leaf.length || sig === prevSig) break;
       if (pageNo === 1) {
@@ -973,7 +993,7 @@ async function scanInboxRows(run, status) {
       if (!hasMorePages(doc, pageNo)) break;
     }
   }
-  log('Inbox', `${status}: ${entry.rows.length} matching row(s) over ${entry.windows} date window(s), ${entry.pages} page(s)`);
+  log('Inbox', `${status}: ${entry.rows.length} matching row(s) over ${entry.windows} date window(s), ${entry.pages} page(s)${entry.incomplete ? `; not read to the end: ${entry.incomplete}` : ''}`);
   return entry;
 }
 
@@ -998,7 +1018,21 @@ export const LETTER_SPECS = {
 
 /** "10/09/2026 17:40 (224222)" - the letter's published date/time and id, as shown in the Post Tenders rows. */
 const LETTER_STAMP_RE = /(\d{2}\/\d{2}\/\d{4})\s+\d{1,2}:\d{2}\s*\((\d+)\)/;
-const LETTER_STAMP = /(\d{2}\/\d{2}\/\d{4})\s+\d{1,2}:\d{2}\s*\((\d+)\)/;
+
+/** The header of the Post Tenders lists' first column: "DAHOD / WESTERN RLY" (department / railway). */
+const UNIT_HEADER_RE = /^Dept\/Rly\.?\s*Unit$/i;
+
+const rowCells = (tr) => [...tr.children].filter((c) => /^t[dh]$/i.test(c.tagName));
+
+/** The column whose header cell reads `re`, counted in its row's own cells; -1 when the page has no such header. */
+export function listColumn(doc, re) {
+  for (const tr of doc.querySelectorAll('tr')) {
+    if (tr.querySelector('tr')) continue;
+    const at = rowCells(tr).findIndex((c) => re.test(norm(c.textContent)));
+    if (at >= 0) return at;
+  }
+  return -1;
+}
 
 const stampDay = (s) => { const [d, m, y] = s.split('/').map(Number); return new Date(y, m - 1, d); };
 
@@ -1011,7 +1045,10 @@ const stampDay = (s) => { const [d, m, y] = s.split('/').map(Number); return new
  *               whose letters are all older (every later page is older still)
  *   windows     [fromDays,toDays] relative to today, for a caller that wants several; a window whose
  *               first page repeats the previous window's is skipped with the rest (dates ignored)
- *   -> { entries: [{ tenderNo, id, date, rq, url }], scripts, unparsed }
+ *   -> { entries: [{ tenderNo, id, date, unit, rq, url }], scripts, unparsed, incomplete }
+ *   unit: the row's "Dept/Rly. Unit" ("DAHOD / WESTERN RLY"), '' when the page has no such column
+ *   unparsed: rows with a letter but no readable date / tender; incomplete: why the list was not read to its
+ *   end (a page IREPS failed to give, or one with no rows that is not the list): the letters read are kept (H4)
  */
 export async function scanPostTenderList(run, status, { windows = null, stopBefore = null } = {}) {
   const spec = LETTER_SPECS[status];
@@ -1027,6 +1064,7 @@ export async function scanPostTenderList(run, status, { windows = null, stopBefo
   const entries = [];
   const seen = new Set();
   let unparsed = 0;
+  let incomplete = ''; // why the list was not read to its end (an HTTP error, a page that is not the list)
   let scripts = form.scripts;
   let prevFirstSig = '';
   for (const win of wins) {
@@ -1039,11 +1077,14 @@ export async function scanPostTenderList(run, status, { windows = null, stopBefo
       if (!p.get('raStatus')) p.set('raStatus', '-1');
       const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, wait: pageWait(run, status) });
       assertSession(res);
-      if (res.status !== 200) break;
+      // a page IREPS fails to give ends the list as before, and is reported (H4): letters on it are missed
+      if (res.status !== 200) { incomplete ||= listFailed(`the ${LETTER_KINDS[status].page} list page ${pageNo}`, res.status).message; break; }
       const doc = parseHtml(res.text());
       scripts += '\n' + inlineScripts(doc);
       const leaf = [...doc.querySelectorAll('tr')].filter((tr) => !tr.querySelector('tr') && tr.querySelector('a,[onclick]'));
       log('Inbox', `${status} ${win.startDate}..${win.endDate} page ${pageNo}: ${leaf.length} row(s), title "${norm(doc.title)}"${leaf.length ? '' : `, text "${norm(doc.body?.textContent).slice(0, 100)}"`}`);
+      // "no rows" is the list's own answer only on IREPS's list page itself
+      if (!leaf.length && !isVendorInboxPage(doc)) { incomplete ||= pageNotRecognised(`the ${LETTER_KINDS[status].page} list page ${pageNo}`, doc).message; break; }
       const sig = leaf.map((t) => norm(t.outerHTML)).join('\n');
       if (!leaf.length || sig === prevSig) break;
       if (pageNo === 1) {
@@ -1052,18 +1093,20 @@ export async function scanPostTenderList(run, status, { windows = null, stopBefo
       }
       prevSig = sig;
       const pageDays = [];
+      const unitCol = listColumn(doc, UNIT_HEADER_RE); // -1 on a page without that header: the unit is then ''
       for (const tr of leaf) {
         const letters = allReqs(elementActions(tr)).filter((x) => spec.re.test(pathOf(x.url)) && spec.accept(x));
         if (!letters.length) continue;
         const tenderNo = norm(tr.querySelector('a[title*="NIT" i]')?.textContent) || norm(tr.querySelector('a')?.textContent);
-        const stamp = LETTER_STAMP.exec(norm(tr.textContent));
+        const stamp = LETTER_STAMP_RE.exec(norm(tr.textContent));
         if (!tenderNo || !stamp) { unparsed++; continue; }
         pageDays.push(stampDay(stamp[1]));
+        const unit = unitCol >= 0 ? norm(rowCells(tr)[unitCol]?.textContent) : '';
         for (const rq of letters) {
           const id = qparam(rq.url, spec.idParam) || stamp[2];
           if (seen.has(`${tenderNo}|${id}`)) continue;
           seen.add(`${tenderNo}|${id}`);
-          entries.push({ tenderNo, id, date: stamp[1], rq, url: rq.url });
+          entries.push({ tenderNo, id, date: stamp[1], unit, rq, url: rq.url });
         }
       }
       if (!hasMorePages(doc, pageNo)) break;
@@ -1077,8 +1120,8 @@ export async function scanPostTenderList(run, status, { windows = null, stopBefo
     }
     if (stopped) break;
   }
-  log('Inbox', `${status}: ${entries.length} letter(s) listed${unparsed ? `, ${unparsed} row(s) without a readable date/tender` : ''}`);
-  return { entries, scripts, unparsed };
+  log('Inbox', `${status}: ${entries.length} letter(s) listed${unparsed ? `, ${unparsed} row(s) without a readable date/tender` : ''}${incomplete ? `; not read to the end: ${incomplete}` : ''}`);
+  return { entries, scripts, unparsed, incomplete };
 }
 
 // ---------------------------------------------------------------- E/F/G. Negotiation, Counter offer, LOA letters
@@ -1098,12 +1141,41 @@ export const LETTER_KINDS = {
 };
 
 /**
+ * How IREPS's own "View LOA Letter" link opens an LOA (loaLetterViewActivity in the LOA list page's script): it
+ * POSTs the "LOA viewed" update (getAjaxData, with ajaxMode and docType), and only when IREPS answers "OK" opens
+ * '<prefix>' + url. -> { prefix, path, ajaxMode, docType, ok } read from that live script, or { problem } when
+ * any part of it cannot be read. Nothing is filled in from defaults (H6): this update is a write to IREPS, so
+ * DocLink sends it only exactly as the page itself would (and the request guard lets only that one through,
+ * tender-core.js LOA_VIEWED_UPDATE).
+ */
+export function readLoaViewScript(scripts = '') {
+  const at = scripts.search(/function\s+loaLetterViewActivity\s*\(/i);
+  if (at < 0) return { problem: 'the LOA list page has no loaLetterViewActivity script' };
+  const fn = scripts.slice(at, at + 2500);
+  const path = /getAjaxData\s*=\s*['"]([^'"]+)['"]/.exec(fn)?.[1] || '';
+  const ajaxMode = /ajaxMode\s*:\s*["']([^"']+)["']/.exec(fn)?.[1] || '';
+  const docType = /docType\s*=\s*["'](\d+)["']/.exec(fn)?.[1] || '';
+  const ok = /result\s*==\s*["']([^"']+)["']/.exec(fn)?.[1] || '';
+  // the letter opens at '<prefix>' + url, or at url itself
+  const opened = /postRequestNewWindow\s*\(\s*['"](\/[\w/]+)['"]\s*\+\s*url\b/.exec(fn);
+  const prefix = opened ? opened[1] : /postRequestNewWindow\s*\(\s*url\b/.test(fn) ? '' : null;
+  const missing = [!path && 'the update address (getAjaxData)', !ajaxMode && 'its ajaxMode', !docType && 'its docType', !ok && 'the answer it waits for',
+    prefix === null && 'how it opens the letter'].filter(Boolean);
+  if (missing.length) return { problem: `loaLetterViewActivity does not show ${missing.join(', ')}` };
+  return { prefix, path, ajaxMode, docType, ok };
+}
+
+/**
  * Download published letters of one Post Tenders list, given the items found in that list
- * (items: { id, rq:{method,url,args}, url }). `scripts` is the list page's inline JS (for the LOA helper).
+ * (items: { id, rq:{method,url,args}, url, date?, unit? }). `scripts` is the list page's inline JS (for the LOA helper).
+ * `unit` (the row's "Dept/Rly. Unit") and `date` (its Letter Date) give an LOA its ECM LOA number and date.
  *   Negotiation: View Negotiation Letters only ("Nego Bid Process" is never requested)
  *   Counter offer: the published letter only, printed; coResponse.do (the response page) and any document attached
  *     to the letter are never requested
- *   LOA: mirrors loaLetterViewActivity - the letter is requested only after the preliminary call answers "OK"
+ *   LOA: mirrors loaLetterViewActivity - the "LOA viewed" update is POSTed as the page's script does (H6, the one
+ *     write DocLink sends: it marks the letter as viewed in IREPS), and the letter is requested only after IREPS
+ *     answers "OK". When that script, or the letter id the link passes it, cannot be read, the LOA fails and
+ *     nothing is sent.
  */
 export async function downloadLetterItems(run, status, items, scripts = '') {
   const kind = LETTER_KINDS[status];
@@ -1111,37 +1183,35 @@ export async function downloadLetterItems(run, status, items, scripts = '') {
   const { ctx } = run;
   log(kind.tag, `Found ${items.length} matching letters`);
 
-  let prefix = '';
-  let loaAck = null;
-  if (status === 'MyAdvanceAcceptanceLetter') {
-    const fnAt = scripts.search(/function\s+loaLetterViewActivity/i);
-    const fn = fnAt >= 0 ? scripts.slice(fnAt, fnAt + 2500) : '';
-    prefix = /['"](\/[\w/]+)['"]\s*\+\s*url/.exec(fn)?.[1] || (fnAt < 0 ? '/epsn' : '');
-    loaAck = {
-      path: /getAjaxData\s*=\s*['"]([^'"]+)['"]/.exec(fn)?.[1] || DEFAULT_AJAX_PATH,
-      ajaxMode: /ajaxMode\s*:\s*["']([^"']+)["']/.exec(fn)?.[1] || 'updateLoaViewedDataByBidder',
-      docType: /docType\s*=\s*["'](\d+)["']/.exec(fn)?.[1] || '11',
-    };
-  }
+  const isLoa = status === 'MyAdvanceAcceptanceLetter';
+  const loaView = isLoa ? readLoaViewScript(scripts) : null;
+  const loaFailure = (detail) => ({ code: 'LOA_SCRIPT', message: describeError('TENDER_LOA_SCRIPT_UNREADABLE', { detail }).message });
+  if (loaView?.problem) log('LOA', `Not sending the "LOA viewed" update: ${loaView.problem}`, 'warn');
+  const prefix = loaView && !loaView.problem ? loaView.prefix : '';
   for (const it of items) noteIds(run, it.url, 'inbox'); // nitOId etc. straight from the live letter action
-  ctx.discoveredActions[LETTER_SPECS[status].key] = items.map((i) => ({ method: loaAck ? 'POST' : i.rq.method, path: prefix + pathOf(i.url) }));
+  ctx.discoveredActions[LETTER_SPECS[status].key] = items.map((i) => ({ method: isLoa ? 'POST' : i.rq.method, path: prefix + pathOf(i.url) }));
   for (const it of items) {
-    it.req = { ...toRequest(it.url, loaAck ? 'POST' : it.rq.method, { prefix }), relativeTo: ctx.searchUrl, wait: pageWait(run, status) };
+    it.req = { ...toRequest(it.url, isLoa ? 'POST' : it.rq.method, { prefix }), relativeTo: ctx.searchUrl, wait: pageWait(run, status) };
     if (status !== 'MyNegotiation') it.skip = bidderMismatch(run, it.url);
-    if (loaAck) it.docId = it.rq.args?.[1] || qparam(it.url, 'letterId');
+    if (!isLoa || it.skip) continue;
+    // the docId IREPS's update gets is the one the row's own loaLetterViewActivity('<url>','<docId>') passes
+    it.docId = String(it.rq.args?.[1] ?? '');
+    if (loaView.problem) it.skip = loaFailure(loaView.problem);
+    else if (!/^\d+$/.test(it.docId)) it.skip = loaFailure(`the View LOA Letter link of letter ${it.id} passes no letter id`);
   }
   // print: IREPS builds every published letter as a web page on each view; Chrome prints it to PDF as Ctrl+P does.
   // The LOA and Counter Offer letters are that page alone (pageOnly): nothing linked or embedded in it (an attached
   // document) is downloaded in place of the letter. One LOA PDF per tender.
-  const pageOnly = status === 'MyAdvanceAcceptanceLetter' || status === 'MyCounterOffer';
-  const single = status === 'MyAdvanceAcceptanceLetter' && new Set(items.map((i) => i.id)).size === 1;
+  // (A Negotiation letter keeps the generic handling: M19, deferred - the download approach must not change.)
+  const pageOnly = isLoa || status === 'MyCounterOffer';
+  const single = isLoa && new Set(items.map((i) => i.id)).size === 1;
   return downloadItems(run, r, items, (it) => ({
-    req: it.req, subdir: kind.subdir, id: it.id, meta: { title: `${kind.tag} letter ${it.id}`, docDate: it.date || '' }, allowHtml: true, allowAnyFile: true, print: true, pageOnly, logAs: pageOnly ? kind.tag : '',
-    before: loaAck && (async () => {
-      const ack = await irepsFetch(run.base, loaAck.path, { method: 'POST', form: { ajaxMode: loaAck.ajaxMode, docId: it.docId, docType: loaAck.docType } });
+    req: it.req, subdir: kind.subdir, id: it.id, unit: it.unit || '', meta: { title: `${kind.tag} letter ${it.id}`, docDate: it.date || '' }, allowHtml: true, allowAnyFile: true, print: true, pageOnly, logAs: pageOnly ? kind.tag : '',
+    before: isLoa && (async () => {
+      const ack = await irepsFetch(run.base, loaView.path, { method: 'POST', form: { ajaxMode: loaView.ajaxMode, docId: it.docId, docType: loaView.docType } });
       assertSession(ack);
       const body = ack.text().trim();
-      if (ack.status !== 200 || body !== 'OK') {
+      if (ack.status !== 200 || body !== loaView.ok) {
         log('LOA', `Preliminary request failed (HTTP ${ack.status}, response "${body.slice(0, 40)}")`);
         throw new TenderError('LOA_ACK', `IREPS did not confirm the LOA view update (HTTP ${ack.status}, response "${body.slice(0, 40)}"); the letter was not requested.`);
       }
@@ -1153,7 +1223,17 @@ export async function downloadLetterItems(run, status, items, scripts = '') {
 async function letterCategory(run, status) {
   const entry = await inbox(run, status);
   const sp = LETTER_SPECS[status];
-  return downloadLetterItems(run, status, letterItems(entry, sp.re, sp.idParam, sp.accept), entry.scripts);
+  const r = await downloadLetterItems(run, status, letterItems(entry, sp.re, sp.idParam, sp.accept), entry.scripts);
+  return entry.incomplete ? listNotReadToEnd(r, entry.incomplete) : r;
+}
+
+/** A category whose list was not read to its end (H4): what was found is kept, and the category says so (PARTIAL / FAILED). */
+function listNotReadToEnd(r, message) {
+  r.discovered++;
+  r.failed++;
+  r.files.push({ fileName: '', status: 'FAILED', error: message, code: 'LIST' });
+  r.note = r.note || message;
+  return finalize(r);
 }
 const negotiation = (run) => letterCategory(run, 'MyNegotiation');
 const counterOffer = (run) => letterCategory(run, 'MyCounterOffer');
@@ -1190,18 +1270,21 @@ function ensureNitOid(run) {
 }
 
 async function findNitOid(run) {
+  // run.nitOidLookupError: why the correspondence list could not be read (an HTTP error, a page that is not it),
+  // so that "no nitOid" is reported as a failure, not as "no correspondence" (H4)
   try {
     const res = await irepsFetch(run.base, CORRES_LIST_PATH, { method: 'POST', form: {} });
     assertSession(res);
-    if (res.status === 200) {
-      const doc = parseHtml(res.text());
-      let rows = findTenderRows(doc, run.ctx.tenderNo);
-      if (!rows.length) rows = findTenderRowsLoose(doc, run.ctx.tenderNo);
-      for (const tr of rows) for (const a of elementActions(tr)) for (const u of a.urls) noteIds(run, u, 'correspondence_list');
-    }
+    if (res.status !== 200) throw listFailed('Tender Related Correspondence', res.status);
+    const doc = parseHtml(res.text());
+    let rows = findTenderRows(doc, run.ctx.tenderNo);
+    if (!rows.length) rows = findTenderRowsLoose(doc, run.ctx.tenderNo);
+    for (const tr of rows) for (const a of elementActions(tr)) for (const u of a.urls) noteIds(run, u, 'correspondence_list');
+    if (!rows.length && !isCorrespondencePage(doc)) throw pageNotRecognised('Tender Related Correspondence', doc);
   } catch (e) {
     if (e.code === 'SESSION_EXPIRED') throw e;
-    log('Correspondence', `list lookup failed: ${e.message}`);
+    run.nitOidLookupError = e.message;
+    log('Correspondence', `list lookup failed: ${e.message}`, 'warn');
   }
   if (!run.ids.nitOid) {
     // Last resort: the tender row's own "oid" (Bid Process / payment actions) - the same value the
@@ -1218,11 +1301,13 @@ async function correspondence(run) {
   const nitOid = await ensureNitOid(run);
   if (!nitOid) {
     log('Correspondence', 'Found 0 matching letters (no nitOid could be discovered)');
+    // "none" only when IREPS's correspondence list was read and does not have the tender
+    if (run.nitOidLookupError) return failedCategory('CORRESPONDENCE', run.nitOidLookupError);
     r.note = 'No nitOid could be discovered for this tender, so the correspondence page could not be opened.';
     return finalize(r);
   }
-  ctx.discoveredActions.correspondence = [{ method: 'POST', path: CORRES_PATH }];
-  const res = await irepsFetch(run.base, CORRES_PATH, { method: 'POST', form: { nitOid } });
+  ctx.discoveredActions.correspondence = [{ method: 'POST', path: CORRES_REPLY_PATH }];
+  const res = await irepsFetch(run.base, CORRES_REPLY_PATH, { method: 'POST', form: { nitOid } });
   assertSession(res);
   const doc = parseHtml(res.text());
   const onPage = pageTenderNo(doc);
@@ -1246,7 +1331,7 @@ async function correspondence(run) {
     seen.add(`${corresId}|${letterId}`);
     const cells = [...(el.closest('tr')?.children || [])].map((c) => norm(c.textContent)).filter(Boolean);
     const route = inferRoute(scripts, 'viewPublishedLtr', call.args);
-    const target = route || { method: 'POST', url: `${CORRES_VIEW_FALLBACK}?nitOid=${oid}&letterID=${letterId}&corresId=${corresId}` };
+    const target = route || { method: 'POST', url: `${CORRES_VIEW_FALLBACK_PATH}?nitOid=${oid}&letterID=${letterId}&corresId=${corresId}` };
     if (!route) log('Correspondence', 'Route not readable from the page; using the documented viewpubIndltr.do route');
     items.push({
       id: letterId, corresId, letterId, nitOid: oid || nitOid, letterNo: cells[0] || '', subject: cells[1] || '',
@@ -1254,6 +1339,8 @@ async function correspondence(run) {
       req: { ...toRequest(target.url, target.method), relativeTo: res.url },
     });
   }
+  // no letters is "none" only on IREPS's own correspondence page (H4)
+  if (!items.length && !isCorrespondencePage(doc)) return failedCategory('CORRESPONDENCE', pageNotRecognised(`the correspondence page of tender ${ctx.tenderNo}`, doc).message);
   if (run.dateRange) {
     // the correspondence page has no date filter of its own: apply the selected range to each letter's date
     const keep = items.filter((i) => i.letterDate && run.dateRange.has(i.letterDate));
@@ -1356,15 +1443,7 @@ export function startTenderRun(base, account, found, folderLabel) {
 export async function downloadTenderDocuments(rawTenderNo, { onProgress = () => {}, onAccount = () => {}, only = CATEGORY_KEYS } = {}) {
   const tenderNo = norm(rawTenderNo);
   if (!tenderNo) throw new TenderError('INPUT', 'Enter a Tender Number.');
-  await ensureDownloadSignIn();
-
-  const base = await getBaseUrl();
-  onProgress('Verifying IREPS account...');
-  const account = await getActiveIrepsAccountContext({ base });
-  onAccount(account);
-  if (!account.authenticated) throw new TenderError('SESSION_EXPIRED', SESSION_MSG);
-  if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
-  const folderLabel = accountFolderLabel(account);
+  const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
 
   onProgress('Finding Tender...');
   const found = await searchTender(base, tenderNo, { onProgress });

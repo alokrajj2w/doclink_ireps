@@ -20,6 +20,47 @@ import { logger } from "../../utils/logger.js";
 
 const CONTENT_SCRIPT = "background/bill-tab-request.js";
 
+/**
+ * Tabs the script was injected into, as tab id -> the injection's promise. The script stays in
+ * the page until the page is reloaded or left, so each tab is injected once (and once more after
+ * the service worker restarted, which empties this map; the script ignores a second copy). A
+ * page that lost the script is noticed when a message finds no receiver, which Chrome reports
+ * without delivering it, and only then is the script injected again (review L14).
+ */
+const injectedTabs = new Map();
+
+/** Chrome's answer when no script in the tab listens: the message was never delivered. */
+const NO_RECEIVER = /Receiving end does not exist|Could not establish connection/i;
+
+function injectScript(tabId) {
+  const pending = chrome.scripting.executeScript({ target: { tabId }, files: [CONTENT_SCRIPT] });
+  injectedTabs.set(tabId, pending);
+  // a failed injection is not remembered: the next call tries again
+  pending.catch(() => {
+    if (injectedTabs.get(tabId) === pending) injectedTabs.delete(tabId);
+  });
+  return pending;
+}
+
+/**
+ * Send a message to DocLink's script in the tab, injecting it first if this tab has not got it.
+ * Sent again (after a new injection) only when Chrome reports that nothing received it, so a
+ * request is never run twice; a message that was delivered and then cut off is not resent.
+ */
+async function sendToTab(tabId, message) {
+  for (let attempt = 0; ; attempt++) {
+    const injected = injectedTabs.get(tabId) || injectScript(tabId);
+    await injected;
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (error) {
+      // whatever went wrong, the next message injects first: a page that went away keeps no script
+      if (injectedTabs.get(tabId) === injected) injectedTabs.delete(tabId);
+      if (attempt > 0 || !NO_RECEIVER.test(String((error && error.message) || error))) throw error;
+    }
+  }
+}
+
 /** Throws BILL_TAB_UNAVAILABLE unless the tab shows the configured IREPS portal. */
 export async function assertIrepsTab(tabId) {
   let tab = null;
@@ -49,9 +90,7 @@ export function tabFetch(tabId) {
   return async (url, init = {}) => {
     let result;
     try {
-      // idempotent: the script registers its listener once per page
-      await chrome.scripting.executeScript({ target: { tabId }, files: [CONTENT_SCRIPT] });
-      result = await chrome.tabs.sendMessage(tabId, {
+      result = await sendToTab(tabId, {
         type: "DOCLINK_TAB_FETCH",
         url: String(url),
         method: init.method || "GET",
@@ -87,8 +126,7 @@ async function askTab(tabId, message) {
     pageBefore = "";
   }
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: [CONTENT_SCRIPT] });
-    return await chrome.tabs.sendMessage(tabId, message);
+    return await sendToTab(tabId, message);
   } catch (error) {
     const text = String((error && error.message) || error);
     let pageAfter = "";

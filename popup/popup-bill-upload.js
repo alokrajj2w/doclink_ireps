@@ -328,21 +328,84 @@ async function uploadDocument() {
   if (response && response.started !== false) el.upDocFile.value = "";
 }
 
+const receiptSearchIn = (r) => (r.source === "CRN" ? "PO Search > Consignment Receipt Note (CRN)" : "PO Search > Receipt Note (R-NOTE)");
+
+/** IREPS's own upload of the receipt, on every bill once its item is saved. */
+const SYSTEM_UPLOAD = /SYSTEM UPLOAD/i;
+const sameText = (a, b) => String(a || "").replace(/\s+/g, " ").trim().toUpperCase() === String(b || "").replace(/\s+/g, " ").trim().toUpperCase();
+const NEED_NOTE = { conditional: " (if the inspection needs it)", optional: " (if applicable)" };
+
+/**
+ * The "Finish in IREPS" steps, built from the documents' actual states (review L13): what is on
+ * the bill in IREPS already (the receipt IREPS attached, every document uploaded from DocLink) is
+ * not asked for again, the files DocLink saved from ECM are named, and a needed document DocLink
+ * has no file for is named so the user finds it. Pure (no DOM), exported for the tests.
+ * @param {object} s  the job's public state (bill-upload-job.js publicState), item saved
+ * @returns {string[]}
+ */
+export function finishSteps(s) {
+  const bill = s.bill;
+  const r = bill.receipt;
+  const steps = [`In IREPS open ${receiptSearchIn(r)} for PO ${r.poNo} and click bill ${bill.billRegNo} (View / Sign & Submit Draft Supplier Bill), or open it from the PO's Bills for Pay tab.`];
+  const onBill = (bill.documentsOnBill || []).filter((d) => !SYSTEM_UPLOAD.test(d.description || ""));
+  const isOnBill = (fileDesc) => onBill.some((d) => sameText(d.description, fileDesc));
+  if (onBill.length) steps.push(`Already on the bill, so don't attach ${onBill.length === 1 ? "it" : "them"} again: ${onBill.map((d) => d.description || d.fileName).join(", ")}.`);
+  const found = s.documents;
+  if (!found) {
+    steps.push(`${onBill.length ? "Attach every other document the bill needs" : "Attach each document the bill needs that is not on it yet"}: type its description, click Select File, pick the file and sign it with your DSC. "Get documents from ECM" above saves the ECM documents and shows the description to type.`);
+  } else {
+    const open = found.documents.filter((d) => d.need !== "not-needed" && !isOnBill(d.fileDesc));
+    const toAttach = open.filter((d) => d.status === "saved");
+    const noFile = open.filter((d) => d.status !== "saved" && (d.need === "required" || d.need === "conditional"));
+    if (toAttach.length) {
+      steps.push(`Attach the files DocLink saved in Downloads/${found.folder}/ that are not on the bill yet: ${toAttach.map((d) => `${d.label}${NEED_NOTE[d.need] || ""}`).join("; ")}. For each one, type the description shown above, click Select File, pick the file and sign it with your DSC.`);
+    }
+    // the list above shows the description to type only for the files it saved
+    if (noFile.length) {
+      steps.push(`Attach your own copy of what DocLink could not get from ECM (type the description, click Select File, pick the file and sign it with your DSC): ${noFile.map((d) => `${d.label}${NEED_NOTE[d.need] || ""}, ${DOC_STATUS[d.status] || d.status}, description "${d.fileDesc}"`).join("; ")}.`);
+    }
+    if (!toAttach.length && !noFile.length) steps.push("Every document DocLink found in ECM is on the bill already.");
+  }
+  steps.push("Click Generate Preview and check every value against the invoice.");
+  steps.push("Click Sign & Submit Bill, select your DSC and enter the PIN.");
+  for (const b of bill.forgottenBills || []) {
+    steps.push(`Draft bill ${b.billRegNo}, which DocLink forgot when you chose Start fresh, is still in IREPS: delete it from the PO's Bills for Pay tab if you no longer need it.`);
+  }
+  return steps;
+}
+
 function renderNextSteps(s) {
   const bill = s.bill;
   const done = s.step === "done" || (bill && bill.existing && bill.existing.status === "item-saved");
   el.next.hidden = !done;
   if (!done) return;
+  el.nextSteps.replaceChildren(...finishSteps(s).map((t) => node("li", null, t)));
+}
+
+/**
+ * The "Start fresh" box (review M26). Before: what forgetting the earlier bill means. After: that
+ * the forgotten draft is still in IREPS and where to find it, since DocLink no longer tracks it.
+ * Pure (no DOM), exported for the tests.
+ * @param {object|null} bill  the job's public bill state
+ * @returns {{ text: string, offer: boolean }|null}  offer: show the confirmation and the button
+ */
+export function startFreshText(bill) {
+  if (!bill || !bill.receipt) return null;
   const r = bill.receipt;
-  const where = r.source === "CRN" ? "PO Search > Consignment Receipt Note (CRN)" : "PO Search > Receipt Note (R-NOTE)";
-  const folder = s.documents ? `Downloads/${s.documents.folder}/` : "the documents folder (step 5)";
-  const steps = [
-    `In IREPS open ${where} for PO ${r.poNo} and click bill ${bill.billRegNo} (View / Sign & Submit Draft Supplier Bill), or open it from the PO's Bills for Pay tab.`,
-    `For each document: type the description shown above, click Select File, pick the file from ${folder} and sign it with your DSC.`,
-    "Click Generate Preview and check every value against the invoice.",
-    "Click Sign & Submit Bill, select your DSC and enter the PIN."
-  ];
-  el.nextSteps.replaceChildren(...steps.map((t) => node("li", null, t)));
+  const findIt = `find it on the PO's Bills for Pay tab (or under ${receiptSearchIn(r)} for PO ${r.poNo}) and delete it there if you no longer need it`;
+  if (bill.existing) {
+    const no = bill.existing.billRegNo;
+    return {
+      offer: true,
+      text: `An earlier try already created draft bill ${no} in IREPS for this receipt. To start again, DocLink can forget that bill and let you create a new one. Bill ${no} stays in IREPS, because DocLink never deletes a bill: ${findIt}.`
+    };
+  }
+  const forgotten = (bill.forgottenBills || []).map((b) => b.billRegNo);
+  if (!forgotten.length) return null;
+  return {
+    offer: false,
+    text: `DocLink forgot draft bill ${forgotten.join(", ")}, so you can create a new bill for this receipt. The old draft is still in IREPS: ${findIt}.`
+  };
 }
 
 function updateCreateButton() {
@@ -408,12 +471,15 @@ function render(s) {
     updateCreateButton();
   }
 
-  // 3b. an earlier try already created a bill for this receipt -> offer to start fresh
-  const existing = bill && bill.existing;
-  el.forget.hidden = !(existing && s.step === "review");
-  if (!el.forget.hidden) {
-    el.forgetText.textContent = `An earlier try already created draft bill ${existing.billRegNo} in IREPS for this receipt. To start again, DocLink can forget that bill and let you create a new one. Bill ${existing.billRegNo} stays in IREPS - delete it from the PO's Bills for Pay if you no longer need it.`;
-    if (previousStep !== "review") el.forgetConfirm.checked = false;
+  // 3b. an earlier try already created a bill for this receipt -> offer to start fresh; once
+  // forgotten, the box says where that bill is in IREPS
+  const fresh = s.step === "review" ? startFreshText(bill) : null;
+  el.forget.hidden = !fresh;
+  if (fresh) {
+    el.forgetText.textContent = fresh.text;
+    el.forgetConfirm.parentElement.hidden = !fresh.offer;
+    el.btnForget.hidden = !fresh.offer;
+    if (previousStep !== "review" || !fresh.offer) el.forgetConfirm.checked = false;
     el.forgetConfirm.disabled = s.busy;
     el.btnForget.disabled = s.busy || !el.forgetConfirm.checked;
   } else {

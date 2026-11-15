@@ -6,25 +6,28 @@
 //
 // This module only READS the panel's Save to preference from chrome.storage.local; it stores nothing.
 
-import { STORAGE_KEYS } from '../utils/messages.js';
+import { STORAGE_KEYS, describeError } from '../utils/messages.js';
 import { SAVE_DESTINATION } from '../services/recon-service.js';
 import { ECM_KIND, saveToEcmOrLocally } from '../services/ecm-service.js';
 import { ECM_KINDS, isGroupedKind } from '../services/ecm-catalog.js';
 import { confirmReconSignIn } from '../services/recon-auth.js';
 import { loadEcmConfig, isDirectEcm } from '../services/ecm-config.js';
-import { loadDownloadLogConfig } from '../services/download-log.js';
+import { loadDownloadLogConfig, DOWNLOAD_LOG_ERROR } from '../services/download-log.js';
 import { TenderError, safeSegment } from './tender-core.js';
+import { localIsoDate } from '../utils/dates.js';
 
-export const SIGN_IN_REQUIRED_MSG = 'Sign in to the Recon Engine to download: DocLink records every download for the signed-in user. Nothing was downloaded.';
+export const SIGN_IN_REQUIRED_MSG = describeError(DOWNLOAD_LOG_ERROR.SIGN_IN_REQUIRED).message;
 
 /**
  * Before any tender download: with the download log on (config.json "downloadLog") the user
  * must be signed in to the Recon Engine, whatever Save to says - the sign-in page asks, and
- * cancelling it stops the run (TenderError SIGN_IN_REQUIRED). A no-op with the log off.
+ * cancelling it stops the run (TenderError SIGN_IN_REQUIRED). When the Recon Engine cannot be
+ * reached the page also offers to download without it (the log never blocks a run); the run
+ * then goes ahead and its records are sent once the Recon Engine is back. A no-op with the log off.
  */
 export async function ensureDownloadSignIn() {
   if (!(await loadDownloadLogConfig())) return;
-  if (!(await confirmReconSignIn({ always: true }))) throw new TenderError('SIGN_IN_REQUIRED', SIGN_IN_REQUIRED_MSG);
+  if (!(await confirmReconSignIn({ always: true, allowOffline: true }))) throw new TenderError('SIGN_IN_REQUIRED', SIGN_IN_REQUIRED_MSG);
 }
 
 /**
@@ -51,7 +54,7 @@ const TITLE_MAX = 200;
 function localDay(iso) {
   const d = iso ? new Date(iso) : null;
   if (!d || Number.isNaN(d.getTime())) return '';
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return localIsoDate(d);
 }
 
 /** The panel's Save to choice; Local when it cannot be read. */
@@ -72,8 +75,9 @@ export async function savedDestination() {
  * Other kinds can hold several documents per tender (corrigenda, letters), so those add what
  * tells them apart: "29263265 - Extension - 1", "29263265 - NBSP - 1204920".
  * Only the fields the ECM has for the kind are sent (services/ecm-catalog.js): the tender
- * number, and the tender date (IREPS closing date) when the run knows it.
- *   action = the download action ({ id, meta: { title, docDate } }), ctx = run.ctx
+ * number, and the tender date (IREPS closing date) when the run knows it. An LOA also carries its
+ * LOA number and LOA date (loaFields below), as the client asked on 13 Nov 2026.
+ *   action = the download action ({ id, unit, meta: { title, docDate } }), ctx = run.ctx
  */
 export function ecmDocumentFor(category, action, ctx) {
   const kind = CATEGORY_ECM_KIND[category];
@@ -89,9 +93,25 @@ export function ecmDocumentFor(category, action, ctx) {
     CORRESPONDENCE: meta.title || id,
   }[category];
   const known = { tender_number: tenderNo, tender_date: ctx.closingDate || localDay(ctx.dueDate) };
+  if (category === 'LOA') Object.assign(known, loaFields(action.unit, tenderNo, id, meta.docDate));
   const fields = Object.fromEntries(ECM_KINDS[kind].fields.filter((key) => key in known).map((key) => [key, known[key]]));
   const title = [tenderNo, ECM_KINDS[kind].code, detail].filter(Boolean).join(' - ');
   return { kind, title: title.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX), fields };
+}
+
+/**
+ * An LOA's number and date, as IREPS prints them on the letter ("Letter No: DAHOD / 61265711C / 1503282
+ * Dated: 12/11/2026"): the department part of the list row's "Dept/Rly. Unit" ("DAHOD / WESTERN RLY"),
+ * the tender number and the letter id, and the row's Letter Date. Both or neither: a number DocLink
+ * cannot build (no unit, or one without " / ") sends no LOA date either, so the ECM never holds the
+ * number of one letter with the date of another (a grouped "<T> - LOA" document keeps its first values).
+ */
+export function loaFields(unit, tenderNo, letterId, letterDate) {
+  const text = String(unit || '').replace(/\s+/g, ' ').trim();
+  const cut = text.lastIndexOf(' / ');
+  const dept = cut > 0 ? text.slice(0, cut).trim() : '';
+  if (!dept || !tenderNo || !letterId || !letterDate) return {};
+  return { loi_number: `${dept} / ${tenderNo} / ${letterId}`, loi_date: letterDate };
 }
 
 /**

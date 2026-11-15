@@ -38,6 +38,7 @@ function detailHtml(d) {
 <a href="#" onclick="postRequest('/epsn/corres/vendor/vendorCorresSubmitReply.do?nitOid=${d.oid}&corresId=${l.corresId || '229609'}&letterId=${l.id}&bidId=1')"><img title="Submit Response" src="/s.gif"></a></td></tr>`;
   const none = '<tr height="25px"><td colspan="4" align="center"> No record found </td></tr>';
   let h = DETAIL_FIX.replace(/L1265428/g, d.tenderNo);
+  if (d.noPendingHeading) h = h.replace('Pending Replies', 'Replies'); // a changed page: its Pending Replies table is not recognised
   // the three result tables, in page order: Pending Replies, Lapsed, Previous Replies
   const parts = h.split(/<tr height="25px;?">[\s\S]*?<\/tr>/);
   assert.equal(parts.length, 4, 'fixture shape: pending row + 2 no-record rows');
@@ -349,6 +350,9 @@ test('Save to ECM / S3: every pending letter and attachment goes to the unit\'s 
       'L1265428 - CRP - 777/B - Attachment - Annexure 1.pdf', 'L1265428 - CRP - 777/B - Attachment - drawing.pdf', 'L1265428 - CRP - 777/B - Clarification / price',
     ]);
     assert.deepEqual(creates.map((p) => p['InvoiceCertificateSchema:tenderNumber']).sort(), ['19264728', '19264728', 'L1265428', 'L1265428', 'L1265428']);
+    // the tender date (13 Nov 2026 meeting): every details page here shows "Closing Date 09/10/2026 10:30" (the fixture
+    // of L1265428); the letters' own "Last date for submission of reply" (15/10/2026) is not the tender's date
+    assert.deepEqual([...new Set(creates.map((p) => p['InvoiceCertificateSchema:tenderDate']))], ['2026-10-09']);
     // nothing that went to the ECM is in Downloads (only the original page of the letter Chrome could not print)
     assert.deepEqual(saved.map((s) => s.filename.split('/').pop()), ['Correspondence_502_11-10-2026_Confirmation;.html']);
     const l3 = stored().letters.find((x) => x.letterId === '9003');
@@ -519,10 +523,85 @@ test('two tenders sharing a number get separate folders; a filename collision ac
   assert.ok(names.some((n) => /Pending\/SAME_1\//.test(n)) && names.some((n) => /Pending\/SAME_2\//.test(n)), names.join('\n'));
 });
 
+// =========================== review fixes: H4, H5, M21, L12 ===============================
+test('H5: the guard also refuses verbs that start the name or run together with it (submitbid, finalSubmission, withdrawalOfBid) and logout', async () => {
+  for (const p of ['/epsn/supply/bid/submitbid.do', '/epsn/supply/tds/finalSubmission.do', '/epsn/supply/tds/withdrawalOfBid.do', '/epsn/home/logout.do', '/epsn/corres/vendor/submitReplyLetter.do']) {
+    assert.throws(() => P.assertReadOnly(p), (e) => e.code === 'BLOCKED', p);
+    await assert.rejects(() => P.pcFetch('https://www.ireps.gov.in', p, { method: 'POST', form: { nitOid: '1' } }), (e) => e.code === 'BLOCKED', p);
+  }
+  P.assertReadOnly('/epsn/x/viewUploadedDoc.do'); P.assertReadOnly('/ireps/corr/Submission_List.pdf'); P.assertReadOnly(VIEW);
+  assert.equal(server.log.length, 0);
+});
+test('H4: a correspondence page without a "Correspondence - Pending" table DocLink can read is an error, never "No correspondence found"', async () => {
+  for (const listOverride of [LIST_FIX.replace('Correspondence - Pending', 'Correspondence - Lapsed'), LIST_FIX.replace(/>Tender No\.<\/th>/, '>Reference</th>')]) {
+    mk({ listOverride });
+    await assert.rejects(() => go(), (e) => e.code === 'PAGE' && /does not recognise/.test(e.message) && /Correspondence - Pending/.test(e.message));
+    assert.deepEqual(server.log.filter((l) => l.path.startsWith('/epsn/corres')).map((l) => l.path), [LIST], 'nothing guessed from it');
+  }
+  mk({ rows: [] });
+  assert.equal((await go()).empty, true, 'IREPS\'s own empty Pending table is still "No correspondence found"');
+});
+test('H4: a details page without a "Pending Replies" table fails that record (Retry failed retries it); an empty one is still "no pending letters"', async () => {
+  mk({
+    rows: [{ no: 'A', oid: '1' }, { no: 'B', oid: '2' }],
+    details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'x' }], noPendingHeading: true }, 2: { oid: '2', tenderNo: 'B', letters: [] } },
+    letters: { 7: letterPdf('a') },
+  });
+  const r = await go();
+  assert.deepEqual([r.summary.failed, r.summary.noPendingLetters, r.summary.lettersDownloaded], [1, 1, 0]);
+  const rec = stored().records.find((x) => x.nitOid === '1');
+  assert.equal(rec.status, 'FAILED');
+  assert.match(rec.error, /no "Pending Replies" table/);
+  assert.equal(server.log.filter((l) => l.path === VIEW).length, 0, 'nothing was guessed from the page');
+  server.s.details[1].noPendingHeading = false;
+  const again = await go({ mode: 'retry' });
+  assert.equal(again.summary.lettersDownloaded, 1, 'retried, and downloaded once IREPS shows the table');
+});
+test('M21: letters and records not seen in a run for 400 days are forgotten; at most 2,000 letters are kept', () => {
+  const now = Date.parse('2026-11-15T10:00:00Z');
+  const iso = (d) => new Date(now - d * 86400000).toISOString();
+  const state = { records: { a: { updatedAt: iso(10) }, b: { updatedAt: iso(500) } }, letters: {} };
+  for (let i = 0; i < 2500; i++) state.letters[`k${i}`] = { key: `k${i}`, seenAt: iso(i % 450) };
+  state.letters.legacy = { key: 'legacy', downloadedAt: '' }; // written before letters had seenAt
+  P.pruneCorrespondenceState(state, now);
+  assert.deepEqual(Object.keys(state.records), ['a']);
+  assert.equal(Object.keys(state.letters).length, P.STATE_LIMITS.maxLetters);
+  assert.ok(Object.values(state.letters).every((l) => Date.parse(l.seenAt) >= now - P.STATE_LIMITS.keepMs));
+  assert.ok(state.letters.legacy, 'a letter without seenAt is stamped and kept, not dropped');
+});
+test('L12: an attachment GET that cannot reach IREPS is tried again; the letter POST is not', async () => {
+  core.fetchSettings.netRetryMs = [5, 5];
+  mk({
+    rows: [{ no: 'A', oid: '1' }],
+    details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'net' }, { no: '2', id: '8', subject: 'post' }] } },
+    letters: { 7: () => ({ status: 200, bytes: enc('<html><body><iframe src="/ireps/corr/l7.pdf"></iframe><a href="/ireps/corr/att7.pdf">Annex</a></body></html>'), type: 'text/html', extra: {} }), 8: letterPdf('eight') },
+    attachments: { 'l7.pdf': letterPdf('l7'), 'att7.pdf': letterPdf('att7') },
+  });
+  const shim = globalThis.fetch;
+  const tries = {};
+  globalThis.fetch = (url, init = {}) => {
+    const key = `${new URL(String(url).replace('https://ext.invalid/', 'https://www.ireps.gov.in/')).pathname}${init.body ? `?${init.body}` : ''}`;
+    tries[key] = (tries[key] || 0) + 1;
+    if ((key === '/ireps/corr/att7.pdf' || /letterID=8/.test(key)) && tries[key] === 1) return Promise.reject(new TypeError('Failed to fetch'));
+    return shim(url, init);
+  };
+  try {
+    const r = await go();
+    assert.equal(tries['/ireps/corr/att7.pdf'], 2, 'the attachment GET was tried again');
+    assert.deepEqual([r.summary.lettersDownloaded, r.summary.attachmentsDownloaded, r.summary.failed], [1, 1, 1]);
+    assert.equal(Object.keys(tries).filter((k) => /letterID=8/.test(k)).map((k) => tries[k]).join(), '1', 'the letter POST was not repeated');
+    assert.match(stored().letters.find((l) => l.letterId === '8').error, /could not reach/);
+  } finally {
+    globalThis.fetch = shim;
+    core.fetchSettings.netRetryMs = [1000, 3000];
+  }
+});
+
 // =========================== UI (real popup.html in jsdom) ==============================
 test('UI: clicking "Download All Correspondence" fills the progress table and counts; empty state shown when nothing pending', async () => {
   const dom = new JSDOM(readFileSync(new URL('../../popup/popup.html', import.meta.url), 'utf8').replace(/<script[^>]*><\/script>/g, ''), { pretendToBeVisual: true });
-  Object.assign(globalThis, { document: dom.window.document, window: dom.window, MutationObserver: dom.window.MutationObserver });
+  // the panel's own events (Recon sign-in, download-again prompt) must be jsdom's, as in the real page
+  Object.assign(globalThis, { document: dom.window.document, window: dom.window, MutationObserver: dom.window.MutationObserver, Event: dom.window.Event, CustomEvent: dom.window.CustomEvent });
   Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
   const $ = (id) => document.getElementById(id);
   scenario();

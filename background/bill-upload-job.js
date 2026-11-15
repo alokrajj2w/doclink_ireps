@@ -22,15 +22,15 @@ import { MESSAGE_TYPES, SESSION_KEYS, describeError } from "../utils/messages.js
 import { IrepsError } from "../services/ireps-api.js";
 import { logger } from "../utils/logger.js";
 import { BILL_ERROR } from "../services/bill-upload/bill-upload-api.js";
-import { findBillableReceipts, prepareBill, reviewBill, forgetBill, createDraftBill, saveItem, collectBillDocuments, billDocumentTypes } from "../services/bill-upload/bill-upload-service.js";
-import { retrieveInvoice, manualInvoice } from "../services/bill-upload/ecm-invoice.js";
-import { invoiceFromFile, receiptInvoiceKey, MAX_INVOICE_FILE_RECORDS } from "../services/bill-upload/invoice-file.js";
+import { findBillableReceipts, invoiceForReceipt, prepareBill, reviewBill, forgetBill, createDraftBill, saveItem, collectBillDocuments, billDocumentTypes } from "../services/bill-upload/bill-upload-service.js";
+import { MAX_INVOICE_FILE_RECORDS } from "../services/bill-upload/invoice-file.js";
 import { createBillStore } from "../services/bill-upload/bill-upload-store.js";
 import { tabFetch, tabSignPdf, tabSaveFile, assertIrepsTab } from "../services/bill-upload/tab-transport.js";
 import { uploadBillDocument, MAX_SIGN_BYTES } from "../services/bill-upload/bill-document-upload.js";
 import { searchRnote } from "../services/rnote/rnote-service.js";
 import { searchCrn } from "../services/crn/crn-service.js";
 import { downloadBytes } from "../services/download-service.js";
+import { holdWorker } from "./keep-alive.js";
 
 const IDLE = Object.freeze({ step: "idle", busy: false, message: "", poNo: "", receipts: [], warnings: [], receiptKey: null, invoiceMode: "ecm", invoice: null, context: null, documents: null, docUpload: null, error: null });
 
@@ -48,8 +48,13 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
     try {
       const got = await chrome.storage.session.get(SESSION_KEYS.BILL_UPLOAD_STATE);
       const saved = got && got[SESSION_KEYS.BILL_UPLOAD_STATE];
-      // a worker that died mid-step is not busy any more
-      if (saved && state.step === "idle") state = { ...saved, busy: false };
+      // a worker that died mid-step is not busy any more; say which step was cut off (a draft bill may
+      // or may not exist in IREPS now, so the user checks there before doing it again)
+      if (saved && state.step === "idle") {
+        state = saved.busy
+          ? { ...saved, busy: false, message: "", error: describeError("BILL_INTERRUPTED", { detail: saved.message || "a bill step" }) }
+          : { ...saved, busy: false };
+      }
     } catch (error) {
       logger.debug("Could not restore the bill upload state", error);
     }
@@ -86,7 +91,8 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
             billRegNo: c.billRegNo || (c.existing && c.existing.billRegNo) || null,
             dispatchNo: c.dispatchNo || (c.existing && c.existing.dispatchNo) || null,
             existing: c.existing || null,
-            documentsOnBill: c.documentsOnBill || null
+            documentsOnBill: c.documentsOnBill || null,
+            forgottenBills: c.forgottenBills || []
           }
         : null,
       documents: state.documents,
@@ -107,7 +113,7 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
   function run(step, message, work) {
     if (state.busy) return { started: false, error: describeError(BILL_ERROR.BUSY) };
     const before = state.step;
-    (async () => {
+    holdWorker(async () => {
       await set({ busy: true, message, error: null });
       try {
         const patch = await work();
@@ -120,7 +126,7 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
         if (error && error.billRegNo && error.context) await set({ busy: false, message: "", step: "item-error", context: error.context, error: info });
         else await set({ busy: false, message: "", step: before, error: info });
       }
-    })();
+    });
     return { started: true };
   }
 
@@ -132,17 +138,6 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
     searchRnote: (options) => searchRnote(options, { parseHtml: (html, o) => parseSearchPo(html, { ...o, criteria: "RNOTE" }) }),
     searchCrn: (options) => searchCrn(options, { parseHtml: (html, o) => parseSearchPo(html, { ...o, criteria: "CRN" }) })
   };
-
-  function requireInvoiceFields(invoice, where = "") {
-    const missing = [];
-    if (!invoice.invoiceNumber) missing.push("invoice number");
-    if (!invoice.invoiceDate) missing.push("invoice date");
-    if (!invoice.amount) missing.push("invoice amount");
-    if (!invoice.hsn) missing.push("HSN code");
-    if (missing.length) {
-      throw new IrepsError(BILL_ERROR.INVOICE_INVALID, "invoice incomplete", { detail: where ? `Invoice ${invoice.invoiceNumber} ${where} has no ${missing.join(", ")}.` : `Enter the ${missing.join(", ")}.` });
-    }
-  }
 
   return {
     [MESSAGE_TYPES.BILL_UPLOAD_GET_STATE]: async () => {
@@ -178,17 +173,8 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
       }
       return run("prepare", invoiceMode === "ecm" ? "Finding the invoice in ECM and reading the bill page in IREPS..." : "Reading the bill page in IREPS...", async () => {
         await assertIrepsTab(msg.panelTabId);
-        let invoice;
-        if (invoiceMode === "manual") {
-          invoice = manualInvoice(msg.manualInvoice || {});
-          requireInvoiceFields(invoice);
-        } else if (invoiceMode === "file") {
-          invoice = invoiceFromFile({ name: file.name, records: file.records }, receiptInvoiceKey(receipt));
-          requireInvoiceFields(invoice, `in ${file.name}`);
-          logger.info("Bill upload: invoice from JSON file", { file: file.name, invoice: invoice.invoiceNumber, po: receipt.poNo, poSr: receipt.poSr });
-        } else {
-          invoice = await retrieveInvoice(receiptInvoiceKey(receipt));
-        }
+        const invoice = await invoiceForReceipt({ receipt, mode: invoiceMode, fields: msg.manualInvoice || {}, file: invoiceMode === "file" ? { name: file.name, records: file.records } : null });
+        if (invoiceMode === "file") logger.info("Bill upload: invoice from JSON file", { file: file.name, invoice: invoice.invoiceNumber, po: receipt.poNo, poSr: receipt.poSr });
         const context = await prepareBill({ receipt, invoice, overrides: msg.overrides || {} }, irepsDeps(msg.panelTabId));
         return { step: "review", receiptKey: receipt.key, invoiceMode, invoice, context, documents: null };
       });
@@ -204,7 +190,8 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
     },
 
     // "Start fresh": DocLink already created a bill for this receipt (an earlier try) and the
-    // user wants to create a new one. Only DocLink's record is dropped; IREPS is not touched.
+    // user wants to create a new one. Only DocLink's record is dropped; IREPS is not touched,
+    // so the old bill's number stays on screen (bill.forgottenBills) for the user to delete it there.
     [MESSAGE_TYPES.BILL_UPLOAD_FORGET]: async () => {
       await restore();
       if (state.busy) return { ok: false, error: describeError(BILL_ERROR.BUSY) };
