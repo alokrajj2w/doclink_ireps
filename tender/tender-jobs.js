@@ -4,33 +4,29 @@
 //   downloadNewNits()          once a day   - NIT documents announced in the inbox (covers Sundays/holidays)
 //   downloadTodaysCorrigenda() once a day   - corrigendum published today (only that document)
 //   downloadLettersByDate()    3-4x a day   - negotiation / counter offer / LOA letters published on a date
-//                                            (alias: checkNewLetters)
-//
-// Financial and Commercial Tabulation are not part of any job.
+//   downloadTabulationsByDate()                - Financial / Commercial Tabulation of tenders CLOSING on the dates
+//                                            (IREPS Closed Tenders); a tabulation shows up some days after closing
 
-import { TenderError, SESSION_MSG, log, norm, getBaseUrl } from './tender-core.js';
-import { assertSameAccount } from './tender-account.js';
-import { getActiveIrepsAccountContext, accountFolderLabel, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
-import { searchTender, fmtDate } from './tender-search.js';
+import { IREPS_DOWN_CODES, log, norm } from './tender-core.js';
+import { assertSameAccount, startTenderJob } from './tender-account.js';
+import { searchTender, fmtDate, railwayOf } from './tender-search.js';
 import { openLedger } from './tender-ledger.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
+  scanClosedTenders, downloadTabulation, TABULATIONS,
 } from './tender-workflows.js';
-import { tenderEcmSink } from './tender-ecm.js';
+import { tenderEcmSink, ECM_TAKES_TENDER_DATE } from './tender-ecm.js';
 
 const DAY = 86400000;
 const ddmmyyyy = (d) => fmtDate(d);
+/** Runs kept in a tender's download record (M21: the record must not grow without end). */
+const RUNS_KEPT = 10;
 
 export async function beginJob({ onProgress, onAccount }) {
-  const base = await getBaseUrl();
-  onProgress('Verifying IREPS account...');
-  const account = await getActiveIrepsAccountContext({ base });
-  onAccount(account);
-  if (!account.authenticated) throw new TenderError('SESSION_EXPIRED', SESSION_MSG);
-  if (!account.verified) throw new TenderError('ACCOUNT', ACCOUNT_UNVERIFIED_MSG);
-  const folderLabel = accountFolderLabel(account);
+  const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
   const ledger = await openLedger(account.irepsAccountId);
-  return { base, account, folderLabel, ledger };
+  // "same answer for the rest of this run" of the download-again prompt, shared by its tenders
+  return { base, account, folderLabel, ledger, redownloadMemo: {} };
 }
 
 /** dd/mm/yyyy strings from `from` to `to` inclusive. */
@@ -44,29 +40,37 @@ const parseDmy = (s) => { const [d, m, y] = s.split('/').map(Number); return new
 /**
  * The tender's closing date (IREPS "Due Date/Time"), searched once per job; '' when IREPS does not
  * find the tender. Only for ECM uploads (their tender date): the Post Tenders letter lists do not
- * show it, and a Local run never pays for this search.
+ * show it, and a Local run - or an ECM without a tenderDate property (ECM_TAKES_TENDER_DATE) -
+ * never pays for this search.
+ *   railway: the letter row's "Dept/Rly. Unit"; when two railways use the tender number, the search takes
+ *            that railway's tender (tender-search.js preferredRows)
  */
-export async function closingDateFor(job, tenderNo, onProgress = () => {}) {
+export async function closingDateFor(job, tenderNo, onProgress = () => {}, { railway = '' } = {}) {
   job.closingDates = job.closingDates || new Map();
-  if (!job.closingDates.has(tenderNo)) {
+  const key = `${tenderNo}|${railwayOf(railway)}`;
+  if (!job.closingDates.has(key)) {
     let date = '';
     try {
-      date = (await searchTender(job.base, tenderNo, { preferWindows: [[-90, 0], [0, 90]], onProgress })).closingDate || '';
+      date = (await searchTender(job.base, tenderNo, { preferWindows: [[-90, 0], [0, 90]], onProgress, prefer: { railway } })).closingDate || '';
     } catch (e) {
       if (e.code === 'SESSION_EXPIRED') throw e;
       log('Letters', `Closing date of ${tenderNo} not found (${e.message}); the ECM tender date is left blank`);
     }
-    job.closingDates.set(tenderNo, date);
+    job.closingDates.set(key, date);
   }
-  return job.closingDates.get(tenderNo);
+  return job.closingDates.get(key);
 }
 
-/** Search for the tender, preferring the date windows implied by its closing date. */
-export async function openTender(job, tenderNo, preferWindows, onProgress) {
-  const found = await searchTender(job.base, tenderNo, { preferWindows, onProgress });
+/**
+ * Search for the tender, preferring the date windows implied by its closing date.
+ *   prefer: { railway, dueDate } - what the caller knows of the tender, used only when two railways use its number
+ */
+export async function openTender(job, tenderNo, preferWindows, onProgress, prefer = {}) {
+  const found = await searchTender(job.base, tenderNo, { preferWindows, onProgress, prefer });
   const { run } = startTenderRun(job.base, job.account, found, job.folderLabel);
   run.ledger = job.ledger;
   run.ledgerMode = 'skip';
+  run.redownloadMemo = job.redownloadMemo;
   return run;
 }
 
@@ -74,7 +78,7 @@ export async function openTender(job, tenderNo, preferWindows, onProgress) {
 // ---------------------------------------------------------------- manifest
 
 /**
- * Create/update download_manifest.json for a tender: the verified account, the tender, the source
+ * Create/update the download record for a tender (kept in extension storage, never downloaded): the verified account, the tender, the source
  * messages, every document (category, title, source date, saved name, validation, timestamp, status/reason)
  * and every run with its date range. The merged record is kept in the ledger so each run adds to it.
  * Holds no cookies, tokens or credentials.
@@ -98,17 +102,12 @@ export async function recordManifest(job, run, categories, { range = null, sourc
     tender: { tenderNo: ctx.tenderNo, tenderTitle: ctx.tenderTitle || prev.tender?.tenderTitle || '', railwayUnit: ctx.railwayUnit || prev.tender?.railwayUnit || '', nitId: run.ids.nitId || prev.tender?.nitId || null, nitOid: run.ids.nitOid || prev.tender?.nitOid || null, dueDate: ctx.dueDate || prev.tender?.dueDate || '' },
     sources: [...new Map([...prev.sources, ...sources].map((s) => [s.oid, s])).values()],
     files,
-    runs: [...prev.runs.slice(-30), {
+    runs: [...prev.runs.slice(-(RUNS_KEPT - 1)), {
       at: new Date().toISOString(), range,
       categories: Object.fromEntries(Object.entries(categories).map(([k, c]) => [k, { status: c.status, discovered: c.discovered, downloaded: c.downloaded, failed: c.failed, note: c.note || '' }])),
     }],
   };
-  job.ledger.setManifest(ctx.tenderNo, manifest);
-  try {
-    await run.saver.saveJson('download_manifest.json', manifest);
-  } catch (e) {
-    log('Download', `manifest not saved: ${e.message}`);
-  }
+  job.ledger.setManifest(ctx.tenderNo, manifest); // kept in extension storage only; no download_manifest.json is saved
 }
 
 // ---------------------------------------------------------------- NIT documents (daily)
@@ -148,11 +147,12 @@ export async function downloadNewNits({ onProgress = () => {}, onAccount = () =>
       if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
       results.push({ tenderNo, error: e.message });
     }
+    await job.ledger.save(); // after every tender (M21)
   }
   if (!aborted) job.ledger.setMeta('lastNitDate', ddmmyyyy(today)); // today is re-read next time (more may arrive)
   job.ledger.setMeta('pendingNit', retry);
   await job.ledger.save();
-  return { account: publicAccount(job.account), dates, notices: notices.length, tenders: results, retryLater: retry, aborted };
+  return { account: publicAccount(job.account), dates, notices: notices.length, tenders: results, retryLater: retry, aborted, incomplete: notices.incomplete || '' };
 }
 
 // ---------------------------------------------------------------- Corrigenda (daily)
@@ -185,10 +185,11 @@ export async function downloadTodaysCorrigenda({ onProgress = () => {}, onAccoun
       if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
       results.push({ tenderNo, error: e.message });
     }
+    await job.ledger.save(); // after every tender (M21)
   }
   await job.ledger.save();
   const sum = (f) => results.reduce((n, r) => n + (r.corrigenda?.[f] || 0), 0);
-  return { account: publicAccount(job.account), date: dateStr, notices: notices.length, tenders: results, aborted, summary: { downloaded: sum('downloaded'), failed: sum('failed') } };
+  return { account: publicAccount(job.account), date: dateStr, notices: notices.length, tenders: results, aborted, incomplete: notices.incomplete || '', summary: { downloaded: sum('downloaded'), failed: sum('failed') } };
 }
 
 // ---------------------------------------------------------------- Letters (several times a day)
@@ -201,16 +202,39 @@ export async function downloadTodaysCorrigenda({ onProgress = () => {}, onAccoun
  * is only ever downloaded once - one published later in the day is simply picked up by the next run.
  * Pass `dateStr` (dd/mm/yyyy) to fetch one specific day.
  */
-export async function downloadLettersByDate({ onProgress = () => {}, onAccount = () => {}, today = new Date(), dateStr = '', dates: datesOverride = null, job: sharedJob = null } = {}) {
+export async function downloadLettersByDate({ onProgress = () => {}, onAccount = () => {}, today = new Date(), dateStr = '', dates: datesOverride = null, job: sharedJob = null, statuses: onlyStatuses = null, tenderNo: onlyTender = '' } = {}) {
   const job = sharedJob || (await beginJob({ onProgress, onAccount }));
   const last = job.ledger.meta('lastLetterDate');
   const dates = datesOverride || (dateStr ? [dateStr] : dayRange(last ? parseDmy(last) : today, today));
   const wanted = new Set(dates);
-  const probe = { base: job.base, ctx: { tenderNo: '' }, inboxCache: new Map() };
+  const probe = { base: job.base, ctx: { tenderNo: '' }, inboxCache: new Map(), onProgress };
 
-  onProgress(`Reading Negotiation, Counter Offer and LOA lists for ${dates[0]}${dates.length > 1 ? ` - ${dates[dates.length - 1]}` : ''}...`);
-  const statuses = Object.keys(LETTER_SPECS);
-  const scans = await Promise.all(statuses.map((st) => scanPostTenderList(probe, st))); // independent lists, read together
+  const statuses = onlyStatuses || Object.keys(LETTER_SPECS);
+  const wantTender = norm(onlyTender).toLowerCase(); // optional exact (normalized) Tender Number filter
+  onProgress(`Reading ${statuses.map((st) => LETTER_KINDS[st].page).join(', ')} list(s) for ${dates[0]}${dates.length > 1 ? ` - ${dates[dates.length - 1]}` : ''}...`);
+  // the lists are newest first: none is read past the earliest wanted Letter Date
+  const stopBefore = dates.length ? new Date(Math.min(...dates.map((d) => parseDmy(d).getTime()))) : null;
+  // independent lists, read together; one that IREPS fails to open is reported on its own and never blocks the others
+  const settled = await Promise.allSettled(statuses.map((st) => scanPostTenderList(probe, st, { stopBefore })));
+  const listErrors = {};
+  const listWarnings = {};
+  const scans = settled.map((s, i) => {
+    const page = LETTER_KINDS[statuses[i]].page;
+    if (s.status === 'fulfilled') {
+      // never silently "no letters" (H4): rows with a letter but no readable Letter Date / tender number, and a
+      // list not read to its end, are reported; the letters that were read are downloaded as before
+      const { unparsed, entries, incomplete } = s.value;
+      const problems = [incomplete, unparsed ? `${unparsed} row(s) with a letter have no Letter Date or tender number DocLink can read` : ''].filter(Boolean);
+      if (problems.length && !entries.length) listErrors[statuses[i]] = `Could not read the ${page} page: ${problems.join('; ')}`;
+      else if (problems.length) listWarnings[statuses[i]] = `The ${page} list was not read in full (${problems.join('; ')}); letters on the part not read were not downloaded.`;
+      return s.value;
+    }
+    const e = s.reason;
+    if (e.code === 'SESSION_EXPIRED') throw e;
+    listErrors[statuses[i]] = IREPS_DOWN_CODES.has(e.code) ? `IREPS failed to open the ${page} page - IREPS is not responding.` : `Could not read the ${page} page: ${e.message}`;
+    log('Letters', `${statuses[i]} list failed: ${e.message}`);
+    return { entries: [], scripts: '', unparsed: 0 };
+  });
 
   const byTender = new Map(); // tenderNo -> { categories, folder }
   // Save to: ECM / S3 (asked once, and only when there is a letter to save), or null
@@ -221,7 +245,7 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
   let listed = 0;
   for (const [i, status] of statuses.entries()) {
     const { entries, scripts } = scans[i];
-    const todays = entries.filter((e) => wanted.has(e.date));
+    const todays = entries.filter((e) => wanted.has(e.date) && (!wantTender || norm(e.tenderNo).toLowerCase() === wantTender)); // Letter Date only
     listed += todays.length;
     const tenders = [...new Set(todays.map((e) => e.tenderNo))];
     log('Letters', `${status}: ${todays.length} letter(s) dated ${[...wanted].join(', ')} for ${tenders.length} tender(s)`);
@@ -232,10 +256,12 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
       onProgress(`${LETTER_KINDS[status].tag} letters for ${tenderNo}...`);
       try {
         const run = startLetterRun(job, tenderNo);
+        run.onProgress = onProgress;
         await assertSameAccount(job.account, { base: job.base });
         run.ecm = await ecmSink();
-        if (run.ecm) run.ctx.closingDate = await closingDateFor(job, tenderNo, onProgress);
-        const items = todays.filter((e) => e.tenderNo === tenderNo).map(({ id, rq, url, date }) => ({ id, rq, url, date }));
+        const items = todays.filter((e) => e.tenderNo === tenderNo).map(({ id, rq, url, date, unit }) => ({ id, rq, url, date, unit }));
+        // the list row's railway picks this tender when another railway uses the same tender number
+        if (run.ecm && ECM_TAKES_TENDER_DATE) run.ctx.closingDate = await closingDateFor(job, tenderNo, onProgress, { railway: items.find((x) => x.unit)?.unit || '' });
         const r = await downloadLetterItems(run, status, items, scripts);
         rec.categories[LETTER_SPECS[status].key] = r;
         await recordManifest(job, run, { [LETTER_SPECS[status].key]: r }, { range: { from: dates[0], to: dates[dates.length - 1] } });
@@ -246,20 +272,75 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
         if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
         rec.error = e.message;
       }
+      await job.ledger.save(); // after every tender (M21): a run cut short keeps what it did
     }
   }
   if (!aborted && !dateStr && !datesOverride) job.ledger.setMeta('lastLetterDate', ddmmyyyy(today)); // today is re-read next time
   if (!sharedJob) await job.ledger.save();
-  return { account: publicAccount(job.account), dates, listed, tenders: [...byTender.values()], aborted, summary: { newLetters } };
+  return { account: publicAccount(job.account), dates, listed, tenders: [...byTender.values()], aborted, listErrors, listWarnings, summary: { newLetters } };
 }
 
-/** The 3-4x-a-day check: letters dated since the last run (normally just today). */
-export const checkNewLetters = downloadLettersByDate;
+
+/**
+ * Financial / Commercial Tabulations of the tenders that CLOSED between `from` and `to` (Dates, both included),
+ * optionally of one Tender Number. IREPS Closed Tenders is read once; each row that shows a wanted
+ * tabulation is downloaded straight from it, with the row's closing date as the ECM tender date. A row
+ * without the link is reported as "not available yet" (IREPS adds it once the bids are opened), and what
+ * was downloaded before is skipped (download log, or the ledger), so the same range can be re-run.
+ * @param pdfTypes  keys of TABULATIONS (default both)
+ */
+export async function downloadTabulationsByDate({ from, to, pdfTypes = Object.keys(TABULATIONS), tenderNo: onlyTender = '', onProgress = () => {}, onAccount = () => {}, job: sharedJob = null } = {}) {
+  const job = sharedJob || (await beginJob({ onProgress, onAccount }));
+  const range = { from: ddmmyyyy(from), to: ddmmyyyy(to) };
+  const probe = { base: job.base, ctx: { tenderNo: '' }, inboxCache: new Map(), onProgress };
+  const wantTender = norm(onlyTender);
+  onProgress(`Reading Closed Tenders (closing date ${range.from} - ${range.to})...`);
+  const { rows, pages, incomplete } = await scanClosedTenders(probe, { from, to, tenderNo: wantTender });
+  const listed = rows.filter((r) => !wantTender || norm(r.tenderNo).toLowerCase() === wantTender.toLowerCase());
+
+  let ecm;
+  const ecmSink = async () => (ecm === undefined ? (ecm = await tenderEcmSink(job.account)) : ecm);
+  const tenders = [];
+  let aborted = null;
+  let downloaded = 0;
+  for (const row of listed) {
+    const rec = { tenderNo: row.tenderNo, title: row.title, closingDate: row.closingDate, categories: {}, folder: '' };
+    tenders.push(rec);
+    const wanted = pdfTypes.filter((t) => row.links[t]);
+    if (!wanted.length) { rec.notAvailable = true; continue; }
+    if (aborted) { rec.error = `Skipped: ${aborted.message}`; continue; }
+    onProgress(`Tabulation for ${row.tenderNo}...`);
+    try {
+      const run = startLetterRun(job, row.tenderNo);
+      run.onProgress = onProgress;
+      Object.assign(run.ctx, { closingDate: row.closingDate, tenderTitle: row.title, railwayUnit: row.dept });
+      await assertSameAccount(job.account, { base: job.base });
+      run.ecm = await ecmSink();
+      for (const t of wanted) {
+        const r = await downloadTabulation(run, t, row.links[t], { relativeTo: row.pageUrl });
+        rec.categories[TABULATIONS[t].key] = r;
+        downloaded += r.downloaded;
+      }
+      await recordManifest(job, run, rec.categories, { range });
+      rec.folder = `Downloads/${run.saver.root}/`;
+    } catch (e) {
+      if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
+      rec.error = e.message;
+    }
+    await job.ledger.save(); // after every tender (M21): a run cut short keeps what it did
+  }
+  if (!sharedJob) await job.ledger.save();
+  return {
+    account: publicAccount(job.account), range, pages, listed: listed.length, tenders, aborted, incomplete: incomplete || '',
+    summary: { downloaded, withTabulation: tenders.filter((t) => !t.notAvailable).length, notAvailable: tenders.filter((t) => t.notAvailable).length },
+  };
+}
 
 export function startLetterRun(job, tenderNo) {
   const found = { tenderNo, tenderTitle: '', railwayUnit: '', department: '', tenderStatus: '', searchUrl: '', row: { actions: [] } };
   const { run } = startTenderRun(job.base, job.account, found, job.folderLabel);
   run.ledger = job.ledger;
   run.ledgerMode = 'skip';
+  run.redownloadMemo = job.redownloadMemo;
   return run;
 }

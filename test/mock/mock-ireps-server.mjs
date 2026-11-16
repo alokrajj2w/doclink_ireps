@@ -53,8 +53,8 @@
  *                                   recordsPerPage, submit and the trailing empty
  *                                   searchCriteria; returns the CRN or R-NOTE
  *                                   results table (table#table_id > table#dTbl) in
- *                                   ONE response like the real portal (the R-NOTE
- *                                   layout is an assumption - no capture yet)
+ *                                   ONE response like the real portal (R-NOTE in
+ *                                   the captured layout, rnote-results-real.html)
  *   POST /epsn/searchPO.do          page-link body (rly, dateFrom, dateTo, pageNo,
  *                                   searchRange, poNo, count, recordsPerPage - no
  *                                   token) -> one result page (scenario crn-paged)
@@ -93,6 +93,11 @@
  *   GET /mock/scenario/ma-pdf-404     every MA/PO PDF URL answers HTTP 404
  *   GET /mock/status                  current scenario + live session count (JSON)
  *
+ * Bill upload ("Upload Bill to IREPS"): the supplier bill endpoints (/epsn/ct/*) and the
+ * ECM calls the bill upload makes (/nuxeo/...) are mocked in mock-bill-upload.mjs; the
+ * R-NOTE results use the captured layout (test/fixtures/rnote-results-real.html) with two
+ * billable receipts.
+ *
  * No real session cookie, token or business data is used anywhere here: the
  * JSESSIONID values are random and only mimic the real cookie's shape.
  */
@@ -102,6 +107,7 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { handleBillUpload, markDraftBills, extraRnoteRowsHtml, extraCrnRowsHtml, EXTRA_RNOTE_DATA, EXTRA_CRN_DATA, BILL_POS, BILL_HUB_LINK } from "./mock-bill-upload.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = join(here, "..", "fixtures");
@@ -117,7 +123,8 @@ const pages = {
   expired: readFileSync(join(fixtures, "session-expired.html"), "utf8"),
   crnSearch: readFileSync(join(fixtures, "crn-search-page.html"), "utf8"),
   crnResults: readFileSync(join(fixtures, "crn-results-page.html"), "utf8"),
-  rnoteResults: readFileSync(join(fixtures, "rnote-results-page.html"), "utf8"),
+  // the captured R-NOTE layout (Bill Claim links, RO / DRR, payment columns)
+  rnoteResults: readFileSync(join(fixtures, "rnote-results-real.html"), "utf8"),
   maResults: readFileSync(join(fixtures, "ma-results-page.html"), "utf8"),
   poResults: readFileSync(join(fixtures, "po-results-page.html"), "utf8"),
   icListPage: readFileSync(join(fixtures, "ic-list-page.html"), "utf8"),
@@ -420,7 +427,8 @@ const CRN_FIXTURE_DATA = [
   { poNo: "04220028100005", poDate: "22/08/2025", rly: "04", crnNo: "013805-26-20005", crnDate: "17/09/2026" },
   { poNo: "06220028100006", poDate: "02/11/2025", rly: "06", crnNo: "013806-26-20006", crnDate: "17/09/2026" },
   { poNo: "RR-PR-WC-1007-25-26-07", poDate: "14/02/2026", rly: "01", crnNo: "013807-26-20007", crnDate: "01/09/2026" },
-  { poNo: "09220028100008", poDate: "05/03/2026", rly: "09", crnNo: "013808-26-20008", crnDate: "15/09/2026" }
+  { poNo: "09220028100008", poDate: "05/03/2026", rly: "09", crnNo: "013808-26-20008", crnDate: "15/09/2026" },
+  ...EXTRA_CRN_DATA
 ];
 
 function generatedCrns(count) {
@@ -518,7 +526,7 @@ function filterCrns(list, form) {
 /** Fixture rows are static HTML; select them by the same rules using CRN_FIXTURE_DATA. */
 function fixtureRowsFor(form) {
   const keep = new Set(filterCrns(CRN_FIXTURE_DATA, form).map((r) => r.crnNo));
-  const rows = crnFixtureRows.split(/(?=\n\s*<tr>)/).filter((chunk) => /<tr>/.test(chunk));
+  const rows = (crnFixtureRows + extraCrnRowsHtml()).split(/(?=\n\s*<tr>)/).filter((chunk) => /<tr>/.test(chunk));
   return rows.filter((chunk) => Array.from(keep).some((no) => chunk.includes(no))).join("");
 }
 
@@ -574,9 +582,11 @@ const rnoteResultsTail = pages.rnoteResults.slice(pages.rnoteResults.indexOf(RNO
 const rnoteFixtureRows = pages.rnoteResults.slice(rnoteResultsHead.length, pages.rnoteResults.indexOf(RNOTE_ROWS_END));
 
 const RNOTE_FIXTURE_DATA = [
-  { poNo: "RR-PR-WC-1001-25-26-01", rly: "01", rnoteNo: "RN-013801-26-40001", crnDate: "10/09/2026" },
-  { poNo: "70220028100002", rly: "13", rnoteNo: "RN-013802-26-40002", crnDate: "11/09/2026" },
-  { poNo: "LR-SCR-2026-0003", rly: "07", rnoteNo: "RN-013803-26-40003", crnDate: "12/09/2026" }
+  { poNo: "11260000100001", rly: "11", rnoteNo: "4800000001", crnDate: "14/10/2026" },
+  { poNo: "22260000100002", rly: "09", rnoteNo: "0600000002", crnDate: "14/10/2026" },
+  { poNo: "21260000100003", rly: "06", rnoteNo: "1000000003", crnDate: "06/10/2026" },
+  { poNo: "05260000100004", rly: "05", rnoteNo: "4400000004", crnDate: "04/09/2026" },
+  ...EXTRA_RNOTE_DATA
 ];
 const RNOTE_STATUSES = ["Accepted", "Accepted", "Partially Accepted", "Rejected"];
 
@@ -606,35 +616,38 @@ function generatedRnotes(count) {
   return out;
 }
 
+/** A generated R-NOTE row in the captured layout; generated receipts are never billable (status text in Bill Claim). */
 function renderRnoteRow(r) {
+  const pay = Array.from({ length: 11 }, () => '<td class="payDtlCls"></td>').join("");
   return `
-									<tr>
-										<td>${r.serial}</td>
-										<td>${r.poNo}</td>
-										<td>${r.poDate}</td>
-										<td>${r.rlyShort}</td>
-										<td>${r.poSerial}</td>
-										<td><a href='/ireps/etender/ct/MOCK/RNOTE/2026/${r.rly}/${40000 + r.serial}/${r.rnoteNo}.pdf' target="_blank">${r.rnoteNo}</a></td>
-										<td>${r.crnDate}</td>
-										<td>${r.challanNo}</td>
-										<td>${r.challanDate}</td>
-										<td>${r.invoiceNo}</td>
-										<td>${r.invoiceDate}</td>
-										<td>${r.qty}</td>
-										<td>${r.status}</td>
-										<td>
-											<a title="Manage Your Purchase Order" class="linkStyle" href="#" onclick="postRequest('/epsn/dispatchParticulars/showDispatchParticular.do?rly=${r.rly}&poKey=${10000 + r.serial}&poNo=${r.poNo}')" >
-												<img src="/ireps/images/common/icon_view.gif" alt="Manage Your Purchase Order" height="15" width="15" border="0" class="linkStyle" />
-											</a>
-										</td>
-									</tr>
+								<tr style="line-height: 26px;" class="trPoRow">
+									<td class="searchDtlCls">${r.serial}</td>
+									<td class="searchDtlCls">${r.rlyShort}</td>
+									<td class="searchDtlCls"><a href="/ireps/etender/pdfdocs/MMIS/PO/2026/${r.rly}/${r.poNo}.pdf" title="Click to View/Download PO" target="_blank">${r.poNo}</a></td>
+									<td> ${r.poDate}</td>
+									<td class="searchDtlCls">${r.poSerial}</td>
+									<td class="searchDtlCls">${r.rnoteNo}</td>
+									<td class="searchDtlCls"> ${r.crnDate} </td>
+									<td class="searchDtlCls">${r.qty} Nos.</td>
+									<td class="searchDtlCls">${r.challanNo}</td>
+									<td class="searchDtlCls">${r.challanDate}</td>
+									<td class="searchDtlCls">R${String(r.serial).padStart(7, "0")}</td>
+									<td class="searchDtlCls">${r.status === "Rejected" ? "Rnote Not Published" : "Paid"}</td>
+									<td class="payDtlCls"><a href="#" onclick="postRequestNewWindow('/epsn/ct/generateBillPreview.do?billRegNo=')" title="Click Here to View / Sign & Submit Draft Supplier Bill" > </a></td>
+									${pay}
+									<td class="dataText">
+										<a title="View/Download RNOTE" class="linkStyle" href="/ireps/etender/pdfdocs/MMIS/RN/2026/${r.rly}/${r.rnoteNo}.pdf" target="_blank"><img src="/ireps/images/common/View Negotiattion Details.png" alt="View/Download" height="15" width="15" border="0" class="linkStyle" /></a>
+										<a title="Manage Your Purchase Order" class="linkStyle" href="#" onclick="postRequest('/epsn/dispatchParticulars/showDispatchParticular.do?rly=${r.rly}&poKey=${10000 + r.serial}&poNo=${r.poNo}')" ><img src="/ireps/images/common/icon_view.gif" alt="Manage Your Purchase Order" height="15" width="15" border="0" class="linkStyle" /></a>
+									</td>
+								</tr>
 `;
 }
 
 function rnoteFixtureRowsFor(form) {
   const keep = new Set(filterCrns(RNOTE_FIXTURE_DATA, form).map((r) => r.rnoteNo));
-  const rows = rnoteFixtureRows.split(/(?=\n\s*<tr>)/).filter((chunk) => /<tr>/.test(chunk));
-  return rows.filter((chunk) => Array.from(keep).some((no) => chunk.includes(no))).join("");
+  const rows = (rnoteFixtureRows + extraRnoteRowsHtml()).split(/(?=<tr\b)/).filter((chunk) => /class="trPoRow"/.test(chunk));
+  // a receipt with a mock draft bill (mock-bill-upload.mjs) shows it, like the portal
+  return markDraftBills(rows.filter((chunk) => Array.from(keep).some((no) => chunk.includes(no))).join(""));
 }
 
 /** R-NOTE results page (assumed layout); same scenarios as CRN. */
@@ -756,7 +769,8 @@ const poResultsTail = pages.poResults.slice(pages.poResults.indexOf(PO_ROWS_END)
 /** Known Purchase Orders (fictitious except the PO number, an example already used throughout this feature's design). */
 const MOCK_PO_DB = [
   { poNo: "27253922100240", rly: "01", unit: "HQ/CR", poDate: "16/01/2026", stockType: "S", poValue: "830705.84", folder: "2026/01" },
-  { poNo: "05220028100004", rly: "05", unit: "HQ/NR", poDate: "20/05/2026", stockType: "N", poValue: "412300.00", folder: "2026/05" }
+  { poNo: "05220028100004", rly: "05", unit: "HQ/NR", poDate: "20/05/2026", stockType: "N", poValue: "412300.00", folder: "2026/05" },
+  ...BILL_POS
 ];
 
 function renderPoRow(po) {
@@ -775,7 +789,7 @@ function renderPoRow(po) {
 											<a title="View/Download PO" class="linkStyle" href="${href}" target="_blank" >
 												<img src="/ireps/images/common/View Negotiattion Details.png" alt="View/Download" height="15" width="15" border="0" class="linkStyle" />
 											</a>
-											<a title="Manage Your Purchase Order" class="linkStyle" href="#" onclick="postRequest('/epsn/dispatchParticulars/showDispatchParticular.do?rly=${po.rly}&poKey=1000&poNo=${po.poNo}')" >
+											<a title="Manage Your Purchase Order" class="linkStyle" href="#" onclick="postRequest('/epsn/dispatchParticulars/showDispatchParticular.do?rly=${po.rly}&poKey=${po.poKey || 1000}&poNo=${po.poNo}')" >
 												<img src="/ireps/images/common/icon_view.gif" alt="Manage Your Purchase Order" height="15" width="15" border="0" class="linkStyle" />
 											</a>
 											<a onclick="viewDocAckDetails('1000');" href="javascript:void(0);">
@@ -812,13 +826,19 @@ function renderPoResults(form, { token = issueToken(), message = "" } = {}) {
  * the folder/call-id shapes, modelled on the captured real response: the PO
  * used throughout this feature's design has 4 issued ICs; any other PO has
  * none, so "Download Inspection Certificate" can be tested both ways).
+ * 05220028100004 has two recent ICs on different days, for "Download ICs by
+ * IC Date" (a search with PO No. empty lists every PO's ICs in the IC Date range).
  */
 const MOCK_IC_DB = {
   "27253922100240": [
-    { callId: "6038184070", poSr: "001", pdf: "3480517" },
-    { callId: "3778184071", poSr: "002", pdf: "2975517" },
-    { callId: "9012184072", poSr: "003", pdf: "6691517" },
-    { callId: "4523184073", poSr: "004", pdf: "8794517" }
+    { callId: "6038184070", poSr: "001", pdf: "3480517", icDate: "08/05/2026" },
+    { callId: "3778184071", poSr: "002", pdf: "2975517", icDate: "08/05/2026" },
+    { callId: "9012184072", poSr: "003", pdf: "6691517", icDate: "08/05/2026" },
+    { callId: "4523184073", poSr: "004", pdf: "8794517", icDate: "08/05/2026" }
+  ],
+  "05220028100004": [
+    { callId: "7110184075", poSr: "001", pdf: "4410603", icDate: "27/10/2026" },
+    { callId: "7110184076", poSr: "002", pdf: "4411603", icDate: "28/10/2026" }
   ]
 };
 
@@ -841,10 +861,11 @@ function renderIcRow(ic, po, index, total) {
   <td class="dataText"><a href="#" onclick="viewPastCallpoSr('${ic.poSr}','01','6581067');">${ic.poSr}</a></td>
   <td class="dataText">29160030: KIT FOR UNLOADER EXHAUST VALVE Part no 790002165.</td>
   <td class="dataText">Product - Final Product Inspection</td>
-  <td class="dataText">106</td>
-  <td class="dataText">08/05/2026</td>
-  <td class="dataText">07/05/2026</td>
-  <td class="dataText">08/05/2026</td>
+  <td class="dataText" style="padding: 5px; text-align: right;">106</td>
+  <td class="dataText" style="padding: 5px; display: none;" > ${ic.icDate} </td>
+  <td class="dataText" style="padding: 5px;"> 07/05/2026 </td>
+  <td class="dataText" style="padding: 5px;"> 07/05/2026 </td>
+  <td class="dataText" style="padding: 5px;">${ic.icDate}</td>
   <td class="dataText">106</td>
   <td class="dataText">Completed (IC Issued)</td>
   <td class="dataText">
@@ -861,14 +882,28 @@ function renderIcListPage({ token = issueToken() } = {}) {
   return pages.icListPage.replace(FIXTURE_TOKEN_RE, `$1${token}$2`);
 }
 
-/** Inspection Call List search result for one PO (POST with token, activity=searchResult). */
-function renderIcResults(poNo, { token = issueToken() } = {}) {
-  const ics = scenario === "no-records" ? [] : MOCK_IC_DB[poNo] || [];
+/**
+ * Inspection Call List search result (POST with token, activity=searchResult): one PO's
+ * ICs, or with PO No. empty every PO's ICs whose IC Date is within IC Date From / To.
+ */
+function renderIcResults(form, { token = issueToken() } = {}) {
+  const poNo = form.get("poNo") || "";
+  const dmy = (t) => { const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(t || ""); return m ? Date.UTC(+m[3], +m[2] - 1, +m[1]) : NaN; };
+  const from = dmy(form.get("dateFromIC"));
+  const to = dmy(form.get("dateToIC"));
+  const groups = scenario === "no-records" ? [] : poNo
+    ? [[poNo, MOCK_IC_DB[poNo] || []]]
+    : Object.entries(MOCK_IC_DB).map(([no, ics]) => [no, ics.filter((ic) => !(dmy(ic.icDate) < from) && !(dmy(ic.icDate) > to))]).filter(([, ics]) => ics.length);
+  const total = groups.reduce((n, [, ics]) => n + ics.length, 0);
   let head = icResultsHead.replace(FIXTURE_TOKEN_RE, `$1${token}$2`);
-  head = head.replace('value="27253922100240"', `value="${poNo}"`).replace('value="4" id="totalRecords"', `value="${ics.length}" id="totalRecords"`);
-  head = head.replace(/Total Records: \d+/, `Total Records: ${ics.length}`);
-  const po = MOCK_PO_DB.find((p) => p.poNo === poNo) || { poNo, poDate: "01/01/2026" };
-  const rowsHtml = ics.map((ic, i) => renderIcRow(ic, po, i, ics.length)).join("");
+  head = head.replace('value="27253922100240"', `value="${poNo}"`).replace('value="4" id="totalRecords"', `value="${total}" id="totalRecords"`);
+  head = head.replace(/Total Records: \d+/, `Total Records: ${total}`);
+  const rowsHtml = groups
+    .map(([no, ics]) => {
+      const po = MOCK_PO_DB.find((p) => p.poNo === no) || { poNo: no, poDate: "01/01/2026" };
+      return ics.map((ic, i) => renderIcRow(ic, po, i, ics.length)).join("");
+    })
+    .join("");
   return head + rowsHtml + icResultsTail;
 }
 
@@ -1014,6 +1049,7 @@ function homePage(loggedIn) {
       <table cellpadding="4">
         <tr><td class="formLabel">Bill Status</td><td><a class="linkStyle" href="/epsn/admin/viewBills.do">View Bills Status</a> &rarr; <code>POST /epsn/admin/viewBills.do</code></td></tr>
         <tr><td class="formLabel">CRN / R-NOTE / MA</td><td><a class="linkStyle" href="/epsn/searchPO.do?searchParam=showPage">View &amp; Manage Contracts (PO Search)</a> &rarr; <code>POST /epsn/searchPO.do</code></td></tr>
+        <tr><td class="formLabel">Upload Bill to IREPS</td><td>${BILL_HUB_LINK}: test receipts, field check, reset</td></tr>
       </table>
     </fieldset>
   </td>
@@ -1035,6 +1071,7 @@ function controlPanel(loggedIn) {
   <p><a href="/epsn/home/showHome.do">&larr; Back to the mock portal</a></p>
   <p>Session: <strong>${loggedIn ? "logged in" : "logged out"}</strong> &middot; live sessions: ${liveSessions.size} &middot; scenario: <code>${scenario}</code></p>
   ${scenario === "auto" ? "" : '<p class="warn">A test scenario is active: portal pages answer abnormally on purpose. <a href="/mock/scenario/auto">back to auto</a></p>'}
+  <p><strong>${BILL_HUB_LINK}</strong>: the screens and test receipts for Upload Bill to IREPS.</p>
   <h3>Session tools</h3>
   <p>${loggedIn ? '<a href="/epsn/home/logout.do">Logout</a> &middot; <a href="/mock/session/expire">Expire session server-side (browser keeps the cookie)</a>' : '<form method="post" action="/login" style="display:inline"><button type="submit">Login with security key (simulated)</button></form>'}</p>
   <h3>Bill Status scenarios (for DocLink error testing)</h3>
@@ -1066,6 +1103,8 @@ const server = createServer(async (req, res) => {
   if (path === "/" || path === "/epsn/home/showHome.do") return html(res, 200, homePage(hasSession(req)));
   if (path === "/mock" || path === "/mock/") return html(res, 200, controlPanel(hasSession(req)));
   if (serveStatic(path, res)) return;
+  // supplier bill endpoints + the ECM calls of the bill upload (mock-bill-upload.mjs)
+  if (await handleBillUpload({ req, res, path, url, html, readBody, hasSession, pages, fixtures, tinyPdf, scenario: () => scenario })) return;
 
   if (path === "/login" && req.method === "POST") {
     const id = issueSession();
@@ -1236,7 +1275,7 @@ const server = createServer(async (req, res) => {
     const kind = form.has("org.apache.struts.taglib.html.TOKEN") ? "search" : "page";
     console.log(
       `[mock-ireps] ${req.method} vendorInspectionCallList.do ${kind}  scenario=${scenario} cookie=${hasSession(req) ? "yes" : "no"}` +
-        (kind === "search" ? `  poNo=${form.get("poNo")} activity=${form.get("activity")}` : "")
+        (kind === "search" ? `  poNo=${form.get("poNo")} icDates=${form.get("dateFromIC")}-${form.get("dateToIC")} activity=${form.get("activity")}` : "")
     );
 
     switch (scenario) {
@@ -1271,7 +1310,7 @@ const server = createServer(async (req, res) => {
         "<html><head><title>Error</title></head><body><h2>Invalid Token</h2><p>The form was already submitted or the page was reloaded. Please try again.</p></body></html>"
       );
     }
-    const page = renderIcResults(form.get("poNo") || "");
+    const page = renderIcResults(form);
     if (scenario === "slow") return setTimeout(() => html(res, 200, page), 6000);
     return html(res, 200, page);
   }
@@ -1288,7 +1327,7 @@ const server = createServer(async (req, res) => {
     return res.end(pdf);
   }
 
-  if (/^\/(ireps\/etender\/ct\/(MMIS\/CONS|MMIS\/CRC\/WAR|MOCK\/RNOTE|sbill)|ireps\/etender\/pdfdocs\/MMIS\/PO|mock\/ma|mock\/po)\/.+\.pdf$/.test(path)) {
+  if (/^\/(ireps\/etender\/ct\/(MMIS\/CONS|MMIS\/CRC\/WAR|MOCK\/RNOTE|sbill)|ireps\/etender\/pdfdocs\/MMIS\/(PO|RN)|mock\/ma|mock\/po)\/.+\.pdf$/.test(path)) {
     const file = decodeURIComponent(path.split("/").pop());
     const flavour = path.includes("/MMIS/CONS/") ? "CRN" : path.includes("/MMIS/CRC/") ? "WARRANTY CLAIM" : path.includes("/MOCK/RNOTE/") ? "RECEIPT NOTE (MOCK)" : path.includes("/mock/ma/") || /_\d+\.pdf$/.test(path) && path.includes("/pdfdocs/") ? "MODIFICATION ADVICE" : path.includes("/mock/po/") || path.includes("/pdfdocs/") ? "PURCHASE ORDER" : "SUPPLIER BILL";
     if (scenario === "ma-pdf-login") return html(res, 200, pages.login);
@@ -1301,8 +1340,145 @@ const server = createServer(async (req, res) => {
     return res.end(pdf);
   }
 
+  /* ---------------------------------------------------- Tender: Closed Tenders tabulations, LOA letters */
+
+  if (path === "/epsn/vendorInboxLink.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const form = new URLSearchParams(req.method === "POST" ? await readBody(req) : url.search);
+    const status = form.get("status") || form.get("listType");
+    console.log(`[mock-ireps] ${req.method} vendorInboxLink.do status=${status} dates=${form.get("startDate") || "-"}..${form.get("endDate") || "-"} page=${form.get("pageNo") || "-"}`);
+    if (status === "MyBidsClosed") return html(res, 200, renderClosedTenders(form));
+    if (status === "MyAdvanceAcceptanceLetter") return html(res, 200, renderLoaList());
+    return html(res, 200, renderClosedTenders(new URLSearchParams()).replace(/<tr class="mock-row">[\s\S]*<\/table>/, "</table>"));
+  }
+
+  if (path === "/epsn/tbo/commTboPdfAction.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const form = new URLSearchParams(req.method === "POST" ? await readBody(req) : url.search);
+    const type = form.get("pdfType");
+    const oid = form.get("tenderOID");
+    console.log(`[mock-ireps] ${req.method} commTboPdfAction.do pdfType=${type} tenderOID=${oid}`);
+    if (!["offer", "financialTabulation", "commercialTabulation"].includes(type)) return html(res, 403, "<html><body><h1>Not allowed in the mock</h1></body></html>");
+    const t = MOCK_CLOSED.find((x) => x.oid === oid);
+    if (t?.viewer && type !== "offer") {
+      // a viewer page around the file, whose name does not say Financial / Commercial
+      return html(res, 200, `<html><head><title>Tabulation</title></head><body><iframe src="/mock/tbo/Tabulation_${oid}_${type === "financialTabulation" ? "F" : "C"}.pdf" width="100%" height="600"></iframe></body></html>`);
+    }
+    if (t && type !== "offer") {
+      // as real IREPS answers (03 Nov 2026): a page that opens the PDF from <body onload>, FIN-TAB / TECH-TAB (Commercial)
+      const file = `http://${req.headers.host}/ireps/supply/pdfdocs//112026/${oid}/${type === "financialTabulation" ? "FIN" : "TECH"}-TAB-${t.no}-${oid}.pdf`;
+      return html(res, 200, `<html>\n<head>\n<script language="javascript">\nfunction openwindow(pdfName)\n{\n   day = new Date();\n   id = day.getTime();\n   var URL=pdfName;\n   eval("page" + id + " = window.open(URL, '" + id + "', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=1024,height=768');");\n   window.close();\n}\n</script>\n</head>\n\n<body onload="openwindow('${file}');">\n<bean:message key = "bid.label.load"/><br>\n<img src="/ireps/images/common/loderBar.gif">\n\n</body>\n</html>`);
+    }
+    return sendTinyPdf(res, `${type}_${oid}.pdf`, [`INDIAN RAILWAYS E-PROCUREMENT SYSTEM (MOCK)`, type === "offer" ? "MY OFFER" : type === "financialTabulation" ? "FINANCIAL TABULATION" : "COMMERCIAL TABULATION", `Tender OID: ${oid}`, `Tender No: ${t?.no || "-"}`]);
+  }
+
+  if (/^\/ireps\/supply\/pdfdocs\/+\d+\/\d+\/(FIN|TECH)-TAB-[^/]+\.pdf$/.test(path)) {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const file = path.split("/").pop();
+    return sendTinyPdf(res, file, [`INDIAN RAILWAYS E-PROCUREMENT SYSTEM (MOCK)`, file.startsWith("FIN-") ? "FINANCIAL TABULATION" : "COMMERCIAL TABULATION", `File: ${file}`]);
+  }
+
+  if (/^\/mock\/tbo\/Tabulation_\d+_[FC]\.pdf$/.test(path)) {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const file = path.split("/").pop();
+    return sendTinyPdf(res, file, [`INDIAN RAILWAYS E-PROCUREMENT SYSTEM (MOCK)`, file.endsWith("_F.pdf") ? "FINANCIAL TABULATION (via viewer)" : "COMMERCIAL TABULATION (via viewer)", `File: ${file}`]);
+  }
+
+  if (path === "/epsn/supply/tds/ajxdata.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    res.writeHead(200, { "Content-Type": "text/html;charset=ISO-8859-1" });
+    return res.end("OK");
+  }
+
+  if (path === "/epsn/supply/tds/publishLOALetter.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const form = new URLSearchParams(req.method === "POST" ? await readBody(req) : url.search);
+    const t = MOCK_LOA.find((x) => x.letter === form.get("letterId"));
+    console.log(`[mock-ireps] ${req.method} publishLOALetter.do letterId=${form.get("letterId")}`);
+    if (!t) return html(res, 200, "<html><head><title>Error</title></head><body><h1>Error</h1> letter not found</body></html>");
+    // the letter page links and embeds other files: DocLink must save only the letter itself
+    return html(res, 200, `<html><head><title>Advance Acceptance Letter</title></head><body>
+<h2>ADVANCE ACCEPTANCE OF TENDER (MOCK)</h2>
+<table border="1"><tr><td>Letter No</td><td>${t.letter}</td></tr><tr><td>Tender No</td><td>${t.no}</td></tr><tr><td>Firm</td><td>SAMPLE RAIL COMPONENTS PRIVATE LIMITED-UNIT 1</td></tr></table>
+<p>Your offer against the above tender has been accepted. A formal contract will follow.</p>
+<p>Annexure: <a href="/mock/loa/Annexure_${t.letter}.pdf" target="_blank">Annexure_${t.letter}.pdf</a></p>
+<iframe src="/mock/loa/Terms_${t.letter}.pdf" width="100%" height="200"></iframe>
+</body></html>`);
+  }
+
+  if (/^\/mock\/loa\/.+\.pdf$/.test(path)) {
+    console.log(`[mock-ireps] GET ${path} (a file inside the LOA letter: DocLink should NOT request this)`);
+    return sendTinyPdf(res, path.split("/").pop(), ["ATTACHMENT INSIDE THE LOA LETTER", "DocLink should not download this file."]);
+  }
+
   html(res, 404, "<html><body>Not found</body></html>");
 });
+
+/* ---------------------------------------------------- tender data (relative to today, so "by date" runs find it) */
+
+const dmy = (d) => `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
+const daysAgo = (n) => new Date(Date.now() - n * 86400000);
+
+/** Closed Tenders rows: a direct PDF, a PDF behind a viewer page, and a tender whose bids are not opened yet. */
+const MOCK_CLOSED = [
+  { no: "24260725", oid: "107120554", nitId: "5470263", bidId: "20913662", title: "Strainer Wire for A9/SA9 Valve", closing: daysAgo(0), tab: true },
+  { no: "61266411", oid: "107218819", nitId: "5590682", bidId: "20911547", title: "Brake Cylinder Gasket", closing: daysAgo(1), tab: true, viewer: true },
+  { no: "88265708", oid: "107211292", nitId: "5581950", bidId: "20870164", title: "Wheel Mounted Brake Disc", closing: daysAgo(1), tab: false },
+];
+
+const MOCK_LOA = [{ no: "29263265", oid: "107200478", letter: "1461928", date: daysAgo(0) }];
+
+function renderClosedTenders(form) {
+  const from = form.get("startDate");
+  const to = form.get("endDate");
+  const parse = (s) => { const [d, m, y] = s.split("/").map(Number); return new Date(y, m - 1, d); };
+  const want = form.get("tenderNo");
+  const day = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const rows = MOCK_CLOSED.filter((t) => (!from || day(t.closing) >= parse(from)) && (!to || day(t.closing) <= parse(to)) && (!want || t.no === want));
+  const row = (t) => `<tr class="mock-row">
+<td width="15%">STORES / MOCK RLY</td><td width="15%"><a class="linkStyle" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=${t.nitId}') title="To View NIT Click the NIT No">${t.no}</a><br>(${t.bidId})</td>
+<td width="35%">${t.title}</td>
+<td width="15%">${dmy(t.closing)} 11:30</td>
+<td nowrap width="20%"><a href="#" title="My Offer" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=${t.oid}&accountID=833&bid_id=${t.bidId}&bidType=N', 'toolbar=0')"><img src="/ireps/images/common/view_t_offer.png"></a>&nbsp;
+${t.tab ? `<a href="#" title="View Financial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?tenderOID=${t.oid}&pdfType=financialTabulation&accountID=833', 'toolbar=0')"><img src="/ireps/images/common/barchart.jpg"></a>&nbsp;<a href="#" title="View Commercial Tabulation" onclick="postRequestNewWindow('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=${t.oid}&accountID=833',  'toolbar=0')"><img src="/ireps/images/common/techEval.jpg"></a>` : ""}
+</td></tr>`;
+  return `<html><head><title>Folder Details</title><script src="/ireps/js/jquery.1.11.1.js"></script><script src="/ireps/js/works/postRequest.js"></script></head><body>
+<form name="buyerInboxLinkForm" method="post" action="/epsn/vendorInboxLink.do" id="schForm">
+<input type="hidden" name="org.apache.struts.taglib.html.TOKEN" value="${issueToken()}">
+<select id="menuLink" name="menuLink"><option value="Tenders" selected>Tenders</option></select>
+<select id="status" name="status"><option value="Payments">My payments</option><option value="MyBidsClosed" selected>Closed Tenders</option></select>
+Tender Number <input type="text" name="tenderNo" value="${want || ""}" id="tenderNumber">
+Closing Date From <input type="text" name="startDate" value="${from || dmy(daysAgo(89))}" readonly> To <input type="text" name="endDate" value="${to || dmy(daysAgo(0))}" readonly>
+<select name="raStatus" id="raStatus"><option value="-1" selected>All</option></select>
+<input type="hidden" name="pageNo" id="pageNo"><input type="hidden" name="listType" id="listType" value="MyBidsClosed">
+<table width="100%" border="1"><tr bgcolor="#E9E9EF"><td><strong>Dept/Rly. Unit</strong></td><td><strong>Tender No./Bid Id</strong></td><td><strong>Tender Title</strong></td><td><strong>Closing Date/Time</strong></td><td><strong>Actions</strong></td></tr>
+${rows.map(row).join("\n")}
+</table></form></body></html>`;
+}
+
+function renderLoaList() {
+  const rows = MOCK_LOA.map((r) => `<tr><td>Dept / MOCK RLY</td><td><a class="linkStyle" title="To View NIT Click the NIT No" href="#" onclick=postRequest('/epsn/works/rfq/nitPublish.do?activity=viewNIT&nitId=9${r.letter}')>${r.no}</a></td><td>${dmy(r.date)} 17:40&nbsp;(${r.letter})</td>
+<td><a title="View LOA Letter" class="linkStyle"href="#" onclick=loaLetterViewActivity('/supply/tds/publishLOALetter.do?Action=ViewPublishedLetter&nitOId=${r.oid}&tdId=3&letterId=${r.letter}&tdVersion=1&bidid=2&bidderAccId=833&signId=9${r.letter}','${r.letter}')>View</a></td></tr>`).join("");
+  return `<html><head><title>Folder Details</title></head><body>
+<form name="buyerInboxLinkForm" method="post" action="/epsn/vendorInboxLink.do" id="schForm">
+<input type="text" name="tenderNo" value="" id="tenderNumber"><input type="text" name="startDate" value="${dmy(daysAgo(89))}" readonly><input type="text" name="endDate" value="${dmy(daysAgo(0))}" readonly>
+<input type="hidden" name="pageNo" id="pageNo"><input type="hidden" name="listType" id="listType" value="MyAdvanceAcceptanceLetter"><input type="hidden" name="raStatus" value="-1">
+<table border="1"><tr><td>Dept</td><td>Tender No</td><td>Letter Date</td><td>Action</td></tr>${rows}</table></form>
+<script>
+function loaLetterViewActivity(url,docId){
+	var docType = "11";
+	var getAjaxData = '/epsn/supply/tds/ajxdata.do';
+	$.ajax({ type: "POST", url: getAjaxData, data: {ajaxMode:"updateLoaViewedDataByBidder",docId:docId,docType:docType}, dataType:'text',
+	    success: function(result) { if(result!=null && result == "OK"){ postRequestNewWindow('/epsn'+url,'toolbar=0'); } else { alert("Try Again."); } } });
+}
+</script></body></html>`;
+}
+
+function sendTinyPdf(res, file, lines) {
+  const pdf = tinyPdf([...lines, "Generated by the DocLink mock server for testing."]);
+  res.writeHead(200, { "Content-Type": "application/pdf", "Content-Length": pdf.length, "Content-Disposition": `inline; filename="${file}"`, "Cache-Control": "no-store" });
+  return res.end(pdf);
+}
 
 server.listen(PORT, () => {
   console.log(`[mock-ireps] listening on http://localhost:${PORT}  (scenario: ${scenario})`);

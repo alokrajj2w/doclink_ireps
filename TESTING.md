@@ -5,33 +5,35 @@ You do **not** need access to the real IREPS portal for Parts A to C; a local
 mock portal is included. Part D covers the real portal once access is
 available.
 
-Folder used throughout:
+Folder used throughout: the repository folder (the one with `manifest.json`).
+Every command below runs from there, in PowerShell, Git Bash, macOS or Linux.
 
-```
-/Users/I36260027/Desktop/DocLink Download/doclink-extension
-```
-
-Requirements: Google Chrome 116 or newer, Node.js 18 or newer.
+Requirements: Google Chrome 116 or newer, Node.js 22.22+ or 24.15+.
 
 ---
 
-## Part A — Automated tests (about 10 seconds, no browser setup)
+## Part A — Automated tests (no browser setup)
 
-Open Terminal and run:
+Open a terminal in the repository folder and run:
 
 ```bash
-cd "/Users/I36260027/Desktop/DocLink Download/doclink-extension"
-
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --headless=new --allow-file-access-from-files --virtual-time-budget=20000 \
-  --dump-dom "file://$PWD/test/run-tests.html" | grep -o 'DOCLINK_TESTS[^<]*'
+npm install          # once: the test and build tools (devDependencies)
+npm test             # every suite; the exit code is 0 only when everything passed
+npm run lint         # ESLint
 ```
 
-Expected output:
+Expected output (the counts grow with the suites):
 
 ```
-DOCLINK_TESTS 100/100 passed
+DOCLINK_TESTS <n>/<n> passed
+NODE_TESTS <n>/<n> passed
+BILL_FLOW_CHECK passed: ...
 ```
+
+`npm test -- browser`, `npm test -- node` and `npm test -- bill` run one part;
+`npm test -- browser --only=po,ic` only some browser suites. Chrome is found
+at its usual install path (set `CHROME_PATH` otherwise). `npm run verify` runs
+lint, every test and the production build; run it before every pull request.
 
 These tests cover the real `viewBills.do` flow with a fake IREPS (empty POST →
 token → Show Results → parsed bills, session expired, token missing, HTTP 500,
@@ -71,9 +73,10 @@ the R-NOTE export (page columns + link columns, xlsx sheet "R-NOTE", csv).
 To look at a sample PDF produced by the PDF engine:
 
 ```bash
-node test/make-sample-pdf.mjs ~/Desktop/DocLink-sample.pdf
-open ~/Desktop/DocLink-sample.pdf
+node test/make-sample-pdf.mjs DocLink-sample.pdf
 ```
+
+Then open `DocLink-sample.pdf` in any PDF viewer.
 
 ---
 
@@ -82,7 +85,7 @@ open ~/Desktop/DocLink-sample.pdf
 1. Open Chrome and go to `chrome://extensions`.
 2. Turn on **Developer mode** (toggle in the top-right corner).
 3. Click **Load unpacked**.
-4. Select the folder `doclink-extension`.
+4. Select the repository folder (the one with `manifest.json`).
 5. DocLink appears in the list with no errors.
 6. Click the puzzle-piece icon in the toolbar and **pin** DocLink.
 
@@ -108,7 +111,6 @@ scenarios from its home page.
 Terminal 1 (leave it running):
 
 ```bash
-cd "/Users/I36260027/Desktop/DocLink Download/doclink-extension"
 node test/mock/mock-ireps-server.mjs
 ```
 
@@ -120,7 +122,7 @@ You should see:
 
 ### C2. Point DocLink at the mock portal
 
-Open `config.json` (in the `doclink-extension` folder) in any text editor
+Open `config.json` (in the repository folder) in any text editor
 and make sure it reads:
 
 ```json
@@ -137,8 +139,11 @@ test/mock/switch-target.mjs mock` does the same one-line edit.)
 Then go to `chrome://extensions` and click **reload** on DocLink.
 
 Both `http://localhost:8765/*` and `https://www.ireps.gov.in/*` are declared
-in `manifest.json` permanently, so `config.json` is genuinely the only thing
-that changes - manifest.json is never touched by switching targets.
+in `manifest.json`, so `config.json` is genuinely the only thing that
+changes - manifest.json is never touched by switching targets. (This is the
+repository copy. A production build, `npm run build`, keeps only the real
+portal, so it cannot be pointed at the mock; `npm run build -- --allow-mock`
+makes a build that can.)
 
 ### C2b. Test: DocLink belongs to its tab and only runs on the configured portal
 
@@ -272,13 +277,101 @@ After any successful download, click **Open printable preview**.
 Expected: a new tab with the same bills rendered as cards. **Download PDF**
 saves another copy; **Print / Save as PDF** opens Chrome's print dialog.
 
-### C9. Test: upload placeholder
+### C9. Test: Upload Bill to IREPS (bill upload) with the mock portal
 
-1. In the popup click **Upload Document**.
-2. Choose a Source, pick any file, choose a Document Type, click **Upload**.
+The mock answers the supplier bill calls (`/epsn/ct/*`) and the ECM calls of the
+bill upload (`test/mock/mock-bill-upload.mjs`), and serves the bill screens of
+`BILL SUBMISSION-Screen shot of IREPS.docx` (`test/mock/mock-bill-screens.mjs`,
+`test/mock/bill-entry-page.html`), so the whole flow runs without creating a real
+draft bill. Start at the test hub, **http://localhost:8765/mock/bill/**: it lists
+the test receipts and what each one tests, and has the reset.
 
-Expected: "Upload integration will be implemented in Phase 2." No network
-request is made.
+**DocLink does not type into the IREPS boxes.** It posts the values to the same
+endpoints. To see where each value landed, open the bill's **field check**
+(`/mock/bill/check?billRegNo=`) or **Open bill** on the PO's *Bills for Pay* tab,
+which shows the saved values in the boxes, in green. The field check works out
+what it expects from the mock's own data, not with DocLink's code.
+
+To run DocLink's bill code against all the test receipts without a browser:
+
+```
+node test/mock/bill-flow-check.mjs
+```
+
+That doesn't cover the search parsers, the panel or sending from the tab, so the
+steps below still matter. Reopening a draft through **Open bill** is a mock
+assumption: how the portal does it has not been captured (`upload.md` section 11).
+
+To use the mock ECM as well, add to `config.local.json` (and reload DocLink):
+
+```json
+{ "ecm": { "domain": "http://localhost:8765", "clientId": "mock", "clientSecret": "mock" } }
+```
+
+Remove it again afterwards: IC / PO / MA "Save to ECM" needs the real ECM.
+
+1. Logged in on the mock, scenario `auto`. Open DocLink and click
+   **Bill** on the *Upload* card. The values for the steps below, plus a
+   matching invoice PDF, are in `test/mock/sample_upload.json` and
+   `test/mock/sample.pdf`.
+2. PO Number `11260000100001`, **Find R-Notes / CRNs**. Expected: R-Note
+   4800000001 (87 Set, RO 48300000001) selectable; with the PO left blank
+   the R-NOTE rows and the mock's CRN rows appear, and only the receipts on the
+   test hub can be selected - e.g. 0600000002 shows "Rnote Not Published",
+   1000000003 "IREPS already shows bill 3999001", the other CRNs "Paid" /
+   "Signed" / ...
+3. Select 4800000001, keep **Find it in ECM**, click **Prepare bill**.
+   Expected (mock terminal): `fetchPODetails`, `populatePayAuthList`,
+   `populatePOSrList`, `getAjaxData`, `populateROList`, `populateRODetails`
+   and `[mock-ecm] RetrieveInvoiceData` - no `saveBillHeader`. The header
+   shows invoice 1331000901, 812656.56, supplier GSTIN 33AAGCS8525B1ZL
+   (source "ECM division WABHSR"), state of supply 37 Andhra Pradesh, place
+   DLS/VSKP, no checks.
+4. Change *Place of supply*: **Create draft bill** is disabled until you click
+   **Apply my changes and check again**.
+5. Tick the confirmation, click **Create draft bill in IREPS**. Expected:
+   "Draft bill 3900001 created in IREPS", dispatch no. 4900001, item values
+   688692.00 + 123964.56 = 812656.56, IGST 18 %, inspection agency TPI.
+   The mock terminal shows `draft bill 3900001 created` and `item saved`.
+6. **Get documents from ECM**. Expected: Invoice, GC/WC, Modvat, WTC, IC and
+   PO copy saved to `Downloads/DocLink/IREPS/BillUpload/1331000901/`, each
+   with the description to type; E-Declaration "not in ECM (if applicable)".
+   *Finish in IREPS* lists the remaining manual steps.
+7. **Start over**, search the same PO again: R-Note 4800000001 is now greyed
+   out with "IREPS already shows bill 3900001". To test it again, follow *Start
+   again* on the test hub: **Delete all mock bills** alone is not enough, because
+   DocLink keeps its own record of the bills it created. For one receipt, delete the
+   mock bills, Prepare it again, then tick *I want to create a new bill for this
+   receipt* and click **Start fresh for this receipt**. The box then reads
+   "DocLink forgot draft bill 3900001, so you can create a new bill for this
+   receipt. The old draft is still in IREPS: find it on the PO's Bills for Pay
+   tab ...", and once the new bill's item is saved, *Finish in IREPS* ends with a
+   reminder to delete draft bill 3900001.
+8. PO `05260000100004` (R-Note 4400000004): the place of supply
+   "Coaching Depot/Guwahati" is cut to 20 characters - a warning that must be
+   ticked as read before **Create** is enabled; IGST to Assam, CONSG, and
+   E-Declaration instead of IC among the documents.
+9. **From a JSON file** instead of ECM: pick `test/mock/sample_upload.json`.
+   With R-Note 4800000001 selected the line under the picker reads
+   "sample_upload.json: 1 invoice. This receipt: invoice 1331000901, amount
+   812656.56"; with 4400000004 it says the file has no invoice for that
+   receipt and lists what it holds. **Prepare bill** for 4800000001 shows the
+   same header as step 3, with "JSON file sample_upload.json" as the source of
+   the invoice values, and no `RetrieveInvoiceData` in the mock terminal. A
+   file that is not JSON, or has no `invoices`, is refused when picked.
+10. **Enter it by hand** instead of ECM: leave the HSN empty and click
+   **Prepare bill** - "Invoice details incomplete". An HSN such as "12" is
+   refused the same way at Prepare ("must be 4 to 8 digits"), and the mock
+   terminal shows no IREPS call for it. With every field filled
+   the flow is the same as with ECM. The test hub's receipt with a bad HSN
+   code in the ECM (PO `04260000100008`) stops at Prepare too; in
+   `bill-flow-check.mjs` it is the "Bad HSN code" case, ending
+   `stopped-before-write`.
+
+### C9a. Test: R-NOTE downloads still work with the captured layout
+
+The mock's R-NOTE results now use the captured layout (`rnote-results-real.html`),
+see C9c.
 
 ### C9b. CRN download with the mock portal
 
@@ -350,10 +443,17 @@ Open the workbook and check:
 ### C9c. R-NOTE download with the mock portal
 
 R-NOTE uses the same PO Search flow; the mock answers `searchCriteria=RNOTE`
-with an **assumed** R-NOTE table (the real layout is not captured yet):
-`#, PO No., PO Date, Rly, PO Sr, R-Note No., R-Note Date, Challan No.,
-Challan Date, Invoice No., Invoice Date, Qty Received, Status, Action`, with
-fake document links under `/ireps/etender/ct/MOCK/RNOTE/…`.
+with the **captured** R-NOTE layout (`test/fixtures/rnote-results-real.html`,
+fictitious values): `Sr. No., Dept / Rly. Unit, PO No., PO Date, PO_SR,
+RNOTE No., RNOTE Date, RNOTE Qty, RO No., RO Date, DRR No., Bill Claim`, the
+payment columns and `Action(s)`, with R-Note PDFs under
+`/ireps/etender/pdfdocs/MMIS/RN/…`. (The automated R-NOTE tests still use the
+older assumed layout, `rnote-results-page.html`, to show the parser does not
+depend on the column set.)
+
+With the captured layout the counts below are 4 rows and 26 columns (24 page
+columns, then *R-Note Document Link* and *Other Links*); row 1 is
+4800000001 with its R-Note PDF link, row 3 carries bill 3999001.
 
 1. Logged in on the mock, scenario `auto`. Open DocLink; the *Download IREPS
    R-NOTE* card has its own **Search options** (same controls as CRN).
@@ -398,7 +498,8 @@ number, PO, unit, PO date and MA date. Mock log:
 
 3. Tick two MAs → **Download Selected (2)**: chips go Queued → Downloading →
    Completed; "✓ 2 MA copies downloaded"; files
-   `MA_<PO>_<MA>.pdf` in `Downloads\DocLink\IREPS\MA\<today YYYY-MM-DD>\`.
+   under the name IREPS gives them (e.g. `07250369100001_007001.pdf`; `MA_<PO>_<MA>.pdf`
+   only when IREPS gives none) in `Downloads\DocLink\IREPS\MA\<today YYYY-MM-DD>\`.
    Each PDF opens and reads "MODIFICATION ADVICE".
 4. **Download All**: all of today's MAs; an MA without a link shows Failed
    with the tooltip "MA copy link not found".
@@ -483,7 +584,6 @@ node test/mock/switch-target.mjs status
    `"target": "real"` (no terminal needed; a command is also available):
 
    ```bash
-   cd "/Users/I36260027/Desktop/DocLink Download/doclink-extension"
    node test/mock/switch-target.mjs real
    node test/mock/switch-target.mjs status
    # target: real
@@ -541,10 +641,38 @@ node test/mock/switch-target.mjs status
     `recordsPerPage=2000`) and `MA records parsed: N` where N must equal
     "Total N result(s)" on the portal's MA search. The list must contain
     exactly the MAs whose *MA Date* column reads today. Tick one and
-    **Download Selected (1)**: the saved `MA_<PO>_<MA>.pdf` must be the same
+    **Download Selected (1)**: the saved MA PDF must be the same
     document the portal opens from that row's "View/Download MA" icon (not
     the PO PDF opened from the PO number). If it fails with **MA copy not
     valid**, capture a HAR of clicking that icon on the portal.
+12. The ECM fields the client asked for on 13 Nov 2026. This needs Save to:
+    ECM / S3 with the direct ECM: load DocLink unpacked from the repository
+    folder, with the TEST ECM client id and secret in `config.local.json` (a
+    built zip has no `config.local.json`, so it saves locally). The TEST
+    ECM's Tenders folder must exist.
+    0. Run `node scripts/check-ecm-schema.mjs`. Every line must say `ok`,
+       `customer_po_serial_number` and `passed_quantity` included. A
+       `MISSING` line means the ECM names that property differently: find
+       its name under "Its other properties", and change it in
+       `services/ecm-catalog.js` `ECM_FIELDS` before you go on.
+    1. Download one tender's NIT, an LOA, a Negotiation or Counter Offer
+       letter, a Pending Correspondence letter, and the ICs of one PO.
+    2. In the ECM, check the documents:
+       - each one shows **Tender Number** and **Tender Date**. The date is the
+         tender's closing date, the "Due Date/Time" of IREPS's Search Tender;
+       - the `<tender> - LOA` document also shows **LOI Number** as printed on
+         the letter ("Letter No: DAHOD / 61265711C / 1503282"), and **LOI
+         Date** as the letter's "Dated";
+       - a correspondence document's Tender Date is the "Closing Date" next to
+         the tender number on its Tender Related Correspondence page, not the
+         reply deadline;
+       - each `<IC no> - IC` document shows **Customer PO Serial Number** and
+         **Passed Quantity**, the same as that IC's "PO Sr." and "Passed Qty."
+         in IREPS's My Inspection Calls list. An IC stored before 16 Nov 2026
+         is found as "Already in ECM" and keeps its old fields.
+    3. If the ECM refuses a document with "No such property", the TEST ECM
+       lacks that field; the document is saved locally, and its row says why.
+       Tell the ECM team which field it named.
 
 If the popup shows **Unable to recognise the IREPS response** on the real
 portal, save the IREPS page (right-click → Save As → "Webpage, HTML Only"),
@@ -576,7 +704,9 @@ HTTP status). Cookies, session ids and form tokens are always redacted.
   report), `doclinkLog.clear()` empties it.
 - Filter the console with `DocLink` or a workflow name (`Bill Status`,
   `CRN`, `R-NOTE`, `MA`, `PO`, `IC`); set the level to *Verbose* to also see
-  the debug lines (state requests).
+  the debug lines (state requests). Only DocLink loaded from the repository
+  prints debug lines; a built copy logs from info up
+  (`npm run build -- --log-level=debug` makes one that prints them too).
 
 - **"DocLink Needs a Reload"** (or, before 1.1.0, a bare "Something Went
   Wrong") right after Search MAs: Chrome is still running an old background
@@ -627,3 +757,106 @@ HTTP status). Cookies, session ids and form tokens are always redacted.
 | 12 | R-NOTE: search → result table saved as .xlsx with page columns + document links | C9c / D10 | ☐ |
 | 13 | MA: today's MAs listed, MA copies (not PO PDFs) saved under the date folder | C9d / D11 | ☐ |
 | 14 | MA: session expiry during PDF download → session message, nothing saved as .pdf | C9d `ma-pdf-login` | ☐ |
+| 15 | Bill upload: Prepare writes nothing; Create saves header + item; documents saved with descriptions | C9 | ☐ |
+| 16 | Bill upload: the same receipt is never billed twice; errors / unread warnings block Create | C9 steps 4, 7, 8 | ☐ |
+
+
+---
+
+## Pending Correspondence tests
+
+```
+node --test tender/tests/pending-tests.mjs
+```
+(jsdom is only a test-time stand-in for the browser's DOMParser. It is a devDependency: `npm install` once, then run from the repo root; `JSDOM_ROOT=<dir>` uses a jsdom installed elsewhere.)
+Fixtures in `tender/tests/fixtures/` are the real list and pending-replies pages from `PENDING CORRESPONDANCE DOWNLOAD.har`
+(user name redacted). The suite covers: all pending rows (count not hardcoded), several letters per tender, Lapsed /
+Previous Replies exclusion, empty table, parent with no pending letters, PDF / embedded-PDF / HTML letters, attachments,
+failure + retry without duplicates, session expiry, the read-only guard (`vendorCorresSubmitReply.do` never requested),
+no secrets in the manifest, and the side-panel UI (real `popup.html` in jsdom).
+
+---
+
+## Batch downloads: POs by PO date, ICs by IC date, ICs from notifications
+
+`test/batch-tests.js` (run by `test/run-tests.js`, so Part A covers it) drives
+all three workflows against an in-memory IREPS simulator: `searchPO.do` (showPage,
+search, `postRequest` page links, the portal's 180-day limit), 
+`vendorInspectionCallList.do` (list page, PO + PO Sr. search, `navigate()`
+paging, results table inside the form, one more data cell than headers - the
+live layout), the notification endpoint and the PDF links. All identifiers in
+the simulator are invented.
+
+Covered: single date, date range, 47 records over 3 pages, no records (empty
+table and "No Record Found" message), out-of-range and duplicate rows,
+duplicate PO numbers across units, missing/broken/HTML/login PDF links,
+expired session, retry of failed items only, transient-failure auto retry,
+range split at 180 days; one / several / repeated / unreadable / LOA / empty
+notifications, leading zeros in the PO serial, no matching call, matching row
+without an IC link, several matching rows, REF_ID mismatch, duplicate
+documents, paging, expired session, invalid JSON, non-PDF content, partial
+failure and retry; ICs by IC date: the search with PO No. empty and the IC
+dates, every PO and serial in the range, out-of-range / not-issued / repeated
+rows, paging, a list that ignores the dates, nothing in the range, a reversed
+range, a From date before the Call Date default, ECM fields, a row without a
+link, and retry. The IC parser is also checked on the captured page layout
+(a hidden cell after Offer Qty.).
+
+Manual check against the mock (`node test/mock/mock-ireps-server.mjs`): under
+Download ICs by IC Date, 27/10/2026 - 28/10/2026 gives 2 ICs of PO
+05220028100004; 01/05/2026 - 31/10/2026 gives 6 ICs of 2 POs.
+
+The summary line must show every test passing (`DOCLINK_TESTS <n>/<n> passed`).
+Not covered by any automatic test: the live portal itself (see README,
+"Batch downloads - what is not verified").
+
+## Tender: LOA letters and Financial / Commercial Tabulation
+
+Automatic (`tender/tests/run-tests.mjs`): an LOA letter page that links an
+annexure, embeds an iframe / embed and opens a file from a script is saved as
+one `LOA_<tender>.pdf`, printed by Chrome, and none of those files is
+requested; an LOA served as a PDF file is kept as it is; when Chrome cannot
+print, only the text PDF is saved (no `.html`). A Counter Offer letter with a
+document attached (link, iframe, embed, script) saves only the printed letter
+`Counter_Offer_<tender>_<letter id>.pdf`; the attachment is never requested,
+also when Chrome cannot print. Tabulations: a direct PDF, a PDF
+behind an iframe viewer, a self-submitting form or a `window.open` target are
+downloaded, and so is the real IREPS answer (03 Nov 2026): a page that opens
+`FIN-TAB-<no>-<oid>.pdf` / `TECH-TAB-<no>-<oid>.pdf` (Commercial) from
+`<body onload>`. A `TECH-TAB` file passes only inside a Commercial Tabulation
+response; Techno-Commercial links inside the viewer are never requested; a
+web page with no PDF fails with its title and nothing is saved. The 29 Oct
+Closed Tenders capture (`tender/tests/fixtures/closed-tenders-29oct.html`) lists
+the 7 tenders with both tabulations.
+
+Manual check against the mock (`node test/mock/mock-ireps-server.mjs`, log in on
+the mock home page): in Download Tender Documents, with From = 2 days ago and
+To = today,
+
+* **Financial Tabulation** / **Commercial Tabulation**: 24260725 (direct PDF)
+  and 61266411 (PDF behind a viewer page) download to
+  `Tender_<no>/Tabulation/`; 88265708 reads "not available yet".
+* **Advance Acceptance Letter**: one `Tender_29263265/Advance_Acceptance_LOA/LOA_29263265.pdf`.
+  The mock console must not show any `/mock/loa/...` request (those are the
+  files inside the letter).
+
+On the real portal, if a tabulation still fails, run `doclinkLog.download()`
+in the side panel console: the `Tabulation` lines show what IREPS answered.
+
+## File names (IREPS names kept)
+
+Run once with **Save to: Local** and once with **ECM / S3** (direct ECM).
+
+1. Tender documents: the NIT PDF is `viewNitPdf_<nitId>.pdf` and each attachment has its IREPS name
+   (`5919538.pdf`, ...), in `NIT_and_Supporting_Documents\` and in the ECM document `<T> - NIT`. The
+   Financial / Commercial Tabulation has the name of the file IREPS opens (e.g. `FIN-TAB-<no>-<oid>.pdf`,
+   `TECH-TAB-<no>-<oid>.pdf`), or `Financial_Tabulation_<T>.pdf` / `Commercial_Tabulation_<T>.pdf` when
+   IREPS gives none.
+2. Pages DocLink prints or renders keep DocLink names: `Corrigendum_NN_<T>.pdf`, `LOA_<T>.pdf`,
+   `Counter_Offer_<T>_<id>.pdf`, `Negotiation_...`, `Correspondence_...` (letter pages).
+3. IC / PO / MA: the PDF is saved under its IREPS name (`8794517.pdf`, `27253922100240.pdf`,
+   `07250369100001_007001.pdf`) in the usual folders, and has that name in the ECM.
+4. Two different documents with one IREPS name: the later one is `<name>_2.pdf` (tender) or keeps
+   DocLink's name (IC / PO / MA batch), so neither replaces the other locally or in the ECM.
+5. ECM "Document type" labels (NIT, PO, LOA, MA, Results, Commercial Tabulation) come from the ECM's
+   vocabulary `invoice_certificate_document_types`; check them after the ECM admin renames them.

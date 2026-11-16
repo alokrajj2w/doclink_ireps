@@ -62,6 +62,58 @@ export function sanitiseFilename(name) {
 }
 
 /**
+ * A file name as IREPS gave it, made safe to save: only characters no file system takes become "_";
+ * spaces, case and the extension are kept (unlike sanitiseFilename). Over 150 characters the stem
+ * is cut, never the extension. "" when nothing is left.
+ * @param {string} name
+ * @returns {string}
+ */
+export function cleanSourceName(name) {
+  let n = String(name || "")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/^[.\s]+|[.\s]+$/g, "");
+  if (n.length > 150) {
+    const dot = n.lastIndexOf(".");
+    const ext = dot > 0 && n.length - dot <= 6 ? n.slice(dot) : "";
+    n = n.slice(0, 150 - ext.length).replace(/[.\s]+$/g, "") + ext;
+  }
+  return /\.[A-Za-z0-9]{2,5}$/.test(n) ? n : "";
+}
+
+/** The file name of a Content-Disposition header (filename* first), decoded; "" when it has none. */
+export function contentDispositionName(header) {
+  const cd = String(header || "");
+  const raw = /filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i.exec(cd)?.[1] || /filename\s*=\s*"?([^";]+)"?/i.exec(cd)?.[1] || "";
+  const t = raw.trim().replace(/^"|"$/g, "");
+  try {
+    return decodeURIComponent(t);
+  } catch {
+    return t;
+  }
+}
+
+/** The last path segment of a URL when it names a file ("viewNitPdf_5470263.pdf"); "" for a .do / .jsp / page URL. */
+export function urlFileName(url) {
+  try {
+    const n = decodeURIComponent(new URL(url, "https://x.invalid/").pathname.split("/").pop() || "");
+    return /\.[A-Za-z0-9]{2,5}$/.test(n) && !/\.(do|jsp|html?|php|aspx?)$/i.test(n) ? n : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The name IREPS gave a file it served: the Content-Disposition file name, else the name in the URL
+ * that answered with it. "" when neither names a file (a POST to a .do action) - the caller then
+ * uses DocLink's own name. A downloaded PDF is saved under this name, locally and in the ECM.
+ * @param {{ contentDisposition?: string, url?: string }} source
+ * @returns {string}
+ */
+export function sourceFileName({ contentDisposition = "", url = "" } = {}) {
+  return cleanSourceName(contentDispositionName(contentDisposition)) || cleanSourceName(urlFileName(url));
+}
+
+/**
  * Build the bill status PDF name, e.g. IREPS_Bill_Status_2026-09-15_12-30-42.pdf
  * @param {Date} date
  * @returns {string}
@@ -218,4 +270,29 @@ export function buildIcFilename(poNo, poSr, callId) {
 export function buildIcDownloadPath(record) {
   const po = String((record && record.poNo) || "").trim() || "unknown-po";
   return `${IC_DOWNLOAD_SUBFOLDER}/${sanitiseFilename(po)}/${buildIcFilename(po, record && record.poSerial, record && record.callId)}`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Purchase Orders downloaded by PO date (batch)                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * PO_<PO-NO>_<YYYY-MM-DD>.pdf, or PO_<PO-NO>_<UNIT>_<YYYY-MM-DD>.pdf when the
+ * same PO number appears for several railway units on that date.
+ * @param {{ poNo?: string|null, railwayUnit?: string|null, dateKey?: string|null }} record
+ * @param {{ withUnit?: boolean, suffix?: number }} [options]
+ */
+export function buildPoDateFilename(record, options = {}) {
+  const po = String((record && record.poNo) || "").trim() || "unknown-po";
+  const date = /^\d{4}-\d{2}-\d{2}$/.test((record && record.dateKey) || "") ? record.dateKey : "undated";
+  const unit = options.withUnit ? String((record && record.railwayUnit) || "").trim() : "";
+  const parts = ["PO", po, unit, date].filter(Boolean);
+  const suffix = options.suffix > 1 ? `_${options.suffix}` : "";
+  return sanitiseFilename(`${parts.join("_")}${suffix}.pdf`);
+}
+
+/** Downloads-relative path: DocLink/IREPS/PO/<YYYY-MM-DD>/PO_<PO>_<YYYY-MM-DD>.pdf. */
+export function buildPoDateDownloadPath(record, options = {}) {
+  const folder = /^\d{4}-\d{2}-\d{2}$/.test((record && record.dateKey) || "") ? record.dateKey : "undated";
+  return `${PO_DOWNLOAD_SUBFOLDER}/${folder}/${buildPoDateFilename(record, options)}`;
 }

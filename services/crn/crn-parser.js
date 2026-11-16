@@ -41,6 +41,7 @@ import {
   normaliseHeaderLabel,
   cellText,
   anchorsOf,
+  billClaimOf,
   isMarkupHeaderRow,
   locateResultTable,
   extractSearchPoPagination,
@@ -154,7 +155,6 @@ function cellValue(text) {
 }
 
 /** Kept for callers/tests that used the CRN-named helpers. */
-export const normaliseCrnLabel = normaliseHeaderLabel;
 export const extractCrnPagination = extractSearchPoPagination;
 export const extractCrnPageMessage = extractSearchPoPageMessage;
 
@@ -169,6 +169,8 @@ export function createEmptyCrnRecord() {
   const record = { index: 0, id: "" };
   for (const f of CRN_FIELDS) record[f.key] = null;
   for (const k of CRN_LINK_FIELDS) record[k] = null;
+  /** { rly, poKey } from the Bill Claim link (services/bill-upload); not an export column. */
+  record.billClaim = null;
   record.extra = {};
   return record;
 }
@@ -223,6 +225,12 @@ export function parseCrnRow(row, columns, ordinal = 1, options = {}) {
         const real = anchors.find((a) => a.href && a.href !== "#" && /\.pdf(\?|$)/i.test(a.href));
         if (real) record.billPdfUrl = resolveIrepsUrl(real.href, options.baseUrl);
       }
+      return;
+    }
+    if (key === "billClaimStatus") {
+      // "Returned" / "Paid" / ... and, when a new bill can be claimed, the Bill Claim link
+      record.billClaimStatus = cellValue(text);
+      record.billClaim = billClaimOf(anchors);
       return;
     }
     if (key.startsWith("extra:")) {

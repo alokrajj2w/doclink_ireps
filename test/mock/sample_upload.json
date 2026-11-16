@@ -1,0 +1,57 @@
+{
+  "_about": "Invoice file for Upload Bill to IREPS, option 'From a JSON file' in step 2 (README section 20). DocLink reads only the 'invoices' list; every other key is a note. Each invoice uses the ECM's RetrieveInvoiceData column names, so the ECM can later replace this file with no other change.",
+  "_howToUse": "Upload > Bill. Step 1: type the PO number and pick the R-Note / CRN. Step 2: choose 'From a JSON file' and pick this file. DocLink uses the invoice whose customerPONumber + customerPOSrNumber + quantity match the receipt. Prepare only reads IREPS. Create draft bill WRITES to IREPS.",
+  "_thisSample": "The invoice below matches the mock portal's receipt R-Note 4800000001 (PO 11260000100001, Sr 001, 87 Set). For live IREPS, copy this file and replace the values with a real receipt of your account and its invoice. The amount must equal what IREPS shows for the receipt, or the checks stop the bill.",
+
+  "invoices": [
+    {
+      "invoiceNumber": "1331000901",
+      "salesInvoiceDate": "2026-10-14",
+      "onivla": 812656.56,
+      "quantity": 87,
+      "rate": 7916,
+      "totalTaxValue": 123964.56,
+      "taxCode": "IGST",
+      "serviceAccountingCode": "86072100",
+      "customerPONumber": "11260000100001",
+      "customerPOSrNumber": "001",
+      "division": "WABHSR",
+      "gstinRecipient": "37AAAGM0289C1ZI",
+      "supplyPlace": "DLS/VSKP",
+      "consigneeLocation": "VISAKHAPATNAM",
+      "consigneeAddressLine4": "VISAKHAPATNAM, AP, 530001, IN",
+      "partDescription": "KIT FOR DIST EQUIPMENT MANIFOLD ASSLY",
+      "Sent to Doculink": ""
+    },
+    {
+      "_note": "TEST invoice for LIVE IREPS receipt PO 07250320103232 / Sr 003 / qty 86 (the three match fields are real). invoiceNumber is a test number, not a real tax invoice: Create draft bill makes a REAL draft bill with it (not signed or submitted). onivla must be the receipt's value in IREPS: Prepare once and copy the amount from the check 'Invoice amount 1 differs from the receipt's value in IREPS (...)'. serviceAccountingCode: put the PO item's HSN (4-8 digits) or the item step stops. Supplier GSTIN: add division (WABHSR = Hosur, WABRTK = Rohtak) or choose it in the review.",
+      "invoiceNumber": "DOCLINK-TEST-01",
+      "salesInvoiceDate": "2026-11-05",
+      "onivla": 1,
+      "quantity": 86,
+      "serviceAccountingCode": "HSN",
+      "customerPONumber": "07250320103232",
+      "customerPOSrNumber": "003",
+      "Sent to Doculink": ""
+    }
+  ],
+
+  "_fields": {
+    "invoiceNumber": "required. Tax invoice no.: up to 16 characters; letters, digits, - and / only",
+    "salesInvoiceDate": "required. Tax invoice date: YYYY-MM-DD or DD/MM/YYYY; not in the future",
+    "onivla": "required. Invoice amount incl. GST, in Rs.",
+    "serviceAccountingCode": "required. HSN code",
+    "customerPONumber, customerPOSrNumber, quantity": "required. How the invoice is matched to the receipt you picked",
+    "division": "WABHSR (Hosur, GSTIN 33AAGCS8525B1ZL) or WABRTK (Rohtak, GSTIN 06AAGCS8525B1ZI): decides the supplier GSTIN. Or give gstinSupplier directly",
+    "gstinRecipient": "railway GSTIN of the consignee: decides the state of supply (else the consignee address in IREPS)",
+    "supplyPlace": "place of supply as on the invoice (IREPS keeps 20 characters)",
+    "rate, totalTaxValue, taxCode, partDescription, consignee*": "optional, shown and checked where DocLink uses them",
+    "Sent to Doculink": "leave empty. Any value (Y, a date) means 'already billed', and the invoice is skipped"
+  },
+
+  "_expectedOnMock": {
+    "afterPrepare": "invoice 1331000901, 812656.56, supplier GSTIN 33AAGCS8525B1ZL, state of supply 37 Andhra Pradesh, place DLS/VSKP, no checks; the mock terminal shows no saveBillHeader",
+    "afterCreate": "Draft bill 3900001 created, dispatch 4900001, item 688692.00 + IGST 18% 123964.56 = 812656.56, inspection TPI (numbers of a freshly started mock)",
+    "attachInIreps": "sample.pdf (this folder) with the description INVOICE, a manual step in IREPS"
+  }
+}

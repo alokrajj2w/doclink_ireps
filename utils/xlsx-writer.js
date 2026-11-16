@@ -80,7 +80,10 @@ function sanitiseSheetName(name, index) {
 function sheetXml(spec) {
   const headers = Array.isArray(spec.headers) ? spec.headers : [];
   const rows = Array.isArray(spec.rows) ? spec.rows : [];
-  const columnCount = Math.min(MAX_COLUMNS, Math.max(headers.length, ...rows.map((r) => (Array.isArray(r) ? r.length : 0)), 1));
+  // a loop, not Math.max(...rows): spreading 100,000+ rows into one call overflows the argument limit
+  let widest = Math.max(headers.length, 1);
+  for (const r of rows) if (Array.isArray(r) && r.length > widest) widest = r.length;
+  const columnCount = Math.min(MAX_COLUMNS, widest);
   const totalRows = (headers.length ? 1 : 0) + rows.length;
   if (totalRows > MAX_ROWS) throw new Error(`Sheet "${spec.name}" exceeds ${MAX_ROWS} rows`);
 
@@ -91,7 +94,7 @@ function sheetXml(spec) {
       let longest = headers[c] ? String(headers[c]).length : 0;
       for (let r = 0; r < Math.min(rows.length, 500); r++) {
         const v = rows[r] && rows[r][c];
-        if (v !== null && v !== undefined) longest = Math.max(longest, ...String(v).split("\n").map((l) => l.length));
+        if (v !== null && v !== undefined) for (const line of String(v).split("\n")) if (line.length > longest) longest = line.length;
       }
       w = Math.min(60, Math.max(8, longest + 2));
     }
@@ -215,15 +218,27 @@ export function buildWorkbook(spec) {
   return buildZip(entries, { date });
 }
 
+/** A plain number ("-12.50", "+5", "1,234.5"): shown as IREPS gave it, never taken for a formula. */
+const PLAIN_NUMBER = /^[+-]?(\d{1,3}(,\d{2,3})*|\d+)(\.\d+)?$/;
+
 /**
- * Build a CSV file (UTF-8 with BOM, CRLF, RFC 4180 quoting).
+ * A cell Excel / LibreOffice would run as a formula when the CSV is opened (=, +, -, @, tab or CR
+ * first, e.g. =HYPERLINK(...)) gets a leading apostrophe, the usual guard against CSV formula
+ * injection. Plain numbers such as -12.50 are left as IREPS gave them.
+ */
+export function csvSafeText(text) {
+  return /^[=+\-@\t\r]/.test(text) && !PLAIN_NUMBER.test(text) ? `'${text}` : text;
+}
+
+/**
+ * Build a CSV file (UTF-8 with BOM, CRLF, RFC 4180 quoting; formula-like cells guarded, csvSafeText).
  * @param {string[]} headers
  * @param {(string|number|null|undefined)[][]} rows
  * @returns {Uint8Array}
  */
 export function buildCsv(headers, rows) {
   const quote = (v) => {
-    const text = cellValue(v);
+    const text = csvSafeText(cellValue(v));
     return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
   const lines = [];

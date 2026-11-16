@@ -29,14 +29,18 @@
  *   doclinkLog.download()   save the whole log as a .txt file (panel only)
  *   doclinkLog.clear()      empty the stored log
  *
- * Levels: debug < info < warn < error. Set LOG_LEVEL to "warn" for release.
+ * Levels: debug < info < warn < error. DocLink loaded unpacked logs from
+ * debug; a built copy logs from info (scripts/build.mjs, --log-level=...).
  */
 
 const PREFIX = "[DocLink]";
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40, silent: 100 };
 
-/** Change to "warn" or "error" for production builds. */
-const LOG_LEVEL = "debug";
+/**
+ * Lowest level printed. The build replaces __DOCLINK_LOG_LEVEL__ with its level (esbuild define);
+ * unpacked from the repo it is not defined, and every level down to debug is printed.
+ */
+const LOG_LEVEL = typeof __DOCLINK_LOG_LEVEL__ === "string" && __DOCLINK_LOG_LEVEL__ in LEVELS ? __DOCLINK_LOG_LEVEL__ : "debug";
 /** Lowest level that is kept in the stored log (debug stays console-only). */
 const STORE_LEVEL = "info";
 
@@ -49,21 +53,35 @@ const MAX_DATA_CHARS = 1500;
 const FLUSH_DELAY_MS = 250;
 
 /**
- * Patterns that must never be printed. Each match is replaced with a marker.
- * These are deliberately broad: a false positive costs nothing, a false
- * negative leaks a credential.
+ * Patterns that must never be printed: [pattern, replacement]. Each match keeps its name and
+ * loses its value. Deliberately broad: a false positive costs nothing, a false negative leaks a
+ * credential. They cover header / query / form text (name=value, name: value), JSON
+ * ("name": "value") and HTML (<input name="...TOKEN" value="...">, either attribute order).
  */
+const SECRET_NAME = String.raw`(?:client[_-]?secret|access[_-]?token|refresh[_-]?token|id[_-]?token|code[_-]?verifier|api[_-]?key|x-api-key|password|passwd|pwd|security[_-]?key|token|secret)`;
 const REDACTION_PATTERNS = [
-  /(cookie\s*[:=]\s*)[^\n]*/gi,
-  /(set-cookie\s*[:=]\s*)[^\n]*/gi,
-  /(jsessionid\s*[:=]\s*)[^;\s&"']*/gi,
-  /(authorization\s*[:=]\s*)[^\n]*/gi,
-  /(bearer\s+)[a-z0-9\-._~+/]+=*/gi,
-  /(x-csrf-token\s*[:=]\s*)[^\n]*/gi,
-  /((?:password|passwd|pwd|securitykey|security-key|token)\s*[:=]\s*)[^\s&"']*/gi
+  [/(cookie\s*[:=]\s*)[^\n]*/gi, "$1[REDACTED]"],
+  [/(set-cookie\s*[:=]\s*)[^\n]*/gi, "$1[REDACTED]"],
+  [/(jsessionid\s*[:=]\s*)[^;\s&"']*/gi, "$1[REDACTED]"],
+  [/(authorization\s*[:=]\s*)[^\n]*/gi, "$1[REDACTED]"],
+  [/(bearer\s+)[a-z0-9\-._~+/]+=*/gi, "$1[REDACTED]"],
+  [/(x-csrf-token\s*[:=]\s*)[^\n]*/gi, "$1[REDACTED]"],
+  // name=value / name: value (query strings, form bodies, headers): TOKEN=..., client_secret=..., x-api-key: ...
+  [new RegExp(String.raw`(${SECRET_NAME}\s*[:=]\s*)[^\s&"',;<>]+`, "gi"), "$1[REDACTED]"],
+  // JSON: "access_token": "...", "clientSecret": "...", "token": "..."
+  [/("[^"\n]*(?:token|secret|password|passwd|api_?key|apikey|authorization|cookie)[^"\n]*"\s*:\s*")[^"]*(")/gi, "$1[REDACTED]$2"],
+  // HTML: the Struts token (or any *token*) field of a page, name before or after value
+  [/(<input\b[^>]*\bname\s*=\s*["']?[^"'>\s]*token[^"'>\s]*["']?[^>]*?\bvalue\s*=\s*["']?)[^"'>\s]*/gi, "$1[REDACTED]"],
+  [/(<input\b[^>]*?\bvalue\s*=\s*["']?)[^"'>\s]*(["']?[^>]*\bname\s*=\s*["']?[^"'>\s]*token)/gi, "$1[REDACTED]$2"]
 ];
 
-const SENSITIVE_KEY = /cookie|session|token|authorization|password|secret|key/i;
+/**
+ * Object keys whose values are secrets, compared without case, "-" or "_": a key ending in one of
+ * these words (accessToken, client_secret, x-api-key, sessionId, setCookie, ...) or exactly one of
+ * the short ones. Document identifiers such as downloadKey, doc_key or poKey are not secrets.
+ */
+const SENSITIVE_KEY = /^(?:.*(?:token|secret|password|passwd|cookie|authorization|apikey|securitykey|secretkey|accesskey|privatekey|sessionid|credential|credentials)|session|auth|key|pwd|pin)$/;
+const isSensitiveKey = (key) => SENSITIVE_KEY.test(String(key).toLowerCase().replace(/[-_]/g, ""));
 
 /**
  * Redact sensitive material from any loggable value.
@@ -72,10 +90,7 @@ const SENSITIVE_KEY = /cookie|session|token|authorization|password|secret|key/i;
  */
 export function redact(value) {
   if (typeof value === "string") {
-    return REDACTION_PATTERNS.reduce(
-      (text, pattern) => text.replace(pattern, "$1[REDACTED]"),
-      value
-    );
+    return REDACTION_PATTERNS.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), value);
   }
   if (value instanceof Error) {
     return `${value.name}: ${redact(value.message)}`;
@@ -86,7 +101,8 @@ export function redact(value) {
   if (value && typeof value === "object") {
     const out = {};
     for (const [key, val] of Object.entries(value)) {
-      out[key] = SENSITIVE_KEY.test(key) ? "[REDACTED]" : redact(val);
+      // a true/false flag (sessionExpired, tokenFound) cannot carry a secret: keep it readable
+      out[key] = isSensitiveKey(key) && typeof val !== "boolean" ? "[REDACTED]" : redact(val);
     }
     return out;
   }

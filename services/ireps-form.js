@@ -74,11 +74,13 @@ export function parseTagAttributes(tag) {
   return attrs;
 }
 
-function stripComments(html) {
+/** The HTML without <!-- comments --> (IREPS pages carry commented-out forms). */
+export function stripComments(html) {
   return String(html || "").replace(/<!--[\s\S]*?-->/g, "");
 }
 
-function findAllTags(html, tagName) {
+/** Every opening <tagName ...> with its position and parsed attributes. */
+export function findAllTags(html, tagName) {
   const re = new RegExp(`<${tagName}\\b[^>]*>`, "gi");
   const out = [];
   let m;
@@ -90,9 +92,13 @@ function findAllTags(html, tagName) {
 /* Regex path (service worker)                                                */
 /* -------------------------------------------------------------------------- */
 
-function locateForm(html) {
+/**
+ * The first <form> whose name is `formName` or whose action contains `formAction`:
+ * { action, inner } (inner = from the <form> tag to its </form>), or null.
+ */
+export function locateFormIn(html, formName, formAction) {
   const forms = findAllTags(html, "form");
-  const form = forms.find((f) => f.attrs.name === BILL_STATUS_FORM_NAME || (f.attrs.action || "").includes(BILL_STATUS_FORM_ACTION));
+  const form = forms.find((f) => f.attrs.name === formName || (f.attrs.action || "").includes(formAction));
   if (!form) return null;
   const close = html.indexOf("</form", form.index);
   return {
@@ -103,7 +109,7 @@ function locateForm(html) {
 
 function extractWithRegex(html) {
   const clean = stripComments(html);
-  const form = locateForm(clean);
+  const form = locateFormIn(clean, BILL_STATUS_FORM_NAME, BILL_STATUS_FORM_ACTION);
   const scope = form ? form.inner : clean;
   const result = emptyForm();
   result.present = !!form;

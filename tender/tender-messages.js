@@ -4,14 +4,14 @@
 // Read-only: nothing is deleted, replied to or archived. (Opening a message does mark it "read" in IREPS,
 // exactly as opening it by hand would.)
 
-import { TenderError, log, norm, irepsFetch, assertSession, parseHtml, parseCalls, qparam } from './tender-core.js';
+import { TenderError, log, norm, irepsFetch, assertSession, parseHtml, parseCalls, INBOX_PATH, dmyOf, isVendorInboxPage, pageNotRecognised, listFailed } from './tender-core.js';
 
-export const INBOX_PATH = '/epsn/vendorInboxLink.do';
+export { INBOX_PATH, dmyOf };
+
 export const MESSAGE_DETAIL_PATH = '/epsn/admin/myMessages/ViewMessageDetailAction.do';
 const MAX_PAGES = 60;
 
 const key = (dmy) => dmy.split('/').reverse().join(''); // dd/mm/yyyy -> yyyymmdd (sortable)
-export const dmyOf = (d) => `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
 
 /** 'NIT' | 'CORRIGENDUM' | 'OTHER' - from the (full) subject. */
 export function classifyMessage(subject) {
@@ -54,6 +54,10 @@ export function parseInboxPage(doc) {
  * Walk the Inbox following its own pagination links (not assuming +1), newest first.
  * Messages dated within [from, to] (Date objects, inclusive) are returned; never the same message twice.
  * Stops following pages once a whole page is older than `from` (IREPS lists newest first).
+ * A page with no message rows counts as "no messages" only when it is IREPS's inbox page itself and does
+ * not report messages it shows none of (H4). The first page anything else is an error (as an HTTP error
+ * is); a later page that is not the inbox ends the scan as before, with `incomplete` saying so - the
+ * messages read so far are kept.
  */
 export async function scanMessages(base, { from, to, onProgress = () => {} }) {
   const lo = key(dmyOf(from));
@@ -64,6 +68,7 @@ export async function scanMessages(base, { from, to, onProgress = () => {} }) {
   const rows = [];
   let total = 0;
   let unreachable = false;
+  let incomplete = '';
   while (queue.length && visited.size < MAX_PAGES) {
     const pageNo = queue.shift();
     if (visited.has(pageNo)) continue;
@@ -71,8 +76,18 @@ export async function scanMessages(base, { from, to, onProgress = () => {} }) {
     onProgress(`Reading My Messages page ${pageNo}...`);
     const res = await irepsFetch(base, INBOX_PATH, { method: 'POST', form: { listType: 'MyMsg', pageNo: String(pageNo) } });
     assertSession(res);
-    if (res.status !== 200) throw new TenderError('HTTP', `My Messages returned HTTP ${res.status}.`);
-    const page = parseInboxPage(parseHtml(res.text()));
+    if (res.status !== 200) throw listFailed(`My Messages page ${pageNo}`, res.status);
+    const doc = parseHtml(res.text());
+    const page = parseInboxPage(doc);
+    if (!page.rows.length && pageNo === 1) {
+      if (!isVendorInboxPage(doc)) throw pageNotRecognised(`My Messages page ${pageNo}`, doc);
+      if (page.total > 0) throw pageNotRecognised(`My Messages reports ${page.total} message(s) but DocLink could read none of them`, doc);
+    }
+    if (!page.rows.length && !isVendorInboxPage(doc)) {
+      incomplete = pageNotRecognised(`My Messages page ${pageNo}`, doc).message;
+      log('Messages', `not read to the end: ${incomplete}`, 'warn');
+      break;
+    }
     total = total || page.total;
     log('Messages', `page ${pageNo}: ${page.rows.length} message(s), pagination links ${page.pages.join(',') || 'none'}`);
     for (const r of page.rows) {
@@ -87,7 +102,7 @@ export async function scanMessages(base, { from, to, onProgress = () => {} }) {
     if (!page.rows.length) break;
   }
   if (queue.length) unreachable = true;
-  return { rows, total, pagesRead: visited.size, truncated: unreachable };
+  return { rows, total, pagesRead: visited.size, truncated: unreachable, incomplete };
 }
 
 // ---------------------------------------------------------------- message detail

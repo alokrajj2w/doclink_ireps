@@ -24,32 +24,47 @@
  * cookies of the same names and shape, so nothing here changes between them.
  *
  * Switching between the mock portal and the real portal is a single line in
- * config.json ("target": "mock" | "real") - both host_permissions are
- * declared permanently in manifest.json so no manifest edit is ever needed.
+ * config.json ("target": "mock" | "real") - both host_permissions are in
+ * manifest.json, so no manifest edit is needed (a production build keeps only
+ * the real portal's).
  * Every context that talks to IREPS (the service worker and the offscreen
  * document each run their own copy of this module) reads it once at
  * startup via loadIrepsConfig(); see background/service-worker.js and
  * background/offscreen.js.
+ *
+ * Fail closed: inside the extension there is no IREPS URL until config.json
+ * names the portal. A config.json that cannot be read, or has no valid
+ * "target", leaves baseUrl empty: nothing is sent to IREPS and the panel
+ * reports a configuration error, never the mock portal in its place.
  */
 
 import { logger } from "../utils/logger.js";
+import { readConfigFiles } from "../utils/config.js";
 import { STRUTS_TOKEN_FIELD, ALL_ZONES_VALUE } from "./ireps-form.js";
 
 const DEFAULT_MOCK_BASE_URL = "http://localhost:8765";
 const DEFAULT_REAL_BASE_URL = "https://www.ireps.gov.in";
 
+/**
+ * Running inside the extension, where config.json is always part of the package. A plain test
+ * page or Node has none, and keeps the mock portal as its default.
+ */
+const inExtension = () => typeof chrome !== "undefined" && !!(chrome.runtime && chrome.runtime.id);
+
 /** Mutable only through loadIrepsConfig(); everything else treats it as read-only. */
-let currentBaseUrl = DEFAULT_MOCK_BASE_URL;
-let currentTarget = "mock";
+let currentBaseUrl = inExtension() ? "" : DEFAULT_MOCK_BASE_URL;
+let currentTarget = inExtension() ? "unconfigured" : "mock";
 let currentPortals = Object.freeze({ mock: DEFAULT_MOCK_BASE_URL, real: DEFAULT_REAL_BASE_URL });
 let configLoaded = false;
+/** A config.json has been applied: a later read that fails keeps it. */
+let configApplied = false;
 
 /** Base configuration. Keep every IREPS URL here. baseUrl is a live getter so config.json can change it after this module has loaded. */
 export const IREPS_CONFIG = Object.freeze({
   get baseUrl() {
     return currentBaseUrl;
   },
-  /** config.json's "target": "mock" | "real" (or "custom" when an explicit baseUrl overrides it). */
+  /** config.json's "target": "mock" | "real" ("custom" when an explicit baseUrl overrides it, "unconfigured" when there is no IREPS URL). */
   get target() {
     return currentTarget;
   },
@@ -67,39 +82,54 @@ export const IREPS_CONFIG = Object.freeze({
 });
 
 /**
- * Read config.json (bundled with the extension, hand-editable, never built)
- * and apply its target to IREPS_CONFIG.baseUrl. Safe to call more than once;
- * after the first successful load it is a no-op unless `force` is passed.
- * On any error (missing file, bad JSON, running outside an extension
- * context) it silently keeps the current baseUrl.
+ * Read config.json (bundled with the extension, hand-editable, never built),
+ * with config.local.json over it (utils/config.js), and apply its target to
+ * IREPS_CONFIG.baseUrl. Safe to call more than once;
+ * after the first load it is a no-op unless `force` is passed.
+ * When the files cannot be read (missing file, bad JSON) or name no valid
+ * target: a config applied earlier is kept; otherwise, inside the extension,
+ * baseUrl is left empty (fail closed, see the top of this file); outside an
+ * extension (test pages, Node) the mock portal default stays.
  *
  * @param {{ force?: boolean }} [options]
- * @returns {Promise<string>} the effective baseUrl after loading
+ * @returns {Promise<string>} the effective baseUrl after loading ("" when none)
  */
 export async function loadIrepsConfig({ force = false } = {}) {
   if (configLoaded && !force) return currentBaseUrl;
   try {
-    const url = typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL("config.json") : "./config.json";
-    const response = await fetch(url, { cache: "no-store" });
-    const config = await response.json();
+    const files = await readConfigFiles({ force });
+    if (!files) throw new Error("config.json could not be read");
+    const config = files.config;
     const portals = Object.freeze({
       mock: (config && config.mockBaseUrl && String(config.mockBaseUrl)) || DEFAULT_MOCK_BASE_URL,
       real: (config && config.realBaseUrl && String(config.realBaseUrl)) || DEFAULT_REAL_BASE_URL
     });
+    let baseUrl;
+    let target;
     if (config && typeof config.baseUrl === "string" && config.baseUrl) {
-      currentBaseUrl = config.baseUrl; // explicit override, takes precedence over target
-      currentTarget = "custom";
-    } else if (config && config.target === "real") {
-      currentBaseUrl = portals.real;
-      currentTarget = "real";
+      baseUrl = config.baseUrl; // explicit override, takes precedence over target
+      target = "custom";
+    } else if (config && (config.target === "real" || config.target === "mock")) {
+      baseUrl = portals[config.target];
+      target = config.target;
     } else {
-      currentBaseUrl = portals.mock;
-      currentTarget = "mock";
+      throw new Error(`config.json "target" must be "mock" or "real", not ${JSON.stringify(config ? config.target : undefined)}`);
     }
+    currentBaseUrl = baseUrl;
+    currentTarget = target;
     currentPortals = portals;
-    logger.info(`IREPS config loaded: target=${(config && config.target) || "mock"}`);
+    configApplied = true;
+    logger.info(`IREPS config loaded: target=${target}`);
   } catch (error) {
-    logger.warn("Could not load config.json; keeping the current IREPS target", error);
+    if (configApplied) {
+      logger.warn("Could not load config.json; keeping the current IREPS target", error);
+    } else if (inExtension()) {
+      currentBaseUrl = "";
+      currentTarget = "unconfigured";
+      logger.error("No IREPS portal configured: config.json could not be read or has no valid \"target\". Nothing is sent to IREPS until it is fixed and DocLink is reloaded.", error);
+    } else {
+      logger.warn("No config.json outside the extension; the mock portal stays the IREPS target", error);
+    }
   } finally {
     configLoaded = true;
   }
@@ -150,7 +180,9 @@ export const IREPS_ERROR = Object.freeze({
   INVALID_RESPONSE: "IREPS_INVALID_RESPONSE",
   PARSE_FAILED: "IREPS_PARSE_FAILED",
   NO_RECORDS: "IREPS_NO_RECORDS",
-  INVALID_REQUEST: "IREPS_INVALID_REQUEST"
+  INVALID_REQUEST: "IREPS_INVALID_REQUEST",
+  /** No IREPS URL: config.json could not be read or has no valid target (nothing is sent). */
+  NOT_CONFIGURED: "IREPS_NOT_CONFIGURED"
 });
 
 /** Error raised for every failed or rejected IREPS interaction. */
@@ -171,16 +203,39 @@ export class IrepsError extends Error {
   }
 }
 
+/** Is this absolute URL on the configured IREPS origin? */
+export function isIrepsOriginUrl(url, baseUrl = IREPS_CONFIG.baseUrl) {
+  try {
+    return new URL(url).origin === new URL(baseUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
+/** Re-label a transport failure (IREPS_REQUEST_FAILED) with a step code. */
+export function rewrapTransportError(error, code, message) {
+  if (error instanceof IrepsError && error.code === IREPS_ERROR.REQUEST_FAILED) {
+    return new IrepsError(code, message, { status: error.status, reason: error.reason, detail: error.detail, cause: error });
+  }
+  return error;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Low level request                                                          */
 /* -------------------------------------------------------------------------- */
 
 /**
  * Build an absolute IREPS URL and refuse anything outside the configured origin.
+ * Throws IREPS_NOT_CONFIGURED when there is no IREPS URL (config.json unreadable).
  * @param {string} path
  * @returns {string}
  */
 export function buildIrepsUrl(path) {
+  if (!IREPS_CONFIG.baseUrl) {
+    throw new IrepsError(IREPS_ERROR.NOT_CONFIGURED, "No IREPS URL: config.json could not be read or has no valid target", {
+      detail: "config.json could not be read or has no valid \"target\""
+    });
+  }
   const url = new URL(path, IREPS_CONFIG.baseUrl);
   if (url.origin !== new URL(IREPS_CONFIG.baseUrl).origin) {
     throw new Error("Refusing to call a non-IREPS origin");
@@ -192,7 +247,9 @@ export function buildIrepsUrl(path) {
  * Perform one request with the browser session. Returns the response text
  * plus minimal metadata; never returns headers, so cookies cannot leak.
  *
- * @param {{ path: string, method?: string, body?: string|null }} request
+ * @param {{ path: string, method?: string, body?: string|null, headers?: Record<string, string> }} request
+ *        headers: extra application-level headers (e.g. the bill page's jQuery AJAX ones);
+ *        they override the defaults below
  * @param {{ fetch?: typeof fetch }} [deps]  injectable fetch for tests
  * @returns {Promise<IrepsResponse>}
  */
@@ -217,6 +274,7 @@ export async function requestIreps(request, deps = {}) {
     init.headers["Content-Type"] = "application/x-www-form-urlencoded";
     init.body = request.body == null ? "" : String(request.body);
   }
+  if (request.headers) Object.assign(init.headers, request.headers);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), IREPS_CONFIG.timeoutMs);

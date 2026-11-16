@@ -7,15 +7,22 @@
  * job continues even if the popup is closed.
  */
 
-import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError } from "../utils/messages.js";
-import { UPLOAD_SOURCES, DOCUMENT_TYPES } from "../services/upload-service.js";
+import { MESSAGE_TYPES, TARGETS, STAGES, STORAGE_KEYS, describeError, asDescribedError } from "../utils/messages.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
+import { loadEcmConfig, isDirectEcm } from "../services/ecm-config.js";
+import { loadDownloadLogConfig, configureDownloadLog, describeSkip, DOWNLOAD_LOG_ERROR } from "../services/download-log.js";
+import { initRedownload } from "./popup-redownload.js";
 import { formatFriendlyDateTime } from "../utils/filename.js";
+import { toIrepsDate } from "../utils/dates.js";
+import { fillSelect } from "./popup-common.js";
 import { initDocuments, handleDocumentMessage, restoreDocuments, refreshDocumentsDestination } from "./popup-documents.js";
 import { initMa, handleMaMessage, restoreMa, refreshMaDestination } from "./popup-ma.js";
 import { initPoIc, handlePoIcMessage, restorePoIc, refreshPoIcDestination } from "./popup-po-ic.js";
-import { initGate, currentPanelTabId } from "./popup-gate.js";
-import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus } from "./popup-recon-auth.js";
+import { initBatch, handleBatchMessage, restoreBatch, refreshBatchDestination } from "./popup-po-ic-batch.js";
+import { initGate, currentPanelTabId, panelOwnTabId, tabExists } from "./popup-gate.js";
+import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser, RECON_OFFLINE } from "./popup-recon-auth.js";
+import { initDownloads } from "./popup-downloads.js";
+import { initBillUpload, handleBillUploadMessage, restoreBillUpload } from "./popup-bill-upload.js";
 import { logger, mirrorLogToConsole, installConsoleHelpers } from "../utils/logger.js";
 
 const $ = (id) => document.getElementById(id);
@@ -28,6 +35,8 @@ const el = {
   viewUpload: $("view-upload"),
   viewMa: $("view-ma"),
   viewPoIc: $("view-po-ic"),
+  viewPoIcBatch: $("view-po-ic-batch"),
+  viewDownloads: $("view-downloads"),
   saveTo: $("save-to"),
   options: $("options"),
   optionsSummary: $("options-summary"),
@@ -57,17 +66,10 @@ const el = {
   btnErrorPreview: $("btn-error-preview"),
   btnErrorRetry: $("btn-error-retry"),
   btnErrorOpenRecon: $("btn-error-open-recon"),
-  btnUpload: $("btn-upload"),
   loginTitle: $("login-title"),
   loginText: $("login-text"),
   btnOpenIreps: $("btn-open-ireps"),
   btnLoginBack: $("btn-login-back"),
-  uploadForm: $("upload-form"),
-  uploadSource: $("upload-source"),
-  uploadFile: $("upload-file"),
-  uploadType: $("upload-type"),
-  uploadMessage: $("upload-message"),
-  btnUploadBack: $("btn-upload-back"),
   metaLastDownload: $("meta-last-download"),
   metaStatus: $("meta-status")
 };
@@ -92,7 +94,7 @@ let resultDownloadId = null;
 /* -------------------------------------------------------------------------- */
 
 /** Requests that only read state; logged at debug level, everything else is a user action. */
-const QUIET_TYPES = /^(GET_|CHECK_IREPS_SESSION|SEARCH_PO_LOAD_FORM)/;
+const QUIET_TYPES = /^(GET_|CHECK_IREPS_SESSION|SEARCH_PO_LOAD_FORM|BILL_UPLOAD_GET_STATE)/;
 
 /** Requests that start a download run; under Save to: ECM / S3 they need the Recon sign-in first. */
 const RUN_TYPES = new Set([
@@ -100,8 +102,20 @@ const RUN_TYPES = new Set([
   MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS,
   MESSAGE_TYPES.MA_DOWNLOAD,
   MESSAGE_TYPES.PO_DOWNLOAD,
-  MESSAGE_TYPES.IC_DOWNLOAD
+  MESSAGE_TYPES.IC_DOWNLOAD,
+  MESSAGE_TYPES.BATCH_START,
+  MESSAGE_TYPES.BATCH_RETRY
 ]);
+
+/** The runs that save to the Recon Engine (S3): Bill Status, CRN and R-NOTE. The rest save ECM documents. */
+const S3_RUN_TYPES = new Set([MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS, MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS]);
+
+/** Whether a run under Save to: ECM / S3 needs the Recon sign-in: always for S3, and for ECM documents unless they go straight to the ECM. */
+async function needsReconSignIn(type) {
+  if (S3_RUN_TYPES.has(type)) return true;
+  await loadEcmConfig();
+  return !isDirectEcm();
+}
 
 function payloadDestination(payload) {
   return payload.destination || (payload.options && payload.options.destination) || SAVE_DESTINATION.LOCAL;
@@ -116,9 +130,26 @@ function toLocal(payload) {
 }
 
 async function send(type, payload = {}) {
-  // Login 2 (Recon Engine) before an ECM / S3 run; login 1 (IREPS) is checked by the run itself.
-  if (RUN_TYPES.has(type) && payloadDestination(payload) === SAVE_DESTINATION.RECON && !(await ensureReconSignedIn())) {
-    payload = toLocal(payload);
+  // Login 2 (Recon Engine) before a run; login 1 (IREPS) is checked by the run itself.
+  if (RUN_TYPES.has(type)) {
+    if (await loadDownloadLogConfig()) {
+      // every download is logged for the signed-in user (services/download-log.js): no sign-in, no run,
+      // unless the Recon Engine is unreachable and the user chose to download without it (the log never blocks a run)
+      const signIn = await ensureReconSignedIn({ always: true, allowOffline: true });
+      if (!signIn) {
+        logger.info(`Panel action not started (no Recon sign-in): ${type}`);
+        return { started: false, error: describeError(DOWNLOAD_LOG_ERROR.SIGN_IN_REQUIRED) };
+      }
+      if (signIn === RECON_OFFLINE && payloadDestination(payload) === SAVE_DESTINATION.RECON && (await needsReconSignIn(type))) {
+        // S3 exports and gateway ECM uploads need the Recon Engine itself: this run saves locally
+        payload = toLocal(payload);
+      }
+    } else if (payloadDestination(payload) === SAVE_DESTINATION.RECON && (await needsReconSignIn(type)) && !(await ensureReconSignedIn())) {
+      payload = toLocal(payload);
+    }
+    // the run asks this panel (not another tab's) which already-downloaded files to download again
+    const panelTabId = await currentPanelTabId();
+    if (panelTabId !== null) payload = { ...payload, panelTabId };
   }
   // Every "Open Recon Engine" button now opens DocLink's own Recon sign-in page.
   if (type === MESSAGE_TYPES.OPEN_RECON) {
@@ -132,7 +163,7 @@ async function send(type, payload = {}) {
   }
   const quiet = QUIET_TYPES.test(type);
   if (quiet) logger.debug(`Panel request: ${type}`);
-  else logger.info(`Panel action: ${type}`, payload);
+  else logger.info(`Panel action: ${type}`, payload && payload.file && typeof payload.file.base64 === "string" ? { ...payload, file: { name: payload.file.name, base64: `<${payload.file.base64.length} chars>` } } : payload);
   try {
     const response = await chrome.runtime.sendMessage({ target: TARGETS.SERVICE_WORKER, type, ...payload });
     // A job DocLink refused to start (busy, bad input) never reaches the worker's workflow log.
@@ -150,6 +181,8 @@ chrome.runtime.onMessage.addListener((message) => {
   if (handleDocumentMessage(message)) return false;
   if (handleMaMessage(message)) return false;
   if (handlePoIcMessage(message)) return false;
+  if (handleBatchMessage(message)) return false;
+  if (handleBillUploadMessage(message)) return false;
   switch (message.type) {
     case MESSAGE_TYPES.IREPS_PROGRESS:
       renderProgress(message.stage, message.message);
@@ -176,7 +209,14 @@ function showView(name) {
   el.viewUpload.hidden = name !== "upload";
   el.viewMa.hidden = name !== "ma";
   el.viewPoIc.hidden = name !== "po-ic";
-  el.saveTo.hidden = name === "login" || name === "upload";
+  el.saveTo.hidden = name === "login" || name === "upload" || name === "downloads";
+  el.viewPoIcBatch.hidden = name !== "po-ic-batch";
+  el.viewDownloads.hidden = name !== "downloads";
+  // the tender / correspondence views (tender/*-ui.js) are opened outside showView; any view
+  // shown here replaces them, so two views are never visible at once
+  $("view-tender").hidden = true;
+  $("view-pending").hidden = true;
+  $("btn-downloads-open").setAttribute("aria-pressed", String(name === "downloads"));
 }
 
 /** Shared "IREPS login required" view (used by Bill Status and CRN). */
@@ -216,7 +256,7 @@ function setConnectionForError(described) {
 function setButtonBusy(busy, label) {
   el.btnDownload.disabled = busy;
   el.btnDownload.classList.toggle("is-busy", busy);
-  el.btnLabel.textContent = label || (selectedDestination() === SAVE_DESTINATION.RECON ? "Download Bill Status to S3" : "Download Bill Status");
+  el.btnLabel.textContent = label || "Bill Status";
 }
 
 /* ------------------------------------------------ shared bottom result panel */
@@ -277,6 +317,19 @@ function renderComplete(summary) {
   setConnection("connected", "Connected");
   const n = summary.recordCount ?? 0;
   const toRecon = summary.destination === SAVE_DESTINATION.RECON;
+  if (summary.skipped) {
+    // the same rows were already downloaded by this user (the download log) and not saved again
+    showResult({
+      title: "Bill Status not saved again",
+      summary: [`Records found: ${n}. ${describeSkip(summary.skip)}: the same records, so no new file was made.`, ...(summary.warnings || [])].join("\n"),
+      filter: summary.filter ? `Search: ${summary.filter}` : "",
+      filename: summary.skip && summary.skip.filename ? `Earlier file: ${summary.skip.filename}` : "",
+      downloadId: null,
+      preview: true
+    });
+    refreshMeta();
+    return;
+  }
   const extras = [];
   if (summary.skippedCount) extras.push(`${summary.skippedCount} incomplete record${summary.skippedCount === 1 ? "" : "s"} skipped`);
   if (toRecon && summary.deduplicated) extras.push("identical file already stored");
@@ -293,7 +346,7 @@ function renderComplete(summary) {
 }
 
 function renderError(error) {
-  const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN");
+  const described = asDescribedError(error);
   el.progress.hidden = true;
   setButtonBusy(false);
   refreshMeta();
@@ -331,29 +384,14 @@ async function refreshMeta() {
 /* Search options                                                             */
 /* -------------------------------------------------------------------------- */
 
-/** "2026-08-01" (input[type=date]) -> "01/08/2026" (IREPS). */
-function toIrepsDate(isoDate) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate || "");
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
-}
-
 function selectedDestination() {
   const checked = el.optDestination.find((r) => r.checked);
-  return checked ? checked.value : SAVE_DESTINATION.LOCAL;
+  return checked ? checked.value : SAVE_DESTINATION.RECON;
 }
 
-/** Buttons of the ECM documents (MA, PO / IC, tenders): under ECM / S3 they read "... to ECM". */
-const ECM_BUTTONS = [
-  ["#btn-ma-open", "Download MA"],
-  ["#btn-po-ic-open", "Download PO / IC"],
-  ["#btn-tender-open", "Download Tender Documents"],
-  ["#btn-auto-run .btn-label", "Scan My Messages & Download"]
-];
-
 /**
- * Button and progress-step labels follow the Save to choice (only while idle), on every card:
- * ECM / S3 reads "Download ... to S3" for Bill Status, CRN and R-NOTE and "Download ... to ECM"
- * for MA, PO / IC and tender documents.
+ * The Save to choice changed: progress steps read "Uploading to S3" under ECM / S3, and CRN /
+ * R-NOTE lock their format to Excel. Button labels name the file type only, whatever Save to says.
  */
 function updateDestination() {
   const toRecon = selectedDestination() === SAVE_DESTINATION.RECON;
@@ -362,20 +400,21 @@ function updateDestination() {
   refreshDocumentsDestination();
   refreshMaDestination();
   refreshPoIcDestination();
-  for (const [selector, label] of ECM_BUTTONS) {
-    const button = document.querySelector(selector);
-    if (button) button.textContent = toRecon ? `${label} to ECM` : label;
-  }
+  refreshBatchDestination();
 }
 
-/** The Save to switch is one panel-wide preference, remembered across panel openings. */
+/**
+ * The Save to switch is one panel-wide preference, remembered across panel openings.
+ * ECM / S3 until the user picks Local; the default is stored too, as the tender runs read it from storage.
+ */
 async function restoreDestination() {
   try {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.SAVE_DESTINATION);
-    const value = stored[STORAGE_KEYS.SAVE_DESTINATION];
-    for (const radio of el.optDestination) radio.checked = radio.value === (value === SAVE_DESTINATION.RECON ? SAVE_DESTINATION.RECON : SAVE_DESTINATION.LOCAL);
+    const value = stored[STORAGE_KEYS.SAVE_DESTINATION] === SAVE_DESTINATION.LOCAL ? SAVE_DESTINATION.LOCAL : SAVE_DESTINATION.RECON;
+    for (const radio of el.optDestination) radio.checked = radio.value === value;
+    if (stored[STORAGE_KEYS.SAVE_DESTINATION] !== value) await chrome.storage.local.set({ [STORAGE_KEYS.SAVE_DESTINATION]: value });
   } catch {
-    /* keep the default (Local) */
+    /* keep the default (ECM / S3) */
   }
   updateDestination();
 }
@@ -422,17 +461,7 @@ function updateOptionsSummary() {
 
 /** Fill the zone list from the IREPS form (values come from the page, never hard-coded). */
 function populateZones(zones) {
-  if (!Array.isArray(zones) || zones.length === 0) return;
-  const current = el.optZone.value;
-  el.optZone.replaceChildren();
-  for (const zone of zones) {
-    const option = document.createElement("option");
-    option.value = zone.value;
-    option.textContent = zone.label;
-    el.optZone.append(option);
-  }
-  el.optZone.value = zones.some((z) => z.value === current) ? current : ALL_ZONES;
-  updateOptionsSummary();
+  if (fillSelect(el.optZone, zones, ALL_ZONES)) updateOptionsSummary();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -494,25 +523,6 @@ async function restoreJobState() {
   return false;
 }
 
-function populateUploadForm() {
-  for (const source of UPLOAD_SOURCES) {
-    const option = document.createElement("option");
-    option.value = source.value;
-    option.textContent = source.label;
-    el.uploadSource.append(option);
-  }
-  const placeholder = document.createElement("option");
-  placeholder.value = "";
-  placeholder.textContent = "Select Type";
-  el.uploadType.append(placeholder);
-  for (const type of DOCUMENT_TYPES) {
-    const option = document.createElement("option");
-    option.value = type.value;
-    option.textContent = type.label;
-    el.uploadType.append(option);
-  }
-}
-
 /* -------------------------------------------------------------------------- */
 /* Wiring                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -538,25 +548,6 @@ el.optZone.addEventListener("change", updateOptionsSummary);
 el.optDateFrom.addEventListener("change", updateOptionsSummary);
 el.optDateTo.addEventListener("change", updateOptionsSummary);
 
-el.btnUpload.addEventListener("click", () => {
-  el.uploadMessage.hidden = true;
-  showView("upload");
-});
-el.btnUploadBack.addEventListener("click", () => showView("main"));
-el.uploadForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const file = el.uploadFile.files && el.uploadFile.files[0];
-  const response = await send(MESSAGE_TYPES.UPLOAD_DOCUMENT, {
-    request: {
-      source: el.uploadSource.value,
-      documentType: el.uploadType.value,
-      file: file ? { name: file.name, size: file.size, type: file.type } : null
-    }
-  });
-  el.uploadMessage.textContent = (response && response.message) || "Upload integration will be implemented in Phase 2.";
-  el.uploadMessage.hidden = false;
-});
-
 /**
  * First time the active tab is the configured IREPS portal: restore any job
  * state and check the session. Later returns to an IREPS tab only refresh
@@ -571,7 +562,9 @@ async function onIrepsTabActive() {
     const documentRestored = restored ? false : await restoreDocuments();
     const maRestored = restored || documentRestored ? false : await restoreMa();
     const poIcRestored = restored || documentRestored || maRestored ? false : await restorePoIc();
-    if (!restored && !documentRestored && !maRestored && !poIcRestored) showView("main");
+    const batchRestored = restored || documentRestored || maRestored || poIcRestored ? false : await restoreBatch();
+    const billRestored = restored || documentRestored || maRestored || poIcRestored || batchRestored ? false : await restoreBillUpload();
+    if (!restored && !documentRestored && !maRestored && !poIcRestored && !batchRestored && !billRestored) showView("main");
     const state = await send(MESSAGE_TYPES.GET_JOB_STATE);
     if (!state || state.status !== "running") {
       if (restored && state && state.status === "error" && state.error && state.error.loginRequired) {
@@ -593,16 +586,23 @@ async function onIrepsTabActive() {
   installConsoleHelpers();
   mirrorLogToConsole();
   logger.info("Side panel opened");
-  populateUploadForm();
   updateOptionsSummary();
   refreshMeta();
   initDocuments({ send, showView, setConnection, setConnectionForError, showLogin, showResult, hideResult, getDestination: selectedDestination });
   initReconAuth({ getDestination: selectedDestination, setDestination });
+  // tender downloads run in this panel: their download-log queue is the panel's own
+  configureDownloadLog({ context: "panel" });
+  initRedownload({ currentTabId: currentPanelTabId, ownTabId: panelOwnTabId, tabExists });
   await restoreDestination();
-  if (selectedDestination() === SAVE_DESTINATION.RECON) refreshReconStatus();
+  // with the download log on, every run needs the Recon sign-in: show who is signed in
+  if (selectedDestination() === SAVE_DESTINATION.RECON || (await loadDownloadLogConfig())) refreshReconStatus();
   initMa({ send, showView, setConnection, setConnectionForError, showLogin, getDestination: selectedDestination });
   initPoIc({ send, showView, setConnection, setConnectionForError, getDestination: selectedDestination });
   updateDestination(); // the MA / PO / IC labels, now that those cards are wired
+  initBatch({ send, showView, setConnection, setConnectionForError, getDestination: selectedDestination });
+  refreshBatchDestination();
+  initBillUpload({ send, showView, setConnection, setConnectionForError, currentPanelTabId });
+  initDownloads({ showView, ensureSignedIn: () => ensureReconSignedIn({ always: true }), currentUser: currentReconUser, openSignIn: openReconSignIn });
   // Nothing talks to IREPS until the active tab is the configured portal.
   await initGate({ send, setConnection, onActive: onIrepsTabActive });
 })();

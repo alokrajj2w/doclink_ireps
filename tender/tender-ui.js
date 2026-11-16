@@ -1,8 +1,12 @@
 // "Download Tender Documents" view: account panel + automatic discovery from My Messages.
-import { runAutomatic } from './tender-auto.js';
+import { runAutomatic, runLetterType, runTabulations } from './tender-auto.js';
 import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
-import { SESSION_MSG, getLogTail } from './tender-core.js';
+import { SESSION_MSG, log } from './tender-core.js';
+import { renderAccountPanel, refreshAccountPanel, wireCopyDiagnostics, wireViewLifecycle, guardTabs } from './view-common.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
+import { describeSkip } from '../services/download-log.js';
+import { claimPanelRun, releasePanelRun, isPanelBusy, PANEL_BUSY_MSG } from './run-lock.js';
+import { localIsoDate } from '../utils/dates.js';
 
 const $ = (id) => document.getElementById(id);
 const main = $('view-main');
@@ -10,54 +14,36 @@ const view = $('view-tender');
 const gate = $('view-gate');
 
 let running = false;
-let lastIds = [];
 
-const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const fromIso = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 
 function show(open) {
   view.hidden = !open;
   if (open) {
     main.hidden = true;
-    if (!$('auto-from').value) { $('auto-from').value = iso(new Date()); $('auto-to').value = iso(new Date()); }
+    if (!$('auto-from').value) { $('auto-from').value = localIsoDate(new Date()); $('auto-to').value = localIsoDate(new Date()); }
     refreshAccount();
   } else if (gate.hidden) main.hidden = false;
 }
 
-function setBusy(busy) {
+/** Disable every download button while a run goes; the clicked one shows the spinner. */
+function setBusy(busy, button) {
   running = busy;
+  if (busy) claimPanelRun('tender'); else releasePanelRun('tender');
   $('btn-auto-run').disabled = busy;
   $('btn-auto-retry').disabled = busy;
+  document.querySelectorAll('[data-status],[data-tabulation]').forEach((b) => { b.disabled = busy; });
   $('btn-account-refresh').disabled = busy;
-  $('btn-auto-run').classList.toggle('is-busy', busy);
+  document.querySelectorAll('.tender-actions .btn').forEach((b) => b.classList.toggle('is-busy', busy && b === button));
 }
 
 // ---------------------------------------------------------------- account panel
 
 /** Render a detected (or failed) account context. Nothing here is assumed: every value is from IREPS. */
-export function renderAccount(a) {
-  const ok = !!(a && a.authenticated && a.verified);
-  $('acc-connection').textContent = a ? (a.authenticated ? 'Connected' : 'Not connected') : 'Not connected';
-  $('acc-company').textContent = ok || a?.companyName ? a.companyName : '—';
-  $('acc-unit').textContent = ok ? a.operatingUnit || 'Not stated' : '—';
-  $('acc-id').textContent = ok || a?.irepsAccountId ? a.irepsAccountId : '—';
-  $('acc-status').textContent = ok ? 'Verified' : 'Account not verified';
-  $('acc-status').className = ok ? 'tender-ok' : 'tender-bad';
-  const w = $('acc-warning');
-  w.textContent = ok ? '' : a && !a.authenticated ? SESSION_MSG : ACCOUNT_UNVERIFIED_MSG;
-  w.hidden = ok;
-}
+const renderAccount = (a) => renderAccountPanel('', a);
 
 async function refreshAccount() {
-  if (running) return;
-  $('acc-connection').textContent = 'Checking…';
-  $('acc-status').textContent = 'Checking…';
-  try {
-    renderAccount(await getActiveIrepsAccountContext());
-  } catch (e) {
-    console.error('[DocLink][Account] check failed:', e.message);
-    renderAccount(null);
-  }
+  if (!running) await refreshAccountPanel('');
 }
 
 // ---------------------------------------------------------------- rendering
@@ -82,12 +68,20 @@ function li(label, value, cls, title, reason) {
 
 // Save to: ECM / S3 - how many of a category's documents the ECM holds; a document the ECM did not take was saved locally
 const inEcm = (c) => (c.files || []).filter((f) => f.ecm && f.ecm.status !== ECM_OUTCOME.FAILED).length;
+// documents attached to a corrigendum page, saved next to it
+const attached = (c) => (c.files || []).filter((f) => f.role === 'attachment' && f.status === 'DOWNLOADED').length;
 const catText = (c) => {
-  const text = c.status === 'NOT_AVAILABLE' ? 'none' : c.status === 'FAILED' ? 'failed' : c.status === 'PARTIAL' ? `${c.downloaded} ok, ${c.failed} failed` : `${c.downloaded} downloaded`;
-  return inEcm(c) ? `${text} (${inEcm(c)} in ECM)` : text;
+  // all of a category already downloaded (skipped) reads "already downloaded", not "none"
+  const text = c.status === 'NOT_AVAILABLE' ? (c.alreadyDownloaded ? 'already downloaded' : 'none') : c.status === 'FAILED' ? 'failed' : c.status === 'PARTIAL' ? `${c.downloaded} ok, ${c.failed} failed` : `${c.downloaded} downloaded`;
+  const extra = [attached(c) ? `+${attached(c)} attached` : '', inEcm(c) ? `${inEcm(c)} in ECM` : '', c.alreadyDownloaded && c.status !== 'NOT_AVAILABLE' ? `${c.alreadyDownloaded} already downloaded` : ''].filter(Boolean);
+  return extra.length ? `${text} (${extra.join(', ')})` : text;
 };
-const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : ''))].filter(Boolean).join('\n');
-const LABEL = { tenderPdf: 'NIT', attachments: 'Attachments', myOffer: 'My Offer', corrigenda: 'Corrigenda', negotiation: 'Negotiation', counterOffer: 'Counter offer', loa: 'LOA', correspondence: 'Correspondence' };
+// download-log skips say when / where, the ledger's only that they were skipped
+const reasons = (c) => [c.note, ...(c.files || []).map((f) => f.error || (f.ecm?.status === ECM_OUTCOME.FAILED ? describeEcmOutcome(f.ecm) : '')), ...(c.skippedFiles || []).map((f) => `${f.title || f.id}: ${describeSkip(f.skip)}`), ...(c.warnings || []).filter((w) => /download log|ECM could not be checked|attached document/i.test(w))].filter(Boolean).join('\n');
+const LABEL = { tenderPdf: 'NIT', attachments: 'Attachments', myOffer: 'My Offer', corrigenda: 'Corrigenda', negotiation: 'Negotiation', counterOffer: 'Counter offer', loa: 'LOA', correspondence: 'Correspondence', financialTabulation: 'Financial Tabulation', commercialTabulation: 'Commercial Tabulation' };
+const TABULATION_NAME = { financialTabulation: 'Financial Tabulation', commercialTabulation: 'Commercial Tabulation' };
+
+const LETTER_PAGE = { MyNegotiation: 'Negotiation', MyCounterOffer: 'Counter Offer', MyAdvanceAcceptanceLetter: 'Advance Acceptance Letter' };
 
 const tenderRows = new Map(); // tenderNo -> <li>, updated live as each tender finishes
 function renderDiscovered(ev) {
@@ -119,37 +113,89 @@ function renderTender(ev) {
 function renderResult(r) {
   const body = $('tender-result-rows');
   body.replaceChildren();
-  if (r.letters) {
-    const n = r.letters.summary?.newLetters || 0;
-    body.append(li('Negotiation / Counter offer / LOA letters (by date)', n ? `${n} downloaded` : 'none for these dates', n ? 'tender-ok' : 'tender-muted', r.letters.error || '', r.letters.error || ''));
-    for (const t of r.letters.tenders) {
-      const parts = Object.entries(t.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
-      body.append(li(`  ${t.tenderNo}`, t.error ? 'failed' : parts.join(' · '), t.error ? 'tender-bad' : 'tender-ok', '', t.error || Object.values(t.categories).map(reasons).filter(Boolean).join('\n')));
-    }
-  }
-  for (const c of r.correspondence) {
-    if (c.error || c.correspondence?.discovered) body.append(li(`Correspondence ${c.tenderNo}`, c.error ? 'failed' : catText(c.correspondence), c.error ? 'tender-bad' : 'tender-ok', '', c.error || reasons(c.correspondence)));
-  }
   $('tender-result-tender').textContent = `Dates ${r.range.from} - ${r.range.to}: ${r.messages.relevant} NIT/corrigendum message(s) of ${r.messages.scanned}, ${r.messages.pagesRead} page(s) read`;
   $('tender-result-totals').textContent = `Downloaded: ${r.summary.downloaded}   Failed tenders: ${r.summary.failed}   Needs review: ${r.summary.needsReview}${r.messages.truncated ? '   (page limit reached - narrow the date range)' : ''}`;
   $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/';
-  lastIds = [];
   $('btn-tender-show').hidden = true;
   $('tender-result').hidden = false;
-  $('btn-auto-retry').hidden = !(r.summary.failed || r.tenders.some((t) => t.status === 'FAILED'));
-  if (r.aborted) {
-    $('tender-error-message').textContent = `Stopped early: ${r.aborted.message}`;
+  $('btn-auto-retry').hidden = !(r.summary.failed || r.tenders.some((t) => t.status === 'FAILED') || r.messages.incomplete);
+  // My Messages not read to its end (H4): the messages after it were not looked at
+  const problems = [r.aborted ? `Stopped early: ${r.aborted.message}` : '', r.messages.incomplete ? `My Messages was not read to the end: ${r.messages.incomplete}` : ''].filter(Boolean);
+  if (problems.length) {
+    $('tender-error-message').textContent = problems.join('\n');
     $('tender-error').hidden = false;
   }
 }
 
-// ---------------------------------------------------------------- run
+// ---------------------------------------------------------------- one letter type
 
-async function run() {
+function renderLetterResult(status, r) {
+  const name = LETTER_PAGE[status];
+  const body = $('tender-result-rows');
+  body.replaceChildren();
+  const l = r.letters;
+  const n = l.summary?.newLetters || 0;
+  const err = l.listErrors?.[status];
+  const warn = l.listWarnings?.[status]; // rows of the list DocLink could not read (shown, never silently skipped)
+  body.append(li(`${name} letters (by Letter Date)`, err ? 'failed' : n ? `${n} downloaded` : 'none for these dates', err || warn ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', err || warn || ''));
+  for (const t of l.tenders) {
+    const parts = Object.entries(t.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
+    body.append(li(`  ${t.tenderNo}`, t.error ? 'failed' : parts.join(' · '), t.error ? 'tender-bad' : 'tender-ok', '', t.error || Object.values(t.categories).map(reasons).filter(Boolean).join('\n')));
+  }
+  $('tender-result-tender').textContent = `${name} letters with Letter Date ${r.range.from} - ${r.range.to}${l.listed ? `: ${l.listed} found` : ''}`;
+  $('tender-result-totals').textContent = `Downloaded: ${n}`;
+  $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/';
+  $('btn-tender-show').hidden = true;
+  $('tender-result').hidden = false;
+  $('btn-auto-retry').hidden = true;
+  if (l.aborted) {
+    $('tender-error-message').textContent = `Stopped early: ${l.aborted.message}`;
+    $('tender-error').hidden = false;
+  }
+}
+
+// ---------------------------------------------------------------- one tabulation type (by closing date)
+
+function renderTabulationResult(pdfType, r) {
+  const name = TABULATION_NAME[pdfType];
+  const body = $('tender-result-rows');
+  body.replaceChildren();
+  const t = r.tabulations;
+  const n = t.summary.downloaded;
+  body.append(li(`${name} (by Closing Date)`, n ? `${n} downloaded` : t.summary.withTabulation ? 'nothing new' : 'none for these dates', n ? 'tender-ok' : 'tender-muted'));
+  for (const x of t.tenders) {
+    if (x.notAvailable) {
+      body.append(li(`  ${x.tenderNo}`, 'not available yet', 'tender-muted', '', `${x.title || ''}${x.closingDate ? ` · closed ${x.closingDate}` : ''} · IREPS shows no ${name} yet`));
+      continue;
+    }
+    const parts = Object.entries(x.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
+    body.append(li(`  ${x.tenderNo}`, x.error ? 'failed' : parts.join(' · '), x.error ? 'tender-bad' : 'tender-ok', '', x.error || Object.values(x.categories).map(reasons).filter(Boolean).join('\n')));
+  }
+  $('tender-result-tender').textContent = `${name} of tenders closing ${r.range.from} - ${r.range.to}: ${t.listed} closed tender(s), ${t.summary.withTabulation} with a ${name}`;
+  $('tender-result-totals').textContent = `Downloaded: ${n}   Not available yet: ${t.summary.notAvailable}`;
+  $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/Tabulation/';
+  $('btn-tender-show').hidden = true;
+  $('tender-result').hidden = false;
+  $('btn-auto-retry').hidden = true;
+  // Closed Tenders not read to its end (H4): tenders on the part not read were not looked at
+  const problems = [t.aborted ? `Stopped early: ${t.aborted.message}` : '', t.incomplete ? `Closed Tenders was not read to the end: ${t.incomplete}` : ''].filter(Boolean);
+  if (problems.length) {
+    $('tender-error-message').textContent = problems.join('\n');
+    $('tender-error').hidden = false;
+  }
+}
+
+/** A run over the From / To dates (and the optional Tender Number): `task({ from, to, tenderNo, onProgress, onAccount })`. */
+async function runByDate(what, task, render, button) {
   if (running) return;
   $('tender-error').hidden = true;
   $('tender-result').hidden = true;
   $('auto-discovered').hidden = true;
+  if (isPanelBusy('tender')) {
+    $('tender-error-message').textContent = PANEL_BUSY_MSG;
+    $('tender-error').hidden = false;
+    return;
+  }
   let from;
   let to;
   try {
@@ -161,8 +207,58 @@ async function run() {
     $('tender-error').hidden = false;
     return;
   }
-  setBusy(true);
+  setBusy(true, button);
   $('tender-progress').hidden = false;
+  const stopGuard = guardTabs();
+  try {
+    render(await task({
+      from, to, tenderNo: $('letter-tender-no').value,
+      onProgress: (m) => ($('tender-progress-message').textContent = m),
+      onAccount: renderAccount,
+    }));
+  } catch (e) {
+    $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
+    $('tender-error').hidden = false;
+    log('Tender', `${what} failed: ${e.code || ''} ${e.message}`, 'error');
+  } finally {
+    stopGuard();
+    $('tender-progress').hidden = true;
+    setBusy(false);
+  }
+}
+
+const runLetters = (status, button) => runByDate('letters', (o) => runLetterType({ status, ...o }), (r) => renderLetterResult(status, r), button);
+const runTabulationType = (pdfType, button) => runByDate('tabulations', (o) => runTabulations({ pdfType, ...o }), (r) => renderTabulationResult(pdfType, r), button);
+
+// ---------------------------------------------------------------- keep the user on the IREPS tab while downloading
+// guardTabs (view-common.js): during a run only the tabs DocLink's own work opened are closed (M23)
+
+// ---------------------------------------------------------------- run
+
+async function run() {
+  if (running) return;
+  $('tender-error').hidden = true;
+  $('tender-result').hidden = true;
+  $('auto-discovered').hidden = true;
+  if (isPanelBusy('tender')) {
+    $('tender-error-message').textContent = PANEL_BUSY_MSG;
+    $('tender-error').hidden = false;
+    return;
+  }
+  let from;
+  let to;
+  try {
+    from = fromIso($('auto-from').value);
+    to = fromIso($('auto-to').value);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) throw new Error('Choose a valid From / To date.');
+  } catch (e) {
+    $('tender-error-message').textContent = e.message;
+    $('tender-error').hidden = false;
+    return;
+  }
+  setBusy(true, $('btn-auto-run'));
+  $('tender-progress').hidden = false;
+  const stopGuard = guardTabs();
   try {
     const r = await runAutomatic({
       from, to,
@@ -175,8 +271,9 @@ async function run() {
     $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('tender-error').hidden = false;
     if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') renderAccount(await getActiveIrepsAccountContext().catch(() => null));
-    console.error('[DocLink][Tender] run failed:', e.code || '', e.message);
+    log('Tender', `run failed: ${e.code || ''} ${e.message}`, 'error');
   } finally {
+    stopGuard();
     $('tender-progress').hidden = true;
     setBusy(false);
   }
@@ -185,24 +282,11 @@ async function run() {
 $('btn-tender-open').addEventListener('click', () => show(true));
 $('btn-tender-back').addEventListener('click', () => show(false));
 $('btn-auto-run').addEventListener('click', run);
+document.querySelectorAll('[data-status]').forEach((b) => b.addEventListener('click', () => runLetters(b.dataset.status, b)));
+document.querySelectorAll('[data-tabulation]').forEach((b) => b.addEventListener('click', () => runTabulationType(b.dataset.tabulation, b)));
 $('btn-auto-retry').addEventListener('click', run); // already-downloaded documents are skipped via the ledger
 $('btn-account-refresh').addEventListener('click', refreshAccount);
-$('btn-copy-diag').addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(getLogTail() || '(no log yet)');
-    $('btn-copy-diag').textContent = 'Copied';
-  } catch {
-    $('btn-copy-diag').textContent = 'Copy failed';
-  }
-  setTimeout(() => ($('btn-copy-diag').textContent = 'Copy diagnostics'), 1500);
-});
+wireCopyDiagnostics($('btn-copy-diag'));
 
-// The user may switch IREPS accounts in another tab: re-detect whenever the panel regains focus.
-const refreshIfVisible = () => !view.hidden && !running && refreshAccount();
-window.addEventListener('focus', refreshIfVisible);
-document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && refreshIfVisible());
-
-// If DocLink's "go to IREPS" gate takes over, keep this view out of the way.
-new MutationObserver(() => {
-  if (!gate.hidden) view.hidden = true;
-}).observe(gate, { attributes: true, attributeFilter: ['hidden'] });
+// Re-detect the account when the panel comes back into view; step aside for the "go to IREPS" gate.
+wireViewLifecycle({ view, gate, isRunning: () => running, refresh: refreshAccount });

@@ -13,11 +13,13 @@
 
 import { MESSAGE_TYPES, MA_STAGES, describeError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
-import { SAVE_DESTINATION } from "../services/recon-service.js";
+import { describeSkip, skipChipText } from "../services/download-log.js";
+import { toIrepsDate, localIsoDate } from "../utils/dates.js";
+import { fillSelect } from "./popup-common.js";
 
 const $ = (id) => document.getElementById(id);
 const ALL_RAILWAYS = "-1";
-const STATUS_LABEL = { queued: "Queued", downloading: "Downloading", completed: "Completed", failed: "Failed" };
+const STATUS_LABEL = { queued: "Queued", downloading: "Downloading", completed: "Completed", failed: "Failed", skipped: "Skipped" };
 
 let ctx = null;
 let currentState = null;
@@ -73,17 +75,6 @@ function bindElements() {
 /* Options                                                                    */
 /* -------------------------------------------------------------------------- */
 
-/** "2026-09-21" (input[type=date]) -> "21/09/2026" (IREPS). */
-function toIrepsDate(isoDate) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate || "");
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
-}
-
-function todayIso() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
 function dateMode() {
   const checked = el.dateModes.find((r) => r.checked);
   return checked ? checked.value : "date";
@@ -115,17 +106,7 @@ function syncDateRows() {
 }
 
 function populateRailways(railways) {
-  if (!Array.isArray(railways) || railways.length === 0) return;
-  const current = el.rly.value;
-  el.rly.replaceChildren();
-  for (const r of railways) {
-    const option = document.createElement("option");
-    option.value = r.value;
-    option.textContent = r.label;
-    el.rly.append(option);
-  }
-  el.rly.value = railways.some((r) => r.value === current) ? current : ALL_RAILWAYS;
-  syncDateRows();
+  if (fillSelect(el.rly, railways, ALL_RAILWAYS)) syncDateRows();
 }
 
 function setSearchBusy(busy, label) {
@@ -185,6 +166,10 @@ function chipFor(item) {
   if (item.status === "failed" && item.error) {
     const described = describeError(item.error.code, { status: item.error.status, detail: item.error.detail });
     chip.title = `${described.title}: ${described.message}`;
+  }
+  if (item.status === "skipped" && item.skip) {
+    chip.textContent = skipChipText(item.skip);
+    chip.title = describeSkip(item.skip);
   }
   return chip;
 }
@@ -287,9 +272,8 @@ function applyFilter() {
 function updateSelectionUi() {
   const n = selected.size;
   const busy = currentState && (currentState.status === "downloading" || currentState.status === "searching");
-  const to = ctx && ctx.getDestination && ctx.getDestination() === SAVE_DESTINATION.RECON ? " to ECM" : "";
-  el.btnDownloadSelected.textContent = n ? `Download Selected (${n})${to}` : `Download Selected${to}`;
-  el.btnDownloadAll.textContent = `Download All${to}`;
+  el.btnDownloadSelected.textContent = n ? `Download Selected (${n})` : "Download Selected";
+  el.btnDownloadAll.textContent = "Download All";
   el.btnDownloadSelected.disabled = busy || n === 0;
   el.btnDownloadAll.disabled = busy || renderedIds.length === 0;
   const visible = visibleIds();
@@ -314,7 +298,8 @@ function renderDownloads(state) {
   } else {
     el.downloadTitle.textContent = d.failed === 0 ? `✓ ${d.completed} MA cop${d.completed === 1 ? "y" : "ies"} downloaded` : `${d.completed} downloaded, ${d.failed} failed`;
     const ecm = summariseEcm(d.items);
-    el.downloadText.textContent = [d.failed === 0 ? "All selected MA PDFs were saved." : "Hover a Failed chip to see why. Failed MAs can be retried.", ecm].filter(Boolean).join("\n");
+    const skipped = d.skipped ? `${d.skipped} skipped: already downloaded or already in the ECM (hover the chip for when / where).` : "";
+    el.downloadText.textContent = [d.failed === 0 ? (d.skipped ? "Every other selected MA PDF was saved." : "All selected MA PDFs were saved.") : "Hover a Failed chip to see why. Failed MAs can be retried.", skipped, ecm, ...(d.warnings || [])].filter(Boolean).join("\n");
   }
   // only files saved on this computer (an MA stored in the ECM has no local copy)
   const local = (d.items || []).filter((i) => i.status === "completed" && i.path && (!i.ecm || i.ecm.status === ECM_OUTCOME.FAILED));
@@ -408,7 +393,7 @@ async function loadForm(force = false) {
 
 async function openView() {
   ctx.showView("ma");
-  if (!el.date.value) el.date.value = todayIso();
+  if (!el.date.value) el.date.value = localIsoDate();
   syncDateRows();
   const state = await refreshState();
   if (!state || state.status === "idle" || state.status === "error") await loadForm(false);
@@ -466,7 +451,7 @@ async function newSearch() {
 /* Public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
-/** Save to changed: the download buttons say where the MAs go. */
+/** Save to changed: refresh the download buttons (their labels do not name the destination). */
 export function refreshMaDestination() {
   if (ctx) updateSelectionUi();
 }
@@ -474,7 +459,7 @@ export function refreshMaDestination() {
 export function initMa(context) {
   ctx = context;
   bindElements();
-  el.date.value = todayIso();
+  el.date.value = localIsoDate();
   el.btnOpen.addEventListener("click", openView);
   el.btnBack.addEventListener("click", () => ctx.showView("main"));
   el.form.addEventListener("submit", startSearch);
@@ -551,7 +536,7 @@ export async function restoreMa() {
   if (!state || state.status === "idle") return false;
   if (state.status === "searching" || state.status === "downloading") {
     ctx.showView("ma");
-    if (!el.date.value) el.date.value = todayIso();
+    if (!el.date.value) el.date.value = localIsoDate();
     syncDateRows();
     render(state);
     return true;

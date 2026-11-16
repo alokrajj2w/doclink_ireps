@@ -10,13 +10,11 @@
  */
 
 import { SEARCH_PO_CRITERIA, errorCodesFor } from "../search-po/search-po-api.js";
-import { searchIrepsDocuments, validateSearchPoSession, SEARCH_PO_FLOW_STAGES } from "../search-po/search-po-service.js";
+import { searchIrepsDocuments } from "../search-po/search-po-service.js";
 import { parseRnoteSearchResults } from "./rnote-parser.js";
 
 /** Controlled error codes for the R-NOTE flow (mapped to UI text in utils/messages.js). */
 export const RNOTE_ERROR = errorCodesFor(SEARCH_PO_CRITERIA.RNOTE);
-export const RNOTE_FLOW_STAGES = SEARCH_PO_FLOW_STAGES;
-export const validateRnoteSession = validateSearchPoSession;
 
 /**
  * @param {import("../search-po/search-po-api.js").SearchPoOptions} [options]

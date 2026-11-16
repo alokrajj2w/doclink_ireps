@@ -24,10 +24,13 @@
  * locked while it is picked.
  */
 
-import { MESSAGE_TYPES, DOCUMENT_STAGES, documentStageLabel, describeError } from "../utils/messages.js";
+import { MESSAGE_TYPES, DOCUMENT_STAGES, documentStageLabel, describeError, asDescribedError } from "../utils/messages.js";
 import { EXPORT_FORMATS } from "../services/search-po/search-po-export.js";
 import { SEARCH_PO_DOCUMENT_TYPES, SEARCH_PO_CRITERIA } from "../services/search-po/search-po-api.js";
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
+import { describeSkip } from "../services/download-log.js";
+import { toIrepsDate } from "../utils/dates.js";
+import { fillSelect } from "./popup-common.js";
 
 const ALL_RAILWAYS = "-1";
 /** The document types that have a card here (PO and MA have their own views). */
@@ -50,12 +53,6 @@ const cards = new Map();
 /** Railway list from the IREPS PO Search page, shared by both cards. */
 let railways = null;
 let railwaysLoading = null;
-
-/** "2026-08-01" (input[type=date]) -> "01/08/2026" (IREPS). */
-function toIrepsDate(isoDate) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate || "");
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
-}
 
 function formatLabel(value) {
   return (EXPORT_FORMATS.find((f) => f.value === value) || EXPORT_FORMATS[0]).label;
@@ -135,7 +132,7 @@ class DocumentCard {
     return (ctx && ctx.getDestination && ctx.getDestination()) || SAVE_DESTINATION.LOCAL;
   }
 
-  /** Recon uploads are always Excel: lock the format; relabel the button and the last step (only while idle). */
+  /** Recon uploads are always Excel: lock the format; relabel the last step. */
   updateDestination() {
     const el = this.el;
     const toRecon = this.selectedDestination() === SAVE_DESTINATION.RECON;
@@ -174,23 +171,13 @@ class DocumentCard {
 
   /** Fill the railway list from the IREPS PO Search form (values come from the page, never hard-coded). */
   setRailways(list) {
-    const select = this.el.rly;
-    const current = select.value;
-    select.replaceChildren();
-    for (const r of list) {
-      const option = document.createElement("option");
-      option.value = r.value;
-      option.textContent = r.label;
-      select.append(option);
-    }
-    select.value = list.some((r) => r.value === current) ? current : ALL_RAILWAYS;
-    this.updateSummary();
+    if (fillSelect(this.el.rly, list, ALL_RAILWAYS)) this.updateSummary();
   }
 
   setBusy(busy, text) {
     this.el.btnDownload.disabled = busy;
     this.el.btnDownload.classList.toggle("is-busy", busy);
-    this.el.btnLabel.textContent = text || (this.selectedDestination() === SAVE_DESTINATION.RECON ? `Download ${this.label} to S3` : `Download ${this.label}`);
+    this.el.btnLabel.textContent = text || this.label;
   }
 
   clearError() {
@@ -228,6 +215,18 @@ class DocumentCard {
     const n = summary.recordCount ?? 0;
     const pages = summary.pagesFetched > 1 ? ` across ${summary.pagesFetched} result pages` : "";
     const toRecon = summary.destination === SAVE_DESTINATION.RECON;
+    if (summary.skipped) {
+      // the same rows were already downloaded by this user (the download log) and not saved again
+      ctx.showView("main");
+      ctx.showResult({
+        title: `${this.label} export not saved again`,
+        summary: [`${this.label} records found: ${n}${pages}. ${describeSkip(summary.skip)}: the same records, so no new file was made.`, ...(summary.warnings || [])].join("\n"),
+        filter: summary.filter ? `Search: ${summary.filter}` : "",
+        filename: summary.skip && summary.skip.filename ? `Earlier file: ${summary.skip.filename}` : "",
+        downloadId: null
+      });
+      return;
+    }
     const stored = toRecon && summary.deduplicated ? ", identical file already stored" : "";
     const loaded = toRecon ? describeIngestStats(summary.ingestStats) : "";
     ctx.showView("main");
@@ -241,7 +240,7 @@ class DocumentCard {
   }
 
   renderError(error) {
-    const described = error && error.title ? error : describeError((error && error.code) || "UNKNOWN");
+    const described = asDescribedError(error);
     const el = this.el;
     el.progress.hidden = true;
     this.setBusy(false);

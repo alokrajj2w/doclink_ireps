@@ -7,3 +7,5 @@ dist/
 *.zip
 .env*
 01_api_data/
+02_recon_engine/
+config.local.json

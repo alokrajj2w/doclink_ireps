@@ -26,6 +26,7 @@ import { IrepsError } from "../ireps-api.js";
 import { SEARCH_PO_CRITERIA, errorCodesFor } from "../search-po/search-po-api.js";
 import { searchIrepsDocuments, SEARCH_PO_FLOW_STAGES } from "../search-po/search-po-service.js";
 import { downloadIrepsDocument } from "../search-po/document-downloader.js";
+import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { buildPoDownloadPath } from "../../utils/filename.js";
 import { parsePoSearchResults } from "./po-parser.js";
 import { ECM_KIND } from "../ecm-service.js";
@@ -73,11 +74,28 @@ export async function searchPo(poNumber, deps = {}) {
     }
     throw error;
   }
-  // "Total 1 result(s)" is the normal case; when IREPS ever lists more than
-  // one row for the same PO No. the first is used and the rest are kept in
-  // `records` so callers can see them.
-  const record = result.records.find((r) => r.poPdfUrl) || result.records[0];
+  // "Total 1 result(s)" is the normal case. Only a row of THIS PO is ever used: a row of another PO
+  // (IREPS echoing unrelated rows) must never give its PDF as this PO's. Of several rows for the
+  // same PO No., the first with a PDF is used and the rest are kept in `records` so callers can see them.
+  const wanted = comparablePoNo(poNo);
+  const matching = result.records.filter((r) => comparablePoNo(r.poNo) === wanted);
+  if (matching.length === 0) {
+    throw new IrepsError(PO_ERROR.NOT_FOUND, `IREPS listed ${result.records.length} PO row(s), none for PO ${poNo}`, { detail: poNo });
+  }
+  const record = matching.find((r) => r.poPdfUrl) || matching[0];
   return { ...result, record };
+}
+
+/** A PO number as compared: without spaces, in capitals. */
+const comparablePoNo = (value) => String(value || "").replace(/\s+/g, "").toUpperCase();
+
+/**
+ * How a PO copy is filed under Save to: ECM / S3 and recorded in the download log (one rule for every PO flow).
+ * `unit`: only when the same PO number was listed for more than one railway unit (PO by date), so
+ * the two documents keep separate download-log records. The ECM's PO copy has no unit field.
+ */
+export function poFiling(poNo, { unit = null } = {}) {
+  return { ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: poNo } }, log: logInfo(LOG_DOC_TYPE.PO, downloadKey.po(poNo, unit)) };
 }
 
 /** Download item for one PO record. */
@@ -88,7 +106,7 @@ export function poDownloadItem(record, poNo) {
     path: buildPoDownloadPath(poNo),
     label: `PO ${poNo}`,
     meta: { poNo, poDate: record ? record.poDate : null, railwayUnit: record ? record.railwayUnit : null },
-    ecm: { kind: ECM_KIND.PO_COPY, fields: { customer_po_number: poNo } }
+    ...poFiling(poNo)
   };
 }
 
@@ -96,8 +114,10 @@ export function poDownloadItem(record, poNo) {
  * Search IREPS for a PO number and download its PO PDF.
  *
  * @param {string} poNumber
- * @param {import("../search-po/search-po-service.js").SearchIrepsDocumentsDeps & { fetch?: typeof fetch, saveFile?: Function }} [deps]
- * @returns {Promise<{ success: true, poNumber: string, documentType: "PO", url: string, filename: string, downloadId: number|null, search: object }>}
+ * `deps.preflight` may answer that the PO is not to be downloaded (already downloaded / in the
+ * ECM): the result then has skipped: true and the reason as `skip`, and no file.
+ * @param {import("../search-po/search-po-service.js").SearchIrepsDocumentsDeps & { fetch?: typeof fetch, saveFile?: Function, preflight?: Function, onSaved?: Function }} [deps]
+ * @returns {Promise<{ success: true, poNumber: string, documentType: "PO", url: string, filename: string|null, downloadId: number|null, search: object, skipped?: boolean, skip?: object, warnings?: string[] }>}
  */
 export async function downloadPo(poNumber, deps = {}) {
   const poNo = normalisePoNumber(poNumber);
@@ -106,8 +126,15 @@ export async function downloadPo(poNumber, deps = {}) {
     throw new IrepsError(PO_ERROR.LINK_NOT_FOUND, `IREPS did not provide a PO PDF link for PO ${poNo}`, { detail: `IREPS did not provide a PO PDF link for PO ${poNo}.` });
   }
   const item = poDownloadItem(found.record, poNo);
-  const done = await downloadIrepsDocument(item, { fetch: deps.fetch, saveFile: deps.saveFile, codes: DOWNLOAD_CODES });
+  const checked = typeof deps.preflight === "function" ? await deps.preflight([item]) : null;
+  const warnings = (checked && checked.warnings) || [];
+  const skip = checked && checked.skip && checked.skip.get(item.id);
+  if (skip) {
+    return { success: true, poNumber: poNo, documentType: "PO", url: item.url, filename: null, downloadId: null, ecm: null, search: found.search, skipped: true, skip, warnings };
+  }
+  const done = await downloadIrepsDocument(item, { fetch: deps.fetch, saveFile: deps.saveFile, onSaved: deps.onSaved, codes: DOWNLOAD_CODES });
   return {
+    warnings,
     success: true,
     poNumber: poNo,
     documentType: "PO",

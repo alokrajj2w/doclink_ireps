@@ -6,6 +6,7 @@ import {
   TenderError, log, norm,
   irepsFetch, assertSession, parseHtml, formParams, findForm, elementActions,
 } from './tender-core.js';
+import { describeError } from '../utils/messages.js';
 
 export const SEARCH_PATH = '/epsn/search/advancedSearch.do';
 
@@ -71,6 +72,40 @@ export function describeRow(tr) {
   return out;
 }
 
+/** The railway of a "Dept/Rly. Unit" value, its last "/" part: "DAHOD / WESTERN RLY" and "LOWER PAREL/WESTERN RLY" -> "WESTERN RLY". */
+export function railwayOf(unit) {
+  const parts = String(unit || '').split('/');
+  return norm(parts[parts.length - 1]).toUpperCase();
+}
+
+/** "28/10/2026 11:00" -> "2026-10-28"; '' when it holds no dd/mm/yyyy date. */
+const dmyDay = (text) => {
+  const m = /(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})/.exec(String(text || ''));
+  return m ? `${m[3]}-${pad2(m[2])}-${pad2(m[1])}` : '';
+};
+
+const localDay = (d) => (d instanceof Date && !Number.isNaN(d.getTime()) ? `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` : '');
+
+/**
+ * Of several result rows with the same tender number (railways reuse numbers: 10263703 is a N F RLY and an
+ * EAST CENTRAL RLY tender), the ones that fit what the caller knows: `railway`, a letter list's "Dept/Rly. Unit",
+ * and `dueDate`, the NIT message's due date (a Date). A hint that no row fits is ignored, so the choice is then
+ * the one made without hints (the row with the most actions).
+ *   rows: [{ tr, actions, info: describeRow(tr) }]
+ */
+export function preferredRows(rows, { railway = '', dueDate = null } = {}) {
+  const fits = (list, test) => {
+    const kept = list.filter(test);
+    return kept.length ? kept : list;
+  };
+  let pool = rows;
+  const wantRailway = railwayOf(railway);
+  if (wantRailway) pool = fits(pool, (r) => railwayOf(`${r.info.department}/${r.info.railwayUnit}`) === wantRailway);
+  const wantDay = localDay(dueDate);
+  if (wantDay) pool = fits(pool, (r) => dmyDay(r.info.closingDate) === wantDay);
+  return pool;
+}
+
 /** Parse the live search form: action, defaults, input length limit and department choices. */
 export function readSearchForm(doc) {
   const form = findForm(doc, (f) => f.querySelector('[name=advancedSearch]'));
@@ -120,8 +155,11 @@ function departmentOrder(divisions) {
  * Find the exact tender. Retries across valid (<= 6 month) date windows, and across departments
  * only if IREPS refuses "all departments".
  * -> { tenderNo, tenderTitle, department, railwayUnit, tenderStatus, closingDate, searchUrl, row, searchTerm, truncated }
+ * NOT_FOUND only when IREPS answered every search (results without the tender, or "No Results Found"); when
+ * a search got an HTTP error or a page DocLink does not recognise, the tender may exist: SEARCH_INCOMPLETE (H4).
+ *   prefer: { railway, dueDate } picks among rows with the same number (preferredRows); it adds no request
  */
-export async function searchTender(base, rawTenderNo, { today = new Date(), onProgress = () => {}, preferWindows = [] } = {}) {
+export async function searchTender(base, rawTenderNo, { today = new Date(), onProgress = () => {}, preferWindows = [], prefer = {} } = {}) {
   const tenderNo = norm(rawTenderNo);
   log('Tender', 'Searching tender number');
   let formInfo = await loadForm(base);
@@ -138,6 +176,7 @@ export async function searchTender(base, rawTenderNo, { today = new Date(), onPr
   const { first, rest } = departmentOrder(formInfo.divisions);
   let allDeptsRejected = false;
   let attempts = 0;
+  const unanswered = []; // searches IREPS did not answer with a page DocLink recognises
 
   const attempt = async (win, dept) => {
     attempts++;
@@ -158,10 +197,15 @@ export async function searchTender(base, rawTenderNo, { today = new Date(), onPr
 
     const res = await irepsFetch(base, formInfo.action, { method: 'POST', form: p, relativeTo: formInfo.pageUrl });
     assertSession(res);
-    if (res.status !== 200) return null;
+    if (res.status !== 200) {
+      unanswered.push(`HTTP ${res.status}`);
+      log('Tender', `window ${win.label} dept ${dept}: HTTP ${res.status}`, 'warn');
+      return null;
+    }
     const doc = parseHtml(res.text());
     const kind = classifySearchResponse(doc);
     if (kind === 'invalid' && dept === '-1') allDeptsRejected = true;
+    if (kind === 'other') unanswered.push(`a page DocLink does not recognise ("${norm(doc.title) || norm(doc.body?.textContent).slice(0, 40)}")`);
     if (kind !== 'results') {
       log('Tender', `window ${win.label} dept ${dept}: ${kind}`);
       return null;
@@ -169,9 +213,15 @@ export async function searchTender(base, rawTenderNo, { today = new Date(), onPr
     const rows = findTenderRows(doc, tenderNo);
     log('Tender', `window ${win.label} dept ${dept}: ${rows.length} exact match(es)`);
     if (!rows.length) return null;
-    const best = rows.map((tr) => ({ tr, actions: elementActions(tr) })).sort((a, b) => b.actions.length - a.actions.length)[0];
+    const described = rows.map((tr) => ({ tr, actions: elementActions(tr), info: describeRow(tr) }));
+    const pool = described.length > 1 ? preferredRows(described, prefer) : described;
+    const best = pool.sort((a, b) => b.actions.length - a.actions.length)[0];
+    if (described.length > 1) {
+      const where = (r) => `${r.info.department}/${r.info.railwayUnit} due ${r.info.closingDate}`;
+      log('Tender', `${described.length} tenders numbered ${tenderNo} (${described.map(where).join('; ')}); took ${where(best)}`);
+    }
     log('Tender', 'Exact tender found');
-    return { ...describeRow(best.tr), tenderNo, searchUrl: res.url, row: best, searchTerm, truncated };
+    return { ...best.info, tenderNo, searchUrl: res.url, row: { tr: best.tr, actions: best.actions }, searchTerm, truncated };
   };
 
   for (const [i, win] of windows.entries()) {
@@ -189,6 +239,12 @@ export async function searchTender(base, rawTenderNo, { today = new Date(), onPr
         if (hit) return hit;
       }
     }
+  }
+  if (unanswered.length) {
+    log('Tender', `Tender not found, but ${unanswered.length} of ${attempts} searches got no answer`, 'warn');
+    throw new TenderError('SEARCH_INCOMPLETE', describeError('TENDER_SEARCH_INCOMPLETE', {
+      detail: `${tenderNo} was not in the ${attempts - unanswered.length} result page(s) IREPS returned, and ${unanswered.length} search(es) got ${[...new Set(unanswered)].slice(0, 2).join(', ')}`,
+    }).message);
   }
   log('Tender', `Tender not found after ${attempts} search attempts`);
   throw new TenderError('NOT_FOUND', `Tender ${tenderNo} was not found in IREPS (checked ${windows.length} date ranges).`);

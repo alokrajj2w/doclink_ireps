@@ -11,7 +11,6 @@ export const MESSAGE_TYPES = Object.freeze({
   OPEN_IREPS: "OPEN_IREPS",
   GET_TAB_SCOPE: "GET_TAB_SCOPE",
   OPEN_PREVIEW: "OPEN_PREVIEW",
-  UPLOAD_DOCUMENT: "UPLOAD_DOCUMENT",
   // opens the Recon Engine (config.json reconAppUrl) so the user can sign in for "Save to: Recon Engine (S3)"
   OPEN_RECON: "OPEN_RECON",
 
@@ -32,6 +31,23 @@ export const MESSAGE_TYPES = Object.freeze({
   IC_DOWNLOAD: "IC_DOWNLOAD",
   GET_IC_STATE: "GET_IC_STATE",
 
+  // popup -> service worker: batch downloads (PO by date, IC from notifications)
+  BATCH_START: "BATCH_START",
+  BATCH_RETRY: "BATCH_RETRY",
+  BATCH_GET_STATE: "BATCH_GET_STATE",
+
+  // popup -> service worker: bill upload (ECM invoice -> IREPS supplier bill, services/bill-upload/)
+  BILL_UPLOAD_SEARCH: "BILL_UPLOAD_SEARCH",
+  BILL_UPLOAD_PREPARE: "BILL_UPLOAD_PREPARE",
+  BILL_UPLOAD_REVIEW: "BILL_UPLOAD_REVIEW",
+  BILL_UPLOAD_CREATE: "BILL_UPLOAD_CREATE",
+  BILL_UPLOAD_SAVE_ITEM: "BILL_UPLOAD_SAVE_ITEM",
+  BILL_UPLOAD_DOCUMENTS: "BILL_UPLOAD_DOCUMENTS",
+  BILL_UPLOAD_GET_STATE: "BILL_UPLOAD_GET_STATE",
+  BILL_UPLOAD_RESET: "BILL_UPLOAD_RESET",
+  BILL_UPLOAD_FORGET: "BILL_UPLOAD_FORGET",
+  BILL_UPLOAD_ADD_DOCUMENT: "BILL_UPLOAD_ADD_DOCUMENT",
+
   // service worker -> popup (broadcast)
   IREPS_PROGRESS: "IREPS_PROGRESS",
   IREPS_DOWNLOAD_COMPLETE: "IREPS_DOWNLOAD_COMPLETE",
@@ -51,6 +67,12 @@ export const MESSAGE_TYPES = Object.freeze({
   IC_DOWNLOAD_PROGRESS: "IC_DOWNLOAD_PROGRESS",
   IC_DOWNLOAD_COMPLETE: "IC_DOWNLOAD_COMPLETE",
   IC_DOWNLOAD_ERROR: "IC_DOWNLOAD_ERROR",
+  BATCH_UPDATE: "BATCH_UPDATE",
+  BILL_UPLOAD_UPDATE: "BILL_UPLOAD_UPDATE",
+
+  // service worker -> popup (request / response): "these files are already downloaded /
+  // in the ECM - download which again?" (services/download-log.js, popup/popup-redownload.js)
+  CONFIRM_REDOWNLOAD: "CONFIRM_REDOWNLOAD",
 
   // service worker -> offscreen document
   PARSE_BILL_STATUS: "PARSE_BILL_STATUS",
@@ -147,6 +169,11 @@ export function documentStageLabel(stage, typeLabel) {
  * "IREPS returned HTTP 500"). `connection` drives the header indicator.
  */
 export const ERROR_CATALOG = Object.freeze({
+  IREPS_NOT_CONFIGURED: {
+    title: "IREPS not configured",
+    message: "DocLink has no usable IREPS address ({detail}). Check config.json (\"target\": \"real\" or \"mock\", and the portal URL) and manifest.json host_permissions, then reload DocLink. Nothing was sent.",
+    connection: "connected"
+  },
   IREPS_SESSION_EXPIRED: {
     title: "IREPS login required",
     message: "IREPS session expired. Please log in to IREPS and try again.",
@@ -423,7 +450,7 @@ export const ERROR_CATALOG = Object.freeze({
   },
   ECM_REJECTED: {
     title: "ECM refused the document",
-    message: "The ECM gateway did not accept the document: {detail}. It was saved locally.",
+    message: "The ECM did not accept the document: {detail}. It was saved locally.",
     notice: true,
     connection: "connected"
   },
@@ -433,9 +460,47 @@ export const ERROR_CATALOG = Object.freeze({
     notice: true,
     connection: "connected"
   },
+  ECM_FILE_DAMAGED: {
+    title: "ECM copy is damaged",
+    message: "The ECM holds this document but cannot serve its file in full ({detail}). It was saved locally; ask the ECM team to remove the damaged copy.",
+    notice: true,
+    connection: "connected"
+  },
+  DOWNLOAD_LOG_SIGN_IN_REQUIRED: {
+    title: "Recon Engine sign-in required",
+    message: "Sign in to the Recon Engine to download: DocLink records every download for the signed-in user, and checks what you already downloaded. Nothing was downloaded.",
+    reconSignIn: true
+  },
+  DOWNLOAD_LOG_UNAVAILABLE: {
+    title: "Download log unavailable",
+    message: "DocLink could not reach the Recon Engine's download log ({detail}). The files are downloaded anyway and recorded once it is back.",
+    notice: true
+  },
   DOCUMENT_BUSY: {
     title: "Download Already Running",
     message: "Please wait for the current CRN / R-NOTE download to finish."
+  },
+
+  /* ------------------------------------------------------- Tender documents and correspondence (tender/) */
+  TENDER_PAGE_NOT_RECOGNISED: {
+    title: "IREPS page not recognised",
+    message: "IREPS answered with a page DocLink does not recognise ({detail}). DocLink did not take it as \"nothing found\": open the page in IREPS to check, then retry."
+  },
+  TENDER_LIST_FAILED: {
+    title: "IREPS list not read",
+    message: "IREPS did not return the list ({detail}). Documents on it may be missing from this download: retry it."
+  },
+  TENDER_SEARCH_INCOMPLETE: {
+    title: "Tender search incomplete",
+    message: "DocLink could not tell whether the tender is in IREPS ({detail}). Retry the download."
+  },
+  TENDER_REQUEST_BLOCKED: {
+    title: "Request refused",
+    message: "DocLink did not send this request to IREPS because it looks like an action that changes something in IREPS ({detail}). DocLink only reads and downloads."
+  },
+  TENDER_LOA_SCRIPT_UNREADABLE: {
+    title: "LOA not requested",
+    message: "DocLink could not read how IREPS's \"View LOA Letter\" link opens this letter ({detail}), so it did not tell IREPS the letter was viewed and did not request it. Open the LOA in IREPS, or retry later."
   },
 
   /* ------------------------------------------------------- PO download */
@@ -521,13 +586,152 @@ export const ERROR_CATALOG = Object.freeze({
     message: "Your IREPS session has expired.\n\nPlease log in again and retry the IC download.",
     connection: "login"
   },
+  IREPS_NOTIFICATIONS_FAILED: {
+    title: "Unable to load IREPS notifications",
+    message: "DocLink could not read the notifications on the IREPS main page ({detail}). Check your network connection and try again.",
+    connection: "offline"
+  },
+  IREPS_NOTIFICATIONS_INVALID: {
+    title: "Unable to read IREPS notifications",
+    message: "IREPS returned a notification list that DocLink could not read ({detail}).",
+    connection: "connected"
+  },
+  BATCH_BUSY: {
+    title: "Download Already Running",
+    message: "Please wait for the current download to finish."
+  },
   IC_BUSY: {
     title: "IC Download Already Running",
     message: "Please wait for the current Inspection Certificate download to finish."
   },
+  /* --------------------------------------- Bill upload (services/bill-upload/) */
+  BILL_REQUEST_FAILED: {
+    title: "IREPS did not answer",
+    message: "DocLink could not complete the bill request to IREPS ({detail}). Check your network connection and try again.",
+    connection: "offline"
+  },
+  BILL_FORM_INVALID: {
+    title: "IREPS bill page not recognised",
+    message: "IREPS did not return the supplier bill page for this receipt ({detail}). Open the receipt's Bill Claim in IREPS to see why.",
+    connection: "connected"
+  },
+  BILL_IREPS_REJECTED: {
+    title: "IREPS refused the bill",
+    message: "IREPS answered: {detail}",
+    connection: "connected"
+  },
+  BILL_RESPONSE_INVALID: {
+    title: "Unexpected IREPS answer",
+    message: "IREPS answered in a form DocLink does not recognise ({detail}). Nothing further was sent.",
+    connection: "connected"
+  },
+  BILL_NO_RECEIPTS: {
+    title: "No receipts found",
+    message: "{detail}.",
+    notice: true,
+    connection: "connected"
+  },
+  BILL_NOT_BILLABLE: {
+    title: "This receipt cannot be billed",
+    message: "{detail}.",
+    notice: true,
+    connection: "connected"
+  },
+  BILL_DRAFT_EXISTS: {
+    title: "Bill already created",
+    message: "{detail}. DocLink does not create a second bill for the same receipt; finish or delete it in IREPS (Bills for Pay), or use \"Start fresh for this receipt\" to create a new one.",
+    connection: "connected"
+  },
+  BILL_CHECKS_FAILED: {
+    title: "Checks did not pass",
+    message: "Nothing was sent to IREPS: {detail}",
+    notice: true,
+    connection: "connected"
+  },
+  BILL_INVOICE_INVALID: {
+    title: "Invoice details incomplete",
+    message: "{detail}",
+    notice: true
+  },
+  BILL_ECM_NOT_FOUND: {
+    title: "Invoice not found in ECM",
+    message: "{detail}. ECM does not store the customer PO Sr no. yet, so the match can fail; you can enter the invoice details by hand.",
+    notice: true
+  },
+  BILL_ECM_AMBIGUOUS: {
+    title: "More than one ECM invoice",
+    message: "{detail}. The spec says to stop when several invoices match.",
+    notice: true
+  },
+  BILL_ECM_ALREADY_SENT: {
+    title: "Invoice already sent",
+    message: "{detail}.",
+    notice: true
+  },
+  BILL_ECM_UNAVAILABLE: {
+    title: "ECM not available",
+    message: "DocLink could not read the ECM ({detail})."
+  },
+  BILL_FILE_INVALID: {
+    title: "Invoice file not usable",
+    message: "{detail}. Nothing was sent to IREPS.",
+    notice: true
+  },
+  BILL_FILE_NO_MATCH: {
+    title: "No invoice for this receipt",
+    message: "{detail}. The file's customerPONumber, customerPOSrNumber and quantity must match the receipt.",
+    notice: true
+  },
+  BILL_FILE_AMBIGUOUS: {
+    title: "More than one invoice in the file",
+    message: "{detail}. Keep one invoice per receipt in the file.",
+    notice: true
+  },
+  BILL_NO_DOCUMENTS: {
+    title: "No documents in ECM",
+    message: "{detail}",
+    notice: true
+  },
+  BILL_TAB_UNAVAILABLE: {
+    title: "IREPS tab needed",
+    message: "DocLink sends the bill from your IREPS tab: {detail}.",
+    connection: "connected"
+  },
+  BILL_BUSY: {
+    title: "Bill upload busy",
+    message: "Please wait for the current bill step to finish."
+  },
+  BILL_INTERRUPTED: {
+    title: "Bill step interrupted",
+    message: "Chrome stopped DocLink's background work during this step ({detail}), so it may not have finished. Before you repeat it, check the bill in IREPS (the PO's Bills for Pay tab), so that no second draft bill is created."
+  },
+  BILL_NOT_PREPARED: {
+    title: "Bill not prepared",
+    message: "{detail}. Start again from the receipt."
+  },
+  BILL_DOC_INVALID: {
+    title: "Document not usable",
+    message: "{detail}. Nothing was sent to IREPS.",
+    notice: true
+  },
+  BILL_SIGNER_UNAVAILABLE: {
+    title: "IREPS signer not reachable",
+    message: "DocLink could not reach the IREPS signing app (eMudhra IREPSSigner) on this computer: {detail}. Start the signer, reload the IREPS tab and try again. Nothing was uploaded.",
+    connection: "connected"
+  },
+  BILL_SIGN_FAILED: {
+    title: "Document not signed",
+    message: "{detail}. Nothing was uploaded.",
+    notice: true,
+    connection: "connected"
+  },
   NO_BACKGROUND_RESPONSE: {
     title: "DocLink Needs a Reload",
     message: "DocLink's background service did not answer ({detail}). Open chrome://extensions, click the reload icon on the DocLink card, then retry."
+  },
+  JOB_INTERRUPTED: {
+    title: "Download interrupted",
+    message: "Chrome stopped DocLink's background work while this run was in progress ({detail}), so it did not finish. Start it again: the files already saved are kept, and the download log recognises them."
   },
   UNKNOWN: {
     title: "Something Went Wrong",
@@ -546,13 +750,23 @@ export function describeError(code, details = {}) {
   return {
     code: ERROR_CATALOG[code] ? code : "UNKNOWN",
     title: entry.title,
-    message: entry.message.replace("{detail}", detail),
+    // a function, so "$&" or "$1" in an IREPS / server text is kept as written, not expanded
+    message: entry.message.replace("{detail}", () => detail),
     loginRequired: entry.loginRequired === true,
     previewAvailable: entry.previewAvailable === true,
     notice: entry.notice === true,
     reconSignIn: entry.reconSignIn === true,
     connection: entry.connection || null
   };
+}
+
+/**
+ * An error as the panel shows it: an already described error (it has a title) as it is,
+ * otherwise a { code, detail, status } error (or nothing) through describeError.
+ */
+export function asDescribedError(error, fallbackCode = "UNKNOWN") {
+  if (error && error.title) return error;
+  return describeError((error && error.code) || fallbackCode, { detail: error && error.detail, status: error && error.status });
 }
 
 /** chrome.storage.local keys (non-sensitive metadata only). */
@@ -575,5 +789,7 @@ export const SESSION_KEYS = Object.freeze({
   DOCUMENT_JOBS: "doclink.documentJobs",
   MA_STATE: "doclink.maState",
   PO_STATE: "doclink.poState",
-  IC_STATE: "doclink.icState"
+  IC_STATE: "doclink.icState",
+  BATCH_STATE: "doclink.batchState",
+  BILL_UPLOAD_STATE: "doclink.billUploadState"
 });

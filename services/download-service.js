@@ -10,6 +10,14 @@ import { buildBillStatusDownloadPath, buildBillStatusFilename } from "../utils/f
 import { pdfToDataUrl } from "./pdf-service.js";
 import { logger } from "../utils/logger.js";
 
+/** Chrome's confirmation is awaited this long before the wait is noted in the log. */
+const CONFIRM_WARN_MS = 60000;
+/**
+ * A download Chrome has not confirmed by then counts as failed: it is never reported (or put in the
+ * download log) as saved. The bytes are already in memory, so a real save takes seconds.
+ */
+const CONFIRM_GIVE_UP_MS = 5 * 60000;
+
 export class DownloadError extends Error {
   constructor(message, cause) {
     super(message);
@@ -23,7 +31,7 @@ export class DownloadError extends Error {
  * has completed (or failed).
  *
  * @param {Uint8Array} bytes
- * @param {{ date?: Date, saveAs?: boolean }} [options]
+ * @param {{ date?: Date, saveAs?: boolean, confirm?: { warnAfterMs?: number, giveUpAfterMs?: number } }} [options]
  * @returns {Promise<{ downloadId: number, filename: string, path: string }>}
  */
 export async function downloadPdf(bytes, options = {}) {
@@ -52,7 +60,7 @@ export async function downloadPdf(bytes, options = {}) {
 
   let finalPath;
   try {
-    finalPath = await waitForDownload(downloadId);
+    finalPath = await waitForDownload(downloadId, options.confirm);
   } catch (error) {
     logger.error("Download failed", { downloadId, path, error });
     throw error;
@@ -85,7 +93,8 @@ export function bytesToDataUrl(bytes, mimeType = "application/octet-stream") {
  * untouched.
  *
  * @param {Uint8Array} bytes
- * @param {{ path: string, mimeType?: string, saveAs?: boolean }} options
+ * @param {{ path: string, mimeType?: string, saveAs?: boolean, confirm?: { warnAfterMs?: number, giveUpAfterMs?: number } }} options
+ *        confirm: how long to wait for Chrome's "complete" (the tests shorten it)
  * @returns {Promise<{ downloadId: number, filename: string, path: string }>}
  */
 export async function downloadBytes(bytes, options) {
@@ -111,7 +120,7 @@ export async function downloadBytes(bytes, options) {
   }
   let finalPath;
   try {
-    finalPath = await waitForDownload(downloadId);
+    finalPath = await waitForDownload(downloadId, options.confirm);
   } catch (error) {
     logger.error("Download failed", { downloadId, path, error });
     throw error;
@@ -122,20 +131,22 @@ export async function downloadBytes(bytes, options) {
 }
 
 /**
- * Resolve when the download completes; reject if Chrome interrupts it.
- * Uses onChanged when available and polls as a fallback so a missed event
- * cannot hang the workflow.
+ * Resolve when the download completes; reject if Chrome interrupts it, or has not confirmed it
+ * after `giveUpAfterMs` (never reported as saved without Chrome saying so). Uses onChanged and
+ * polls as a fallback so a missed event cannot hang the workflow.
  * @param {number} downloadId
+ * @param {{ warnAfterMs?: number, giveUpAfterMs?: number }} [timing]
  * @returns {Promise<string|null>} final filename reported by Chrome
  */
-function waitForDownload(downloadId) {
+function waitForDownload(downloadId, { warnAfterMs = CONFIRM_WARN_MS, giveUpAfterMs = CONFIRM_GIVE_UP_MS } = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
       clearInterval(poll);
-      clearTimeout(timeout);
+      clearTimeout(warn);
+      clearTimeout(giveUp);
       chrome.downloads.onChanged.removeListener(onChanged);
       fn(value);
     };
@@ -156,11 +167,11 @@ function waitForDownload(downloadId) {
       chrome.downloads.search({ id: downloadId }).then((items) => inspect(items[0])).catch(() => {});
     }, 750);
 
-    const timeout = setTimeout(() => {
-      // A very large file may still be writing; report success with the
-      // requested name rather than blocking the user.
-      logger.warn("Download not confirmed complete after 60 s; continuing", { downloadId });
-      finish(resolve, null);
-    }, 60000);
+    const warn = setTimeout(() => {
+      logger.warn(`Download not confirmed complete after ${Math.round(warnAfterMs / 1000)} s; still waiting for Chrome`, { downloadId });
+    }, warnAfterMs);
+    const giveUp = setTimeout(() => {
+      finish(reject, new DownloadError(`Chrome did not confirm the download within ${Math.round(giveUpAfterMs / 1000)} s`));
+    }, giveUpAfterMs);
   });
 }

@@ -13,6 +13,7 @@ import { searchPo, downloadPo, poDownloadItem, PO_ERROR } from "../services/po/p
 import { fetchIrepsDocument } from "../services/search-po/document-downloader.js";
 import { buildPoFilename, buildPoDownloadPath } from "../utils/filename.js";
 import { describeError, PO_STAGES } from "../utils/messages.js";
+import { withIrepsFormLock } from "../services/ireps-form-lock.js";
 
 const BASE = IREPS_CONFIG.baseUrl;
 const EXPECTED_PO_BODY = (token, poNo = "27253922100240") =>
@@ -145,6 +146,58 @@ export async function runPoTests({ test, assert, eq, rejects, fixture }) {
     await rejects(searchPo(""), PO_ERROR.INVALID_REQUEST);
   });
 
+  await test("searchPo (M11): only a row of the requested PO is used; another PO's row and PDF never stand in for it", async () => {
+    const other = poPage.split("27253922100240").join("11111111111111");
+    const a = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(other) });
+    const e = await rejects(searchPo("27253922100240", { fetch: a.fetchImpl, parseHtml }), PO_ERROR.NOT_FOUND);
+    eq(e.detail, "27253922100240");
+    // the right PO listed after an unrelated row: the right one is used
+    const both = poPage.replace(/(<!-- PO rows from here -->)(\s*<tr[\s\S]*?<\/tr>)/, (m, marker, row) => marker + row.split("27253922100240").join("11111111111111") + row);
+    const b = fakeIreps({ page: searchPage, onSearch: (x, t, respond) => respond(both) });
+    const found = await searchPo("27253922100240", { fetch: b.fetchImpl, parseHtml });
+    eq(found.recordCount, 2, "both rows are read");
+    eq(found.record.poNo, "27253922100240");
+    assert(found.record.poPdfUrl.endsWith("/27253922100240.pdf"), found.record.poPdfUrl);
+  });
+
+  await test("IREPS form lock (M2): two searches at once never spoil each other's Struts token; a session check never waits behind one", async () => {
+    // like Struts: ONE token per session, replaced by every form load and used up by a search
+    let current = null;
+    let issued = 0;
+    let invalid = 0;
+    const respond = (html) => new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+    const fetchImpl = async (url, init = {}) => {
+      const params = new URLSearchParams(init.body || "");
+      await new Promise((r) => setTimeout(r, 5)); // network time: without the lock the two runs interleave here
+      if (params.get("searchParam") === "showPage") {
+        current = `TOKEN-${++issued}`;
+        return respond(searchPage.replace("FAKE-TOKEN-0123456789abcdef0123456789abcdef", current));
+      }
+      if (params.get("org.apache.struts.taglib.html.TOKEN") !== current) {
+        invalid++;
+        return respond("<html><head><title>Error</title></head><body><h2>Invalid Token</h2></body></html>");
+      }
+      current = null;
+      return respond(poPage);
+    };
+    const [a, b] = await Promise.all([searchPo("27253922100240", { fetch: fetchImpl, parseHtml }), searchPo("27253922100240", { fetch: fetchImpl, parseHtml })]);
+    eq(a.record.poNo, "27253922100240");
+    eq(b.record.poNo, "27253922100240");
+    eq(invalid, 0, "no search was sent with a token another search had replaced");
+    eq(issued, 2, "each search loaded its form once (no retries needed)");
+
+    let release;
+    let held;
+    // the check is made once the search really holds the lock
+    await new Promise((started) => {
+      held = withIrepsFormLock(() => new Promise((r) => { release = r; started(); }));
+    });
+    eq(await withIrepsFormLock(async () => "loaded", { ifBusy: () => "busy" }), "busy", "while a search runs, the check answers without loading a form");
+    release();
+    await held;
+    eq(await withIrepsFormLock(async () => "loaded", { ifBusy: () => "busy" }), "loaded");
+  });
+
   await test("searchPo: PO not found -> IREPS_PO_NOT_FOUND with the PO number as detail", async () => {
     const { fetchImpl } = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(noPoResults(poPage)) });
     const e = await rejects(searchPo("99999999999999", { fetch: fetchImpl, parseHtml }), PO_ERROR.NOT_FOUND);
@@ -208,8 +261,8 @@ export async function runPoTests({ test, assert, eq, rejects, fixture }) {
     eq(result.poNumber, "27253922100240");
     eq(result.documentType, "PO");
     eq(fetched[0], `${BASE}/ireps/etender/pdfdocs/MMIS/PO/2026/01/27253922100240.pdf`);
-    eq(result.filename, "PO_27253922100240.pdf");
-    eq(saved[0], "DocLink/IREPS/PO/PO_27253922100240.pdf");
+    eq(result.filename, "27253922100240.pdf", "the PO PDF keeps its IREPS name");
+    eq(saved[0], "DocLink/IREPS/PO/27253922100240.pdf");
 
     const noLinkRow = `<tr class="trPoRow"><td>1</td><td>HQ/CR</td><td>27253922100240</td><td>16/01/2026</td><td>S</td><td>830705.84</td><td></td></tr>`;
     const noLinkPage = poPageWithRows(poPage, noLinkRow);

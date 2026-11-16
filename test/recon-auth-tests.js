@@ -20,7 +20,9 @@ const CLIENT_ID = "0oa2uq0thn3v0mHWG0h8";
 const EXT_ID = "abcdefghijklmnopabcdefghijklmnop";
 const REDIRECT = `https://${EXT_ID}.chromiumapp.org/okta`;
 const AUTHORIZE = `${ISSUER}/v1/authorize?response_type=code&client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT)}&state=st-1`;
-const USER = { id: 7, email: "alok@example.com", name: "Alok", role: "analyst" };
+// /api/auth/me as the Recon Engine answers it (roles: a list, with their permissions)
+const USER = { id: 7, email: "alok@example.com", name: "Alok", roles: ["tendering"], permissions: ["ingest.ireps", "read", "reconcile.run"] };
+const PARSED = { id: 7, email: "alok@example.com", name: "Alok", roles: ["tendering"], role: "tendering", isAdmin: false };
 const CONFIG = { reconBaseUrl: BASE, okta: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, redirectPath: "okta" } };
 
 function jsonResponse(status, body) {
@@ -83,7 +85,21 @@ export async function runReconAuthTests({ test, assert, eq }) {
     eq(init.credentials, "include", "the session cookie lands in Chrome's jar");
     eq(init.headers["Content-Type"], "application/json");
     eq(init.body, JSON.stringify({ email: "alok@example.com", password: "s3cret pass" }));
-    eq(JSON.stringify(user), JSON.stringify(USER));
+    eq(JSON.stringify(user), JSON.stringify(PARSED));
+  });
+
+  await test("Recon sign-in: the user's roles list, admin among them; a single role from an older backend still reads", async () => {
+    applyReconConfig(CONFIG);
+    const admin = await reconWhoAmI({ fetch: fakeFetch(() => jsonResponse(200, { ...USER, roles: ["admin", "finance"] })), hostPermissions: HOSTS });
+    eq(JSON.stringify(admin.user.roles), JSON.stringify(["admin", "finance"]));
+    eq(admin.user.role, "admin, finance");
+    eq(admin.user.isAdmin, true);
+    const older = await reconWhoAmI({ fetch: fakeFetch(() => jsonResponse(200, { id: 1, email: "a@x.com", name: "A", role: "admin" })), hostPermissions: HOSTS });
+    eq(JSON.stringify(older.user.roles), JSON.stringify(["admin"]));
+    eq(older.user.isAdmin, true);
+    const none = await reconWhoAmI({ fetch: fakeFetch(() => jsonResponse(200, { id: 2, email: "b@x.com", name: "B" })), hostPermissions: HOSTS });
+    eq(none.user.roles.length, 0);
+    eq(none.user.isAdmin, false);
   });
 
   await test("Recon sign-in: 401 / 422 / 403 / 429 / 5xx / network each map to a code with catalog text", async () => {

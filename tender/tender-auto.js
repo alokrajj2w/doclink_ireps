@@ -1,16 +1,20 @@
-// Automatic mode: no tender number is typed. DocLink reads My Messages, opens each NIT / corrigendum
-// message, takes the tender number from it, downloads the NIT + supporting documents, and collects the
-// other documents by DATE (corrigenda, negotiation, counter offer, LOA, correspondence, My Offer).
-// Only documents of the discovered tenders / the selected dates are fetched - nothing unrelated.
-// Financial and Commercial Tabulation are never part of this.
+// Automatic mode ("NIT Documents"): no tender number is typed. DocLink reads My Messages, opens each
+// NIT / corrigendum message, takes the tender number from it and downloads that tender's NIT, supporting
+// documents and My Offer, and its corrigenda dated in the range. Nothing else: Negotiation, Counter Offer
+// and LOA letters have their own run (runLetterType, by Letter Date), Financial and Commercial Tabulation
+// theirs (runTabulations, by Closing Date), and correspondence comes from the Correspondence view.
 
 import { TenderError, log, norm } from './tender-core.js';
-import { searchTender } from './tender-search.js';
-import { runSteps, publicAccount, startTenderRun } from './tender-workflows.js';
-import { beginJob, dayRange, openTender, recordManifest, downloadLettersByDate, startLetterRun } from './tender-jobs.js';
+import { runSteps, publicAccount } from './tender-workflows.js';
+import { beginJob, dayRange, openTender, recordManifest, downloadLettersByDate, downloadTabulationsByDate } from './tender-jobs.js';
 import { scanMessages, readMessageDetail, dmyOf } from './tender-messages.js';
 
 const DAY = 86400000;
+
+/** What a NIT message brings: the tender PDF, its attached documents and My Offer. */
+const NIT_STEPS = ['tenderPdf', 'attachments', 'myOffer'];
+/** A category with nothing left to fetch: all downloaded, or nothing (more) there (already downloaded, none shown). */
+const succeeded = (c) => !!c && (c.status === 'DOWNLOADED' || c.status === 'NOT_AVAILABLE');
 
 /** Search windows around the tender's due date (IREPS ranges are <= 6 months), then "next 6 months". */
 export function windowsFor(dueDate, now = new Date()) {
@@ -24,8 +28,8 @@ export function windowsFor(dueDate, now = new Date()) {
 }
 
 /**
- * @param from,to  Date objects (inclusive days) - message range AND the date range for the date-based documents
- * @param onEvent  progress events for the UI: {type:'discovered'|'tender'|'letters', ...}
+ * @param from,to  Date objects (inclusive days) - message range AND the date range for the corrigenda
+ * @param onEvent  progress events for the UI: {type:'discovered'|'tender', ...}
  */
 export async function runAutomatic({ from, to, onProgress = () => {}, onAccount = () => {}, onEvent = () => {} }) {
   if (!(from instanceof Date) || !(to instanceof Date) || from > to) throw new TenderError('INPUT', 'Choose a valid From / To date.');
@@ -79,7 +83,8 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
     if (!steps.length) { out.status = 'ALREADY_DOWNLOADED'; onEvent({ type: 'tender', ...out }); continue; }
     onProgress(`Tender ${t.tenderNo} (${i + 1}/${tenders.size})...`);
     try {
-      const run = await openTender(job, t.tenderNo, windowsFor(t.dueDate), onProgress);
+      // the message's due date picks this tender when another railway uses the same tender number
+      const run = await openTender(job, t.tenderNo, windowsFor(t.dueDate), onProgress, { dueDate: t.dueDate || null });
       run.ctx.dueDate = t.dueDate ? t.dueDate.toISOString() : '';
       run.dateRange = rangeSet;
       const { categories, aborted: ab } = await runSteps(run, steps, onProgress);
@@ -87,13 +92,17 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
       out.categories = categories;
       out.folder = `Downloads/${run.saver.root}/`;
       out.nitOid = run.ids.nitOid || '';
-      const nitOk = categories.tenderPdf?.status === 'DOWNLOADED';
-      if (nitOk) job.ledger.mark('nit', t.tenderNo);
+      // the NIT is done only when every one of its categories is (H7): a failed attachment or My Offer keeps the
+      // tender and its message open, so "Retry failed" fetches them (the ledger's docs bucket skips the rest)
+      const nitRan = steps.includes('tenderPdf');
+      const nitDone = nitRan ? NIT_STEPS.every((k) => succeeded(categories[k])) : job.ledger.has('nit', t.tenderNo);
+      if (nitRan && nitDone) job.ledger.mark('nit', t.tenderNo);
+      const corrDone = categories.corrigenda?.status === 'DOWNLOADED' || (categories.corrigenda?.status === 'NOT_AVAILABLE' && categories.corrigenda.alreadyDownloaded > 0);
       const failed = Object.values(categories).some((c) => c.status === 'FAILED' || c.status === 'PARTIAL');
       out.status = failed ? 'FAILED' : 'DOWNLOADED';
-      // a message is "done" once its documents are in; otherwise it is looked at again next time
+      // a message is "done" once all its documents are in; otherwise it is looked at again next time
       for (const m of t.messages) {
-        const done = m.kind === 'NIT' ? nitOk : ['DOWNLOADED'].includes(categories.corrigenda?.status);
+        const done = m.kind === 'NIT' ? nitDone : corrDone;
         if (done) job.ledger.mark('msgs', m.oid);
       }
       await recordManifest(job, run, categories, { range, sources: t.messages });
@@ -102,41 +111,9 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
       out.status = e.code === 'NOT_FOUND' ? 'NOT_FOUND' : 'FAILED';
       out.error = e.message;
     }
+    // after every tender (M21): a run cut short (panel closed, Chrome stopped) keeps what it did
+    await job.ledger.save();
     onEvent({ type: 'tender', ...out });
-  }
-
-  // ---- date-based documents, no tender number needed: negotiation / counter offer / LOA letters by letter date
-  let letters = null;
-  if (!aborted) {
-    onProgress('Collecting negotiation, counter offer and LOA letters for the selected dates...');
-    try {
-      letters = await downloadLettersByDate({ job, dates, onProgress });
-      onEvent({ type: 'letters', summary: letters.summary });
-      if (letters.aborted) aborted = letters.aborted;
-    } catch (e) {
-      if (e.code === 'SESSION_EXPIRED') aborted = { code: e.code, message: e.message };
-      letters = { tenders: [], summary: { newLetters: 0 }, error: e.message };
-    }
-  }
-
-  // ---- correspondence dated in the range, for the tenders involved (its page is per tender and has no date filter)
-  const nitOids = new Map([...results, ...(letters?.tenders || [])].filter((x) => x.nitOid).map((x) => [x.tenderNo, x.nitOid]));
-  const involved = new Set([...results.filter((r) => r.categories.corrigenda).map((r) => r.tenderNo), ...(letters?.tenders || []).map((x) => x.tenderNo)]);
-  const correspondence = [];
-  for (const tenderNo of involved) {
-    if (aborted) break;
-    onProgress(`Correspondence for ${tenderNo}...`);
-    try {
-      const run = startLetterRun(job, tenderNo);
-      run.dateRange = rangeSet;
-      if (nitOids.get(tenderNo)) { run.ids.nitOid = nitOids.get(tenderNo); run.idSource.nitOid = 'inbox'; } // from the live letter/row actions of this same tender
-      const { categories, aborted: ab } = await runSteps(run, ['correspondence'], onProgress);
-      if (ab) aborted = ab;
-      if (categories.correspondence.discovered) await recordManifest(job, run, categories, { range });
-      correspondence.push({ tenderNo, correspondence: categories.correspondence });
-    } catch (e) {
-      correspondence.push({ tenderNo, error: e.message });
-    }
   }
 
   await job.ledger.save();
@@ -144,10 +121,10 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
   return {
     account: publicAccount(job.account),
     range,
-    messages: { scanned: scan.rows.length, relevant: relevant.length, opened, pagesRead: scan.pagesRead, total: scan.total, truncated: scan.truncated },
-    tenders: results, review, letters, correspondence, aborted,
+    messages: { scanned: scan.rows.length, relevant: relevant.length, opened, pagesRead: scan.pagesRead, total: scan.total, truncated: scan.truncated, incomplete: scan.incomplete || '' },
+    tenders: results, review, aborted,
     summary: {
-      downloaded: results.reduce((n, r) => n + sumDl(r.categories), 0) + (letters?.summary.newLetters || 0) + correspondence.reduce((n, c) => n + (c.correspondence?.downloaded || 0), 0),
+      downloaded: results.reduce((n, r) => n + sumDl(r.categories), 0),
       failed: results.filter((r) => r.status === 'FAILED' || r.status === 'NOT_FOUND').length,
       needsReview: review.length,
     },
@@ -155,3 +132,30 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
 }
 
 export { dmyOf };
+
+/**
+ * One kind of letter (Negotiation / Counter Offer / Advance Acceptance Letter) for the selected Letter Dates,
+ * optionally for one Tender Number. Only published letters are downloaded - nothing is submitted or changed.
+ * @param status  'MyNegotiation' | 'MyCounterOffer' | 'MyAdvanceAcceptanceLetter'
+ */
+export async function runLetterType({ status, from, to, tenderNo = '', onProgress = () => {}, onAccount = () => {} }) {
+  if (!(from instanceof Date) || !(to instanceof Date) || from > to) throw new TenderError('INPUT', 'Choose a valid From / To date.');
+  const job = await beginJob({ onProgress, onAccount });
+  const dates = dayRange(from, to);
+  const letters = await downloadLettersByDate({ job, dates, statuses: [status], tenderNo, onProgress });
+  await job.ledger.save();
+  return { range: { from: dates[0], to: dates[dates.length - 1] }, letters };
+}
+
+/**
+ * Financial or Commercial Tabulation of the tenders CLOSING on the selected dates (IREPS Closed Tenders),
+ * optionally for one Tender Number. Only the published tabulation is downloaded - nothing is changed.
+ * @param pdfType  'financialTabulation' | 'commercialTabulation'
+ */
+export async function runTabulations({ pdfType, from, to, tenderNo = '', onProgress = () => {}, onAccount = () => {} }) {
+  if (!(from instanceof Date) || !(to instanceof Date) || from > to) throw new TenderError('INPUT', 'Choose a valid From / To date.');
+  const job = await beginJob({ onProgress, onAccount });
+  const tabulations = await downloadTabulationsByDate({ job, from, to, pdfTypes: [pdfType], tenderNo, onProgress });
+  await job.ledger.save();
+  return { range: tabulations.range, tabulations };
+}

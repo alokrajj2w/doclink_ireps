@@ -21,16 +21,15 @@
  */
 
 import { IrepsError } from "../ireps-api.js";
-import { isIrepsLoginPage } from "../session-service.js";
-import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
+import { downloadIrepsDocuments } from "../search-po/document-downloader.js";
+import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { buildIcDownloadPath } from "../../utils/filename.js";
-import { loadIcListPage, submitIcSearch, buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
-import { extractIcForm, hasIcForm } from "./ic-form.js";
+import { buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
+import { runIcSearch, validateIcSession } from "./ic-search.js";
 import { parseIcSearchResults } from "./ic-parser.js";
 import { ECM_KIND } from "../ecm-service.js";
 
-export { IC_ERROR };
-export const IC_DOWNLOAD_STATUS = DOCUMENT_DOWNLOAD_STATUS;
+export { IC_ERROR, validateIcSession };
 
 /** Progress stage ids emitted through deps.onProgress. */
 export const IC_FLOW_STAGES = Object.freeze({
@@ -46,21 +45,6 @@ const DOWNLOAD_CODES = Object.freeze({
   INVALID_PDF: IC_ERROR.INVALID_PDF,
   SESSION_EXPIRED: IC_ERROR.SESSION_EXPIRED
 });
-
-/** Validate a vendorInspectionCallList.do response and decide whether the user is authenticated. */
-function validateIcSession(html, response = {}, notRecognisedCode = IC_ERROR.LIST_PAGE_FAILED) {
-  if (response.status !== undefined && response.ok === false) {
-    return { authenticated: false, reason: `IREPS returned HTTP ${response.status}`, code: notRecognisedCode, status: response.status };
-  }
-  if (!html || html.trim().length === 0) {
-    return { authenticated: false, reason: "IREPS returned an empty response", code: notRecognisedCode };
-  }
-  if (isIrepsLoginPage(html, response)) {
-    return { authenticated: false, reason: "IREPS session expired", code: IC_ERROR.SESSION_EXPIRED };
-  }
-  if (hasIcForm(html)) return { authenticated: true, reason: null, code: "OK" };
-  return { authenticated: false, reason: "IREPS response was not recognised as the Inspection Call List page", code: notRecognisedCode };
-}
 
 /** Trim and validate a PO number; throws IrepsError(IREPS_INVALID_REQUEST) when empty. */
 export function normalisePoNumber(poNumber) {
@@ -79,9 +63,13 @@ export function normalisePoNumber(poNumber) {
  * @property {string} fetchedAt
  */
 
+/** Most result pages read for one PO (IREPS lists 50 calls a page): beyond that the rest is reported, not dropped silently. */
+export const MAX_PO_IC_PAGES = 40;
+
 /**
- * Find every issued Inspection Certificate of a PO. A PO with zero issued
- * ICs is a successful result (`certificates: [], count: 0`), never an error.
+ * Find every issued Inspection Certificate of a PO: every result page, not only the first
+ * (a PO can have more inspection calls than one page shows). A PO with zero issued ICs is
+ * a successful result (`certificates: [], count: 0`), never an error.
  *
  * @param {string} poNumber
  * @param {{ fetch?: typeof fetch, parseHtml?: Function, onProgress?: (stage: string) => void }} [deps]
@@ -92,43 +80,54 @@ export async function searchInspectionCertificates(poNumber, deps = {}) {
   const poNo = normalisePoNumber(poNumber);
   const progress = typeof deps.onProgress === "function" ? deps.onProgress : () => {};
   const parseHtml = deps.parseHtml || ((html, options) => parseIcSearchResults(html, poNo, options));
-  const requestDeps = { fetch: deps.fetch };
 
   progress(IC_FLOW_STAGES.CHECKING_SESSION);
-  const listPage = await loadIcListPage(requestDeps);
-  const listVerdict = validateIcSession(listPage.html, listPage);
-  if (!listVerdict.authenticated) {
-    throw new IrepsError(listVerdict.code, listVerdict.reason || "IREPS session is not active", { status: listVerdict.status });
-  }
-  progress(IC_FLOW_STAGES.CONNECTED);
-
-  const formState = extractIcForm(listPage.html);
-  if (!formState.token) throw new IrepsError(IC_ERROR.TOKEN_NOT_FOUND, "Struts token not found on the Inspection Call List page");
-
-  progress(IC_FLOW_STAGES.SEARCHING);
-  const request = buildIcSearchRequest(formState, poNo);
-  const results = await submitIcSearch(request, requestDeps);
-  const verdict = validateIcSession(results.html, results, IC_ERROR.RESULTS_INVALID);
-  if (!verdict.authenticated) {
-    throw new IrepsError(verdict.code, verdict.reason || "IREPS response not recognised", { status: verdict.status });
-  }
-
-  progress(IC_FLOW_STAGES.PARSING);
-  let parsed;
-  try {
-    parsed = await parseHtml(results.html, { sourceUrl: results.url || null });
-  } catch (error) {
-    throw new IrepsError(IC_ERROR.PARSE_FAILED, "IC results HTML could not be parsed", { cause: error });
-  }
-  if (!parsed || !Array.isArray(parsed.records)) throw new IrepsError(IC_ERROR.PARSE_FAILED, "Parser returned no result");
+  const certificates = [];
+  const warnings = [];
+  const seen = new Set();
+  let pageLimit = false;
+  await runIcSearch(
+    {
+      buildRequest: (form) => buildIcSearchRequest(form, poNo),
+      parseHtml,
+      onStage: progress,
+      // one PO: every result page, in the order IREPS lists them (ids are the call ids, unique per PO)
+      maxPages: MAX_PO_IC_PAGES,
+      onPageLimit: () => {
+        pageLimit = true;
+      },
+      onPage: (page) => {
+        for (const record of page.records) {
+          if (seen.has(record.id)) continue;
+          seen.add(record.id);
+          certificates.push({ ...record, index: certificates.length + 1 });
+        }
+        warnings.push(...(page.warnings || []));
+      }
+    },
+    { fetch: deps.fetch }
+  );
+  if (pageLimit) warnings.push(`IREPS listed more than ${MAX_PO_IC_PAGES} result pages for PO ${poNo}; only the ICs on those pages were read.`);
 
   return {
     success: true,
     poNumber: poNo,
-    certificates: parsed.records,
-    count: parsed.records.length,
-    warnings: parsed.warnings || [],
+    certificates,
+    count: certificates.length,
+    warnings,
     fetchedAt: new Date().toISOString()
+  };
+}
+
+/**
+ * How an IC is filed under Save to: ECM / S3 and recorded in the download log (one rule for every
+ * IC flow). The PO serial and passed quantity are the row's "PO Sr." and "Passed Qty." as IREPS
+ * shows them.
+ */
+export function icFiling({ icNumber, poNo, poSerial, callId, icDate, passedQty }) {
+  return {
+    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: icNumber, customer_po_number: poNo, ic_date: icDate, customer_po_serial_number: poSerial, passed_quantity: passedQty } },
+    log: logInfo(LOG_DOC_TYPE.IC, downloadKey.ic({ poNo, poSerial, callId, icNumber }))
   };
 }
 
@@ -140,7 +139,7 @@ export function icDownloadItems(records, poNo) {
     path: buildIcDownloadPath({ poNo: r.poNo || poNo, poSerial: r.poSerial, callId: r.callId }),
     label: `IC ${r.callId || "?"} (PO Sr. ${r.poSerial || "?"})`,
     meta: { callId: r.callId, icNumber: r.icNumber, poNo: r.poNo || poNo, poSerial: r.poSerial, icDate: r.icDate },
-    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: r.icNumber, customer_po_number: r.poNo || poNo, ic_date: r.icDate } }
+    ...icFiling({ ...r, poNo: r.poNo || poNo })
   }));
 }
 
@@ -157,7 +156,7 @@ export function icDownloadItems(records, poNo) {
  * A PO with zero issued ICs succeeds with an empty download batch.
  *
  * @param {string} poNumber
- * @param {{ fetch?: typeof fetch, parseHtml?: Function, saveFile?: Function, concurrency?: number,
+ * @param {{ fetch?: typeof fetch, parseHtml?: Function, saveFile?: Function, concurrency?: number, preflight?: Function, onSaved?: Function,
  *          onProgress?: (stage: string) => void, onDownloadProgress?: (snapshot: object) => void }} [deps]
  * @returns {Promise<IcDownloadResult>}
  */
@@ -167,6 +166,8 @@ export async function downloadInspectionCertificates(poNumber, deps = {}) {
   const downloads = await downloadIrepsDocuments(items, {
     fetch: deps.fetch,
     saveFile: deps.saveFile,
+    preflight: deps.preflight,
+    onSaved: deps.onSaved,
     concurrency: deps.concurrency,
     codes: DOWNLOAD_CODES,
     onProgress: deps.onDownloadProgress
