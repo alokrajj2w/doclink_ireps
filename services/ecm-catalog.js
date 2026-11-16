@@ -24,11 +24,17 @@ export const TYPE_PROPERTY = "InvoiceCertificateSchema:type";
  * Only properties the ECM's InvoiceCertificateSchema has: a search or create naming any other
  * answers HTTP 400 "No such property". tenderDate, loiNumber and loiDate were added to the TEST
  * ECM after 26/10/2026 (seen in GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema on
- * 03/11/2026), as the gateway's document_kinds.toml already lists them.
+ * 03/11/2026), as the gateway's document_kinds.toml already lists them. The IC's Customer PO
+ * Serial Number and Passed Quantity were added to the ECM on 16/11/2026: customerPOSrNumber is
+ * the name the spec gives the new PO serial column (sheet "Meta data from ECM Bill upload"),
+ * passedQuantity the ECM form's label. `node scripts/check-ecm-schema.mjs` checks every
+ * property here against the live schema.
  */
 export const ECM_FIELDS = Object.freeze({
   invoice_number: "InvoiceCertificateSchema:invoiceNumber",
   customer_po_number: "InvoiceCertificateSchema:customerPONumber",
+  customer_po_serial_number: "InvoiceCertificateSchema:customerPOSrNumber",
+  passed_quantity: "InvoiceCertificateSchema:passedQuantity",
   ic_number: "InvoiceCertificateSchema:icNumber",
   ic_date: "InvoiceCertificateSchema:icDate",
   co_number: "InvoiceCertificateSchema:coNumber",
@@ -59,10 +65,12 @@ const groupKind = (code, extra = {}) => tenderKind(code, { group: true, ...extra
  * title; tender uploads give their own (tender/tender-ecm.js), which starts the same way.
  * "ECM - Download speci-v1" marks more fields mandatory than IREPS supplies (or the ECM
  * has, see ECM_FIELDS), so `required` is what DocLink always has; the rest is sent
- * whenever it is known.
+ * whenever it is known. `details` (see matchFields) describe a document without
+ * identifying it.
  */
 export const ECM_KINDS = Object.freeze({
-  inspectionCertificate: { fields: ["invoice_number", "customer_po_number", "ic_number", "ic_date", "co_number"], required: ["ic_number", "customer_po_number"], location: "inputs", code: "IC", title: "{ic_number} - IC" },
+  // the PO serial and passed quantity let the ECM link an IC to its invoice (13/11/2026 meeting)
+  inspectionCertificate: { fields: ["invoice_number", "customer_po_number", "ic_number", "ic_date", "co_number", "customer_po_serial_number", "passed_quantity"], details: ["customer_po_serial_number", "passed_quantity"], required: ["ic_number", "customer_po_number"], location: "inputs", code: "IC", title: "{ic_number} - IC" },
   poCopy: { fields: ["customer_po_number"], required: ["customer_po_number"], location: "inputs", code: "PO", title: "{customer_po_number} - PO" },
   modificationAdvise: { fields: ["customer_po_number", "modification_advise_number", "tender_number"], required: ["customer_po_number", "modification_advise_number"], location: "inputs", code: "MA", title: "{modification_advise_number} - MA" },
   // grouped (group: true, see groupKind): "<T> - NIT" (tender PDF + its attached documents),
@@ -80,6 +88,19 @@ export const ECM_KINDS = Object.freeze({
 
 /** True for a kind kept as one ECM document per tender (nit, loi, tenderResult). */
 export const isGroupedKind = (kind) => Boolean(ECM_KINDS[kind] && ECM_KINDS[kind].group);
+
+/**
+ * The fields a lookup compares to tell whether a document is already in the ECM: all but the
+ * kind's `details`. An IC stored before the ECM had its PO serial and passed quantity holds
+ * neither, and must still be found, or it would be stored a second time.
+ * @param {string} kind
+ * @param {Object<string, string>} fields
+ * @returns {Object<string, string>}
+ */
+export function matchFields(kind, fields) {
+  const details = (ECM_KINDS[kind] && ECM_KINDS[kind].details) || [];
+  return Object.fromEntries(Object.entries(fields || {}).filter(([key]) => !details.includes(key)));
+}
 
 /**
  * Sites by environment.

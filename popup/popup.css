@@ -268,6 +268,39 @@ body {
   text-underline-offset: 2px;
 }
 
+/* Back: a small outlined button at the right of a card heading, with an arrow before its label */
+.btn-back {
+  width: auto;
+  flex: none;
+  gap: 6px;
+  padding: 4px 12px 4px 10px;
+  font-size: 13px;
+  color: var(--primary);
+  background: var(--surface);
+  border-color: var(--border);
+}
+.btn-back::before {
+  content: "\2190";
+  font-size: 14px;
+  line-height: 1;
+}
+.btn-back:not(:disabled):hover {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+}
+
+/* the PO / IC view's three bulk-download buttons, above the PO Number field: stacked in a
+   narrow panel, one row when it is wide (never two and one) */
+.btn-grid.batch-open {
+  grid-template-columns: 1fr;
+  margin-bottom: 14px;
+}
+@media (min-width: 560px) {
+  .btn-grid.batch-open {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
 .btn-spinner {
   display: none;
   width: 14px;

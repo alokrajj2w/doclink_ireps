@@ -43,7 +43,7 @@
 import { logger } from "../utils/logger.js";
 import { fetchWithDeadline, DeadlineError } from "../utils/http.js";
 import { ECM_CONFIG, loadEcmConfig, ecmDirectProblem } from "./ecm-config.js";
-import { DOC_TYPE, TYPE_PROPERTY, ECM_FIELDS, ECM_KINDS, ECM_SITES, routeSite, renderTitle } from "./ecm-catalog.js";
+import { DOC_TYPE, TYPE_PROPERTY, ECM_FIELDS, ECM_KINDS, ECM_SITES, routeSite, renderTitle, matchFields } from "./ecm-catalog.js";
 import { EcmError, ECM_ERROR, ecmFields, ecmErrorCode, isTransientStatus } from "./ecm-service.js";
 import { manifestHostPermissions } from "./recon-service.js";
 
@@ -329,7 +329,8 @@ async function folderUid(conn, site, location) {
  * document comes back; this keeps it to one copy.
  * Dates are left out: the ECM keeps them as timestamps whose day depends on the time zone
  * of whoever stored them (1 Jul IST is 2025-06-30T18:30:00.000Z), and the other fields
- * already pin the document down.
+ * already pin the document down. So are the kind's details (matchFields), which a
+ * document stored before the ECM had them lacks.
  */
 export function existingDocumentQuery({ kind, folderUid: parent, title, filename, values }) {
   const clauses = [
@@ -339,7 +340,7 @@ export function existingDocumentQuery({ kind, folderUid: parent, title, filename
     `ecm:parentId = ${nxqlLiteral(parent)}`,
     `dc:title = ${nxqlLiteral(title)}`,
     `file:content/name = ${nxqlLiteral(filename)}`,
-    ...Object.entries(values)
+    ...Object.entries(matchFields(kind, values))
       .filter(([key]) => !isDateField(key))
       .map(([key, value]) => fieldClause(key, value))
   ];

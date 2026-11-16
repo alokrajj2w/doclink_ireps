@@ -347,6 +347,39 @@ export async function runDownloadLogTests({ test, assert, eq }) {
     applyEcmConfig({ ecmBackendAws: true });
   });
 
+  await test("download log: an IC's PO serial and passed quantity are left out of the ECM check, so an IC stored without them is still found", async () => {
+    const IC = { ref: "ic-1", fields: { ic_number: "3480517", customer_po_number: "27253922100240", ic_date: "12/05/2026", customer_po_serial_number: "001", passed_quantity: "36" } };
+    resetEcmDirectState();
+    applyEcmConfig({ ecmBackendAws: false, ecm: { env: "TEST", domain: NUXEO, clientId: "id", clientSecret: "s" } });
+    const queries = [];
+    const direct = async (url) => {
+      const u = new URL(url);
+      if (u.pathname === "/nuxeo/oauth2/token") return json(200, { access_token: "tok", expires_in: 3600 });
+      if (u.pathname === "/nuxeo/api/v1/search/lang/NXQL/execute") {
+        queries.push(u.searchParams.get("query"));
+        // stored before the ECM had the two properties
+        const props = { "dc:title": "3480517 - IC", "InvoiceCertificateSchema:icNumber": "3480517", "InvoiceCertificateSchema:customerPONumber": "27253922100240" };
+        return json(200, { entries: [{ uid: "u-old", path: "/x/3480517 - IC", title: "3480517 - IC", properties: props }], isNextPageAvailable: false });
+      }
+      if (u.pathname === `/nuxeo/api/v1/id/${HOSUR_INPUTS}`) return json(200, { uid: HOSUR_INPUTS, path: "/FT/workspaces/Sites/HSR/Invoice Certificate - TS/Inputs" });
+      return json(404, {});
+    };
+    const found = await findInEcm({ kind: ECM_KIND.INSPECTION_CERTIFICATE, account: HOSUR, candidates: [IC] }, { fetch: direct, hostPermissions: HOSTS });
+    eq(found.ok, true);
+    eq(found.found.get("ic-1") && found.found.get("ic-1").uid, "u-old", "found by its IC and PO numbers, so it is not stored a second time");
+    assert(!/customerPOSrNumber|passedQuantity/.test(queries.join("\n")), "the query names neither");
+
+    applyEcmConfig({ ecmBackendAws: true });
+    let asked = null;
+    const gateway = async (url, init) => {
+      if (!String(url).endsWith("/api/ecm/documents/exists")) return json(404, {});
+      asked = JSON.parse(init.body);
+      return json(200, { found: {} });
+    };
+    await findInEcm({ kind: ECM_KIND.INSPECTION_CERTIFICATE, account: HOSUR, candidates: [IC] }, { fetch: gateway, hostPermissions: HOSTS });
+    eq(JSON.stringify(asked && asked.candidates), JSON.stringify([{ ref: "ic-1", fields: { ic_number: "3480517", customer_po_number: "27253922100240", ic_date: "2026-05-12" } }]), "the gateway is asked about neither");
+  });
+
   await test("download log: the shared downloader skips what preflight says, fetches the rest and reports each save", async () => {
     const base = IREPS_CONFIG.baseUrl;
     const pdf = new TextEncoder().encode("%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n");

@@ -18,13 +18,14 @@
   },
   "//downloadLog": "Download log (services/download-log.js): every file DocLink saves is recorded in the Recon Engine for the signed-in user (POST {reconBaseUrl}/api/doclink/downloads), and before a run DocLink asks which documents that user already downloaded to the same destination (and, under ECM / S3, which are already in their ECM folder) and offers to skip them. It needs the Recon sign-in for every run. false turns all of it off (old behaviour); config.local.json may override it.",
   "downloadLog": { "enabled": true },
-  "//ecm": "Save to: ECM / S3 for IC, PO, MA and tender documents. ecmBackendAws=true sends them through the Recon Engine's ECM gateway (POST {reconBaseUrl}/api/ecm/documents, Recon sign-in needed); false calls the ECM (Nuxeo) directly from DocLink with the client credentials below (local testing). env = TEST or PROD picks the ECM folders (services/ecm-catalog.js); domain's origin must also be in manifest.json host_permissions. Never put a real client id / secret here: put them in config.local.json (same shape, gitignored, never packaged), which overrides this file.",
+  "//ecm": "Save to: ECM / S3 for IC, PO, MA and tender documents. ecmBackendAws=true sends them through the Recon Engine's ECM gateway (POST {reconBaseUrl}/api/ecm/documents, Recon sign-in needed); false calls the ECM (Nuxeo) directly from DocLink with the client credentials below (local testing). env = TEST or PROD picks the ECM folders (services/ecm-catalog.js); domain's origin must also be in manifest.json host_permissions. Never put a real client id / secret here: put them in config.local.json (same shape, gitignored, never packaged), which overrides this file. ecm.loaAndCorrespondenceFields=true adds the fields the client asked for on 13 Nov 2026 (the LOA number and LOA date on LOA documents, the tender date on correspondence documents); keep it false until it has been checked on the TEST ECM.",
   "ecmBackendAws": false,
   "ecm": {
     "env": "TEST",
     "domain": "http://wctsrvecmtstsn1.wabtec.com:8080",
     "clientId": "abc",
     "clientSecret": "abc",
-    "timeoutMs": 120000
+    "timeoutMs": 120000,
+    "loaAndCorrespondenceFields": false
   }
 }

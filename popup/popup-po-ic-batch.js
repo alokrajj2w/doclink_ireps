@@ -1,6 +1,7 @@
 /**
  * "Download POs by PO Date", "Download ICs by IC Date" and "Download ICs from
- * Notifications" views.
+ * Notifications" views: one card each in view-po-ic-batch, opened alone by its own
+ * button on the PO / IC view.
  *
  * Each is a pure view of the state object the service worker keeps per kind
  * ("po-date" / "ic-date" / "ic-notif") and broadcasts as BATCH_UPDATE: the panel sends
@@ -50,13 +51,12 @@ function savedWhere(items, localFolder) {
 }
 
 function bind() {
-  Object.assign(el, {
-    view: $("view-po-ic-batch"),
-    btnOpen: $("btn-po-ic-batch-open"),
-    btnBack: $("btn-pod-back")
-  });
+  el.view = $("view-po-ic-batch");
   for (const { prefix } of Object.values(KINDS)) {
     el[prefix] = {
+      card: $(`card-${prefix}`),
+      open: $(`btn-batch-${prefix}`), // on the PO / IC view
+      back: $(`btn-${prefix}-back`),
       from: $(`${prefix}-from`),
       to: $(`${prefix}-to`),
       button: $(`btn-${prefix}-download`),
@@ -176,7 +176,7 @@ function renderPoDate(state) {
   const already = c.alreadyDownloaded || 0;
   const noLink = c.skipped - already;
   renderCounts("pod", [
-    ["Date range searched", `${state.dateFrom} – ${state.dateTo}`],
+    ["Date range searched", `${state.dateFrom} - ${state.dateTo}`],
     ["Matching PO records found", c.found],
     ["PDFs downloaded", c.downloaded],
     ["Already downloaded (skipped)", already],
@@ -255,7 +255,7 @@ function renderIcDate(state) {
   // "skipped" holds both: rows without an IC link, and ICs the user already has (not a problem)
   const already = c.alreadyDownloaded || 0;
   const noLink = c.skipped - already;
-  const range = `${state.dateFrom}${state.dateFrom === state.dateTo ? "" : " – " + state.dateTo}`;
+  const range = `${state.dateFrom}${state.dateFrom === state.dateTo ? "" : " - " + state.dateTo}`;
   renderCounts("icd", [
     ["IC dates searched", range],
     ["ICs issued in the range", c.found],
@@ -450,12 +450,9 @@ export function initBatch(context) {
     el[KINDS[kind].prefix].from.value = today;
     el[KINDS[kind].prefix].to.value = today;
   }
-  el.btnOpen.addEventListener("click", async () => {
-    ctx.showView("po-ic-batch");
-    await Promise.all(Object.keys(KINDS).map(refresh));
-  });
-  el.btnBack.addEventListener("click", () => ctx.showView("po-ic"));
   for (const [kind, { prefix }] of Object.entries(KINDS)) {
+    el[prefix].open.addEventListener("click", () => openBatch([kind]));
+    el[prefix].back.addEventListener("click", () => ctx.showView("po-ic"));
     el[prefix].button.addEventListener("click", () => start(kind));
     el[prefix].retry.addEventListener("click", () => retry(kind));
     el[prefix].openIreps.addEventListener("click", () => ctx.send(MESSAGE_TYPES.OPEN_IREPS));
@@ -477,11 +474,26 @@ export function handleBatchMessage(message) {
   return true;
 }
 
-/** Reopen the batch view when a batch is still running. */
-export async function restoreBatch() {
-  const states = await Promise.all(Object.keys(KINDS).map((kind) => ctx.send(MESSAGE_TYPES.BATCH_GET_STATE, { kind })));
-  if (!states.some((s) => s && s.running)) return false;
+/** Show only the cards of `kinds` in the batch view (the others keep their state, hidden). */
+function showCards(kinds) {
+  for (const [kind, { prefix }] of Object.entries(KINDS)) el[prefix].card.hidden = !kinds.includes(kind);
+}
+
+/** The batch view with the cards of `kinds` only: each button on the PO / IC view opens its own. */
+async function openBatch(kinds) {
+  showCards(kinds);
   ctx.showView("po-ic-batch");
-  Object.keys(KINDS).forEach((kind, i) => RENDERERS[kind](states[i]));
+  await Promise.all(kinds.map(refresh));
+}
+
+/** Reopen the batch view when a batch is still running, on the card(s) of the running kind(s). */
+export async function restoreBatch() {
+  const kinds = Object.keys(KINDS);
+  const states = await Promise.all(kinds.map((kind) => ctx.send(MESSAGE_TYPES.BATCH_GET_STATE, { kind })));
+  const running = kinds.filter((_, i) => states[i] && states[i].running);
+  if (running.length === 0) return false;
+  showCards(running);
+  ctx.showView("po-ic-batch");
+  kinds.forEach((kind, i) => RENDERERS[kind](states[i]));
   return true;
 }

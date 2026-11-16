@@ -2,7 +2,7 @@
 // fake Recon Engine behind globalThis.fetch. Run with the other node suites (npm test -- node), or:
 //   node --test test/node/panel-tests.mjs
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -257,5 +257,67 @@ test('My downloads (L10): not signed in, not allowed, or the Recon Engine down: 
     assert.equal($('btn-downloads-more').hidden, true);
   } finally {
     who.signedIn = true;
+  }
+});
+
+// ------------------------------------------------ PO / IC bulk downloads (popup-po-ic-batch.js)
+const { initBatch, restoreBatch } = await import('../../popup/popup-po-ic-batch.js');
+const batch = { view: 'main', running: [] };
+initBatch({
+  send: async (type, { kind } = {}) => (type === 'BATCH_GET_STATE' ? { kind, phase: 'idle', running: batch.running.includes(kind) } : null),
+  showView: (name) => { batch.view = name; },
+  setConnection: () => {},
+  setConnectionForError: () => {},
+  getDestination: () => 'local',
+});
+const CARDS = { 'po-date': 'card-pod', 'ic-date': 'card-icd', 'ic-notif': 'card-icn' };
+const cardsShown = () => Object.entries(CARDS).filter(([, id]) => !$(id).hidden).map(([kind]) => kind);
+
+test('PO / IC bulk downloads: each of the three buttons opens the batch view with its own card only', async () => {
+  for (const [button, kind] of [['btn-batch-pod', 'po-date'], ['btn-batch-icd', 'ic-date'], ['btn-batch-icn', 'ic-notif']]) {
+    batch.view = 'po-ic';
+    $(button).click();
+    await tick();
+    assert.equal(batch.view, 'po-ic-batch', button);
+    assert.deepEqual(cardsShown(), [kind], `${button} shows only its card`);
+  }
+});
+
+test("PO / IC bulk downloads: every card's Back button returns to the PO / IC view", () => {
+  for (const back of ['btn-pod-back', 'btn-icd-back', 'btn-icn-back']) {
+    batch.view = 'po-ic-batch';
+    $(back).click();
+    assert.equal(batch.view, 'po-ic', back);
+  }
+});
+
+test('PO / IC bulk downloads: a run still going when the panel reopens brings back its own card', async () => {
+  batch.running = ['ic-date'];
+  try {
+    assert.equal(await restoreBatch(), true);
+    assert.equal(batch.view, 'po-ic-batch');
+    assert.deepEqual(cardsShown(), ['ic-date']);
+    batch.running = [];
+    batch.view = 'main';
+    assert.equal(await restoreBatch(), false, 'nothing running: the panel stays where it is');
+    assert.equal(batch.view, 'main');
+  } finally {
+    batch.running = [];
+  }
+});
+
+test('Back buttons are buttons, not links: every Back in the panel has the btn-back style', () => {
+  const backs = [...document.querySelectorAll('button')].filter((b) => b.textContent.trim() === 'Back');
+  assert.ok(backs.length >= 10, `${backs.length} Back buttons`);
+  for (const b of backs) assert.ok(b.classList.contains('btn-back') && !b.classList.contains('btn-link'), b.id);
+});
+
+test('No em or en dash in what the panel shows: popup.html and the panel and tender UI scripts use "-"', () => {
+  const read = (p) => readFileSync(new URL(`../../${p}`, import.meta.url), 'utf8');
+  const files = ['popup/popup.html', 'pages/preview.html', 'utils/messages.js', 'tender/view-common.js', 'tender/pending-ui.js', 'tender/tender-ui.js',
+    ...['popup', 'pages'].flatMap((dir) => readdirSync(new URL(`../../${dir}/`, import.meta.url)).filter((f) => f.endsWith('.js')).map((f) => `${dir}/${f}`))];
+  for (const file of files) {
+    const line = read(file).split('\n').findIndex((l) => /[–—]/.test(l));
+    assert.equal(line, -1, `${file}:${line + 1} has an em or en dash`);
   }
 });
