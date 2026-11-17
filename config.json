@@ -18,6 +18,11 @@
   },
   "//downloadLog": "Download log (services/download-log.js): every file DocLink saves is recorded in the Recon Engine for the signed-in user (POST {reconBaseUrl}/api/doclink/downloads), and before a run DocLink asks which documents that user already downloaded to the same destination (and, under ECM / S3, which are already in their ECM folder) and offers to skip them. It needs the Recon sign-in for every run. false turns all of it off (old behaviour); config.local.json may override it.",
   "downloadLog": { "enabled": true },
+  "//schedular_phase1": "Scheduled downloads, Phase 1 (always to S3 / ECM, never local). enabled: true = this DocLink takes part in the shared schedules kept in the Recon Engine (one DocLink runs each due download for the IREPS account; nobody downloads it twice); false = no scheduling at all. documents: the document types the scheduler may trigger - BillStatus, CRN, RNote, MA, PO, IC (IC = ICs by IC date and ICs from notifications). Remove a name and that type is never triggered automatically; manual downloads are unchanged. config.local.json may override the whole block.",
+  "schedular_phase1": {
+    "enabled": true,
+    "documents": ["BillStatus", "CRN", "RNote", "MA", "PO", "IC"]
+  },
   "//ecm": "Save to: ECM / S3 for IC, PO, MA and tender documents. ecmBackendAws=true sends them through the Recon Engine's ECM gateway (POST {reconBaseUrl}/api/ecm/documents, Recon sign-in needed); false calls the ECM (Nuxeo) directly from DocLink with the client credentials below (local testing). env = TEST or PROD picks the ECM folders (services/ecm-catalog.js); domain's origin must also be in manifest.json host_permissions. Never put a real client id / secret here: put them in config.local.json (same shape, gitignored, never packaged), which overrides this file. ecm.loaAndCorrespondenceFields=true adds the fields the client asked for on 13 Nov 2026 (the LOA number and LOA date on LOA documents, the tender date on correspondence documents); keep it false until it has been checked on the TEST ECM.",
   "ecmBackendAws": false,
   "ecm": {
