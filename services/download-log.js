@@ -71,7 +71,9 @@ export const TENDER_DOC_TYPE = Object.freeze({
 });
 
 /** Why a document was not downloaded. */
-export const SKIP_REASON = Object.freeze({ ALREADY_DOWNLOADED: "already_downloaded", ALREADY_IN_ECM: "already_in_ecm" });
+// ALREADY_SAVED_FOR_ACCOUNT: a scheduled run found the document saved for its IREPS account by anyone
+// (services/scheduler/shared-run-hooks.js)
+export const SKIP_REASON = Object.freeze({ ALREADY_DOWNLOADED: "already_downloaded", ALREADY_IN_ECM: "already_in_ecm", ALREADY_SAVED_FOR_ACCOUNT: "already_saved_for_account" });
 
 /** Error codes; each has an entry in utils/messages.js ERROR_CATALOG. */
 export const DOWNLOAD_LOG_ERROR = Object.freeze({
@@ -690,11 +692,13 @@ export function describeSkip(skip) {
   const when = skip.date ? ` on ${skip.date}${skip.time ? ` at ${skip.time.slice(0, 5)}` : ""}` : "";
   if (skip.reason === SKIP_REASON.ALREADY_IN_ECM) return `Already in ECM${skip.path ? `: ${skip.path}` : ""}${skip.date ? ` (you downloaded it${when})` : ""}`;
   if (skip.reason === SKIP_REASON.ALREADY_DOWNLOADED) return `Already downloaded${when}${skip.count > 1 ? ` (${skip.count} times)` : ""}`;
+  if (skip.reason === SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT) return skip.inProgress ? `Being saved by ${skip.by || "another DocLink user"}` : `Already saved${skip.by ? ` by ${skip.by}` : ""}${when}`;
   return "";
 }
 
 /** The chip text of a skipped document. */
 export function skipChipText(skip) {
+  if (skip && skip.reason === SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT) return "Already saved";
   return skip && skip.reason === SKIP_REASON.ALREADY_IN_ECM ? "Already in ECM" : "Already downloaded";
 }
 

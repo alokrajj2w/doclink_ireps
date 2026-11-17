@@ -22,6 +22,7 @@ import { initBatch, handleBatchMessage, restoreBatch, refreshBatchDestination } 
 import { initGate, currentPanelTabId, panelOwnTabId, tabExists } from "./popup-gate.js";
 import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser, RECON_OFFLINE } from "./popup-recon-auth.js";
 import { initDownloads } from "./popup-downloads.js";
+import { initSchedule, handleScheduleMessage } from "./popup-schedule.js";
 import { initBillUpload, handleBillUploadMessage, restoreBillUpload } from "./popup-bill-upload.js";
 import { logger, mirrorLogToConsole, installConsoleHelpers } from "../utils/logger.js";
 
@@ -37,6 +38,7 @@ const el = {
   viewPoIc: $("view-po-ic"),
   viewPoIcBatch: $("view-po-ic-batch"),
   viewDownloads: $("view-downloads"),
+  viewSchedule: $("view-schedule"),
   saveTo: $("save-to"),
   options: $("options"),
   optionsSummary: $("options-summary"),
@@ -183,6 +185,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (handlePoIcMessage(message)) return false;
   if (handleBatchMessage(message)) return false;
   if (handleBillUploadMessage(message)) return false;
+  if (handleScheduleMessage(message)) return false;
   switch (message.type) {
     case MESSAGE_TYPES.IREPS_PROGRESS:
       renderProgress(message.stage, message.message);
@@ -209,14 +212,17 @@ function showView(name) {
   el.viewUpload.hidden = name !== "upload";
   el.viewMa.hidden = name !== "ma";
   el.viewPoIc.hidden = name !== "po-ic";
-  el.saveTo.hidden = name === "login" || name === "upload" || name === "downloads";
+  // scheduled downloads always go to S3 / ECM, so the Save to switch does not apply there
+  el.saveTo.hidden = name === "login" || name === "upload" || name === "downloads" || name === "schedule";
   el.viewPoIcBatch.hidden = name !== "po-ic-batch";
   el.viewDownloads.hidden = name !== "downloads";
+  el.viewSchedule.hidden = name !== "schedule";
   // the tender / correspondence views (tender/*-ui.js) are opened outside showView; any view
   // shown here replaces them, so two views are never visible at once
   $("view-tender").hidden = true;
   $("view-pending").hidden = true;
   $("btn-downloads-open").setAttribute("aria-pressed", String(name === "downloads"));
+  $("btn-schedule-open").setAttribute("aria-pressed", String(name === "schedule"));
 }
 
 /** Shared "IREPS login required" view (used by Bill Status and CRN). */
@@ -603,6 +609,7 @@ async function onIrepsTabActive() {
   refreshBatchDestination();
   initBillUpload({ send, showView, setConnection, setConnectionForError, currentPanelTabId });
   initDownloads({ showView, ensureSignedIn: () => ensureReconSignedIn({ always: true }), currentUser: currentReconUser, openSignIn: openReconSignIn });
+  initSchedule({ send, showView }).catch((error) => logger.warn("Scheduled downloads view not set up", error));
   // Nothing talks to IREPS until the active tab is the configured portal.
   await initGate({ send, setConnection, onActive: onIrepsTabActive });
 })();

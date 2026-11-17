@@ -20,7 +20,7 @@
  * password field is cleared as soon as it has been sent.
  */
 
-import { describeError } from "../utils/messages.js";
+import { describeError, MESSAGE_TYPES, TARGETS } from "../utils/messages.js";
 import { SAVE_DESTINATION, RECON_CONFIG, loadReconConfig } from "../services/recon-service.js";
 import { loadEcmConfig, isDirectEcm } from "../services/ecm-config.js";
 import { loadDownloadLogConfig, isDownloadLogEnabled, setDownloadLogUser, flushDownloadLog } from "../services/download-log.js";
@@ -178,6 +178,11 @@ export async function ensureReconSignedIn({ always = false, allowOffline = false
   });
 }
 
+/** A scheduled download that waited for the Recon sign-in may start now (background/scheduler-job.js). */
+function nudgeScheduler() {
+  chrome.runtime.sendMessage({ target: TARGETS.SERVICE_WORKER, type: MESSAGE_TYPES.SCHEDULE_NUDGE, reason: "recon sign-in" }).catch(() => {});
+}
+
 async function onSignIn(event) {
   event.preventDefault();
   hideError();
@@ -186,6 +191,7 @@ async function onSignIn(event) {
     const user = await reconSignIn(el.email.value, el.password.value);
     status = { signedIn: true, user };
     setDownloadLogUser(user);
+    nudgeScheduler();
     renderPill();
     settle(true);
   } catch (error) {
@@ -203,6 +209,7 @@ async function onOkta() {
     const user = await reconOktaSignIn();
     status = { signedIn: true, user };
     setDownloadLogUser(user);
+    nudgeScheduler();
     renderPill();
     settle(true);
   } catch (error) {

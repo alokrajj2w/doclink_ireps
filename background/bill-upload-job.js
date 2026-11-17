@@ -139,7 +139,7 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
     searchCrn: (options) => searchCrn(options, { parseHtml: (html, o) => parseSearchPo(html, { ...o, criteria: "CRN" }) })
   };
 
-  return {
+  const handlers = {
     [MESSAGE_TYPES.BILL_UPLOAD_GET_STATE]: async () => {
       await restore();
       return publicState();
@@ -268,4 +268,8 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
       });
     }
   };
+  // not a message handler (non-enumerable, so `...billUploadJob` leaves it out): the scheduler
+  // starts no scheduled download while a bill step is running
+  Object.defineProperty(handlers, "isBusy", { value: () => state.busy === true });
+  return handlers;
 }

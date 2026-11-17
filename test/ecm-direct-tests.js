@@ -3,7 +3,7 @@
  * ECM (Nuxeo) REST API itself (services/ecm-direct.js) with the folders of
  * services/ecm-catalog.js. A fake Nuxeo answers the token, NXQL search, batch upload and
  * create calls and records them - request shapes, the spec's queries, token reuse and
- * refresh, deduplication, folder routing for every kind and site, PROD path lookup, every
+ * refresh, deduplication, folder routing for every kind and site, the PROD creation folder, every
  * error path, the config.local.json merge and the gateway / direct switch. No extension
  * APIs are used. Invoked from run-tests.js.
  */
@@ -13,7 +13,7 @@ import { uploadToNuxeo, buildEcmQuery, existingDocumentQuery, groupDocumentQuery
 import { applyEcmConfig, ECM_CONFIG, isDirectEcm } from "../services/ecm-config.js";
 import { mergeConfig } from "../utils/config.js";
 import { DeadlineError } from "../utils/http.js";
-import { ECM_KINDS, ECM_SITES, routeSite } from "../services/ecm-catalog.js";
+import { ECM_KINDS, ECM_SITES, PROD_CREATION_FOLDER, routeSite } from "../services/ecm-catalog.js";
 import { applyReconConfig } from "../services/recon-service.js";
 
 const DOMAIN = "http://ecm.test:8080";
@@ -514,24 +514,25 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     eq(gateway.calls.length, 0, "nothing sent");
   });
 
-  await test("ECM direct: on PROD the folder path is looked up once; tender kinds have no PROD folder and are refused", async () => {
-    fresh({ ...CONFIG, ecm: { ...CONFIG.ecm, env: "PROD" } });
-    const inputs = "/FT/workspaces/Sites/HPD/Invoice Certificate/Input";
-    const fetch = fakeNuxeo({ folders: { [inputs]: "prod-rohtak-inputs" } });
-    await uploadToNuxeo({ ...IC, account: ROHTAK }, { fetch, hostPermissions: HOSTS });
-    await uploadToNuxeo({ ...IC, account: ROHTAK, filename: "second.pdf" }, { fetch, hostPermissions: HOSTS });
-    const lookups = fetch.calls.filter((c) => c.query && c.query.includes("ecm:path ="));
-    eq(lookups.length, 1, "the folder uid is cached");
-    eq(lookups[0].query, `SELECT * FROM Document WHERE ecm:path = '${inputs}'`);
-    eq(fetch.creates()[0].path, "/nuxeo/api/v1/id/prod-rohtak-inputs");
+  await test("ECM direct: on PROD every kind of both sites goes to the one creation folder, opened once", async () => {
+    const prod = { ...CONFIG, ecm: { ...CONFIG.ecm, env: "PROD" } };
+    const folder = PROD_CREATION_FOLDER.uid;
+    fresh(prod);
+    const fetch = fakeNuxeo();
+    const deps = { fetch, hostPermissions: HOSTS };
+    await uploadToNuxeo(IC, deps);
+    await uploadToNuxeo({ ...IC, account: ROHTAK, filename: "second.pdf" }, deps);
+    await uploadToNuxeo({ ...IC, kind: ECM_KIND.NIT, fields: { tender_number: "T-1" }, filename: "nit.pdf" }, deps);
+    await uploadToNuxeo({ ...IC, kind: ECM_KIND.COUNTER_OFFER, account: ROHTAK, fields: { tender_number: "T-2" }, filename: "co.pdf" }, deps);
+    eq(fetch.creates().map((c) => c.path).join(" | "), Array(4).fill(`/nuxeo/api/v1/id/${folder}`).join(" | "), "Hosur and Rohtak, inputs and tenders");
+    eq(fetch.calls.filter((c) => c.method === "GET" && c.path === `/nuxeo/api/v1/id/${folder}`).length, 1, "the folder is opened once per session");
+    eq(fetch.calls.filter((c) => c.query && c.query.includes("ecm:path =")).length, 0, "no path lookup");
 
-    const untouched = fakeNuxeo();
-    const error = await rejectsEcm(uploadToNuxeo({ ...IC, kind: ECM_KIND.NIT, fields: { tender_number: "T-1" } }, { fetch: untouched, hostPermissions: HOSTS }), ECM_ERROR.REJECTED, "no PROD tenders folder");
-    eq(error.detail, "the Hosur site has no tenders folder on PROD, so it cannot hold nit documents");
-    eq(untouched.calls.length, 0, "refused before anything is sent");
-
-    const missing = fakeNuxeo();
-    await rejectsEcm(uploadToNuxeo(IC, { fetch: missing, hostPermissions: HOSTS }), ECM_ERROR.REJECTED, "a folder path the ECM does not have");
+    fresh(prod);
+    const gone = fakeNuxeo({ respond: (call) => (call.method === "GET" && call.path === `/nuxeo/api/v1/id/${folder}` ? jsonResponse(404, { "entity-type": "exception", status: 404, message: folder }) : undefined) });
+    const error = await rejectsEcm(uploadToNuxeo(IC, { fetch: gone, hostPermissions: HOSTS }), ECM_ERROR.REJECTED, "a folder the ECM cannot open");
+    assert(error.detail.includes(folder), error.detail);
+    eq(gone.creates().length, 0, "nothing created");
   });
 
   await test("ECM direct: missing metadata, unknown or conflicting accounts are refused before anything is sent", async () => {

@@ -47,6 +47,12 @@ export const MESSAGE_TYPES = Object.freeze({
   BILL_UPLOAD_RESET: "BILL_UPLOAD_RESET",
   BILL_UPLOAD_FORGET: "BILL_UPLOAD_FORGET",
   BILL_UPLOAD_ADD_DOCUMENT: "BILL_UPLOAD_ADD_DOCUMENT",
+  // Phase 1 scheduled downloads (services/scheduler/, background/scheduler-job.js)
+  SCHEDULE_GET_STATE: "SCHEDULE_GET_STATE",
+  SCHEDULE_NUDGE: "SCHEDULE_NUDGE",
+  SCHEDULE_LIST: "SCHEDULE_LIST",
+  SCHEDULE_SAVE: "SCHEDULE_SAVE",
+  SCHEDULE_DELETE: "SCHEDULE_DELETE",
 
   // service worker -> popup (broadcast)
   IREPS_PROGRESS: "IREPS_PROGRESS",
@@ -69,6 +75,7 @@ export const MESSAGE_TYPES = Object.freeze({
   IC_DOWNLOAD_ERROR: "IC_DOWNLOAD_ERROR",
   BATCH_UPDATE: "BATCH_UPDATE",
   BILL_UPLOAD_UPDATE: "BILL_UPLOAD_UPDATE",
+  SCHEDULE_STATE: "SCHEDULE_STATE",
 
   // service worker -> popup (request / response): "these files are already downloaded /
   // in the ECM - download which again?" (services/download-log.js, popup/popup-redownload.js)
@@ -733,6 +740,83 @@ export const ERROR_CATALOG = Object.freeze({
     title: "Download interrupted",
     message: "Chrome stopped DocLink's background work while this run was in progress ({detail}), so it did not finish. Start it again: the files already saved are kept, and the download log recognises them."
   },
+  /* ------------------------------------- Scheduled downloads (Phase 1) */
+  SCHEDULE_BACKEND_UNAVAILABLE: {
+    title: "Scheduled downloads: Recon Engine unavailable",
+    message: "DocLink could not reach the Recon Engine's schedules ({detail}), so no scheduled download runs from this browser. Manual downloads work as usual."
+  },
+  SCHEDULE_NO_PERMISSION: {
+    title: "Scheduled downloads not allowed",
+    message: "Your Recon Engine role does not allow scheduled downloads ({detail}). Ask an admin for the doclink.schedule.run permission. Manual downloads work as usual."
+  },
+  SCHEDULE_INVALID: {
+    title: "Schedule not saved",
+    message: "The Recon Engine refused the schedule: {detail}."
+  },
+  SCHEDULE_EXISTS: {
+    title: "Schedule already exists",
+    message: "This IREPS account already has a schedule for that document type ({detail}). Change the existing one instead."
+  },
+  SCHEDULE_NOT_FOUND: {
+    title: "Schedule not found",
+    message: "That schedule no longer exists in the Recon Engine ({detail}). Refresh the view."
+  },
+  SCHEDULE_SLOT_NOT_FOUND: {
+    title: "Scheduled download not found",
+    message: "The scheduled download no longer exists ({detail})."
+  },
+  SCHEDULE_WRONG_ACCOUNT: {
+    title: "Scheduled download belongs to another account",
+    message: "That scheduled download is for another IREPS account ({detail})."
+  },
+  SCHEDULE_NOT_DUE: {
+    title: "Scheduled download not due",
+    message: "That scheduled download is outside its time window or waits for its next check ({detail})."
+  },
+  SCHEDULE_SLOT_DONE: {
+    title: "Already downloaded",
+    message: "This scheduled download already ran for this IREPS account ({detail}). It runs again at its next scheduled time: the next hour for hourly downloads, tomorrow for daily ones."
+  },
+  SCHEDULE_SLOT_TAKEN: {
+    title: "Another DocLink user is downloading",
+    message: "Another DocLink user is running this scheduled download now ({detail}). Nothing is downloaded twice."
+  },
+  SCHEDULE_ACCOUNT_BUSY: {
+    title: "Another DocLink user is downloading",
+    message: "Another DocLink user is running a scheduled download for this IREPS account now ({detail}). The next one starts when it ends."
+  },
+  SCHEDULE_CLAIM_LOST: {
+    title: "Scheduled download handed over",
+    message: "This browser lost its turn for the scheduled download ({detail}), so it stopped; another DocLink user carries on. Documents already saved are kept."
+  },
+  SCHEDULE_ACCOUNT_MISMATCH: {
+    title: "Different IREPS account",
+    message: "The scheduled download is for another IREPS account than the one logged in here ({detail}), so this browser did not run it."
+  },
+  SCHEDULE_ACCOUNT_UNVERIFIED: {
+    title: "IREPS account not verified",
+    message: "DocLink could not tell which IREPS account is logged in ({detail}), so it runs no scheduled download. Open an IREPS page and log in."
+  },
+  SCHEDULE_DESTINATION_REFUSED: {
+    title: "Not saved to S3 / ECM",
+    message: "The document could not be saved to S3 / ECM ({detail}). A scheduled download never saves locally; the next check tries it again."
+  },
+  SCHEDULE_NOT_RESERVED: {
+    title: "Document not reserved",
+    message: "The document was not reserved for this scheduled download ({detail}), so it was not saved."
+  },
+  SCHEDULE_DOWNLOAD_FAILED: {
+    title: "Scheduled document not downloaded",
+    message: "The document could not be downloaded from IREPS ({detail}). The next check tries it again."
+  },
+  SCHEDULE_TYPE_NOT_SUPPORTED: {
+    title: "Document type not scheduled here",
+    message: "This DocLink cannot run that scheduled document type ({detail})."
+  },
+  SCHEDULE_MISSED: {
+    title: "Scheduled download missed",
+    message: "Nobody with DocLink was logged in to IREPS during its time, so the scheduled download did not run ({detail}). An hourly download catches up in its next run."
+  },
   UNKNOWN: {
     title: "Something Went Wrong",
     message: "DocLink could not complete the download ({detail}). Please retry."
@@ -779,7 +863,9 @@ export const STORAGE_KEYS = Object.freeze({
   LAST_IC_DOWNLOAD: "doclink.lastIcDownload",
   // the panel-wide Save to switch: "local" | "recon" (shown as "ECM / S3": IC, PO, MA and
   // tender documents go to the ECM, Bill Status, CRN and R-NOTE to the Recon Engine's S3)
-  SAVE_DESTINATION: "doclink.saveDestination"
+  SAVE_DESTINATION: "doclink.saveDestination",
+  // scheduled downloads: the last verified IREPS account id ({ id, at }), never page content
+  SCHEDULER_ACCOUNT: "doclink.scheduler.account"
 });
 
 /** chrome.storage.session keys (memory only, cleared when Chrome closes). */
@@ -791,5 +877,7 @@ export const SESSION_KEYS = Object.freeze({
   PO_STATE: "doclink.poState",
   IC_STATE: "doclink.icState",
   BATCH_STATE: "doclink.batchState",
-  BILL_UPLOAD_STATE: "doclink.billUploadState"
+  BILL_UPLOAD_STATE: "doclink.billUploadState",
+  // scheduled downloads: when IREPS was last active / the IREPS check last failed in this browser
+  SCHEDULER_SIGNALS: "doclink.scheduler.signals"
 });

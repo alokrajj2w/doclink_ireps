@@ -96,7 +96,9 @@ export function confirmReconSignIn({ always = false, allowOffline = false } = {}
 /** The Recon user from /api/auth/me or a sign-in answer: `roles` (a list), or a single `role` from an older backend. */
 function userFrom(body) {
   const roles = Array.isArray(body.roles) ? body.roles.map(String) : body.role ? [String(body.role)] : [];
-  return { id: body.id, email: body.email || "", name: body.name || body.email || "", roles, role: roles.join(", "), isAdmin: roles.includes("admin") };
+  // permissions: what the roles allow (the scheduler checks doclink.schedule.run / .manage)
+  const permissions = Array.isArray(body.permissions) ? body.permissions.map(String) : [];
+  return { id: body.id, email: body.email || "", name: body.name || body.email || "", roles, role: roles.join(", "), isAdmin: roles.includes("admin"), permissions };
 }
 
 /** The Okta redirect DocLink uses, e.g. https://<id>.chromiumapp.org/okta ("" outside an extension). */
