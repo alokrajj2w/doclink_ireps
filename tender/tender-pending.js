@@ -21,15 +21,23 @@ import {
 } from './tender-core.js';
 import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { openLedger } from './tender-ledger.js';
+import { sharedRun, ledgerIdFor } from './tender-shared-run.js';
 import { inferRoute, publicAccount } from './tender-workflows.js';
 import { tenderEcmSink, ecmDocumentFor } from './tender-ecm.js';
 import { printPageToPdf } from './tender-print.js';
 import { contentDispositionName, urlFileName, sourceFileName } from '../utils/filename.js';
 import { logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE } from '../services/download-log.js';
 
-/** The download log of one saved file (letters keep their own "already saved" check: force / Download again). */
-const logPending = (entry, role, { filename, ecm }) =>
-  logDownload(downloadRecord({ docType: TENDER_DOC_TYPE.PENDING_CORRESPONDENCE, key: downloadKey.pending(entry.key, role) }, { filename, ecm }));
+/**
+ * The download log of one saved file (letters keep their own "already saved" check: force / Download again).
+ * A scheduled run (tender-shared-run.js) reports it to the Recon Engine with its reservation instead.
+ */
+const logPending = async (entry, role, { filename, ecm }) => {
+  const record = downloadRecord({ docType: TENDER_DOC_TYPE.PENDING_CORRESPONDENCE, key: downloadKey.pending(entry.key, role) }, { filename, ecm });
+  const shared = sharedRun();
+  if (shared) await shared.documentSaved(record);
+  else logDownload(record);
+};
 
 export const LIST_PATH = CORRES_LIST_PATH;
 export const REPLY_PATH = CORRES_REPLY_PATH;
@@ -517,7 +525,7 @@ const publicLetter = ({ key, req, ...l }) => ({ ...l, key: undefined, files: l.f
  */
 export async function downloadPendingCorrespondence({ mode = 'all', force = false, onProgress = () => {}, onAccount = () => {}, onEvent = () => {}, sleep = defaultSleep, pace = 200 } = {}) {
   const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
-  const ledger = await openLedger(account.irepsAccountId);
+  const ledger = await openLedger(ledgerIdFor(account.irepsAccountId));
   const state = ledger.manifest(MANIFEST_KEY) || blank();
   state.records ||= {};
   state.letters ||= {};
@@ -676,6 +684,10 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
           continue;
         }
         try {
+          if (await savedByAnotherRun(entry)) {
+            emitLetter(entry);
+            continue;
+          }
           await processLetter({ base, saver, ecm, state, rec, entry, letter, page, detailUrl: detail.url, force, sleep, pace, onProgress });
         } catch (e) {
           if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') {
@@ -727,6 +739,24 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   return { account: publicAccount(account), empty: false, summary: summarize(state, run), skipped, aborted, folder, toEcm: !!ecm };
 }
 
+/**
+ * A scheduled run reserves each letter before it is opened (tender-shared-run.js): true when anyone already
+ * saved it for this IREPS account (or another run holds it), and the letter is skipped without a question.
+ * A reservation that cannot be made throws, so nothing is fetched without one. Always false in a manual run.
+ */
+async function savedByAnotherRun(entry) {
+  const shared = sharedRun();
+  if (!shared) return false;
+  const key = downloadKey.pending(entry.key, 'letter');
+  const { granted, taken } = await shared.reserveDocuments([key]);
+  if (granted.has(key)) return false;
+  const by = taken.get(key)?.by;
+  entry.status = STATUS.DOWNLOADED;
+  entry.alreadyDownloaded = true;
+  log('Pending', `letter ${entry.letterId}: already saved for this IREPS account${by ? ` by ${by}` : ''}; skipped`);
+  return true;
+}
+
 async function processLetter({ base, saver, ecm, state, rec, entry, letter, page, detailUrl, force, sleep, pace, onProgress }) {
   const prevLetterFile = !force && entry.files.find((f) => f.role === 'letter' && f.status === 'DOWNLOADED');
   if (!force && entry.attachmentsComplete && prevLetterFile) {
@@ -770,13 +800,14 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
     const letterNo = letter.letterNo || letter.letterId;
     const stored = await storeFile({ saver, ecm, rec, letter }, name, opened.bytes, [letterNo, letter.subject].filter(Boolean).join(' - '), opened.contentType);
     const check = stored.saved ? await verifySaved(stored.saved, opened.bytes, 'letter') : {};
-    logPending(entry, 'letter', { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm });
+    await logPending(entry, 'letter', { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm });
     files.push({
       role: 'letter', ...storedEntry(name, opened.bytes, stored), status: 'DOWNLOADED', downloadedAt: new Date().toISOString(),
       validation: { ok: true, kind: opened.form === 'html' ? 'pdf (rendered from HTML)' : opened.form === 'printed' ? 'pdf (printed by Chrome)' : opened.form, source: opened.via, ...(printError ? { printError } : {}), extension: opened.ext, httpStatus: opened.httpStatus, contentType: opened.contentType, pdfSignature: opened.ext === '.pdf' ? isPdfBytes(opened.bytes) : null, ...check },
     });
-    if (opened.form === 'html') {
-      // the original page stays in Downloads, also when the letter went to the ECM (as for tender letters)
+    if (opened.form === 'html' && !sharedRun()) {
+      // the original page stays in Downloads, also when the letter went to the ECM (as for tender letters);
+      // not in a scheduled run, which saves to the ECM only
       const htmlName = (stored.saved ? stored.saved.relPath : name).replace(/\.pdf$/i, '') + '.html';
       const s2 = await saver.save('', htmlName, new TextEncoder().encode(opened.html), 'text/html');
       files.push({ role: 'letter_source_html', fileName: s2.relPath, relPath: s2.relPath, status: 'DOWNLOADED', size: s2.size, downloadedAt: new Date().toISOString(), downloadId: s2.downloadId, note: 'original IREPS letter page' });
@@ -799,7 +830,7 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
         ? withSuffix(got.fileName, safeSegment(letter.letterNo || letter.letterId, 40)) : got.fileName;
       const stored = await storeFile({ saver, ecm, rec, letter }, name, got.bytes, [letter.letterNo || letter.letterId, 'Attachment', got.fileName].join(' - '), got.contentType);
       const check = stored.saved ? await verifySaved(stored.saved, got.bytes, 'attachment') : {};
-      logPending(entry, `attachment:${att.id}`, { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm });
+      await logPending(entry, `attachment:${att.id}`, { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm });
       files.push({
         role: 'attachment', attId: att.id, ...storedEntry(name, got.bytes, stored), originalName: got.fileName, status: 'DOWNLOADED', downloadedAt: new Date().toISOString(),
         validation: { ok: true, kind: got.kind, extension: got.ext, httpStatus: got.httpStatus, contentType: got.contentType, ...check },

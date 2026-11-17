@@ -625,3 +625,35 @@ test('UI: clicking "Download All Correspondence" fills the progress table and co
   assert.equal($('pc-empty').hidden, false);
   assert.equal($('pc-empty').textContent, 'No correspondence found');
 });
+
+// =========================== scheduled downloads, Phase 2 (tender-shared-run.js) ===========================
+const sharedRun = await import('../tender-shared-run.js');
+const dlog = await import('../../services/download-log.js');
+test('Scheduled run: each pending letter is reserved; one already saved is not opened; the rest go to the ECM only', async () => {
+  scenario();
+  const calls = { reserved: [], ecm: [], saved: [] };
+  const firstKey = [];
+  sharedRun.beginSharedRun({
+    reserveDocuments: async (keys) => {
+      calls.reserved.push(...keys);
+      if (!firstKey.length) firstKey.push(keys[0]); // the first letter: already saved by someone else
+      const taken = keys.filter((k) => k === firstKey[0]);
+      return { granted: new Set(keys.filter((k) => !taken.includes(k))), taken: new Map(taken.map((k) => [k, { by: 'Priya' }])) };
+    },
+    ecmSink: { save: async (doc) => { calls.ecm.push(doc); return { ecm: { status: 'stored', uid: `u${calls.ecm.length}` }, local: null }; } },
+    documentSaved: async (record) => { calls.saved.push(record); },
+  });
+  try {
+    await go();
+  } finally {
+    sharedRun.endSharedRun();
+  }
+  assert.equal(calls.reserved.length, 3, 'every letter reserved');
+  assert.ok(calls.reserved.every((k) => k.startsWith('pending:') && k.endsWith('|letter')));
+  assert.deepEqual(server.log.filter((l) => l.path === VIEW).map((l) => l.form.letterID), ['9002', '9003'], 'the taken letter (9001) was not opened');
+  assert.deepEqual(saved, [], 'nothing in Downloads (no .html copy either)');
+  assert.ok(calls.ecm.length >= 2 && calls.ecm.every((d) => d.kind === 'crp'));
+  assert.equal(calls.saved.length, calls.ecm.length, 'every ECM save reported');
+  assert.ok(calls.saved.every((r) => r.destination === 'ecm' && r.doc_type === dlog.TENDER_DOC_TYPE.PENDING_CORRESPONDENCE));
+  assert.ok(Object.keys(store).some((k) => k.endsWith('#scheduled')), 'its own ledger');
+});

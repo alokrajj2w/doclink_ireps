@@ -15,6 +15,7 @@ import { loadEcmConfig, isDirectEcm } from '../services/ecm-config.js';
 import { loadDownloadLogConfig, DOWNLOAD_LOG_ERROR } from '../services/download-log.js';
 import { TenderError, safeSegment } from './tender-core.js';
 import { localIsoDate } from '../utils/dates.js';
+import { sharedRun } from './tender-shared-run.js';
 
 export const SIGN_IN_REQUIRED_MSG = describeError(DOWNLOAD_LOG_ERROR.SIGN_IN_REQUIRED).message;
 
@@ -26,6 +27,9 @@ export const SIGN_IN_REQUIRED_MSG = describeError(DOWNLOAD_LOG_ERROR.SIGN_IN_REQ
  * then goes ahead and its records are sent once the Recon Engine is back. A no-op with the log off.
  */
 export async function ensureDownloadSignIn() {
+  // a scheduled run has no one to answer a sign-in page: the scheduler checked the Recon sign-in before
+  // it claimed the run, and every request of the run fails clearly (RECON_AUTH_REQUIRED) if it has ended
+  if (sharedRun()) return;
   if (!(await loadDownloadLogConfig())) return;
   if (!(await confirmReconSignIn({ always: true, allowOffline: true }))) throw new TenderError('SIGN_IN_REQUIRED', SIGN_IN_REQUIRED_MSG);
 }
@@ -147,6 +151,9 @@ export const ECM_TAKES_TENDER_DATE = Object.values(CATEGORY_ECM_KIND).some((kind
  * The account is the run's verified IREPS account; its unit picks the ECM folder.
  */
 export async function tenderEcmSink(account, deps = {}) {
+  // a scheduled run: the ECM only, whatever the panel's Save to switch says (tender-shared-run.js)
+  const shared = sharedRun();
+  if (shared) return shared.ecmSink;
   if ((await savedDestination()) !== SAVE_DESTINATION.RECON) return null;
   // Login 2: the Recon Engine sign-in page answers before the run; "Use Local instead" -> local.
   // Not needed when the documents go straight to the ECM (config.json "ecmBackendAws": false).

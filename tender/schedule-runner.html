@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DocLink - scheduled tender download</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; color: #1f2937; background: #fff; }
+    h1 { font-size: 1.1rem; margin: 0 0 .5rem; }
+    #status { color: #4b5563; }
+  </style>
+</head>
+<body>
+  <h1>DocLink: scheduled tender download</h1>
+  <p>DocLink is downloading new tender documents for your IREPS account's shared schedule, straight to the ECM.
+     This tab closes by itself when the run ends. Closing it stops the run; another DocLink user can run it instead.</p>
+  <p id="status" aria-live="polite">Starting…</p>
+  <script type="module" src="schedule-runner.js"></script>
+</body>
+</html>

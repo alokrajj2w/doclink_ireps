@@ -11,6 +11,7 @@ import { IREPS_DOWN_CODES, log, norm } from './tender-core.js';
 import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { searchTender, fmtDate, railwayOf } from './tender-search.js';
 import { openLedger } from './tender-ledger.js';
+import { ledgerIdFor } from './tender-shared-run.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
   scanClosedTenders, downloadTabulation, TABULATIONS,
@@ -24,7 +25,7 @@ const RUNS_KEPT = 10;
 
 export async function beginJob({ onProgress, onAccount }) {
   const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
-  const ledger = await openLedger(account.irepsAccountId);
+  const ledger = await openLedger(ledgerIdFor(account.irepsAccountId));
   // "same answer for the rest of this run" of the download-again prompt, shared by its tenders
   return { base, account, folderLabel, ledger, redownloadMemo: {} };
 }

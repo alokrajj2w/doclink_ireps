@@ -58,6 +58,8 @@ const ENTRY_POINTS = [
   "background/service-worker.js",
   "background/offscreen.js",
   "pages/preview.js",
+  // the background tab of a scheduled tender download (Phase 2)
+  "tender/schedule-runner.js",
 ];
 
 /** The <script type="module"> tags of popup/popup.html: one page, so one module graph (code splitting). */
@@ -79,6 +81,7 @@ const STATIC_FILES = [
   "pages/preview.html",
   "pages/preview.css",
   "tender/tender.css",
+  "tender/schedule-runner.html",
 ];
 
 /** The IREPS portals when config.json names none (as in services/ireps-api.js). */
@@ -275,7 +278,7 @@ function checkConfig({ allowMock }) {
 }
 
 /**
- * Scheduled downloads (config.json "schedular_phase1"): the build log says whether this build
+ * Scheduled downloads (config.json "schedular_phase1" and "schedular_phase2"): the build log says whether this build
  * schedules and which types, and a misspelt document name stops the build (unpacked, DocLink
  * would only ignore it, and that type would quietly never run).
  */
@@ -283,8 +286,8 @@ function checkSchedulerConfig(config) {
   const scheduler = parseSchedulerConfig(config);
   if (scheduler.unknown.length) {
     throw new Error(
-      `config.json "schedular_phase1.documents" names unknown document types: ${scheduler.unknown.join(", ")}. ` +
-        "Use BillStatus, CRN, RNote, MA, PO, IC.",
+      `config.json "schedular_phase1/2.documents" name unknown document types: ${scheduler.unknown.join(", ")}. ` +
+        "Use BillStatus, CRN, RNote, MA, PO, IC (phase 1) and NIT, CounterOffer, LOA, Tabulation, Correspondence, Negotiation (phase 2).",
     );
   }
   log(`  scheduled downloads    ${scheduler.enabled ? `on: ${scheduler.types.join(", ")}` : `off (${scheduler.reason})`}`);

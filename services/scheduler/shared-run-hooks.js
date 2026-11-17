@@ -11,6 +11,10 @@
  *   - complete: each saved document is reported, with its download-log record, so the next
  *     reservation by anyone sees it at once. Failed documents are released for the next check;
  *   - the claim check: before each upload the run must still hold its claim (fresh heartbeat).
+ *
+ * Phase 2 (tender documents) uses the same pieces through `tenderHooks`, installed in the tender code
+ * by tender/tender-shared-run.js: reserveDocuments before a category or letter is fetched, an ECM sink
+ * that never saves locally, and documentSaved for each file the ECM took.
  */
 
 import { downloadKey, exportFingerprint, downloadRecord, logDownload, SKIP_REASON, LOG_DESTINATION } from "../download-log.js";
@@ -76,6 +80,9 @@ export function createSharedRunHooks(deps) {
   let pendingDone = [];
   const stats = { saved: 0, skipped: 0, failed: 0, notReported: 0 };
   let aborted = null;
+  /** tender runs: keys this run reserved, and keys it saved */
+  const grantedKeys = new Set();
+  const savedKeys = new Set();
 
   function assertClaim() {
     if (aborted) throw new SharedRunError(aborted);
@@ -233,7 +240,59 @@ export function createSharedRunHooks(deps) {
     return { ...saved, skipped: false, warnings: [] };
   }
 
+  /**
+   * Tender runs: reserve `keys` (download-log keys) before anything is fetched.
+   * -> { granted: Set<key>, taken: Map<key, skip> }. A reservation that cannot be made aborts the run:
+   * it throws, so nothing is fetched without one.
+   */
+  async function reserveDocuments(keys) {
+    assertClaim();
+    let answer;
+    try {
+      answer = await reserve([...new Set(keys)], LOG_DESTINATION.ECM);
+    } catch (error) {
+      aborted = aborted || (error && error.code) || "SCHEDULE_BACKEND_UNAVAILABLE";
+      logger.warn(`Scheduled run: documents not reserved (${aborted}); none is downloaded`);
+      throw new SharedRunError(aborted, "the documents could not be reserved for this run");
+    }
+    for (const k of answer.granted) grantedKeys.add(k);
+    const taken = new Map([...answer.taken].map(([k, v]) => [k, takenSkip(v)]));
+    stats.skipped += taken.size;
+    return { granted: answer.granted, taken };
+  }
+
+  /** The ECM sink of a tender run (the shape of tender-ecm.js tenderEcmSink): the ECM only, never local. */
+  const ecmSink = {
+    // the second argument (save locally instead) is ignored on purpose: a refused upload is a failed document
+    async save(doc) {
+      assertClaim();
+      const stored = await uploadEcm({ ...doc, account });
+      return { ecm: { status: stored.deduplicated ? ECM_OUTCOME.ALREADY_STORED : ECM_OUTCOME.STORED, site: stored.site, uid: stored.uid, path: stored.path }, local: null };
+    }
+  };
+
+  /** A tender file the ECM took: its download-log record goes to `complete`. */
+  async function documentSaved(record) {
+    pendingDone.push(record);
+    savedKeys.add(record.doc_key);
+    stats.saved++;
+    if (pendingDone.length >= COMPLETE_BATCH) await flushDone();
+  }
+
+  /** After a tender run: report what was saved and release what was reserved but not saved. */
+  async function finishTenderRun() {
+    const failed = [...grantedKeys].filter((k) => !savedKeys.has(k)).map((k) => ({ doc_key: k, destination: LOG_DESTINATION.ECM, code: "SCHEDULE_DOWNLOAD_FAILED" }));
+    stats.failed += failed.length;
+    const done = pendingDone;
+    pendingDone = [];
+    await complete(done, failed);
+    return { ...stats, aborted };
+  }
+
   return {
+    /** deps for tender runs (tender/tender-shared-run.js) */
+    tenderHooks: { reserveDocuments, ecmSink, documentSaved },
+    finishTenderRun,
     /** deps for MA / PO-by-date / IC runs (document-downloader.js) */
     documentHooks: { preflight, saveFile, onSaved },
     finishDocuments,

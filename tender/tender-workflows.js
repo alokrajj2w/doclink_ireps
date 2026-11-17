@@ -18,9 +18,10 @@ import {
 import { describeError } from '../utils/messages.js';
 import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { printPageToPdf } from './tender-print.js';
+import { sharedRun } from './tender-shared-run.js';
 import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
 import { ecmDocumentFor, ecmCheckDocumentFor, ecmFileName, tenderEcmSink, CATEGORY_ECM_KIND } from './tender-ecm.js';
-import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION } from '../services/download-log.js';
+import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION, SKIP_REASON } from '../services/download-log.js';
 
 const MAX_INBOX_PAGES = 15;
 /** A list scanned by date (letters, Closed Tenders) normally stops long before this (see OLD_PAGES_TO_STOP). */
@@ -112,8 +113,9 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
   const fileName = reserveFileName(run, action, action.id, given);
   const out = [await saveDocument(run, action, { fileName, bytes: doc.bytes, contentType: doc.contentType, id: action.id, meta: action.meta },
     { converted: !!doc.converted, ...(doc.printed ? { printed: true } : {}), validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '' } })];
-  if (doc.kind === 'html' && !doc.printed && !action.pageOnly) {
+  if (doc.kind === 'html' && !doc.printed && !action.pageOnly && !sharedRun()) {
     // Keep the complete original page next to the text rendering: nothing from the letter is lost.
+    // (Not in a scheduled run: it saves to the ECM only, and the ECM has the rendering.)
     // (A page Chrome printed is already complete, as Ctrl+P would save it.)
     const htmlName = fileName.replace(/\.pdf$/i, '') + '.html';
     const savedHtml = await run.saver.save(action.subdir, htmlName, new TextEncoder().encode(doc.html), 'text/html');
@@ -180,10 +182,13 @@ async function saveDocument(run, action, { fileName, bytes, contentType, id, met
   const size = saved ? saved.size : bytes.length;
   const name = saved ? saved.relPath.split('/').pop() : fileName;
   // the download log (no-op when it is off); the HTML companion of a rendered page is not a document of its own
-  logDownload(downloadRecord(
+  const record = downloadRecord(
     { docType: TENDER_DOC_TYPE[action.category] || 'tender_document', key: downloadKey.tender(action.category, run.ctx.tenderNo, id) },
     { filename: name, ecm, account: run.account }
-  ));
+  );
+  const shared = sharedRun();
+  if (shared) await shared.documentSaved(record); // a scheduled run reports it with its reservation
+  else logDownload(record);
   const { validation, ...rest } = extra;
   // fileName / relPath: the file as Chrome saved it (L11); requestedPath: the name asked for, when Chrome had to change it
   return { fileName: name, relPath: saved ? saved.relPath : null, ...(saved?.requestedPath ? { requestedPath: saved.requestedPath } : {}), status: 'DOWNLOADED', id: id || '', downloadId: saved ? saved.downloadId : null, size, ...rest,
@@ -207,7 +212,10 @@ const ITEM_CONCURRENCY = 3;
 const itemId = (it) => String(it.id ?? '') || '-'; // the NIT itself may have no id
 
 async function checkAlreadyDownloaded(run, result, items, build) {
-  if (!items.length || !(await loadDownloadLogConfig())) return null;
+  if (!items.length) return null;
+  const shared = sharedRun();
+  if (shared) return reserveForSharedRun(shared, run, result, items);
+  if (!(await loadDownloadLogConfig())) return null;
   const toEcm = Boolean(run.ecm && CATEGORY_ECM_KIND[result.category]);
   const candidates = items.map((it) => ({
     id: itemId(it),
@@ -232,6 +240,19 @@ async function checkAlreadyDownloaded(run, result, items, build) {
   const checked = await preflightDownloads(candidates, { destination: toEcm ? LOG_DESTINATION.ECM : LOG_DESTINATION.LOCAL, account: run.account, ask });
   for (const w of checked.warnings) result.warnings.push(w);
   return checked;
+}
+
+/**
+ * A scheduled run (tender-shared-run.js): every document is reserved for the IREPS account before it is
+ * fetched; one anyone already saved (or another run holds) is skipped, without a question. A reservation
+ * that cannot be made throws, so nothing is fetched without one.
+ */
+async function reserveForSharedRun(shared, run, result, items) {
+  const keyOf = (it) => downloadKey.tender(result.category, run.ctx.tenderNo, it.id);
+  const { granted, taken } = await shared.reserveDocuments(items.map(keyOf));
+  const skip = new Map();
+  for (const it of items) if (!granted.has(keyOf(it))) skip.set(itemId(it), taken.get(keyOf(it)) || { reason: SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT, by: '' });
+  return { checked: true, skip, warnings: [] };
 }
 
 async function downloadItems(run, result, items, build) {

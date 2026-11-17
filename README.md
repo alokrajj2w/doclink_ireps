@@ -1693,7 +1693,7 @@ network / timeout / HTTP 5xx only. An expired session is never retried.
 
 ---
 
-## 23. Scheduled downloads (Phase 1: Bill Status, CRN, R-NOTE, MA, PO, IC)
+## 23. Scheduled downloads (Phase 1: Bill Status, CRN, R-NOTE, MA, PO, IC; Phase 2: tender documents)
 
 Downloads that run by themselves for each IREPS account, shared by every DocLink user of that account: Bill
 Status, CRN and R-NOTE once a morning; MA, POs and ICs every hour, each run fetching only what is new. The design, decisions and API contract are in `schedular_implementation_plan.md`
@@ -1776,6 +1776,56 @@ messages), `popup/popup-schedule.js`. The worker's jobs are started through `lau
 promise the scheduler awaits; a panel click uses the same functions. Tests: `test/scheduler-tests.js`
 (`npm test -- browser --only=scheduler`).
 
-**Not in Phase 1:** tender documents and correspondence (they run in the side panel; Phase 2), single PO / IC
-downloads by PO number, and anything while Chrome is closed.
+**Not scheduled:** single PO / IC downloads by PO number, a single tender by tender number, and anything while
+Chrome is closed.
+
+### Phase 2: tender documents
+
+**Switch.** Its own block, beside `schedular_phase1` (config.local.json may replace it whole):
+
+```json
+"schedular_phase2": { "enabled": true, "documents": ["NIT", "CounterOffer", "LOA", "Tabulation", "Correspondence", "Negotiation"] }
+```
+
+Same rules as phase 1: on only with `enabled: true` and a known name; names ignore case; a phase 1 name in
+this block (or the other way round) is unknown and stops a build. Either block switches scheduling on. The repo
+ships it off.
+
+| Name | Schedule type | What a run does (with the claim's date range) | Default timing (IST) |
+|---|---|---|---|
+| `NIT` | `tenderNit` | "NIT Documents" (automatic mode): My Messages in the range → each tender's NIT, attachments, My Offer and its corrigenda | hourly, 10:30 … 18:30 |
+| `CounterOffer` | `tenderCounterOffer` | Counter Offer letters by Letter Date | hourly, 10:30 … 18:30 |
+| `LOA` | `tenderLoa` | Advance Acceptance (LOA) letters by Letter Date. Sends IREPS's own "LOA viewed" request first, as a manual LOA download does, with nobody clicking | hourly, 10:30 … 18:30 |
+| `Tabulation` | `tenderTabulations` | Financial and Commercial Tabulation of tenders closing in the range (look-back 15 days: a tabulation appears days after closing) | hourly, 10:30 … 18:30 |
+| `Correspondence` | `tenderCorrespondence` | Every letter IREPS lists as pending (no date range) | hourly, 10:30 … 18:30 |
+| `Negotiation` | `tenderNegotiation` | Negotiation letters by Letter Date. Its own schedule because IREPS opens these pages very slowly | 12:30, 15:30, 18:30 (retry every 30 min) |
+
+Every hourly run is retried every 15 minutes within its hour; the 18:30 run is the last. Each run fetches only
+what is new: the reservations skip every document anyone saved for the account.
+
+**Where it runs.** The tender code needs a page (it reads IREPS pages with `DOMParser` and prints letters with
+Chrome's print-to-PDF), so the DocLink that wins a tender slot opens `tender/schedule-runner.html` in a
+**background tab** (not focused), runs the job there and closes the tab when it ends. While a letter or corrigendum
+is printed, Chrome briefly shows "DocLink started debugging this browser", as in a manual run. A user who closes
+the tab stops the run; the slot is given back without counting an attempt, and another DocLink may run it.
+A run is given 50 minutes at most.
+
+**Same guarantees as phase 1** (`tender/tender-shared-run.js`, `shared-run-hooks.js` `tenderHooks`):
+
+* Every document is reserved for the IREPS account before it is fetched (tender documents per category,
+  correspondence per letter, keys from `downloadKey.tender` / `downloadKey.pending`). One anyone already saved is
+  skipped without the "download again?" question; a reservation that fails fetches nothing.
+* The ECM only (NIT, LOA and Result as grouped documents, direct ECM), never Downloads: a refused upload is a
+  failed document, retried at the next check. No `.html` copy of a rendered letter is kept.
+* Each saved file is reported with its download-log record. The run must still hold its claim before each upload
+  (the tab asks the worker every 20 s; the worker sends the heartbeats).
+* A scheduled run keeps its own tender ledger (`<account>#scheduled`), so a document the user once downloaded to
+  Local never makes it skip that document.
+* The Recon sign-in page is never shown in the runner tab: the scheduler checked the sign-in before it claimed.
+* The run is for the account the worker verified: another IREPS account logged in stops it before any download.
+
+**Code.** `services/scheduler/tender-runner.js` (opens and closes the tab, the job, the outcome),
+`tender/schedule-runner.html` / `schedule-runner.js` (the tab), `tender/tender-shared-run.js` (the switch inside
+the tender code). Tests: `test/scheduler-tests.js`, and "Scheduled run" in `tender/tests/run-tests.mjs` and
+`tender/tests/pending-tests.mjs`.
 

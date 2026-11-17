@@ -25,7 +25,13 @@ const REPEATS = [
   [120, "every 2 hours"],
   [180, "every 3 hours"]
 ];
-const DEFAULT_LOOKBACK = { billStatus: 90, crn: 30, rnote: 30, ma: 2, poDate: 2, icDate: 2, icNotifications: 1 };
+// the Recon Engine's defaults (schedules.py LOOKBACK_DEFAULT); tabulations go by closing date and appear days later
+const DEFAULT_LOOKBACK = {
+  billStatus: 90, crn: 30, rnote: 30, ma: 2, poDate: 2, icDate: 2, icNotifications: 1,
+  tenderNit: 2, tenderCounterOffer: 2, tenderLoa: 2, tenderTabulations: 15, tenderCorrespondence: 1, tenderNegotiation: 2
+};
+/** Types whose run takes no date range (what IREPS lists now). */
+const NO_LOOKBACK = new Set(["icNotifications", "tenderCorrespondence"]);
 
 let el = null;
 let ctx = null;
@@ -211,7 +217,7 @@ function editor(type, schedule) {
   const row = document.createElement("div");
   row.className = "date-row";
   row.append(field("From", from), field("To", to), field("Runs", runs), field("Retry", every));
-  if (type !== "icNotifications") row.append(field(type === "billStatus" ? "Look back (days; 90 = Last 90 Days)" : "Look back (days)", lookback));
+  if (!NO_LOOKBACK.has(type)) row.append(field(type === "billStatus" ? "Look back (days; 90 = Last 90 Days)" : "Look back (days)", lookback));
 
   const days = document.createElement("div");
   days.className = "schedule-days";

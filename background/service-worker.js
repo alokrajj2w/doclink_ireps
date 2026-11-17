@@ -1581,7 +1581,7 @@ function guardIrepsJob(message) {
   return { ok: false, started: false, error: describeError("IREPS_NOT_CONFIGURED", { detail }) };
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return false;
   if (message.target && message.target !== TARGETS.SERVICE_WORKER) return false;
   const handler = handlers[message.type];
@@ -1591,7 +1591,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // lifetime, before the first request it can affect; the listener itself
   // stays registered synchronously above so no wake-up event is missed.
   loadIrepsConfig()
-    .then(() => guardIrepsJob(message) || handler(message))
+    .then(() => guardIrepsJob(message) || handler(message, sender))
     .then((response) => sendResponse(response ?? { ok: true }))
     .catch((error) => {
       logger.error(`Handler ${message.type} failed`, error);
@@ -1672,6 +1672,9 @@ if (chrome.alarms) {
     if (schedulerJob.isSchedulerAlarm(alarm)) loadIrepsConfig().then(() => schedulerJob.onAlarm());
   });
 }
+
+// a scheduled tender download's runner tab closed before it finished: its slot is given back
+chrome.tabs.onRemoved.addListener((tabId) => schedulerJob.onTabRemoved(tabId));
 
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (changeInfo.status !== "complete" || !tab || !tab.url) return;

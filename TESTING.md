@@ -866,6 +866,28 @@ End to end, with the mock portal and a local Recon Engine:
 11. Set `"enabled": false` in B's copy (reload): no Schedule icon, no scheduler request from B. Remove `"IC"` from
     `documents` in both copies: no IC is downloaded automatically, and a manual IC download still works.
 
+## Scheduled downloads (Phase 2: tender documents)
+
+Automated: `npm test -- browser --only=scheduler` (the runner tab, outcomes, `schedular_phase2`, tender hooks) and
+`node --test --test-name-pattern="Scheduled run" tender/tests/run-tests.mjs tender/tests/pending-tests.mjs`.
+
+End to end, with the setup of the Phase 1 section (mock portal, local Recon Engine, two Chrome profiles A and B):
+
+1. Add `"schedular_phase2": { "enabled": true, "documents": ["NIT", "CounterOffer", "LOA", "Tabulation", "Correspondence", "Negotiation"] }`
+   to `config.local.json` in both profiles and reload DocLink.
+2. As admin, add the LOA and Correspondence schedules (defaults: hourly 10:30-18:30) with a window starting now.
+3. Load a mock IREPS page in both profiles. Exactly one opens a background tab "DocLink: scheduled tender download";
+   it prints the LOA (Chrome's debugging bar shows briefly), saves to the ECM and closes by itself. Nothing appears in
+   Downloads (no PDF, no .html). The Recon Engine has one `doclink_downloads` row per file.
+4. At the next hour the other profile may win: it skips every letter already saved ("already saved ... by A") and
+   fetches only new ones (add a letter to the mock between the two runs).
+5. Close the runner tab mid-run: the slot shows "Will retry" without an attempt counted, and the other profile can run it.
+6. Have A download a letter manually with Save to: Local, then let a scheduled run come: the letter still goes to the
+   ECM (the scheduled run's own ledger and the reservations decide, not A's local history).
+7. Log in to another IREPS account in the winner's browser: the runner tab stops before any download.
+8. Remove `"LOA"` from `schedular_phase2.documents`: no LOA is downloaded automatically, and no "LOA viewed" request
+   reaches the mock (check its request log); a manual LOA download still works.
+
 ## File names (IREPS names kept)
 
 Run once with **Save to: Local** and once with **ECM / S3** (direct ECM).

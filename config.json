@@ -23,6 +23,11 @@
     "enabled": false,
     "documents": ["BillStatus", "CRN", "RNote", "MA", "PO", "IC"]
   },
+  "//schedular_phase2": "Scheduled downloads, Phase 2: tender documents (always to the ECM, never local), run in a background DocLink tab that closes when the run ends. enabled: true = this DocLink takes part, as for phase 1; false = no tender scheduling. documents: NIT (NIT documents, attachments, My Offer and corrigenda from My Messages), CounterOffer, LOA (sends IREPS's own 'LOA viewed' request, as a manual LOA download does), Tabulation (Financial and Commercial), Correspondence (pending tender correspondence), Negotiation (its own, less frequent schedule: IREPS opens these slowly). Remove a name and that type is never triggered automatically. config.local.json may override the whole block.",
+  "schedular_phase2": {
+    "enabled": false,
+    "documents": ["NIT", "CounterOffer", "LOA", "Tabulation", "Correspondence", "Negotiation"]
+  },
   "//ecm": "Save to: ECM / S3 for IC, PO, MA and tender documents. ecmBackendAws=true sends them through the Recon Engine's ECM gateway (POST {reconBaseUrl}/api/ecm/documents, Recon sign-in needed); false calls the ECM (Nuxeo) directly from DocLink with the client credentials below (local testing). env = TEST or PROD picks the ECM folders (services/ecm-catalog.js); domain's origin must also be in manifest.json host_permissions. Never put a real client id / secret here: put them in config.local.json (same shape, gitignored, never packaged), which overrides this file.",
   "ecmBackendAws": false,
   "ecm": {

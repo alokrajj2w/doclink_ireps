@@ -7,6 +7,7 @@ import { IREPS_CONFIG, loadIrepsConfig } from '../services/ireps-api.js';
 import { logger } from '../utils/logger.js';
 import { describeError } from '../utils/messages.js';
 import { sourceFileName } from '../utils/filename.js';
+import { sharedRun, LOCAL_SAVE_REFUSED } from './tender-shared-run.js';
 
 /** The panel-wide session-expired text (utils/messages.js), so every view says the same. */
 export const SESSION_MSG = describeError('IREPS_SESSION_EXPIRED').message;
@@ -1070,6 +1071,8 @@ export function createSaver({ accountLabel, tenderNo, subPath = null, conflict =
   }
 
   async function save(subdir, fileName, bytes, mime, { exact = false } = {}) {
+    // a scheduled run (tender-shared-run.js) saves to the ECM only: a local save is a failed document
+    if (sharedRun()) throw new TenderError(LOCAL_SAVE_REFUSED, `A scheduled download saves to the ECM only, never to Downloads (${fileName}).`);
     if (!bytes || !bytes.length) throw new TenderError('EMPTY', 'Refusing to save an empty file.');
     const ext = (/\.[A-Za-z0-9]+$/.exec(fileName) || [''])[0].toLowerCase();
     if (ext === '.pdf' && !isPdfBytes(bytes)) throw new TenderError('NOT_PDF', 'Refusing to save a non-PDF payload as .pdf.');

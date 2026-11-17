@@ -1,22 +1,26 @@
 /**
- * Phase 1 scheduled downloads in the service worker: the chrome.* side of services/scheduler/.
+ * Scheduled downloads in the service worker: the chrome.* side of services/scheduler/.
  *
  *   - wakes the scheduler on its alarm, on an IREPS page load (the user is active there), on a
  *     panel nudge (Recon sign-in, a passing IREPS check), on browser start and when a manual job
  *     ends while a slot waited for it;
  *   - runs a claimed slot through the worker's own jobs (launchers passed in), with the shared
  *     hooks: reserved for the IREPS account, saved to S3 / ECM only, reported to the Recon Engine;
+ *   - runs a claimed tender slot (Phase 2) in a background DocLink tab (services/scheduler/tender-runner.js,
+ *     tender/schedule-runner.js) and answers that tab's READY / PING / DONE;
  *   - shows "!" on the toolbar icon while a slot of this account waits for an IREPS login;
  *   - answers the Schedule view (state, today's slots, schedules).
  *
- * Off unless config.json "schedular_phase1" says otherwise (services/scheduler/schedule-types.js).
+ * Off unless config.json "schedular_phase1" / "schedular_phase2" say otherwise (services/scheduler/schedule-types.js).
  */
 
 import { createScheduler, RUN_PERMISSION, MANAGE_PERMISSION } from "../services/scheduler/scheduler.js";
 import { createScheduleApi, ScheduleApiError } from "../services/scheduler/schedule-api.js";
 import { createLocalSignals } from "../services/scheduler/local-signals.js";
 import { createRunnerFactory } from "../services/scheduler/runners.js";
-import { parseSchedulerConfig } from "../services/scheduler/schedule-types.js";
+import { parseSchedulerConfig, TENDER_SCHEDULE_TYPES } from "../services/scheduler/schedule-types.js";
+import { createTenderRunner } from "../services/scheduler/tender-runner.js";
+import { holdWorker } from "./keep-alive.js";
 import { readConfigFiles } from "../utils/config.js";
 import { reconWhoAmI } from "../services/recon-auth.js";
 import { SAVE_DESTINATION } from "../services/recon-service.js";
@@ -109,6 +113,14 @@ export function createSchedulerJob(deps) {
     icDate: documentRunner(batch("ic-date", true)),
     icNotifications: documentRunner(batch("ic-notif", false))
   };
+  // Phase 2: tender documents run in a background DocLink tab
+  const tenderRunner = createTenderRunner({
+    openTab: async (path) => (await chrome.tabs.create({ url: chrome.runtime.getURL(path), active: false })).id,
+    closeTab: (tabId) => chrome.tabs.remove(tabId),
+    holdWorker
+  });
+  for (const type of TENDER_SCHEDULE_TYPES) runners[type] = tenderRunner.run;
+  const senderTab = (sender) => (sender && sender.tab ? sender.tab.id : null);
 
   const alarms = {
     set: async (when) => {
@@ -218,7 +230,11 @@ export function createSchedulerJob(deps) {
       withAccount(async () => {
         await api.deleteSchedule(message.id);
         return { ok: true };
-      })
+      }),
+    // the runner tab of a tender slot (only the tab this run opened is answered)
+    [MESSAGE_TYPES.SCHEDULE_RUNNER_READY]: (message, sender) => tenderRunner.ready(message.claimId, senderTab(sender)),
+    [MESSAGE_TYPES.SCHEDULE_RUNNER_PING]: (message, sender) => tenderRunner.ping(message.claimId, senderTab(sender)),
+    [MESSAGE_TYPES.SCHEDULE_RUNNER_DONE]: (message, sender) => tenderRunner.done(message.claimId, message.outcome, senderTab(sender))
   };
 
   return {
@@ -237,6 +253,8 @@ export function createSchedulerJob(deps) {
       await scheduler.wake("ireps session check", { quietable: true });
     },
     onBrowserStart: () => scheduler.wake("browser start", { force: true }),
+    /** A tab closed: a tender runner tab closed before its run ended gives the slot back. */
+    onTabRemoved: (tabId) => tenderRunner.tabRemoved(tabId),
     /** A manual job ended: a slot that waited for it may run now. */
     jobEnded() {
       if (scheduler.getState().waitingFor === "busy") scheduler.wake("job ended", { force: true });

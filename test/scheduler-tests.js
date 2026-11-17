@@ -7,7 +7,8 @@
  * Invoked from run-tests.js.
  */
 
-import { parseSchedulerConfig, SCHEDULE_TYPES, SCHEDULE_DEFAULT_TIMING } from "../services/scheduler/schedule-types.js";
+import { parseSchedulerConfig, SCHEDULE_TYPES, SCHEDULE_DEFAULT_TIMING, TENDER_SCHEDULE_TYPES } from "../services/scheduler/schedule-types.js";
+import { createTenderRunner, tenderRunOutcome, cleanOutcome, tenderCode, RUNNER_PAGE } from "../services/scheduler/tender-runner.js";
 import { createScheduler, LEASE_MS, HEARTBEAT_MS, RUNNING_POLL_MS, DEBOUNCE_MS } from "../services/scheduler/scheduler.js";
 import { createRunnerFactory, failedOutcome } from "../services/scheduler/runners.js";
 import { createSharedRunHooks, istParts, RESERVE_CHUNK } from "../services/scheduler/shared-run-hooks.js";
@@ -654,5 +655,135 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(Object.keys(SCHEDULE_DEFAULT_TIMING).join(), SCHEDULE_TYPES.join());
     for (const t of ["billStatus", "crn", "rnote"]) eq(JSON.stringify(SCHEDULE_DEFAULT_TIMING[t]), JSON.stringify(once), t);
     for (const t of ["ma", "poDate", "icDate", "icNotifications"]) eq(JSON.stringify(SCHEDULE_DEFAULT_TIMING[t]), JSON.stringify(hourly), t);
+  });
+  /* ------------------------------------------------------------ Phase 2: tender documents */
+
+  await test("schedular_phase2: its own switch and names; either phase on turns scheduling on", () => {
+    const p2 = parseSchedulerConfig({ schedular_phase2: { enabled: true, documents: ["NIT", "loa", "Tabulation", "Correspondence", "CounterOffer", "Negotiation"] } });
+    eq(p2.enabled, true);
+    eq(p2.types.join(), TENDER_SCHEDULE_TYPES.join(), "every tender type, in run order (Negotiation last)");
+    const both = parseSchedulerConfig({ schedular_phase1: { enabled: true, documents: ["CRN"] }, schedular_phase2: { enabled: true, documents: ["LOA"] } });
+    eq(both.types.join(), "crn,tenderLoa");
+    const onlyOne = parseSchedulerConfig({ schedular_phase1: { enabled: true, documents: ["CRN"] }, schedular_phase2: { enabled: false, documents: ["LOA"] } });
+    eq(onlyOne.types.join(), "crn", "phase 2 off: no tender type");
+    const mixed = parseSchedulerConfig({ schedular_phase1: { enabled: true, documents: ["CRN", "NIT"] }, schedular_phase2: { enabled: true, documents: ["IC", "NIT"] } });
+    eq(mixed.types.join(), "crn,tenderNit", "a name counts only in its own phase");
+    eq(mixed.unknown.join(), "NIT,IC");
+    const off = parseSchedulerConfig({ schedular_phase1: { enabled: false, documents: ["CRN"] }, schedular_phase2: { enabled: "true", documents: ["LOA"] } });
+    eq(off.enabled, false);
+    eq(off.reason, "schedular_phase1.enabled is not true; schedular_phase2.enabled is not true");
+    eq(parseSchedulerConfig({ schedular_phase1: { enabled: false } }).reason, "schedular_phase1.enabled is not true", "phase 2 absent: phase 1's reason alone");
+  });
+
+  await test("Tender defaults: hourly 10:30-18:30 (runs at 10:30 ... 18:30); Negotiation 12:30, 15:30, 18:30", () => {
+    for (const t of TENDER_SCHEDULE_TYPES.filter((x) => x !== "tenderNegotiation")) {
+      eq(JSON.stringify(SCHEDULE_DEFAULT_TIMING[t]), JSON.stringify({ window_start: "10:30", window_end: "18:30", check_every_minutes: 15, repeat_every_minutes: 60 }), t);
+    }
+    eq(JSON.stringify(SCHEDULE_DEFAULT_TIMING.tenderNegotiation), JSON.stringify({ window_start: "12:30", window_end: "18:30", check_every_minutes: 30, repeat_every_minutes: 180 }));
+  });
+
+  /** A tender runner on fakes: tabs open as ids 41, 42 ...; timers run by hand. */
+  function tenderHarness({ openFails = false, live = true } = {}) {
+    const tabs = { opened: [], closed: [] };
+    const pending = [];
+    const runner = createTenderRunner({
+      openTab: async (path) => {
+        if (openFails) throw new Error("no window");
+        tabs.opened.push(path);
+        return 40 + tabs.opened.length;
+      },
+      closeTab: async (id) => tabs.closed.push(id),
+      holdWorker: (task) => task(),
+      timers: { setTimeout: (fn) => (pending.push(fn), pending.length), clearTimeout: () => {} },
+      timeoutMs: 1000
+    });
+    const ctx = { slot: { id: 7, doc_type: "tenderLoa" }, claimId: "claim-1", params: { dateFrom: "16/11/2026", dateTo: "17/11/2026", lookbackDays: 2 }, account: ACCOUNT, isClaimLive: () => live };
+    return { runner, ctx, tabs, fireTimeout: () => pending.forEach((fn) => fn()) };
+  }
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  await test("Tender runner: opens a background tab, gives it the job (only that tab), and closes it with the tab's outcome", async () => {
+    const h = tenderHarness();
+    const ended = h.runner.run(h.ctx);
+    await tick();
+    eq(h.tabs.opened.join(), `${RUNNER_PAGE}?claim=claim-1`);
+    eq((await h.runner.ready("claim-1", 99)).ok, false, "another tab gets nothing");
+    const job = await h.runner.ready("claim-1", 41);
+    eq(job.ok, true);
+    eq(JSON.stringify(job.job), JSON.stringify({ claimId: "claim-1", docType: "tenderLoa", slotId: 7, params: h.ctx.params, account: ACCOUNT }));
+    eq(h.runner.ping("claim-1", 41).live, true);
+    eq(h.runner.ping("claim-1", 99).live, false);
+    eq(h.runner.done("claim-1", { outcome: "done", result: { saved: 2 } }, 99).ok, false, "another tab cannot end it");
+    eq(h.runner.done("claim-1", { outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result: { saved: 2, failed: 1, secret: "x" } }, 41).ok, true);
+    const outcome = await ended;
+    eq(outcome.outcome, "partial");
+    eq(JSON.stringify(outcome.result), JSON.stringify({ saved: 2, failed: 1 }), "only known result fields");
+    eq(h.tabs.closed.join(), "41");
+    eq((await h.runner.ready("claim-1", 41)).ok, false, "a finished run has no job");
+  });
+
+  await test("Tender runner: a lost claim shows in the ping; a closed tab gives the slot back without an attempt; a slow run times out", async () => {
+    const lost = tenderHarness({ live: false });
+    const r0 = lost.runner.run(lost.ctx);
+    await tick();
+    eq(lost.runner.ping("claim-1", 41).live, false);
+    lost.runner.tabRemoved(41);
+    const closed = await r0;
+    eq(JSON.stringify([closed.outcome, closed.code, closed.countsAsAttempt, closed.stopWake]), JSON.stringify(["failed", "SCHEDULE_RUNNER_CLOSED", false, true]));
+    const slow = tenderHarness();
+    const r1 = slow.runner.run(slow.ctx);
+    await tick();
+    slow.fireTimeout();
+    eq((await r1).code, "SCHEDULE_RUNNER_TIMEOUT");
+    eq(slow.tabs.closed.join(), "41", "the tab is closed");
+    const none = tenderHarness({ openFails: true });
+    const r2 = await none.runner.run(none.ctx);
+    eq(JSON.stringify([r2.code, r2.countsAsAttempt]), JSON.stringify(["SCHEDULE_RUNNER_NOT_OPENED", false]));
+  });
+
+  await test("Tender run outcome: aborted reservation, session lost, failures -> partial, else done", () => {
+    const counts = (o = {}) => ({ saved: 0, skipped: 0, failed: 0, notReported: 0, aborted: null, ...o });
+    eq(tenderRunOutcome({ result: {}, counts: counts({ aborted: "SCHEDULE_CLAIM_LOST" }) }).code, "SCHEDULE_CLAIM_LOST");
+    const expired = tenderRunOutcome({ error: { code: "SESSION_EXPIRED" }, counts: counts({ saved: 1 }) });
+    eq(JSON.stringify([expired.code, expired.countsAsAttempt, expired.sessionExpired]), JSON.stringify(["IREPS_SESSION_EXPIRED", false, true]));
+    eq(tenderRunOutcome({ result: { letters: { aborted: { code: "SESSION_EXPIRED" } } }, counts: counts() }).code, "IREPS_SESSION_EXPIRED", "a job that stopped early");
+    eq(tenderRunOutcome({ result: {}, counts: counts({ saved: 3, failed: 1 }) }).outcome, "partial");
+    eq(tenderRunOutcome({ result: { summary: { failed: 1 } }, counts: counts() }).outcome, "partial", "a tender the job could not handle");
+    const done = tenderRunOutcome({ result: { summary: { failed: 0 } }, counts: counts({ saved: 2, skipped: 5 }) });
+    eq(JSON.stringify([done.outcome, done.result.saved, done.result.skipped]), JSON.stringify(["done", 2, 5]));
+    eq(tenderCode("ACCOUNT_CHANGED"), "SCHEDULE_ACCOUNT_MISMATCH");
+    eq(tenderCode("ECM_REJECTED"), "ECM_REJECTED");
+    eq(tenderCode("weird code"), "SCHEDULE_TENDER_FAILED");
+    eq(cleanOutcome({ outcome: "won" }).code, "SCHEDULE_TENDER_FAILED", "an unknown outcome is a failure");
+    eq(cleanOutcome({ outcome: "done", code: "not a code!" }).code, null);
+  });
+
+  await test("Shared hooks (tender): reserve -> granted / taken; a failed reservation throws; ECM only; unsaved keys released", async () => {
+    const api = hooksApi({ taken: { "tender:LOA|T1|2": { status: "done", by: { user_id: 4, name: "Rahul" }, at: "2026-11-16T09:32:00+00:00" } } });
+    const uploads = [];
+    const hooks = createSharedRunHooks({ api, claimId: "c1", account: ACCOUNT, isClaimLive: () => true, uploadEcm: async (doc) => (uploads.push(doc), { uid: "u1", site: "hosur", path: "/x", deduplicated: false }) });
+    const t = hooks.tenderHooks;
+    const r = await t.reserveDocuments(["tender:LOA|T1|1", "tender:LOA|T1|2", "tender:LOA|T1|3", "tender:LOA|T1|1"]);
+    eq([...r.granted].join(), "tender:LOA|T1|1,tender:LOA|T1|3");
+    eq(describeSkip(r.taken.get("tender:LOA|T1|2")), "Already saved by Rahul on 2026-11-16 at 15:02");
+    eq(api.calls.reserve[0].keys.length, 3, "each key once");
+    const saved = await t.ecmSink.save({ kind: "loi", title: "T1 - LOA", bytes: new Uint8Array([1]), filename: "LOA_T1.pdf" }, () => { throw new Error("must never save locally"); });
+    eq(JSON.stringify([saved.local, saved.ecm.uid, uploads[0].account.irepsAccountId]), JSON.stringify([null, "u1", "833"]));
+    await t.documentSaved({ doc_type: "loa", doc_key: "tender:LOA|T1|1", filename: "LOA_T1.pdf", destination: "ecm" });
+    const counts = await hooks.finishTenderRun();
+    eq(JSON.stringify([counts.saved, counts.skipped, counts.failed, counts.aborted]), JSON.stringify([1, 1, 1, null]));
+    const last = api.calls.complete[api.calls.complete.length - 1];
+    eq(last.done.map((d) => d.doc_key).join(), "tender:LOA|T1|1");
+    eq(last.failed.map((d) => d.doc_key).join(), "tender:LOA|T1|3", "reserved but not saved: released");
+
+    const down = createSharedRunHooks({ api: hooksApi({ reserveError: conflict("SCHEDULE_CLAIM_LOST") }), claimId: "c2", account: ACCOUNT, isClaimLive: () => true });
+    let thrown = null;
+    try {
+      await down.tenderHooks.reserveDocuments(["tender:LOA|T1|1"]);
+    } catch (error) {
+      thrown = error;
+    }
+    eq(thrown && thrown.code, "SCHEDULE_CLAIM_LOST");
+    eq((await down.finishTenderRun()).aborted, "SCHEDULE_CLAIM_LOST");
   });
 }

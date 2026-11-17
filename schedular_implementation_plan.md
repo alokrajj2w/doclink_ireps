@@ -1,6 +1,6 @@
 # Scheduled Downloads: Implementation Plan
 
-Status: **Phase 1 implemented**, 2026-11-16; **timing changed 2026-11-17** (exports once 09:00-10:00 every 10 min, PDFs hourly 09:00-18:00, last run at 18:00; D7 and Appendix A updated, Appendix B "Timing change"). DocLink branch `user/alok/scheduler`, Recon Engine branch `user/alok/doclink_schedule`, not committed. Appendix B lists where the build differs from the text below. It replaces the single-user draft of 2026-11-15.
+Status: **Phase 1 implemented**, 2026-11-16; **timing changed 2026-11-17**; **Phase 2 (tender documents) implemented 2026-11-17** (section 14) (exports once 09:00-10:00 every 10 min, PDFs hourly 09:00-18:00, last run at 18:00; D7 and Appendix A updated, Appendix B "Timing change"). DocLink branch `user/alok/scheduler`, Recon Engine branch `user/alok/doclink_schedule`, not committed. Appendix B lists where the build differs from the text below. It replaces the single-user draft of 2026-11-15.
 
 Repos and branches:
 - DocLink: `ireps_portal_mock`, new branch `user/alok/scheduler` off `main`.
@@ -741,22 +741,47 @@ intended differences, which should be none for IREPS.
 
 ---
 
-## 14. Phase 2 outline: tender documents
+## 14. Phase 2: tender documents (implemented 2026-11-17)
 
-Tender and correspondence code runs in the side panel (`tender/`), not in the worker. It has its own ledger,
-run lock and print-to-PDF through `chrome.debugger`. Plan for Phase 2:
+Asked for on 2026-11-17: tender documents every hour from 10:30 to 18:30, looking for new documents, "same
+functionality as the other scheduler", flags and fields in config. Decisions taken with the user that day:
 
-1. **Same backend.** The same slots, claims, leases and document reservations. New doc types: `tender_nit`,
-   `tender_letters`, `tender_tabulations`, `correspondence`. The existing tender `downloadKey`s
-   (`tender:`, `pending:`) are the document keys.
-2. **A runner page.** When the scheduler wins a tender slot, it opens the panel page in a background tab
-   (`chrome.tabs.create({ url: "popup/popup.html?runner=<claim_id>", active: false })`). That page has full
-   extension APIs. It runs `runAutomatic`, `downloadLettersByDate` or `downloadTabulationsByDate` with the
-   claim's date range, sends heartbeats, reserves documents, reports to the worker, and closes itself.
-3. **Grouped ECM kinds** (NIT, LOA, Result: one ECM document per tender, direct ECM only). Reserve per
-   **PDF**, not per tender document, so a later run can still attach a new LOA to an existing tender document.
-4. **To settle before Phase 2:** how `confirmReconSignIn` and the tender ledger behave on a page nobody is
-   looking at, and whether the print-to-PDF path works in a background tab. Write a short design note first.
+| # | Decision | Built |
+|---|---|---|
+| P1 | Negotiation letters (IREPS opens them very slowly) | Their own type `tenderNegotiation`, less often: 12:30, 15:30, 18:30 (repeat 180 min, retry every 30) |
+| P2 | Window | Hourly runs at 10:30, 11:30 … 18:30 IST (the last at 18:30), retried every 15 min within the hour |
+| P3 | LOA letters need IREPS's "LOA viewed" POST | Scheduled too: the run sends it unattended, as a manual LOA download does. **The tech lead's 15 Nov approval should be extended** |
+| P4 | Where a tender run happens | A background DocLink tab, with Chrome's print-to-PDF as in a manual run (the "started debugging" bar shows briefly) |
+| P5 | Config | `schedular_phase2: { enabled, documents }` beside `schedular_phase1`: NIT, CounterOffer, LOA, Tabulation, Correspondence, Negotiation. Needs the tech lead's sign-off like D10 |
+
+**Types** (Recon Engine `TENDER_TYPES`, destination `ecm`, run after the phase 1 types, Negotiation last):
+`tenderNit` (automatic mode: My Messages → NIT, attachments, My Offer, corrigenda; look-back 2), `tenderCounterOffer`,
+`tenderLoa` (letters by Letter Date; 2), `tenderTabulations` (Financial + Commercial by closing date; 15),
+`tenderCorrespondence` (pending letters; no date range), `tenderNegotiation` (2).
+
+**How a tender slot runs.** The scheduler (unchanged) claims it like any slot, checks IREPS once, and calls the
+tender runner (`services/scheduler/tender-runner.js`). That opens `tender/schedule-runner.html?claim=<id>` with
+`chrome.tabs.create({ active: false })` and waits under `holdWorker`. The page asks READY (the worker answers only
+the tab it opened: type, date range, verified account), runs the existing tender job with the shared-run hooks
+installed, asks PING every 20 s (the claim is live while the worker's heartbeat is fresh), and reports DONE with its
+outcome; the worker closes the tab. A closed tab gives the slot back without an attempt; 50 minutes is the limit.
+
+**Inside the tender code** (`tender/tender-shared-run.js`, installed only in the runner tab):
+- reserve before fetch: `checkAlreadyDownloaded` reserves each category's documents (`downloadKey.tender`), the
+  correspondence loop each letter (`downloadKey.pending(key, "letter")`); taken ones are skipped without a question;
+- ECM only: `tenderEcmSink` returns the hooks' sink (no local fallback), `createSaver` refuses any local save, and
+  the `.html` copy of a rendered letter is not kept;
+- report: each saved file's download-log record goes to `complete`; reserved keys not saved are released at the end;
+- a separate ledger (`<account>#scheduled`) so the user's own manual (Local) history never makes a run skip;
+- no Recon sign-in page (the scheduler checked the sign-in); another IREPS account logged in stops the run.
+
+**Grouped ECM kinds** (NIT, LOA, Result) are reserved per PDF key, so a later run can still add a new LOA to an
+existing tender document. They need direct ECM (`ecmBackendAws: false`, as config.json ships); through the gateway
+they would be refused and, in a scheduled run, fail instead of falling back to Local.
+
+**Not settled / to check:** the runner tab has run against the mocks only (unit and FakeIreps tests), not yet in a
+real Chrome against the mock portal; a manual tender run in a panel and a scheduled one in a runner tab can hit IREPS
+at the same time (the tender code does not share the worker's busy check).
 
 ---
 
@@ -771,8 +796,9 @@ code is fixed.
   `YYYY-MM-DD`. Times of day: IST `HH:MM`.
 - Errors: `{"detail": {"error": "<CODE>", "detail": "<text>", ...extra}}`, the same shape as
   `app/downloads.py`. 409 answers add `holder` (`{user_id, name}`), `lease_until` and `doc_type` when they apply.
-- Schedule types, in run order: `billStatus`, `crn`, `rnote`, `ma`, `poDate`, `icDate`, `icNotifications`.
-  Destination is fixed by type: `s3` for the first three, `ecm` for the rest.
+- Schedule types, in run order: `billStatus`, `crn`, `rnote`, `ma`, `poDate`, `icDate`, `icNotifications`, then the
+  Phase 2 tender types `tenderNit`, `tenderCounterOffer`, `tenderLoa`, `tenderTabulations`, `tenderCorrespondence`,
+  `tenderNegotiation`. Destination is fixed by type: `s3` for the first three, `ecm` for the rest.
 - Weekdays: 0 = Sunday … 6 = Saturday, in IST.
 - Constants: lease 600 s; DocLink heartbeat every 120 s.
 

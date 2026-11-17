@@ -2186,3 +2186,80 @@ test('L12: a GET that cannot reach IREPS is tried again (1s, then 3s); a POST is
     core.fetchSettings.netRetryMs = [1000, 3000];
   }
 });
+
+// =========================== scheduled downloads, Phase 2 (tender-shared-run.js) ===========================
+const sharedRun = await import('../tender-shared-run.js');
+/** Fake hooks of services/scheduler/shared-run-hooks.js tenderHooks: `taken` keys are skipped, `refuse` makes the ECM refuse. */
+function fakeShared({ taken = [], failReserve = false, refuse = false } = {}) {
+  const calls = { reserved: [], ecm: [], saved: [] };
+  const hooks = {
+    reserveDocuments: async (keys) => {
+      calls.reserved.push(...keys);
+      if (failReserve) throw Object.assign(new Error('backend down'), { code: 'SCHEDULE_BACKEND_UNAVAILABLE' });
+      return { granted: new Set(keys.filter((k) => !taken.includes(k))), taken: new Map(keys.filter((k) => taken.includes(k)).map((k) => [k, { reason: 'already_saved_for_account', by: 'Priya' }])) };
+    },
+    ecmSink: {
+      save: async (doc, saveLocally) => {
+        calls.ecm.push({ ...doc, hadLocalFallback: typeof saveLocally === 'function' });
+        if (refuse) throw Object.assign(new Error('ECM refused'), { code: 'ECM_REFUSED' });
+        return { ecm: { status: 'stored', uid: `u${calls.ecm.length}`, site: 'hosur' }, local: null };
+      },
+    },
+    documentSaved: async (record) => { calls.saved.push(record); },
+  };
+  return { hooks, calls };
+}
+const scheduledCo = () => mk({ tenders: [T({})], inbox: { MyNegotiation: [], MyCounterOffer: [{ no: '29263265', oid: '107200478', letter: '1461275', date: daysAgo(12) }], MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
+const coKey = dlog.downloadKey.tender('COUNTER_OFFER', '29263265', '1461275');
+async function scheduled(shared, fn) {
+  sharedRun.beginSharedRun(shared.hooks);
+  try {
+    return await fn();
+  } finally {
+    sharedRun.endSharedRun();
+  }
+}
+const coRun = () => auto.runLetterType({ status: 'MyCounterOffer', from: daysAgo(13), to: daysAgo(0) });
+
+test('Scheduled run: each letter is reserved first, goes to the ECM only (no local fallback) and is reported', async () => {
+  scheduledCo();
+  const shared = fakeShared();
+  const r = await scheduled(shared, coRun);
+  assert.equal(r.letters.summary.newLetters, 1);
+  assert.deepEqual(shared.calls.reserved, [coKey]);
+  assert.equal(shared.calls.ecm.length, 1);
+  assert.equal(shared.calls.ecm[0].kind, 'co');
+  assert.deepEqual(saved, [], 'nothing was saved to Downloads');
+  assert.deepEqual(shared.calls.saved.map((x) => [x.doc_key, x.destination, x.ecm.uid]), [[coKey, 'ecm', 'u1']]);
+  assert.ok(Object.keys(store).some((k) => k.includes('#scheduled')), 'the scheduled run keeps its own ledger');
+});
+test('Scheduled run: a letter anyone already saved for the account is skipped without being fetched', async () => {
+  scheduledCo();
+  const shared = fakeShared({ taken: [coKey] });
+  const r = await scheduled(shared, coRun);
+  assert.equal(r.letters.summary.newLetters, 0);
+  assert.ok(!server.log.some((l) => l.path.endsWith('publishCounterOfferLetter.do')), 'the letter was not opened');
+  assert.deepEqual([shared.calls.ecm.length, saved.length, shared.calls.saved.length], [0, 0, 0]);
+});
+test('Scheduled run: an ECM refusal fails the letter; it is never saved locally', async () => {
+  scheduledCo();
+  const shared = fakeShared({ refuse: true });
+  await scheduled(shared, coRun);
+  assert.equal(shared.calls.ecm.length, 1);
+  assert.deepEqual([saved.length, shared.calls.saved.length], [0, 0]);
+});
+test('Scheduled run: a reservation that cannot be made fetches nothing', async () => {
+  scheduledCo();
+  const shared = fakeShared({ failReserve: true });
+  await scheduled(shared, coRun);
+  assert.ok(!server.log.some((l) => l.path.endsWith('publishCounterOfferLetter.do')));
+  assert.deepEqual([shared.calls.ecm.length, saved.length], [0, 0]);
+});
+test('Scheduled run: a manual run after it is unchanged (no hooks left installed)', async () => {
+  scheduledCo();
+  await scheduled(fakeShared(), coRun);
+  assert.equal(sharedRun.sharedRun(), null);
+  scheduledCo();
+  await coRun();
+  assert.equal(saved.length, 1, 'the manual run saves to Downloads as before');
+});

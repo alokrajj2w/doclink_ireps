@@ -53,6 +53,10 @@ export const MESSAGE_TYPES = Object.freeze({
   SCHEDULE_LIST: "SCHEDULE_LIST",
   SCHEDULE_SAVE: "SCHEDULE_SAVE",
   SCHEDULE_DELETE: "SCHEDULE_DELETE",
+  // Phase 2: the background runner tab of a tender slot (tender/schedule-runner.js -> worker)
+  SCHEDULE_RUNNER_READY: "SCHEDULE_RUNNER_READY",
+  SCHEDULE_RUNNER_PING: "SCHEDULE_RUNNER_PING",
+  SCHEDULE_RUNNER_DONE: "SCHEDULE_RUNNER_DONE",
 
   // service worker -> popup (broadcast)
   IREPS_PROGRESS: "IREPS_PROGRESS",
@@ -812,6 +816,22 @@ export const ERROR_CATALOG = Object.freeze({
   SCHEDULE_TYPE_NOT_SUPPORTED: {
     title: "Document type not scheduled here",
     message: "This DocLink cannot run that scheduled document type ({detail})."
+  },
+  SCHEDULE_RUNNER_TIMEOUT: {
+    title: "Scheduled tender download took too long",
+    message: "The scheduled tender download did not finish in time ({detail}). What it saved is kept; the next check fetches the rest."
+  },
+  SCHEDULE_RUNNER_CLOSED: {
+    title: "Scheduled tender download stopped",
+    message: "The DocLink tab running the scheduled tender download was closed ({detail}). What it saved is kept; another DocLink user can run it now."
+  },
+  SCHEDULE_RUNNER_NOT_OPENED: {
+    title: "Scheduled tender download not started",
+    message: "DocLink could not open the tab that runs scheduled tender downloads ({detail}). It tries again at the next check."
+  },
+  SCHEDULE_TENDER_FAILED: {
+    title: "Scheduled tender download failed",
+    message: "The scheduled tender download stopped with an error ({detail}). The next check tries again."
   },
   SCHEDULE_MISSED: {
     title: "Scheduled download missed",
