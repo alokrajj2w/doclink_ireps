@@ -1727,8 +1727,14 @@ IC 2). A new schedule starts with these timings:
 | MA, POs by PO date, ICs by IC date, ICs from notifications | 09:00-18:00 | every hour (09:00, 10:00, … 18:00) | every 15 min within the hour |
 
 Admins (`doclink.schedule.manage`) edit them in the panel's **Scheduled downloads** view (clock icon in the
-header); everyone sees what ran today. An hourly type shows its latest run, the next run, and the earlier runs
-of the day folded into one line ("Earlier today: 3 of 4 runs done, 12 saved").
+header). Each type is a box like the panel's other option boxes, its title line showing the timing ("09:00–10:00 ·
+once a day") or "Off" / "Not scheduled"; opened, it holds On / Off, From and To (hour and minute dropdowns, IST),
+Runs, Retry, Look back and the days, with **Save** and **Delete** (or **Add schedule**). A new schedule can be added only for a type this DocLink runs
+(tender types only with `schedular_phase2` on), and an existing schedule of any type stays editable. Everyone sees what ran today. An hourly type shows its
+latest run, the next run, and the earlier runs of the day folded into one line ("Earlier today: 3 of 4 runs
+done, 12 saved"). A slot that has not run reads "Scheduled 18:00–19:00" before its window, "Due 18:00–19:00, not
+run yet" inside it, and "Not run during 09:00–10:00" once missed. What this DocLink waits for (an IREPS login, a
+manual run, the Recon Engine) and its last failed check ("Last check failed: …") are in the line at the top.
 
 **Each slot once, by one DocLink.** A once-a-day schedule makes one slot per day; an hourly one makes one slot
 per hour (09:00-10:00, 10:00-11:00, …): for a repeating schedule the window's end is the start of the last

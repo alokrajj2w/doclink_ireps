@@ -15,12 +15,12 @@ import { createSharedRunHooks, istParts, RESERVE_CHUNK } from "../services/sched
 import { createScheduleApi, ScheduleApiError } from "../services/scheduler/schedule-api.js";
 import { createLocalSignals, IREPS_ACTIVITY_MS } from "../services/scheduler/local-signals.js";
 import { isIrepsActivityUrl } from "../background/scheduler-job.js";
-import { slotText, istTime, todayRows, earlierText } from "../popup/popup-schedule.js";
+import { slotText, istTime, todayRows, earlierText, editorTypes, lastErrorText, initSchedule } from "../popup/popup-schedule.js";
 import { describeSkip, SKIP_REASON } from "../services/download-log.js";
 import { EcmError } from "../services/ecm-service.js";
 import { WorkflowError } from "../services/export-save-service.js";
 import { DOCUMENT_DOWNLOAD_STATUS } from "../services/search-po/document-downloader.js";
-import { describeError } from "../utils/messages.js";
+import { describeError, MESSAGE_TYPES } from "../utils/messages.js";
 
 const T0 = Date.parse("2026-11-17T03:30:00Z"); // 09:00 IST
 const ON = { enabled: true, types: [...SCHEDULE_TYPES], unknown: [], reason: null };
@@ -103,12 +103,17 @@ function harness(options = {}) {
       let n = 0;
       return () => `claim-${++n}`;
     })(),
-    timers: {
-      setInterval: (fn, ms) => intervals.push({ fn, ms }) - 1,
-      clearInterval: () => {},
-      setTimeout: (fn, ms) => timeouts.push({ fn, ms }) - 1,
-      clearTimeout: () => {}
-    }
+    // realTimers: none injected, so the scheduler uses the browser's own timers, as in the extension
+    ...(options.realTimers
+      ? {}
+      : {
+          timers: {
+            setInterval: (fn, ms) => intervals.push({ fn, ms }) - 1,
+            clearInterval: () => {},
+            setTimeout: (fn, ms) => timeouts.push({ fn, ms }) - 1,
+            clearTimeout: () => {}
+          }
+        })
   });
   return { scheduler, calls, intervals, timeouts, advance: (ms) => (clock += ms) };
 }
@@ -334,6 +339,23 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(quiet.calls.whoAmI, 0, "quiet: no call at all");
     await quiet.scheduler.wake("alarm", { force: true, quietable: false });
     eq(quiet.calls.whoAmI, 1, "the alarm still runs");
+  });
+
+  await test("Scheduler: with the browser's own timers (none injected) a claimed slot runs, and a trigger inside 15 s is deferred", async () => {
+    // Chrome throws "Illegal invocation" when its timer functions are called as methods of another object
+    const h = harness({
+      realTimers: true,
+      dues: [
+        { due: [slot(1, "ma")], running: null, next_check_at: null, slots: [] },
+        { due: [], running: null, next_check_at: null, slots: [] }
+      ]
+    });
+    await h.scheduler.wake("ireps page");
+    eq(h.calls.runs.map((r) => r.type).join(), "ma", "the claimed slot ran (the heartbeat timer started)");
+    eq(h.calls.finish.map((f) => f.outcome).join(), "done", "and its end was reported");
+    eq(h.scheduler.getState().lastError, null);
+    await h.scheduler.wake("ireps page");
+    eq(h.calls.whoAmI, 1, "a trigger right after the wake is deferred, not thrown");
   });
 
   await test("Scheduler: IC not in schedular_phase1 -> IC types are not asked for, and an IC slot is never claimed", async () => {
@@ -622,8 +644,34 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(istTime("2026-11-17T04:38:00+00:00"), "10:08");
     eq(slotText({ status: "done", done_by: { name: "Priya" }, ended_at: "2026-11-17T04:38:00+00:00", result: { saved: 1, skipped: 2 } }), "Done by Priya at 10:08 · 1 saved, 2 already saved");
     eq(slotText({ status: "in_progress", holder: { name: "Rahul" } }), "Running – Rahul");
-    assert(slotText({ status: "pending", window_start_at: "2026-11-17T03:30:00+00:00", window_end_at: "2026-11-17T06:30:00+00:00" }).includes("09:00–12:00"));
-    assert(slotText({ status: "missed", window_start_at: "2026-11-17T03:30:00+00:00", window_end_at: "2026-11-17T06:30:00+00:00" }).startsWith("Nobody with DocLink"));
+    const nineToNoon = { window_start_at: "2026-11-17T03:30:00+00:00", window_end_at: "2026-11-17T06:30:00+00:00" }; // 09:00-12:00 IST
+    eq(slotText({ status: "pending", ...nineToNoon }, null, T0 - 60000), "Scheduled 09:00–12:00", "before its window");
+    eq(slotText({ status: "pending", ...nineToNoon }, null, T0 + 60000), "Due 09:00–12:00, not run yet", "inside its window");
+    eq(slotText({ status: "missed", ...nineToNoon }), "Not run during 09:00–12:00");
+    eq(slotText({ status: "missed", code: "IREPS_SESSION_EXPIRED", ...nineToNoon }), `Not run during 09:00–12:00 (last: ${describeError("IREPS_SESSION_EXPIRED").title})`);
+    for (const status of ["pending", "missed"]) {
+      assert(!/logged in/i.test(slotText({ status, ...nineToNoon }, null, T0)), `a ${status} slot claims nothing about IREPS logins`);
+    }
+  });
+
+  await test("Schedule view: the scheduler's last failure is shown in the status line", () => {
+    eq(lastErrorText(null), "");
+    eq(lastErrorText({ code: "UNKNOWN", detail: "Illegal invocation" }), `Last check failed: ${describeError("UNKNOWN").title} (Illegal invocation).`);
+    eq(lastErrorText({ code: "SCHEDULE_BACKEND_UNAVAILABLE", detail: null }), `Last check failed: ${describeError("SCHEDULE_BACKEND_UNAVAILABLE").title}.`);
+  });
+
+  await test("Schedule view: the admin list offers only the types this DocLink runs; an existing schedule stays editable", () => {
+    const phase1 = parseSchedulerConfig({
+      schedular_phase1: { enabled: true, documents: ["BillStatus", "CRN", "RNote", "MA", "PO", "IC"] },
+      schedular_phase2: { enabled: false, documents: ["NIT", "LOA"] }
+    });
+    const PHASE1 = "billStatus,crn,rnote,ma,poDate,icDate,icNotifications";
+    eq(editorTypes(phase1, []).join(), PHASE1, "phase 2 off: no tender type is offered");
+    eq(editorTypes(phase1, [{ doc_type: "tenderLoa" }]).join(), `${PHASE1},tenderLoa`, "an existing tender schedule can still be edited or deleted");
+    const noIc = parseSchedulerConfig({ schedular_phase1: { enabled: true, documents: ["BillStatus", "MA"] } });
+    eq(editorTypes(noIc, [{ doc_type: "icDate" }]).join(), "billStatus,ma,icDate", "in run order");
+    const both = parseSchedulerConfig({ schedular_phase1: { enabled: true, documents: ["MA"] }, schedular_phase2: { enabled: true, documents: ["LOA"] } });
+    eq(editorTypes(both, undefined).join(), "ma,tenderLoa", "phase 2 on: its types are offered");
   });
 
   await test("Schedule view: an hourly type shows its latest run, the next run and the earlier ones folded", () => {
@@ -648,6 +696,227 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(slotText(rows[1].slot, { ...hourly, window_end: "11:00" }), "Done by Rahul at 11:05 · 1 saved", "the last run (window_end): no next run today");
     eq(slotText(rows[0].slot, { doc_type: "billStatus", window_end: "10:00" }), "Done by Priya at 09:05", "a once-a-day slot never names a next run");
   });
+
+  // The panel's layout is checked with its own stylesheet and markup, loaded here (outside the timed
+  // tests); the stylesheet is removed after them.
+  const panelCss = Object.assign(document.createElement("link"), { rel: "stylesheet", href: new URL("../popup/popup.css", import.meta.url).href });
+  const panelCssLoaded = new Promise((resolve) => {
+    panelCss.onload = panelCss.onerror = resolve;
+  });
+  document.head.append(panelCss);
+  await panelCssLoaded;
+  const panelHtml = new DOMParser().parseFromString(await (await fetch(new URL("../popup/popup.html", import.meta.url))).text(), "text/html");
+  const TEAL = "rgb(56, 152, 144)"; // --primary
+  await test("Schedule view: the admin list fits a 320 px side panel and uses DocLink's buttons and toggles", async () => {
+    const host = document.createElement("div");
+    host.className = "app-main";
+    host.style.cssText = "position: absolute; left: -10000px; top: 0; width: 320px";
+    host.innerHTML = `<section id="view-schedule" class="view" hidden><article class="card">
+      <div class="card-heading"><h2>Scheduled downloads</h2><button id="btn-schedule-back" class="btn btn-secondary btn-back" type="button">Back</button></div>
+      <p class="card-text schedule-status" id="schedule-status"></p>
+      <div id="schedule-error" class="result result-error" hidden><div class="result-title" id="schedule-error-title"></div><p id="schedule-error-message" class="result-text"></p></div>
+      <ul class="schedule-list" id="schedule-today"></ul><p class="schedule-empty" id="schedule-today-empty" hidden></p>
+      <div id="schedule-manage" hidden><div class="schedule-editors" id="schedule-editors"></div></div>
+      <button id="btn-schedule-refresh" class="btn btn-primary" type="button">Refresh</button>
+    </article></section><button id="btn-schedule-open" type="button"></button>`;
+    document.body.append(host);
+    const view = {
+      config: { enabled: true, types: ["billStatus", "crn", "rnote", "ma", "poDate", "icDate", "icNotifications"], unknown: [], reason: null },
+      account: "833",
+      user: { name: "Priya", canRun: true, canManage: true },
+      waitingFor: null,
+      lastError: null,
+      slots: [],
+      schedules: [
+        { id: 1, doc_type: "billStatus", enabled: true, window_start: "09:00", window_end: "10:00", check_every_minutes: 10, repeat_every_minutes: null, days: [0, 1, 2, 3, 4, 5, 6], lookback_days: 90 },
+        { id: 2, doc_type: "ma", enabled: false, window_start: "08:07", window_end: "18:00", check_every_minutes: 15, repeat_every_minutes: 60, days: [1, 2, 3, 4, 5], lookback_days: 2 }
+      ],
+      error: null
+    };
+    const sent = [];
+    let answerSave = null;
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    const until = async (check) => {
+      for (let i = 0; i < 100 && !check(); i++) await tick();
+    };
+    try {
+      await initSchedule({
+        send: async (type, payload) => {
+          sent.push({ type, payload });
+          if (type === MESSAGE_TYPES.SCHEDULE_SAVE) return new Promise((resolve) => (answerSave = () => resolve({ ok: true })));
+          return view;
+        },
+        showView: (name) => {
+          host.querySelector("#view-schedule").hidden = name !== "schedule";
+        }
+      });
+      host.querySelector("#btn-schedule-open").click();
+      await until(() => host.querySelector("#schedule-editors > *"));
+      const boxes = () => [...host.querySelectorAll("#schedule-editors > details.options")];
+      eq(boxes().length, 7, "one DocLink option box per type this DocLink runs");
+      for (const box of boxes()) box.open = true;
+      await tick();
+
+      const card = host.querySelector(".card");
+      const fields = host.querySelector(".schedule-fields");
+      assert(fields && getComputedStyle(fields).display === "grid", "the fields are laid out by the panel's stylesheet");
+      const style = getComputedStyle(card);
+      const edge = card.getBoundingClientRect().right - parseFloat(style.borderRightWidth) - parseFloat(style.paddingRight);
+      // only drawn elements: a hidden one (or an <option>) has an empty box at 0, 0
+      const sticking = [...card.querySelectorAll("*")].filter((n) => {
+        const box = n.getBoundingClientRect();
+        return box.width > 0 && box.right > edge + 0.5;
+      });
+      assert(card.scrollWidth <= card.clientWidth && sticking.length === 0, `nothing is pushed past the panel's edge: ${sticking.map((n) => `<${n.tagName.toLowerCase()} class="${n.className}"> "${n.textContent.trim().slice(0, 30)}"`).join(", ")}`);
+
+      const summary = (i) => boxes()[i].querySelector("summary").textContent;
+      eq(summary(0), "Bill Status09:00–10:00 · once a day");
+      eq(summary(1), "CRNNot scheduled");
+      eq(summary(3), "MA copiesOff08:07–18:00 · every hour");
+      const buttons = [...host.querySelectorAll("#schedule-editors button")];
+      assert(buttons.length > 0 && buttons.every((b) => b.classList.contains("btn") && !b.classList.contains("btn-link")), "Add schedule / Save / Delete are buttons, not links");
+      eq(boxes()[0].querySelector(".btn-primary").textContent, "Save");
+      eq(boxes()[0].querySelector(".btn-danger").textContent, "Delete");
+      eq(boxes()[1].querySelector(".btn-primary").textContent, "Add schedule");
+      assert(!boxes()[1].querySelector(".btn-danger"), "nothing to delete before it is added");
+      const choices = [...host.querySelectorAll('#schedule-editors input[type="checkbox"], #schedule-editors input[type="radio"]')];
+      assert(choices.every((input) => input.closest(".segmented")), "every on / off and day choice is a DocLink toggle, not a bare browser checkbox");
+      eq(boxes()[3].querySelectorAll(".schedule-days input:checked").length, 5, "MA runs Monday to Friday");
+      eq(boxes()[3].querySelector('input[type="radio"]:checked').parentElement.textContent, "Off");
+      assert(!host.querySelector('#schedule-editors input[type="time"]'), "no browser time picker: From and To are DocLink dropdowns");
+      const times = [...boxes()[3].querySelectorAll(".schedule-time select")];
+      eq(times.map((s) => s.value).join(","), "08,07,18,00", "hour and minute dropdowns for From and To; a stored 08:07 is shown as it is");
+
+      // Save: busy (sent once), with the toggles' values; the box stays open when the list is drawn again
+      const save = boxes()[3].querySelector(".btn-primary");
+      save.click();
+      await until(() => answerSave);
+      assert(save.classList.contains("is-busy") && save.disabled && boxes()[3].querySelector(".btn-danger").disabled, "busy while the Recon Engine answers");
+      answerSave();
+      await until(() => sent.filter((s) => s.type === MESSAGE_TYPES.SCHEDULE_GET_STATE).length === 2);
+      await until(() => !boxes()[3] || boxes()[3].querySelector(".btn-primary") !== save);
+      const saved = sent.find((s) => s.type === MESSAGE_TYPES.SCHEDULE_SAVE).payload.schedule;
+      eq(JSON.stringify([saved.id, saved.doc_type, saved.enabled, saved.days.join(""), saved.repeat_every_minutes, saved.lookback_days, saved.window_start, saved.window_end]), JSON.stringify([2, "ma", false, "12345", 60, 2, "08:07", "18:00"]));
+      assert(boxes()[3].open, "the edited box is still open after the save");
+      answerSave = null;
+      boxes()[1].querySelector(".btn-primary").click();
+      await until(() => answerSave);
+      const added = sent.filter((s) => s.type === MESSAGE_TYPES.SCHEDULE_SAVE)[1].payload.schedule;
+      eq(JSON.stringify([added.id, added.doc_type, added.enabled, added.window_start, added.window_end]), JSON.stringify([undefined, "crn", true, "09:00", "10:00"]), "a new schedule is added switched on, from the defaults");
+      answerSave();
+    } finally {
+      host.remove();
+    }
+  });
+
+  await test("Panel header: the logo on the left, centred, nothing under it; the status pills and icons in the right corner", async () => {
+    for (const width of [320, 400, 480, 540, 760]) {
+      const host = document.createElement("div");
+      host.style.cssText = `position: absolute; left: -10000px; top: 0; width: ${width}px`;
+      host.append(document.importNode(panelHtml.querySelector("header.app-header"), true));
+      document.body.append(host);
+      try {
+        const header = host.querySelector(".app-header");
+        const logo = header.querySelector(".brand-logo");
+        if (!logo.complete) await new Promise((resolve) => (logo.onload = logo.onerror = resolve));
+        assert(logo.naturalWidth > 0, "the logo is drawn (its width counts)");
+        header.querySelector("#connection").dataset.state = "login";
+        header.querySelector("#connection-text").textContent = "Login Required";
+        header.querySelector("#recon-connection").hidden = false;
+        header.querySelector("#recon-connection-text").textContent = "firstname.lastname@joulestowatts.com";
+        header.querySelector("#btn-schedule-open").hidden = false;
+        const box = (selector) => header.querySelector(selector).getBoundingClientRect();
+        const [brand, icons, ireps, recon, row] = [box(".brand"), box(".header-actions"), box("#connection"), box("#recon-connection"), box(".app-header-row")];
+        assert(icons.left >= brand.right && icons.top < brand.bottom, `${width} px: the icons sit on the brand's row, right of it`);
+        if (width >= 480) {
+          assert(ireps.left >= brand.right && recon.left >= brand.right, `${width} px: nothing under the logo: the pills are right of it`);
+          assert(recon.top >= ireps.bottom && Math.abs(recon.right - ireps.right) < 1, `${width} px: IREPS above RECON, right-aligned`);
+          assert(icons.left >= Math.max(ireps.right, recon.right), `${width} px: the icons right of the pills, in the corner`);
+          assert(Math.abs((brand.top + brand.bottom) / 2 - (row.top + row.bottom) / 2) < 1, `${width} px: the logo is vertically centred`);
+        } else {
+          assert(ireps.top >= brand.bottom && recon.top >= brand.bottom, `${width} px: too narrow for the corner: the pills go under the brand`);
+          assert(Math.abs(ireps.top - recon.top) < 1 && recon.left >= ireps.right, `${width} px: the two pills share one line, side by side`);
+        }
+        assert(header.scrollWidth <= header.clientWidth, `${width} px: the header is ${header.scrollWidth - header.clientWidth} px too wide`);
+        assert(recon.right <= header.getBoundingClientRect().right - 15.5, `${width} px: the RECON pill stays inside the header`);
+        if (width === 320) {
+          const email = header.querySelector("#recon-connection-text");
+          assert(email.scrollWidth > email.clientWidth, "a long e-mail ends in … (the full one is in the tooltip)");
+          eq(getComputedStyle(header.querySelector("#connection")).backgroundColor, "rgb(251, 231, 233)", "Login Required tints its pill (--danger-soft)");
+        }
+      } finally {
+        host.remove();
+      }
+    }
+  });
+
+  await test("Every view's Back is a small DocLink button, not a link and not full width", () => {
+    const backs = [...panelHtml.querySelectorAll('button[id$="-back"]')];
+    assert(backs.length > 0, "the views have a Back");
+    for (const back of backs) assert(back.classList.contains("btn-secondary") && back.classList.contains("btn-back"), `${back.id} is the small outlined Back button`);
+    const host = document.createElement("div");
+    host.className = "card";
+    host.style.cssText = "position: absolute; left: -10000px; top: 0; width: 320px";
+    host.innerHTML = '<button class="btn btn-primary" type="button">Open IREPS</button><button class="btn btn-secondary btn-back" type="button">Back</button>';
+    document.body.append(host);
+    try {
+      const [open, back] = host.querySelectorAll("button");
+      assert(back.getBoundingClientRect().width < 120, `Back is small (${Math.round(back.getBoundingClientRect().width)} px in a 320 px card)`);
+      eq(Math.round(back.getBoundingClientRect().top - open.getBoundingClientRect().bottom), 8, "8 px under the button above it");
+    } finally {
+      host.remove();
+    }
+  });
+
+  await test("No action looks like link text: every .btn-link is a small outlined button", () => {
+    const actions = [...panelHtml.querySelectorAll(".btn-link")];
+    assert(actions.length > 0 && actions.every((b) => b.tagName === "BUTTON"), "the panel's .btn-link actions are buttons");
+    const host = document.createElement("div");
+    host.className = "card";
+    host.style.cssText = "position: absolute; left: -10000px; top: 0; width: 320px";
+    host.innerHTML = '<div class="result-actions"><button class="btn btn-link" type="button">Show in folder</button></div><button class="btn btn-link" type="button">Load more</button>';
+    document.body.append(host);
+    try {
+      for (const b of host.querySelectorAll(".btn-link")) {
+        const s = getComputedStyle(b);
+        eq(s.textDecorationLine, "none", `${b.textContent}: not underlined`);
+        eq(s.borderTopWidth, "1px", `${b.textContent}: a border`);
+        eq(s.borderTopColor, "rgb(214, 224, 223)", `${b.textContent}: DocLink's border colour (--border)`);
+        eq(s.borderTopLeftRadius, "8px", `${b.textContent}: rounded`);
+        assert(b.getBoundingClientRect().width < 160, `${b.textContent}: small, not full width`);
+      }
+      const [inRow, alone] = host.querySelectorAll(".btn-link");
+      eq(getComputedStyle(inRow).marginTop, "0px", "in a row of actions, the row's gap spaces it");
+      eq(getComputedStyle(alone).marginTop, "10px", "on its own line (Load more), it keeps 10 px from what is above it");
+    } finally {
+      host.remove();
+    }
+  });
+
+  await test("Dropdowns, checkboxes and radio buttons use DocLink's teal, the opened list included", () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position: absolute; left: -10000px; top: 0; width: 320px";
+    host.innerHTML = `<label class="field"><span class="field-label">Railway</span><select><option value="-1">All</option><option value="1" selected>CENTRAL RLY</option></select></label>
+      <input type="checkbox" checked><input type="radio" checked>`;
+    document.body.append(host);
+    try {
+      eq(getComputedStyle(host.querySelector('input[type="checkbox"]')).accentColor, TEAL, "checkboxes");
+      eq(getComputedStyle(host.querySelector('input[type="radio"]')).accentColor, TEAL, "radio buttons");
+      const select = host.querySelector("select");
+      eq(getComputedStyle(select).borderTopLeftRadius, "8px", "the closed dropdown");
+      // the opened list can be styled from Chrome 135 (customizable select); older Chrome keeps its own
+      if (CSS.supports("appearance", "base-select")) {
+        eq(getComputedStyle(select).appearance, "base-select");
+        const [all, chosen] = select.options;
+        eq(getComputedStyle(chosen).backgroundColor, TEAL, "the chosen option");
+        eq(getComputedStyle(chosen).color, "rgb(255, 255, 255)");
+        eq(getComputedStyle(all).backgroundColor, "rgba(0, 0, 0, 0)", "the other options plain");
+      }
+    } finally {
+      host.remove();
+    }
+  });
+  panelCss.remove();
 
   await test("Schedule defaults: the exports once 09:00-10:00 every 10 min, the PDFs hourly 09:00-18:00", () => {
     const once = { window_start: "09:00", window_end: "10:00", check_every_minutes: 10, repeat_every_minutes: null };
@@ -683,7 +952,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
   });
 
   /** A tender runner on fakes: tabs open as ids 41, 42 ...; timers run by hand. */
-  function tenderHarness({ openFails = false, live = true } = {}) {
+  function tenderHarness({ openFails = false, live = true, realTimers = false } = {}) {
     const tabs = { opened: [], closed: [] };
     const pending = [];
     const runner = createTenderRunner({
@@ -694,7 +963,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
       },
       closeTab: async (id) => tabs.closed.push(id),
       holdWorker: (task) => task(),
-      timers: { setTimeout: (fn) => (pending.push(fn), pending.length), clearTimeout: () => {} },
+      ...(realTimers ? {} : { timers: { setTimeout: (fn) => (pending.push(fn), pending.length), clearTimeout: () => {} } }),
       timeoutMs: 1000
     });
     const ctx = { slot: { id: 7, doc_type: "tenderLoa" }, claimId: "claim-1", params: { dateFrom: "16/11/2026", dateTo: "17/11/2026", lookbackDays: 2 }, account: ACCOUNT, isClaimLive: () => live };
@@ -739,6 +1008,16 @@ export async function runSchedulerTests({ test, assert, eq }) {
     const none = tenderHarness({ openFails: true });
     const r2 = await none.runner.run(none.ctx);
     eq(JSON.stringify([r2.code, r2.countsAsAttempt]), JSON.stringify(["SCHEDULE_RUNNER_NOT_OPENED", false]));
+  });
+
+  await test("Tender runner: with the browser's own timers (none injected) a run starts and ends", async () => {
+    const h = tenderHarness({ realTimers: true });
+    const ended = h.runner.run(h.ctx);
+    await tick();
+    eq(h.tabs.opened.length, 1, "the runner tab opened (the timeout timer started)");
+    eq(h.runner.done("claim-1", { outcome: "done", result: { saved: 1 } }, 41).ok, true);
+    eq((await ended).outcome, "done");
+    eq(h.tabs.closed.join(), "41");
   });
 
   await test("Tender run outcome: aborted reservation, session lost, failures -> partial, else done", () => {

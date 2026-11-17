@@ -9,33 +9,39 @@
 </head>
 <body>
   <header class="app-header">
-    <div class="brand">
-      <img class="brand-logo" src="../assets/logo.png" alt="Joules to Watts">
-      <h1>DocLink</h1>
-    </div>
-    <div class="connections">
-      <!-- Login 1: IREPS (the user's own portal login with the e-sign key; DocLink only detects it) -->
-      <div class="connection" id="connection" data-state="checking" title="IREPS session status">
-        <span class="connection-label">IREPS</span>
-        <span class="connection-status"><span class="dot"></span><span id="connection-text">Checking…</span></span>
+    <!-- The brand on the left; the status pills and the view icons in the right corner -->
+    <div class="app-header-row">
+      <div class="brand">
+        <img class="brand-logo" src="../assets/logo.png" alt="Joules to Watts">
+        <h1>DocLink</h1>
       </div>
-      <!-- Login 2: Recon Engine (joulestowatts password or Okta), only for Save to: ECM / S3 -->
-      <button class="connection connection-recon" id="recon-connection" type="button" data-state="checking" title="Recon Engine sign-in (for Save to: ECM / S3)" hidden>
-        <span class="connection-label">RECON</span>
-        <span class="connection-status"><span class="dot"></span><span id="recon-connection-text">Checking…</span></span>
-      </button>
-      <!-- My downloads (the download log, popup-downloads.js); a second click goes back -->
-      <button class="header-icon" id="btn-downloads-open" type="button" title="My downloads" aria-label="My downloads" aria-pressed="false">
-        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/>
-        </svg>
-      </button>
-      <!-- Scheduled downloads (config.json "schedular_phase1", popup-schedule.js); shown only when on -->
-      <button class="header-icon" id="btn-schedule-open" type="button" title="Scheduled downloads" aria-label="Scheduled downloads" aria-pressed="false" hidden>
-        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/>
-        </svg>
-      </button>
+      <!-- Status: one pill per login -->
+      <div class="connections">
+        <!-- Login 1: IREPS (the user's own portal login with the e-sign key; DocLink only detects it) -->
+        <div class="connection" id="connection" data-state="checking" title="IREPS session status">
+          <span class="connection-label">IREPS</span>
+          <span class="connection-status"><span class="dot"></span><span id="connection-text">Checking…</span></span>
+        </div>
+        <!-- Login 2: Recon Engine (joulestowatts password or Okta), only for Save to: ECM / S3 -->
+        <button class="connection connection-recon" id="recon-connection" type="button" data-state="checking" title="Recon Engine sign-in (for Save to: ECM / S3)" hidden>
+          <span class="connection-label">RECON</span>
+          <span class="connection-status"><span class="dot"></span><span id="recon-connection-text">Checking…</span></span>
+        </button>
+      </div>
+      <div class="header-actions">
+        <!-- My downloads (the download log, popup-downloads.js); a second click goes back -->
+        <button class="header-icon" id="btn-downloads-open" type="button" title="My downloads" aria-label="My downloads" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 4v11"/><path d="M7 10l5 5 5-5"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/>
+          </svg>
+        </button>
+        <!-- Scheduled downloads (config.json "schedular_phase1", popup-schedule.js); shown only when on -->
+        <button class="header-icon" id="btn-schedule-open" type="button" title="Scheduled downloads" aria-label="Scheduled downloads" aria-pressed="false" hidden>
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/>
+          </svg>
+        </button>
+      </div>
     </div>
   </header>
 
@@ -229,7 +235,7 @@
           <li>Click Download again</li>
         </ol>
         <button id="btn-open-ireps" class="btn btn-primary" type="button">Open IREPS</button>
-        <button id="btn-login-back" class="btn btn-link" type="button">Back</button>
+        <button id="btn-login-back" class="btn btn-secondary btn-back" type="button">Back</button>
       </article>
     </section>
 
@@ -238,7 +244,7 @@
       <article class="card">
         <div class="card-heading">
           <h2>IREPS Modification Advice (MA)</h2>
-          <button id="btn-ma-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-ma-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
         <p class="card-text">Finds the Modification Advices of a date and downloads their MA PDF copies from IREPS.</p>
 
@@ -328,7 +334,7 @@
       <article class="card">
         <div class="card-heading">
           <h2>IREPS Document Download</h2>
-          <button id="btn-po-ic-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-po-ic-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
         <p class="card-text">Enter a PO Number once, then download the Purchase Order and/or its issued Inspection Certificates.</p>
         <button id="btn-po-ic-batch-open" class="btn btn-link" type="button">Download POs / ICs by date, or ICs from notifications &rarr;</button>
@@ -397,7 +403,7 @@
       <article class="card" id="card-pod">
         <div class="card-heading">
           <h2>Download POs by PO Date</h2>
-          <button id="btn-pod-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-pod-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
         <p class="card-text">Downloads every Purchase Order dated in the range, across all result pages. For one day, use the same date in both fields.</p>
         <div class="date-row batch-dates">
@@ -477,7 +483,7 @@
       <article class="card">
         <div class="card-heading">
           <h2>My Downloads</h2>
-          <button id="btn-downloads-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-downloads-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
         <p class="card-text downloads-who" id="downloads-who"></p>
         <div class="date-row">
@@ -539,7 +545,7 @@
       <article class="card">
         <div class="card-heading">
           <h2>Scheduled downloads</h2>
-          <button id="btn-schedule-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-schedule-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
         <p class="card-text schedule-status" id="schedule-status"></p>
         <div id="schedule-error" class="result result-error" hidden>
@@ -551,8 +557,8 @@
         <p class="schedule-empty" id="schedule-today-empty" hidden>No scheduled download for this IREPS account today.</p>
         <div id="schedule-manage" hidden>
           <div class="group-title">Schedules (admin)</div>
-          <p class="field-hint">Every day by default, between the times below, checked at the interval. Each type is downloaded once a day, by whichever DocLink user is logged in to IREPS first; always to S3 / ECM.</p>
-          <div id="schedule-editors"></div>
+          <p class="schedule-hint">Times are IST. A schedule runs once in its window, or once per period when it repeats, by the first DocLink whose user is active on IREPS, and is retried at its Retry interval until done. Always saved to S3 / ECM.</p>
+          <div class="schedule-editors" id="schedule-editors"></div>
         </div>
         <button id="btn-schedule-refresh" class="btn btn-primary" type="button">Refresh</button>
       </article>
@@ -563,7 +569,7 @@
       <article class="card">
         <div class="card-heading">
           <h2>DocLink — Tender Documents</h2>
-          <button id="btn-tender-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-tender-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
 
         <!-- Active IREPS account (read live from the IREPS home page; never hardcoded) -->
@@ -652,7 +658,7 @@
       <article class="card">
         <div class="card-heading">
           <h2>Correspondence Downloads</h2>
-          <button id="btn-pc-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-pc-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
 
         <div class="tender-account" aria-live="polite">
@@ -709,7 +715,7 @@
       <article class="card bill-upload">
         <div class="card-heading">
           <h2>Upload Bill to IREPS</h2>
-          <button id="btn-bill-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-bill-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
         <p class="card-text">DocLink reads the receipt in IREPS and the invoice in ECM, checks them, and fills the bill header and item. You then attach the documents, sign and submit in IREPS.</p>
 

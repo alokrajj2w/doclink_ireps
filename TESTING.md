@@ -227,6 +227,7 @@ Open **Search options** in the popup (above the Download button).
 | Railway Zone = ICF (list comes from the IREPS page, 35 entries) | Mock log shows `zone=13 searchRange=3`; PDF filter "Railway Zone: ICF" |
 | Select Date, From 01/08/2026 To 31/08/2026 | Mock log shows `searchRange=2 dateFrom=01/08/2026 dateTo=31/08/2026` |
 | Select Date, range longer than 180 days | Popup shows **Invalid search options** before any request is sent |
+| Open the Railway Zone list (Chrome 135 or later) | The list opens in DocLink's style: white rounded panel, the chosen zone in teal, a pale teal row under the mouse. Chrome 116–134 shows its own list |
 
 ### C5. Test: download twice (Acceptance Test 8)
 
@@ -750,6 +751,7 @@ HTTP status). Cookies, session ids and form tokens are always redacted.
 | 14 | MA: session expiry during PDF download → session message, nothing saved as .pdf | C9d `ma-pdf-login` | ☐ |
 | 15 | Bill upload: Prepare writes nothing; Create saves header + item; documents saved with descriptions | C9 | ☐ |
 | 16 | Bill upload: the same receipt is never billed twice; errors / unread warnings block Create | C9 steps 4, 7, 8 | ☐ |
+| 17 | Panel look: dropdown lists (the scheduler's From / To hour and minute ones included) and checkboxes in DocLink's style; every action (Back, Load more, Show in folder, Try again, Start over, …) is a small outlined button with room above it, never underlined text or a full-width bar; the header shows the logo on the left, vertically centred with nothing under it, and the IREPS / RECON pills (stacked) and the icons in the right corner; only a side panel under 480 px moves the pills to a strip under the logo, with nothing overlapping | C4b, then narrow the side panel | ☐ |
 
 
 ---
@@ -848,8 +850,12 @@ End to end, with the mock portal and a local Recon Engine:
 3. As admin, open **Scheduled downloads** (clock icon). A new schedule starts from the defaults (Bill Status
    09:00-10:00, once a day, retry every 10 min; ICs every hour 09:00-18:00, retry every 15 min). Add Bill Status
    with a window from now to now + 45 min, and ICs from notifications with a window from now to now + 2 h, runs
-   every 30 min.
+   every 30 min. With `schedular_phase2` off, the list offers no tender type. Before its window a slot reads
+   "Scheduled HH:MM–HH:MM"; inside it, "Due HH:MM–HH:MM, not run yet". Narrow the side panel as far as it goes:
+   every field of an opened schedule box stays inside the panel, and Add schedule / Save / Delete are buttons that
+   show a spinner until the Recon Engine answers.
 4. Load a mock IREPS page in both profiles. Exactly one runs; the other shows "Running – A", then "Done by A".
+   `chrome://extensions` shows no "Scheduler: wake failed" error for DocLink.
    The Recon Engine's `doclink_downloads` has one row per document. At the next two checks neither profile claims
    or sends anything to IREPS (the mock server log shows no request).
 5. Set A's Save to switch to **Local** and let A run a slot: every file still goes to S3 / ECM, nothing appears in

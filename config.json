@@ -20,7 +20,7 @@
   "downloadLog": { "enabled": true },
   "//schedular_phase1": "Scheduled downloads, Phase 1 (always to S3 / ECM, never local). enabled: true = this DocLink takes part in the shared schedules kept in the Recon Engine (one DocLink runs each due download for the IREPS account; nobody downloads it twice); false = no scheduling at all. documents: the document types the scheduler may trigger - BillStatus, CRN, RNote, MA, PO, IC (IC = ICs by IC date and ICs from notifications). Remove a name and that type is never triggered automatically; manual downloads are unchanged. config.local.json may override the whole block.",
   "schedular_phase1": {
-    "enabled": false,
+    "enabled": true,
     "documents": ["BillStatus", "CRN", "RNote", "MA", "PO", "IC"]
   },
   "//schedular_phase2": "Scheduled downloads, Phase 2: tender documents (always to the ECM, never local), run in a background DocLink tab that closes when the run ends. enabled: true = this DocLink takes part, as for phase 1; false = no tender scheduling. documents: NIT (NIT documents, attachments, My Offer and corrigenda from My Messages), CounterOffer, LOA (sends IREPS's own 'LOA viewed' request, as a manual LOA download does), Tabulation (Financial and Commercial), Correspondence (pending tender correspondence), Negotiation (its own, less frequent schedule: IREPS opens these slowly). Remove a name and that type is never triggered automatically. config.local.json may override the whole block.",

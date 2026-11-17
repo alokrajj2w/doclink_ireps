@@ -58,16 +58,33 @@ body {
 
 /* ------------------------------------------------------------------ header */
 
+/* One row: the brand on the left, vertically centred, with nothing under it; the status pills (IREPS above
+   RECON) and the view icons in the right corner. Only a panel too narrow for that puts the pills on a strip
+   under the brand (the container query below). */
 .app-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px 10px;
+  container-type: inline-size;
+  padding: 10px 16px;
   background: var(--surface);
   border-bottom: 3px solid var(--brand-teal);
 }
 
+.app-header-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "brand status actions";
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.header-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .brand {
+  grid-area: brand;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -89,16 +106,24 @@ body {
   border-left: 2px solid var(--border);
 }
 
+/* a status pill: "IREPS ● Connected", "RECON ● name@company.com" */
 .connection {
-  text-align: right;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
   font-size: 11px;
+  line-height: 1.4;
 }
 
 .connection-label {
-  display: block;
   color: var(--text-muted);
   letter-spacing: 0.6px;
-  font-weight: 600;
+  font-weight: 700;
 }
 
 .connection-status {
@@ -258,14 +283,61 @@ body {
   background: var(--primary-soft);
 }
 
+/* An outlined red button for a removal (Delete a schedule) */
+.btn-danger {
+  background: var(--surface);
+  color: var(--danger);
+  border-color: #f0c2c6;
+}
+.btn-danger:not(:disabled):hover {
+  background: var(--danger-soft);
+}
+
+/* A secondary action (Load more, Show in folder, Try again, Start over, ...): a small outlined button,
+   never underlined text. The class keeps its name, so every view and script uses it unchanged. */
 .btn-link {
   width: auto;
-  padding: 4px 0;
-  background: none;
+  padding: 4px 12px;
+  background: var(--surface);
   color: var(--primary);
+  border-color: var(--border);
+  font-size: 12px;
   font-weight: 600;
-  text-decoration: underline;
-  text-underline-offset: 2px;
+}
+.btn-link:not(:disabled):hover {
+  background: var(--primary-soft);
+}
+/* on a line of its own (Load more under a list, Start over, Use Local instead, Retry failed, ...) it keeps
+   clear of what is above it; in a row of actions the row's gap does that instead */
+.btn-link {
+  margin-top: 10px;
+}
+.result-actions .btn-link,
+.tender-links .btn-link,
+.doc-results-head .btn-link {
+  margin-top: 0;
+}
+
+/* Back, at the top right of a view's card: a small outlined button (.btn-secondary), on every view */
+.btn-back {
+  flex: none;
+  width: auto;
+  gap: 4px;
+  padding: 4px 12px 4px 9px;
+  font-size: 12px;
+}
+.btn-back::before {
+  content: "‹";
+  font-size: 16px;
+  line-height: 1;
+  margin-top: -2px;
+}
+.card-heading .btn-back {
+  margin-bottom: 10px;
+}
+/* under another button (IREPS login required: Open IREPS, then Back) */
+.btn + .btn-back {
+  margin-top: 8px;
 }
 
 .btn-spinner {
@@ -283,9 +355,14 @@ body {
 }
 
 /* on an outlined button the spinner is teal, not white */
-.btn-secondary .btn-spinner {
+.btn-secondary .btn-spinner,
+.btn-link .btn-spinner {
   border-color: rgba(56, 152, 144, 0.3);
   border-top-color: var(--primary);
+}
+.btn-danger .btn-spinner {
+  border-color: rgba(216, 32, 48, 0.3);
+  border-top-color: var(--danger);
 }
 
 /* Buttons side by side: one column in a narrow panel, more as the panel is widened */
@@ -442,8 +519,8 @@ body {
 
 .result-actions {
   display: flex;
-  gap: 14px;
-  margin-top: 6px;
+  gap: 8px;
+  margin-top: 8px;
   flex-wrap: wrap;
 }
 
@@ -487,6 +564,85 @@ body {
   border-radius: 8px;
   background: var(--surface);
   color: var(--text);
+}
+
+/* Checkboxes and radio buttons in DocLink's teal, not the browser's blue */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--primary);
+}
+
+/* Dropdowns: every <select> of the panel in DocLink's colours, its opened list included (Chrome 135+
+   customizable select). An older Chrome keeps its native list; the closed control looks the same. */
+@supports (appearance: base-select) {
+  select,
+  ::picker(select) {
+    appearance: base-select;
+  }
+  select {
+    cursor: pointer;
+  }
+  .field select {
+    width: 100%;
+  }
+  select::picker-icon {
+    content: "▾";
+    color: var(--text-muted);
+    transition: rotate 0.15s ease;
+  }
+  select:open::picker-icon {
+    rotate: 180deg;
+  }
+  select:open {
+    border-color: var(--primary);
+  }
+  select:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -1px;
+  }
+  select:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+  ::picker(select) {
+    margin-block: 4px;
+    padding: 4px;
+    max-block-size: 280px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    box-shadow: 0 6px 18px rgba(16, 24, 40, 0.14);
+  }
+  option {
+    padding: 6px 10px;
+    border-radius: 6px;
+    color: var(--text);
+    cursor: pointer;
+  }
+  option::checkmark {
+    display: none;
+  }
+  option:hover,
+  option:focus-visible {
+    background: var(--primary-soft);
+    outline: none;
+  }
+  /* the chosen one as the panel's other choices (Save to: ECM / S3, On / Off) */
+  option:checked {
+    background: var(--primary);
+    color: #fff;
+    font-weight: 600;
+  }
+  option:checked:hover,
+  option:checked:focus-visible {
+    background: var(--primary-hover);
+  }
+  option:disabled {
+    background: none;
+    color: var(--text-muted);
+    cursor: default;
+  }
 }
 
 .form-message {
@@ -689,10 +845,6 @@ body[data-gate="on"] .app-main > .save-to,
 
 /* --------------------------------------------------------------------- CRN */
 
-.card-heading .btn-link {
-  padding: 0;
-}
-
 .field input[type="text"] {
   font: inherit;
   padding: 8px 10px;
@@ -734,7 +886,6 @@ body[data-gate="on"] .app-main > .save-to,
   gap: 8px;
 }
 .doc-results-head .btn-link {
-  padding: 0;
   white-space: nowrap;
 }
 
@@ -849,6 +1000,10 @@ body[data-gate="on"] .app-main > .save-to,
 
 .result-error.is-notice .result-actions .btn-link {
   color: var(--warning);
+  border-color: #f0c987;
+}
+.result-error.is-notice .result-actions .btn-link:not(:disabled):hover {
+  background: var(--warning-soft);
 }
 
 /* -------------------------------------------------------- not-on-IREPS gate */
@@ -951,20 +1106,74 @@ body[data-gate="on"] .app-footer {
 
 /* ------------------------------------------- Recon Engine sign-in (login 2) */
 
+/* the status pills, in the right corner: IREPS above RECON */
 .connections {
+  grid-area: status;
+  justify-self: end;
   display: flex;
-  align-items: flex-start;
-  gap: 14px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+}
+.connections > .connection {
+  max-width: 100%;
+}
+/* a panel under 480 px has no room for the pills beside the brand: they go on a strip under it, side by side
+   (the header's content box is the panel minus its 2 x 16 px padding) */
+@container (max-width: 447px) {
+  .app-header-row {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "brand actions" "status status";
+  }
+  .header-actions {
+    justify-self: end;
+  }
+  .connections {
+    justify-self: stretch;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+  }
 }
 
+/* a login that needs the user, or a portal that cannot be reached, tints its pill */
+.connection[data-state="login"] {
+  background: var(--danger-soft);
+  border-color: #f3c4c8;
+}
+.connection[data-state="offline"] {
+  background: var(--warning-soft);
+  border-color: #f0c987;
+}
+
+/* the RECON pill is a button (sign in / sign out); it gives way first when the strip is short */
 .connection-recon {
   font: inherit;
   font-size: 11px;
-  background: none;
-  border: 0;
-  padding: 0;
   cursor: pointer;
   color: inherit;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.connection-recon:not([data-state="login"]):not([data-state="offline"]):hover {
+  background: var(--primary-soft);
+}
+/* a long sign-in e-mail ends in "…" (the full one is in the tooltip) instead of crowding the header */
+.connection-recon .connection-status {
+  min-width: 0;
+  max-width: 100%;
+}
+.connection-recon .dot {
+  flex: none;
+}
+#recon-connection-text {
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .connection-recon[hidden] {
   display: none;
@@ -1420,27 +1629,96 @@ body[data-gate="on"] #view-redownload {
   color: var(--text-muted);
   font-size: 13px;
 }
-.schedule-editor {
-  padding: 10px 0;
-  border-bottom: 1px solid var(--border);
+.schedule-hint {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: 12px;
 }
-.schedule-editor-head {
+.schedule-editors {
+  margin-bottom: 4px;
+}
+/* Admin list: one DocLink option box (.options) per type, its timing on the summary line */
+.schedule-editor {
+  margin: 0 0 8px;
+}
+.schedule-editor > summary {
+  align-items: center;
+}
+.schedule-editor-name {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+.schedule-editor .options-summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 2px 6px;
+  color: var(--text-muted);
+}
+.schedule-editor .options-summary > span {
+  white-space: nowrap;
+}
+.schedule-editor .options-body {
+  padding-top: 10px;
+}
+/* From, To, Runs, Retry, Look back wrap to the panel's width: two columns when it is narrow */
+.schedule-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 8px;
+}
+.schedule-fields .field {
+  min-width: 0;
+}
+.schedule-editor input[type="number"],
+.schedule-editor select {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+/* From / To: hour and minute dropdowns (the browser's own time picker cannot take DocLink's style) */
+.schedule-time {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.schedule-time select {
+  flex: 1;
+  padding-inline: 8px 6px;
+}
+.schedule-time-sep {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+.schedule-editor input:focus-visible,
+.schedule-editor select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -1px;
+}
+/* On | Off and Sun … Sat: DocLink's toggles, as Save to: Local | ECM / S3 */
+.schedule-editor .segmented {
+  align-self: flex-start;
+}
+.schedule-editor .segmented label {
+  padding: 4px 14px;
+}
+.schedule-days.segmented {
+  align-self: stretch;
+}
+.schedule-days.segmented label {
+  flex: 1;
+  padding: 4px 0;
+}
+.schedule-actions {
   display: flex;
   gap: 8px;
-  align-items: center;
-  font-weight: 600;
-  font-size: 13px;
-  margin-bottom: 6px;
-}
-.schedule-days {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  font-size: 12px;
-  margin: 4px 0;
-}
-.schedule-days label {
-  display: inline-flex;
-  gap: 3px;
-  align-items: center;
 }

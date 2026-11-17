@@ -201,6 +201,7 @@ export function createSchedulerJob(deps) {
       account,
       user,
       waitingFor: st.waitingFor,
+      lastError: st.lastError,
       running: st.running,
       lastRun: st.lastRun,
       nextCheckAt: st.nextCheckAt,

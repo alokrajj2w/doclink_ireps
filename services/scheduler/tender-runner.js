@@ -102,7 +102,8 @@ export function tenderRunOutcome({ result = null, error = null, counts }) {
  * @param {number} [deps.timeoutMs]
  */
 export function createTenderRunner(deps) {
-  const timers = deps.timers || { setTimeout, clearTimeout };
+  // wrapped: Chrome throws "Illegal invocation" when its timer functions are called as methods of another object
+  const timers = deps.timers || { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (id) => clearTimeout(id) };
   const timeoutMs = deps.timeoutMs || RUNNER_TIMEOUT_MS;
   /** claimId -> { ctx, tabId, end(outcome) } */
   const runs = new Map();

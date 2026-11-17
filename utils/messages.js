@@ -835,7 +835,7 @@ export const ERROR_CATALOG = Object.freeze({
   },
   SCHEDULE_MISSED: {
     title: "Scheduled download missed",
-    message: "Nobody with DocLink was logged in to IREPS during its time, so the scheduled download did not run ({detail}). An hourly download catches up in its next run."
+    message: "No DocLink ran this scheduled download during its time ({detail}). An hourly download catches up in its next run."
   },
   UNKNOWN: {
     title: "Something Went Wrong",

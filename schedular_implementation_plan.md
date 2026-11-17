@@ -490,7 +490,7 @@ Anyone may claim again at once. Documents already `done` stay done.
 
 ### 8.8 Manifest
 
-Add `"alarms"` to `permissions` (D1, needs approval) and bump `version` to 1.6.0. No new `host_permissions`:
+Add `"alarms"` to `permissions` (D1, needs approval) and bump `version` to 1.6.1. No new `host_permissions`:
 the scheduler API is on the Recon origin, which is already listed.
 
 ### 8.9 The `schedular_phase1` setting (D10)

@@ -59,7 +59,13 @@ export function createScheduler(deps) {
   const now = deps.now || (() => Date.now());
   const random = deps.random || Math.random;
   const uuid = deps.uuid || (() => crypto.randomUUID());
-  const timers = deps.timers || { setInterval, clearInterval, setTimeout, clearTimeout };
+  // wrapped: Chrome throws "Illegal invocation" when its timer functions are called as methods of another object
+  const timers = deps.timers || {
+    setInterval: (fn, ms) => setInterval(fn, ms),
+    clearInterval: (id) => clearInterval(id),
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (id) => clearTimeout(id)
+  };
   const onState = deps.onState || (() => {});
 
   const state = {
