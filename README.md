@@ -1,7 +1,7 @@
 # DocLink — IREPS Document Automation (Chrome Extension, Manifest V3)
 
 DocLink is a Chrome extension for users of the Indian Railways IREPS portal.
-Version 1.5.0 implements the downloads below. One **Save to: Local |
+Version 1.6.0 implements the downloads below. One **Save to: Local |
 ECM / S3** switch at the top of the panel applies to every download. Local saves
 under `Downloads/DocLink/`. ECM / S3 sends Bill Status, CRN and R-NOTE to the
 Recon Engine, which stores them in S3 and loads them into reconciliation, and
@@ -489,7 +489,7 @@ Every build also:
 * logs from `info` up (DocLink loaded unpacked logs from `debug`;
   `-- --log-level=debug` makes a build that does too);
 * stamps the git commit into the built manifest's `version_name`, which
-  `chrome://extensions` shows (`1.5.0 (97185b8)`; `-dirty` when the tree had
+  `chrome://extensions` shows (`1.6.0 (97185b8)`; `-dirty` when the tree had
   uncommitted changes, `test build` for `--allow-mock`), and into
   `build-info.json`;
 * obfuscates with a fixed seed: the same sources and `package-lock.json` give
@@ -505,7 +505,7 @@ npm install
 
 # 2. Before building:
 #    - config.json  -> "target": "real" for users ("mock" only for local testing)
-#    - manifest.json and package.json -> raise "version" for a new release (e.g. "1.5.0");
+#    - manifest.json and package.json -> raise "version" for a new release (e.g. "1.6.0");
 #      Chrome accepts 1-4 dot-separated numbers
 
 # 3. Build
@@ -1131,7 +1131,7 @@ and document type in the catalog against the live ECM (read-only; it uses the cl
 secret in `config.local.json` and prints neither): run it on TEST and on PROD before a build
 that sends a new field.
 
-**The fields the client asked for on 13/11/2026.** DocLink sends them since version 1.5.0, with
+**The fields the client asked for on 13/11/2026.** DocLink sends them since version 1.6.0, with
 no setting to switch them.
 - **LOA.** `loi_number` is the number IREPS prints on the letter, `<Dept> / <Tender No> / <LetterId>`
   (e.g. `DAHOD / 61265711C / 1503282`). DocLink builds it from the LOA list row:
@@ -1613,9 +1613,13 @@ ECM `gstinRecipient` (else the consignee address), place of supply from
 
 Not supported yet (stopped by a check): advance / part payment, PVC, POs with
 discount / packing / freight / other charges, several paying authorities,
-several receipts per PO Sr without a match, multi-invoice bills. Not verified on
-the live portal: the ECM `RetrieveInvoiceData` answer (no response captured) and
-re-opening a DocLink-created draft in IREPS to attach the documents (IREPS
+several receipts per PO Sr without a match, multi-invoice bills. The ECM
+`RetrieveInvoiceData` answer was first seen live on 17/11/2026. It gives the invoice
+date as epoch milliseconds in text (`1793314800000`: midnight 30/10/2026 in Paris,
+29/10 23:00 UTC). DocLink takes the day in India, 30/10/2026, and does the same for any
+timestamp or zoned ISO time. DocLink found none of the columns it reads for state / place
+of supply and bill description in that answer; the raw answer is still to be read. Not
+verified on the live portal: re-opening a DocLink-created draft in IREPS to attach the documents (IREPS
 offers "View / Sign & Submit Draft Supplier Bill" from the R-NOTE / CRN row).
 The mock portal serves the flow up to the saved item, including the ECM calls, plus a test hub
 with the bill screens at http://localhost:8765/mock/bill/ (TESTING.md C9);

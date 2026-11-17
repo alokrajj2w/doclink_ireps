@@ -90,6 +90,19 @@ export const ECM_KINDS = Object.freeze({
 export const isGroupedKind = (kind) => Boolean(ECM_KINDS[kind] && ECM_KINDS[kind].group);
 
 /**
+ * The fields a lookup compares to tell whether a document is already in the ECM: all but the
+ * kind's `details`. An IC stored before the ECM had its PO serial and passed quantity holds
+ * neither, and must still be found, or it would be stored a second time.
+ * @param {string} kind
+ * @param {Object<string, string>} fields
+ * @returns {Object<string, string>}
+ */
+export function matchFields(kind, fields) {
+  const details = (ECM_KINDS[kind] && ECM_KINDS[kind].details) || [];
+  return Object.fromEntries(Object.entries(fields || {}).filter(([key]) => !details.includes(key)));
+}
+
+/**
  * The PROD folder DocLink's PROD client may create documents in (16/11/2026), used for every
  * kind of both sites until the per-site folders are supplied. Its path is not confirmed yet:
  * the first upload of a session logs the real one ("ECM folder ... is at ...").

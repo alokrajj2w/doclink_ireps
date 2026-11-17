@@ -344,6 +344,18 @@ export async function runBillUploadTests({ test, assert, eq, rejects, fixture })
     eq(invoiceDateToIreps("8/9/2026"), "08/09/2026");
     eq(invoiceDateToIreps("18-Aug-2026"), "18/08/2026");
     eq(invoiceDateToIreps("31/02/2026"), null);
+    // The live ECM (RetrieveInvoiceData, 17/11/2026) sends the date as epoch milliseconds in text: midnight
+    // 30/10/2026 in Paris, which is 29/10 23:00 UTC. The day is read in India, so it is never a day early.
+    eq(invoiceDateToIreps("1793314800000"), "30/10/2026");
+    eq(invoiceDateToIreps(1793314800000), "30/10/2026", "a number too, read in IST, not UTC");
+    eq(invoiceDateToIreps("1782856800000"), "01/07/2026", "midnight in Paris in summer is 22:00 UTC the day before");
+    eq(invoiceDateToIreps("2026-10-29T23:00:00.000Z"), "30/10/2026", "a time with a zone is read in IST as well");
+    eq(invoiceDateToIreps("2026-10-29T18:30:00.000Z"), "30/10/2026", "midnight IST kept as UTC");
+    eq(invoiceDateToIreps("2026-10-30T00:00:00+05:30"), "30/10/2026");
+    eq(invoiceDateToIreps("2026-08-18T00:00:00"), "18/08/2026", "no zone: the written day");
+    for (const value of ["20261030", "0", 0, 20261030, "17933148000001"]) {
+      eq(invoiceDateToIreps(value), null, `${JSON.stringify(value)} is not read as a 1970 or year-2500 timestamp`);
+    }
     eq(stateCodeOf("TN"), "33");
     eq(stateCodeOf("Uttar Pradesh"), "09");
     eq(stateCodeOf("ODISHA"), "21");

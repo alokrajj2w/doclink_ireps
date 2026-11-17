@@ -74,6 +74,17 @@ export const LIMITS = Object.freeze({ invoiceNo: 16, invoiceAmount: 12, placeOfS
 
 const GSTIN_RE = /^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
 const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+/**
+ * An ECM timestamp is a moment, and its invoice date is that moment's day in India. The live
+ * RetrieveInvoiceData answer (17/11/2026) gave "1793314800000": midnight 30/10/2026 in Paris, which is
+ * 29/10 23:00 UTC. Read in UTC it would be a day early.
+ */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+/** Epoch milliseconds before 2000 are no invoice date: a yyyymmdd number would otherwise read as January 1970. */
+const EPOCH_MS_FLOOR = Date.UTC(2000, 0, 1);
+const EPOCH_MS_TEXT = /^\d{12,13}$/;
+/** An ISO time that names its zone ("…Z", "…+05:30"): a moment, read in IST like epoch milliseconds. */
+const ZONED_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export function isValidGstin(value) {
   return GSTIN_RE.test(String(value || "").trim().toUpperCase());
@@ -98,9 +109,11 @@ export function stateCodeOf(text) {
 }
 
 /**
- * An ECM invoice date as IREPS writes it, dd/mm/yyyy, from "2026-08-18 00:00:00.000", "2026-08-18T..", "18/08/2026",
- * "18-08-2026", "18-Aug-2026" or epoch ms; null when it is not a real calendar date. (The panel's date inputs use
- * utils/dates.js toIrepsDate, which takes only an <input type="date"> value.)
+ * An ECM invoice date as IREPS writes it, dd/mm/yyyy; null when it is not a real calendar date.
+ *   - The written day of "2026-08-18 00:00:00.000", "2026-08-18", "18/08/2026", "18-08-2026", "18-Aug-2026".
+ *   - The day in India of a moment: epoch milliseconds from 2000 on, as a number or as 12-13 digits of
+ *     text (the live ECM sends "1793314800000"), and an ISO time with a zone ("2026-10-29T23:00:00.000Z").
+ * (The panel's date inputs use utils/dates.js toIrepsDate, which takes only an <input type="date"> value.)
  */
 export function invoiceDateToIreps(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -109,11 +122,16 @@ export function invoiceDateToIreps(value) {
     const date = new Date(Date.UTC(y, m - 1, d));
     return date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d ? `${pad(d)}/${pad(m)}/${y}` : null;
   };
-  if (typeof value === "number") {
-    const date = new Date(value);
-    return Number.isFinite(date.getTime()) ? valid(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()) : null;
-  }
+  const dayInIndia = (ms) => {
+    if (!Number.isFinite(ms)) return null;
+    const date = new Date(ms + IST_OFFSET_MS);
+    return valid(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate());
+  };
+  const epochDay = (ms) => (ms >= EPOCH_MS_FLOOR ? dayInIndia(ms) : null);
+  if (typeof value === "number") return epochDay(value);
   const t = String(value).trim();
+  if (EPOCH_MS_TEXT.test(t)) return epochDay(Number(t));
+  if (ZONED_TIME.test(t)) return dayInIndia(Date.parse(t));
   let m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T].*)?$/.exec(t);
   if (m) return valid(+m[1], +m[2], +m[3]);
   m = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(t);

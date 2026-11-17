@@ -620,8 +620,8 @@ export async function runSchedulerTests({ test, assert, eq }) {
   await test("Schedule view: slot lines say who did what, in IST", () => {
     eq(istTime("2026-11-17T04:38:00+00:00"), "10:08");
     eq(slotText({ status: "done", done_by: { name: "Priya" }, ended_at: "2026-11-17T04:38:00+00:00", result: { saved: 1, skipped: 2 } }), "Done by Priya at 10:08 · 1 saved, 2 already saved");
-    eq(slotText({ status: "in_progress", holder: { name: "Rahul" } }), "Running – Rahul");
-    assert(slotText({ status: "pending", window_start_at: "2026-11-17T03:30:00+00:00", window_end_at: "2026-11-17T06:30:00+00:00" }).includes("09:00–12:00"));
+    eq(slotText({ status: "in_progress", holder: { name: "Rahul" } }), "Running - Rahul");
+    assert(slotText({ status: "pending", window_start_at: "2026-11-17T03:30:00+00:00", window_end_at: "2026-11-17T06:30:00+00:00" }).includes("09:00-12:00"));
     assert(slotText({ status: "missed", window_start_at: "2026-11-17T03:30:00+00:00", window_end_at: "2026-11-17T06:30:00+00:00" }).startsWith("Nobody with DocLink"));
   });
 

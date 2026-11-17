@@ -101,7 +101,7 @@ export function earlierText(earlier) {
  * finished period of a repeating schedule then names the next run.
  */
 export function slotText(slot, schedule = null) {
-  const window = `${istTime(slot.window_start_at)}–${istTime(slot.window_end_at)}`;
+  const window = `${istTime(slot.window_start_at)}-${istTime(slot.window_end_at)}`;
   const reason = slot.code ? describeError(slot.code).title : "";
   switch (slot.status) {
     case "done": {
@@ -111,7 +111,7 @@ export function slotText(slot, schedule = null) {
       return [`Done by ${who(slot.done_by)} at ${istTime(slot.ended_at)}`, resultText(slot.result), more].filter(Boolean).join(" · ");
     }
     case "in_progress":
-      return `Running – ${who(slot.holder)}`;
+      return `Running - ${who(slot.holder)}`;
     case "pending":
       return `Waits for a DocLink user logged in to IREPS (${window})`;
     case "partial":
