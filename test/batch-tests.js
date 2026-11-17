@@ -607,7 +607,7 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     assert(!JSON.stringify(manifest).toLowerCase().includes("token") && !JSON.stringify(manifest).toLowerCase().includes("cookie"), "manifest holds no secrets");
   });
 
-  await test("IC notifications: under Save to ECM / S3 each IC is filed as inspectionCertificate (IC number from the PDF name, PO, IC date); the manifest records the ECM outcome", async () => {
+  await test("IC notifications: under Save to ECM / S3 each IC is filed as inspectionCertificate (IC number from the PDF name, PO, IC date, PO serial, passed quantity); the manifest records the ECM outcome", async () => {
     const sim = simulator(pages, { notifications: [note(101, icMsg("L1000000000001", "001"), "Inspection", "8000000001")], icRows: [ic("L1000000000001", "001", "8000000001", true, { icDate: "12/10/2026" })] });
     const ecm = ecmSaver();
     const { state } = await runIc(sim, { saveFile: ecm.saveFile });
@@ -618,6 +618,8 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(filed.fields.ic_number, "8000000001");
     eq(filed.fields.customer_po_number, "L1000000000001");
     eq(filed.fields.ic_date, "12/10/2026");
+    eq(filed.fields.customer_po_serial_number, "001", "the PO Sr. as IREPS shows it, leading zeros kept");
+    eq(filed.fields.passed_quantity, "1", "the row's Passed Qty.");
     eq(state.items[0].ecm.status, "stored");
     eq(state.manifest[0].ecm.status, "stored");
     eq(state.manifest[0].ecm.uid, "u-1");
@@ -896,12 +898,12 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(sim.state.icSearches[0].dateFrom, "01/12/2024");
   });
 
-  await test("IC date: Save to ECM / S3 files each IC as inspectionCertificate with IC number, PO and IC date; a row without a link is skipped", async () => {
+  await test("IC date: Save to ECM / S3 files each IC as inspectionCertificate with IC number, PO, IC date, PO serial and passed quantity; a row without a link is skipped", async () => {
     const sim = simulator(pages, { icDateFilter: true, icRows: [...inRange.slice(0, 2), ic("P9", "001", "C91", false, { icDate: "12/09/2026" })] });
     const ecm = ecmSaver();
     const { state } = await runIcd(sim, undefined, { saveFile: ecm.saveFile });
     eq(ecm.filed.length, 2);
-    eq(JSON.stringify(ecm.filed[0].ecm), JSON.stringify({ kind: "inspectionCertificate", fields: { ic_number: "C11", customer_po_number: "P1", ic_date: "17/09/2026" } }));
+    eq(JSON.stringify(ecm.filed[0].ecm), JSON.stringify({ kind: "inspectionCertificate", fields: { ic_number: "C11", customer_po_number: "P1", ic_date: "17/09/2026", customer_po_serial_number: "001", passed_quantity: "1" } }));
     eq(state.counts.skipped, 1);
     eq(state.items[2].error.code, "IREPS_IC_LINK_NOT_FOUND");
   });

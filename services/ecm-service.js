@@ -37,7 +37,7 @@ import { describeError } from "../utils/messages.js";
 import { RECON_CONFIG, loadReconConfig, reconConfigProblem, manifestHostPermissions, apiErrorDetail } from "./recon-service.js";
 import { loadEcmConfig, isDirectEcm } from "./ecm-config.js";
 import { uploadToNuxeo, findInFolder } from "./ecm-direct.js";
-import { isGroupedKind } from "./ecm-catalog.js";
+import { isGroupedKind, matchFields } from "./ecm-catalog.js";
 
 const CHECK_TIMEOUT_MS = 30000;
 /** The Web Lock that keeps ECM uploads one at a time across the service worker and every panel. */
@@ -277,8 +277,9 @@ async function uploadViaGateway(doc, deps) {
 /**
  * Before a run under Save to: ECM / S3: which of these documents are already in the folder
  * their upload would go to (the account's unit, the kind's location). Matched on the field
- * values (dates aside) and the title when given, not on file names: other tools store the
- * same document under other names. Through the gateway or straight to the ECM, like
+ * values (dates and the kind's details aside, see matchFields) and the title when given, not
+ * on file names: other tools store the same document under other names. Through the gateway
+ * or straight to the ECM, like
  * uploadToEcm. Never throws: when the check cannot be made it answers { ok: false } and
  * the documents are downloaded (an upload is still not stored twice).
  *
@@ -287,7 +288,7 @@ async function uploadViaGateway(doc, deps) {
  * @returns {Promise<{ ok: boolean, found: Map<string, { uid: string, path: string|null, title: string|null }>, code?: string, detail?: string }>}
  */
 export async function findInEcm(query, deps = {}) {
-  const candidates = (query.candidates || []).map((c) => ({ ref: String(c.ref), fields: ecmFields(c.fields), title: c.title || undefined }));
+  const candidates = (query.candidates || []).map((c) => ({ ref: String(c.ref), fields: matchFields(query.kind, ecmFields(c.fields)), title: c.title || undefined }));
   if (candidates.length === 0) return { ok: true, found: new Map() };
   try {
     await loadEcmConfig();

@@ -72,13 +72,13 @@ function onEvent(ev) {
   if (ev.type === 'records') {
     $('pc-table-wrap').hidden = !ev.records.length && !ev.skipped.length;
     $('pc-counts').hidden = false;
-    for (const r of ev.records) upsert(`r:${r.nitOid}`, { tenderNo: r.tenderNo, railway: r.railway, letterNo: '—', letterDate: '', subject: r.tenderTitle, deadline: r.replyDeadline, status: 'PENDING' });
-    for (const [i, s] of ev.skipped.entries()) upsert(`s:${i}`, { tenderNo: s.tenderNo, railway: s.railway, letterNo: '—', subject: s.tenderTitle, deadline: s.replyDeadline, status: 'NEEDS_REVIEW', note: s.reason });
+    for (const r of ev.records) upsert(`r:${r.nitOid}`, { tenderNo: r.tenderNo, railway: r.railway, letterNo: '-', letterDate: '', subject: r.tenderTitle, deadline: r.replyDeadline, status: 'PENDING' });
+    for (const [i, s] of ev.skipped.entries()) upsert(`s:${i}`, { tenderNo: s.tenderNo, railway: s.railway, letterNo: '-', subject: s.tenderTitle, deadline: s.replyDeadline, status: 'NEEDS_REVIEW', note: s.reason });
   } else if (ev.type === 'record') {
     const r = ev.record;
     // a record row is replaced by its letter rows once they exist; until then it carries the record's own state
     if (['NO_PENDING_LETTERS', 'FAILED', 'SESSION_EXPIRED', 'NEEDS_REVIEW', 'IN_PROGRESS'].includes(r.status) || !rows.has(`r:${r.nitOid}`)) {
-      upsert(`r:${r.nitOid}`, { tenderNo: r.tenderNo, railway: r.railway, letterNo: '—', subject: r.tenderTitle, deadline: r.replyDeadline, status: r.status, note: r.status === 'NO_PENDING_LETTERS' ? 'No pending letters at download time' : r.error });
+      upsert(`r:${r.nitOid}`, { tenderNo: r.tenderNo, railway: r.railway, letterNo: '-', subject: r.tenderTitle, deadline: r.replyDeadline, status: r.status, note: r.status === 'NO_PENDING_LETTERS' ? 'No pending letters at download time' : r.error });
     }
   } else if (ev.type === 'letter') {
     const l = ev.letter;

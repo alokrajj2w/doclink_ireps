@@ -229,7 +229,7 @@
           <li>Click Download again</li>
         </ol>
         <button id="btn-open-ireps" class="btn btn-primary" type="button">Open IREPS</button>
-        <button id="btn-login-back" class="btn btn-link" type="button">Back</button>
+        <button id="btn-login-back" class="btn btn-back" type="button">Back</button>
       </article>
     </section>
 
@@ -238,7 +238,7 @@
       <article class="card">
         <div class="card-heading">
           <h2>IREPS Modification Advice (MA)</h2>
-          <button id="btn-ma-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-ma-back" class="btn btn-back" type="button">Back</button>
         </div>
         <p class="card-text">Finds the Modification Advices of a date and downloads their MA PDF copies from IREPS.</p>
 
@@ -328,10 +328,16 @@
       <article class="card">
         <div class="card-heading">
           <h2>IREPS Document Download</h2>
-          <button id="btn-po-ic-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-po-ic-back" class="btn btn-back" type="button">Back</button>
         </div>
         <p class="card-text">Enter a PO Number once, then download the Purchase Order and/or its issued Inspection Certificates.</p>
-        <button id="btn-po-ic-batch-open" class="btn btn-link" type="button">Download POs / ICs by date, or ICs from notifications &rarr;</button>
+        <!-- each opens the batch view with its own card only (popup-po-ic-batch.js) -->
+        <div class="group-title">Bulk downloads</div>
+        <div class="btn-grid batch-open">
+          <button id="btn-batch-pod" class="btn btn-secondary" type="button">POs by PO Date</button>
+          <button id="btn-batch-icd" class="btn btn-secondary" type="button">ICs by IC Date</button>
+          <button id="btn-batch-icn" class="btn btn-secondary" type="button">ICs from Notifications</button>
+        </div>
 
         <label class="field">
           <span class="field-label">PO Number</span>
@@ -392,12 +398,12 @@
       </article>
     </section>
 
-    <!-- ===== PO by date + IC by date + IC from notifications (batch downloads) ===== -->
+    <!-- ===== PO by date + IC by date + IC from notifications (batch downloads): one card shown at a time ===== -->
     <section id="view-po-ic-batch" class="view" hidden>
       <article class="card" id="card-pod">
         <div class="card-heading">
           <h2>Download POs by PO Date</h2>
-          <button id="btn-pod-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-pod-back" class="btn btn-back" type="button">Back</button>
         </div>
         <p class="card-text">Downloads every Purchase Order dated in the range, across all result pages. For one day, use the same date in both fields.</p>
         <div class="date-row batch-dates">
@@ -424,7 +430,10 @@
       </article>
 
       <article class="card" id="card-icd">
-        <div class="card-heading"><h2>Download ICs by IC Date</h2></div>
+        <div class="card-heading">
+          <h2>Download ICs by IC Date</h2>
+          <button id="btn-icd-back" class="btn btn-back" type="button">Back</button>
+        </div>
         <p class="card-text">Downloads every Inspection Certificate issued in the range, for every PO, across all result pages. For one day, use the same date in both fields.</p>
         <div class="date-row batch-dates">
           <label class="field"><span class="field-label">From Date</span><input type="date" id="icd-from"></label>
@@ -450,7 +459,10 @@
       </article>
 
       <article class="card" id="card-icn">
-        <div class="card-heading"><h2>Download ICs from Notifications</h2></div>
+        <div class="card-heading">
+          <h2>Download ICs from Notifications</h2>
+          <button id="btn-icn-back" class="btn btn-back" type="button">Back</button>
+        </div>
         <p class="card-text">Reads the IC-issued notifications on the IREPS main page and downloads the IC of each notified PO and PO serial only. For every IC of a period, use Download ICs by IC Date.</p>
         <button id="btn-icn-download" class="btn btn-primary" type="button">
           <span class="btn-spinner" aria-hidden="true"></span>
@@ -477,7 +489,7 @@
       <article class="card">
         <div class="card-heading">
           <h2>My Downloads</h2>
-          <button id="btn-downloads-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-downloads-back" class="btn btn-back" type="button">Back</button>
         </div>
         <p class="card-text downloads-who" id="downloads-who"></p>
         <div class="date-row">
@@ -562,16 +574,16 @@
     <section id="view-tender" class="view" hidden>
       <article class="card">
         <div class="card-heading">
-          <h2>DocLink — Tender Documents</h2>
-          <button id="btn-tender-back" class="btn btn-link" type="button">Back</button>
+          <h2>DocLink - Tender Documents</h2>
+          <button id="btn-tender-back" class="btn btn-back" type="button">Back</button>
         </div>
 
         <!-- Active IREPS account (read live from the IREPS home page; never hardcoded) -->
         <div id="tender-account" class="tender-account" aria-live="polite">
           <div class="tender-acc-row"><span class="tender-acc-k">IREPS Connection</span><span id="acc-connection">Checking…</span></div>
-          <div class="tender-acc-row"><span class="tender-acc-k">Company</span><span id="acc-company">—</span></div>
-          <div class="tender-acc-row"><span class="tender-acc-k">Operating Unit</span><span id="acc-unit">—</span></div>
-          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Account ID</span><span id="acc-id">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Company</span><span id="acc-company">-</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Operating Unit</span><span id="acc-unit">-</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Account ID</span><span id="acc-id">-</span></div>
           <div class="tender-acc-row"><span class="tender-acc-k">Account Status</span><span id="acc-status">Checking…</span></div>
           <p id="acc-warning" class="result-text tender-bad" hidden></p>
           <button id="btn-account-refresh" class="btn btn-link" type="button">Refresh account</button>
@@ -652,14 +664,14 @@
       <article class="card">
         <div class="card-heading">
           <h2>Correspondence Downloads</h2>
-          <button id="btn-pc-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-pc-back" class="btn btn-back" type="button">Back</button>
         </div>
 
         <div class="tender-account" aria-live="polite">
           <div class="tender-acc-row"><span class="tender-acc-k">IREPS Connection</span><span id="pc-acc-connection">Checking…</span></div>
-          <div class="tender-acc-row"><span class="tender-acc-k">Company</span><span id="pc-acc-company">—</span></div>
-          <div class="tender-acc-row"><span class="tender-acc-k">Operating Unit</span><span id="pc-acc-unit">—</span></div>
-          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Account ID</span><span id="pc-acc-id">—</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Company</span><span id="pc-acc-company">-</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">Operating Unit</span><span id="pc-acc-unit">-</span></div>
+          <div class="tender-acc-row"><span class="tender-acc-k">IREPS Account ID</span><span id="pc-acc-id">-</span></div>
           <div class="tender-acc-row"><span class="tender-acc-k">Account Status</span><span id="pc-acc-status">Checking…</span></div>
           <p id="pc-acc-warning" class="result-text tender-bad" hidden></p>
           <button id="btn-pc-account-refresh" class="btn btn-link" type="button">Refresh account</button>
@@ -709,7 +721,7 @@
       <article class="card bill-upload">
         <div class="card-heading">
           <h2>Upload Bill to IREPS</h2>
-          <button id="btn-bill-back" class="btn btn-link" type="button">Back</button>
+          <button id="btn-bill-back" class="btn btn-back" type="button">Back</button>
         </div>
         <p class="card-text">DocLink reads the receipt in IREPS and the invoice in ECM, checks them, and fills the bill header and item. You then attach the documents, sign and submit in IREPS.</p>
 

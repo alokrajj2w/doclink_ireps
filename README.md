@@ -1082,7 +1082,7 @@ settings, sign-in cookie and host permission as section 15:
 
 | Document | `kind` | `fields` | Title (`dc:title`) |
 |---|---|---|---|
-| Inspection Certificate | `inspectionCertificate` | `ic_number` (the IC PDF's file name, e.g. `3480517`), `customer_po_number`, `ic_date` | `3480517 - IC` |
+| Inspection Certificate | `inspectionCertificate` | `ic_number` (the IC PDF's file name, e.g. `3480517`), `customer_po_number`, `ic_date`, `customer_po_serial_number` (the row's "PO Sr.", e.g. `001`), `passed_quantity` (its "Passed Qty.") | `3480517 - IC` |
 | PO | `poCopy` | `customer_po_number` | `<PO no> - PO` |
 | Modification Advice | `modificationAdvise` | `customer_po_number`, `modification_advise_number` | `<MA no> - MA` |
 | NIT + attached documents | `nit` | `tender_number`, `tender_date` | **one document per tender**, `<tender no> - NIT`: the tender PDF is its main file, each attached document an attachment |
@@ -1126,7 +1126,10 @@ one new attachments go into.
 (`GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema`). Tender documents now
 carry `tenderDate` (the IREPS closing date). Map any new property in
 `services/ecm-catalog.js` `ECM_FIELDS` and list it in the kinds; the gateway's
-`document_kinds.toml` must match.
+`document_kinds.toml` must match. `node scripts/check-ecm-schema.mjs` checks every property
+and document type in the catalog against the live ECM (read-only; it uses the client id /
+secret in `config.local.json` and prints neither): run it on TEST and on PROD before a build
+that sends a new field.
 
 **The fields the client asked for on 13/11/2026.** DocLink sends them since version 1.5.0, with
 no setting to switch them.
@@ -1143,6 +1146,18 @@ no setting to switch them.
   Related Correspondence page, which is the tender's closing date. The letter quotes it ("Ref:
   Tender No. 86256328 closing date 15/07/2025 11:00"); the letter's own deadline is "Last date for
   submission of reply".
+- **Inspection Certificate.** The ECM added Customer PO Serial Number and Passed Quantity on
+  16/11/2026, so the ECM can link an IC to its invoice. Every IC flow (one PO, IC by date, IC from
+  notifications) sends the IC list row's "PO Sr." as `customer_po_serial_number`
+  (`InvoiceCertificateSchema:customerPOSrNumber`, as IREPS shows it, leading zeros kept, the same
+  value the bill upload's invoice lookup uses) and its "Passed Qty." as `passed_quantity`
+  (`InvoiceCertificateSchema:passedQuantity`). A value IREPS leaves blank is not sent.
+  - They describe the IC but don't identify it (`details` in `ecm-catalog.js`, `matchFields`). The
+    download check and the upload's duplicate search leave them out, so an IC stored before
+    16/11/2026, which has neither, is still found and not stored a second time. Such an IC keeps
+    its old metadata: DocLink does not add the two fields to it.
+  - The Recon gateway's `document_kinds.toml` needs the same two fields before
+    `ecmBackendAws: true`.
 
 **Where the tender date comes from.**
 
@@ -1637,11 +1652,14 @@ Unverified against the live portal: the exact response of `viewpubIndltr.do` (it
 
 ## 22. Batch downloads (PO by date, IC by date, IC from notifications)
 
-All three live in the side panel under **Download PO / IC → "Download POs / ICs by date, or ICs from notifications"**.
+All three are opened from the **PO / IC** view, under "Bulk downloads": the buttons **POs by PO Date**, **ICs by IC Date**
+and **ICs from Notifications** each open their own card only, with a **Back** button to the PO / IC view. A run still going
+when the panel is reopened brings back its own card.
 They are download-only (no inspection call is submitted, approved, withdrawn or revalidated).
 The **Save to** switch applies to all of them, as to a single PO / IC download: under **ECM / S3**
 each PO is filed as `poCopy` (`customer_po_number`) and each IC as `inspectionCertificate`
-(`ic_number` from the PDF name, `customer_po_number`, `ic_date`), with the same Recon sign-in
+(`ic_number` from the PDF name, `customer_po_number`, `ic_date`, `customer_po_serial_number`,
+`passed_quantity`), with the same Recon sign-in
 and the same local fallback when the ECM does not take a document (section 16). A retry uses
 the switch's current choice. The IC manifest records each document's ECM outcome.
 
