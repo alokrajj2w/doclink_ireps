@@ -48,6 +48,7 @@ import { runDownloadLogTests } from "./download-log-tests.js";
 import { runExportSaveTests } from "./export-save-tests.js";
 import { runReconAuthTests } from "./recon-auth-tests.js";
 import { runBillUploadTests } from "./bill-upload-tests.js";
+import { runSchedulerTests } from "./scheduler-tests.js";
 import { runSanitizerTests } from "./sanitizer-tests.js";
 import { compileMatchPatterns, compileMatchPattern, classifyTabUrl, TAB_SCOPE } from "../utils/url-scope.js";
 
@@ -1101,6 +1102,8 @@ currentSuite = "bill-upload";
 await runBillUploadTests({ test, assert, eq, rejects, fixture });
 currentSuite = "sanitizer";
 await runSanitizerTests({ test, assert, eq });
+currentSuite = "scheduler";
+await runSchedulerTests({ test, assert, eq });
 
 /* ---------------------------------------------------------------- report */
 

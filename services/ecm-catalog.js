@@ -90,17 +90,11 @@ export const ECM_KINDS = Object.freeze({
 export const isGroupedKind = (kind) => Boolean(ECM_KINDS[kind] && ECM_KINDS[kind].group);
 
 /**
- * The fields a lookup compares to tell whether a document is already in the ECM: all but the
- * kind's `details`. An IC stored before the ECM had its PO serial and passed quantity holds
- * neither, and must still be found, or it would be stored a second time.
- * @param {string} kind
- * @param {Object<string, string>} fields
- * @returns {Object<string, string>}
+ * The PROD folder DocLink's PROD client may create documents in (16/11/2026), used for every
+ * kind of both sites until the per-site folders are supplied. Its path is not confirmed yet:
+ * the first upload of a session logs the real one ("ECM folder ... is at ...").
  */
-export function matchFields(kind, fields) {
-  const details = (ECM_KINDS[kind] && ECM_KINDS[kind].details) || [];
-  return Object.fromEntries(Object.entries(fields || {}).filter(([key]) => !details.includes(key)));
-}
+export const PROD_CREATION_FOLDER = Object.freeze({ uid: "99e2faf3-7f92-4d5b-af65-6f90eeb48a53", path: "(PROD creation folder, path to confirm)" });
 
 /**
  * Sites by environment.
@@ -136,24 +130,28 @@ export const ECM_SITES = Object.freeze({
       folderIds: { inputs: "93a37d6e-f3e1-499b-9f10-6ba52f1262bb", tenders: "a6594520-2d2b-4a33-b344-47426e116389" }
     }
   },
-  // From "Download and Upload v1.xlsx"; confirm before first PROD use.
-  // No PROD tenders folder has been supplied, so tender kinds cannot be uploaded on PROD.
+  // Site ids from "Download and Upload v1.xlsx"; confirm before first PROD use. Until the ECM
+  // team supplies each site's Inputs and Tenders folders, every PROD document of both sites,
+  // tenders included, goes to the one creation folder DocLink's PROD client can write to
+  // (PROD_CREATION_FOLDER). The spreadsheet's Inputs paths, for when they do:
+  //   Hosur  /FT/workspaces/Sites/HSR/Invoice Certificate/Inputs
+  //   Rohtak /FT/workspaces/Sites/HPD/Invoice Certificate/Input   ("Input", singular)
   [ECM_ENV.PROD]: {
     hosur: {
       name: "Hosur",
       siteId: "7dfe3fc0-3157-489d-826a-9435e65631fc",
       vendorCodes: ["833"],
       operatingUnits: ["HOSUR", "HSR"],
-      locations: { inputs: "/FT/workspaces/Sites/HSR/Invoice Certificate/Inputs" },
-      folderIds: {}
+      locations: { inputs: PROD_CREATION_FOLDER.path, tenders: PROD_CREATION_FOLDER.path },
+      folderIds: { inputs: PROD_CREATION_FOLDER.uid, tenders: PROD_CREATION_FOLDER.uid }
     },
     rohtak: {
       name: "Rohtak",
       siteId: "f2a5bf87-877b-4e4c-b4fc-7301cabfd236",
       vendorCodes: ["60828"],
       operatingUnits: ["ROHTAK", "BRH"],
-      locations: { inputs: "/FT/workspaces/Sites/HPD/Invoice Certificate/Input" }, // "Input", singular, as in the spreadsheet
-      folderIds: {}
+      locations: { inputs: PROD_CREATION_FOLDER.path, tenders: PROD_CREATION_FOLDER.path },
+      folderIds: { inputs: PROD_CREATION_FOLDER.uid, tenders: PROD_CREATION_FOLDER.uid }
     }
   }
 });

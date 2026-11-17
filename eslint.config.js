@@ -12,7 +12,7 @@ import js from "@eslint/js";
 import globals from "globals";
 
 /** Run only by the service worker, which has no DOM (no document, window or DOMParser). */
-const WORKER_ONLY = ["background/service-worker.js", "background/bill-upload-job.js", "background/keep-alive.js"];
+const WORKER_ONLY = ["background/service-worker.js", "background/bill-upload-job.js", "background/keep-alive.js", "background/scheduler-job.js"];
 /** Injected into the user's IREPS tab as a plain script (chrome.scripting.executeScript({ files })). */
 const TAB_SCRIPT = "background/bill-tab-request.js";
 /** The node:test suites stand in for the browser: a fake `chrome` and a jsdom `document` on globalThis. */

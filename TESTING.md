@@ -843,6 +843,38 @@ To = today,
 On the real portal, if a tabulation still fails, run `doclinkLog.download()`
 in the side panel console: the `Tabulation` lines show what IREPS answered.
 
+## Scheduled downloads (Phase 1)
+
+Automated: `npm test -- browser --only=scheduler` (order of checks, claims, runners, shared hooks, API client).
+The Recon Engine side has its own tests (`backend/tests/test_doclink_schedule.py`, 20 concurrent claims included).
+
+End to end, with the mock portal and a local Recon Engine:
+
+1. Start the Recon Engine locally with three users: an admin and two `tendering` users (A and B). Point
+   `reconBaseUrl` at it in `config.local.json` and add a `schedular_phase1` block with `"enabled": true`.
+2. `node test/mock/mock-ireps-server.mjs`, `node test/mock/switch-target.mjs mock`, then load DocLink in **two Chrome
+   profiles**, signed in to the Recon Engine as A and B.
+3. As admin, open **Scheduled downloads** (clock icon). A new schedule starts from the defaults (Bill Status
+   09:00-10:00, once a day, retry every 10 min; ICs every hour 09:00-18:00, retry every 15 min). Add Bill Status
+   with a window from now to now + 45 min, and ICs from notifications with a window from now to now + 2 h, runs
+   every 30 min.
+4. Load a mock IREPS page in both profiles. Exactly one runs; the other shows "Running – A", then "Done by A".
+   The Recon Engine's `doclink_downloads` has one row per document. At the next two checks neither profile claims
+   or sends anything to IREPS (the mock server log shows no request).
+5. Set A's Save to switch to **Local** and let A run a slot: every file still goes to S3 / ECM, nothing appears in
+   A's Downloads folder.
+6. Make the mock ECM refuse one IC: it is saved nowhere, the slot shows "Partly done", and the next check fetches
+   only that IC.
+7. Close A's Chrome during a long IC run (`/mock/scenario/slow`): about 10 minutes later B takes over and saves only
+   what A did not.
+8. Choose scenario `login` in A's browser: A wins a claim, fails its IREPS check and gives the slot back; B runs it.
+9. Hourly runs: after the ICs slot is done, nothing runs until the next period starts; then one profile runs it
+   again and saves only ICs not saved before (add one in the mock between the two runs). The view shows the
+   latest run, "next run HH:MM" and "Earlier today: 1 of 1 run done".
+10. Stop the Recon Engine: no scheduled run, the view says so, a manual run still works.
+11. Set `"enabled": false` in B's copy (reload): no Schedule icon, no scheduler request from B. Remove `"IC"` from
+    `documents` in both copies: no IC is downloaded automatically, and a manual IC download still works.
+
 ## File names (IREPS names kept)
 
 Run once with **Save to: Local** and once with **ECM / S3** (direct ECM).

@@ -22,7 +22,7 @@ const REDIRECT = `https://${EXT_ID}.chromiumapp.org/okta`;
 const AUTHORIZE = `${ISSUER}/v1/authorize?response_type=code&client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT)}&state=st-1`;
 // /api/auth/me as the Recon Engine answers it (roles: a list, with their permissions)
 const USER = { id: 7, email: "alok@example.com", name: "Alok", roles: ["tendering"], permissions: ["ingest.ireps", "read", "reconcile.run"] };
-const PARSED = { id: 7, email: "alok@example.com", name: "Alok", roles: ["tendering"], role: "tendering", isAdmin: false };
+const PARSED = { id: 7, email: "alok@example.com", name: "Alok", roles: ["tendering"], role: "tendering", isAdmin: false, permissions: ["ingest.ireps", "read", "reconcile.run"] };
 const CONFIG = { reconBaseUrl: BASE, okta: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, redirectPath: "okta" } };
 
 function jsonResponse(status, body) {

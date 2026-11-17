@@ -157,6 +157,7 @@ Reopening the popup restores the current or last state via `GET_JOB_STATE`.
 ```
 doclink/
 ├── manifest.json  config.json  (config.local.json: gitignored overrides, never packaged)
+│                  config.local.prod.example.json  (PROD ECM template for config.local.json; never read)
 ├── background/
 │   ├── service-worker.js      job orchestration, message router (handlers keyed by MESSAGE_TYPES)
 │   ├── offscreen.html / offscreen.js   DOMParser for the worker (one answer() per parse request)
@@ -231,8 +232,10 @@ doclink/
 | `unlimitedStorage` | Lifts the 10 MB limit of `chrome.storage.local`, so the tender ledger (what was downloaded, per tender) keeps growing instead of silently no longer being saved |
 | `tabs` | Read the active tab's URL so the side panel can tell IREPS (mock or real) from any other site and show the right view (`popup/popup-gate.js`); opening IREPS / the preview page itself needs no permission |
 | `offscreen` | Create an invisible offscreen document so the parser can use `DOMParser`; MV3 service workers have no DOM |
+| `sidePanel` | DocLink's UI is Chrome's side panel, one per tab (`popup.html?tabId=<id>`); the toolbar icon opens and closes it (`chrome.sidePanel.setOptions` / `setPanelBehavior` in the service worker) |
 | `identity` | Only for **Sign in with Okta** to the Recon Engine (section 17): `chrome.identity.launchWebAuthFlow` opens the Okta sign-in window and returns to `https://<extension id>.chromiumapp.org/okta` |
 | `scripting` | Only for **Upload Bill to IREPS**: the supplier bill calls (`/epsn/ct/*`) are sent from inside the user's IREPS tab (`services/bill-upload/tab-transport.js`), so they leave from the portal's own origin like the bill page's own requests. Nothing is injected into other sites |
+| `alarms` | Only for **scheduled downloads** (section 23): one alarm (`doclink.scheduler`) wakes the worker at the next check the Recon Engine names (09:00, 09:10, …). The alarm only asks the Recon Engine what is due; it never sends anything to IREPS |
 | `debugger` | Only for **published letters and corrigenda** (LOA, Negotiation, Counter Offer, Correspondence, Corrigendum - in Download Tender Documents and Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both in `manifest.json`; a production build keeps only the real portal, section 9) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
 | host `http://localhost:8000/*` and `https://wabtec.reconalpha-staging.joulestowatts.com/*` (the Recon Engine, local and staging; add the deployed Recon URL; a production build drops the localhost one) | The Recon Engine sign-in (section 17), the download log (section 18) and the **Save to: ECM / S3** uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
@@ -1238,12 +1241,19 @@ for the Recon sign-in in direct mode.
   |---|---|---|---|
   | `TEST` | Hosur (833) | `ad5090e5-648d-4f75-8c14-7052e8ac3b72` | Inputs `d440070d-…`, Tenders `aa28acbe-…` |
   | `TEST` | Rohtak (60828) | `34a61f51-10fe-44ce-a669-2ea14dc86ff4` | Inputs `93a37d6e-…`, Tenders `a6594520-…` |
-  | `PROD` | Hosur | `7dfe3fc0-3157-489d-826a-9435e65631fc` | `/FT/workspaces/Sites/HSR/Invoice Certificate/Inputs` (path looked up once) |
-  | `PROD` | Rohtak | `f2a5bf87-877b-4e4c-b4fc-7301cabfd236` | `/FT/workspaces/Sites/HPD/Invoice Certificate/Input` (path looked up once) |
+  | `PROD` | Hosur | `7dfe3fc0-3157-489d-826a-9435e65631fc` | Inputs and Tenders: the PROD creation folder `99e2faf3-…` |
+  | `PROD` | Rohtak | `f2a5bf87-877b-4e4c-b4fc-7301cabfd236` | Inputs and Tenders: the PROD creation folder `99e2faf3-…` |
 
   IC, PO and MA go to Inputs. NIT, LOI, corrigendum, negotiation, counter offer,
-  correspondence and the tabulations go to Tenders. PROD has no Tenders folder yet, so
-  tender documents on PROD are refused and saved locally.
+  correspondence and the tabulations go to Tenders. On PROD, until the ECM team supplies
+  each site's folders, every document of both sites goes to the one creation folder the
+  PROD client can write to (`PROD_CREATION_FOLDER` in `services/ecm-catalog.js`). Because
+  that folder is shared, a tender both sites download gets one NIT / LOA / Result document,
+  not one per site.
+* **Switching to PROD.** Copy `config.local.prod.example.json` to `config.local.json` and
+  fill in the PROD `domain`, `clientId` and `clientSecret` there. Set all four `ecm` keys:
+  any key you leave out comes from `config.json` (the TEST ECM). The PROD origin must also
+  be in `manifest.json` `host_permissions`. DocLink never reads the example file itself.
 * **Folder check.** A supplied folder uid is opened once per session (`GET /id/{uid}`).
   If the ECM cannot open it, the upload is refused with the folder's name, path and uid,
   and the document is saved locally. On 26/10/2026 both TEST Tenders folders failed this
@@ -1698,3 +1708,92 @@ network / timeout / HTTP 5xx only. An expired session is never retried.
 * Notifications beyond what `getMyActivitesData` returns (no other notification endpoint is called).
 * The IC Date search with PO No. empty. The captured list page (no PO, portal defaults) lists every PO's ICs and has
   the IC Date From / To fields, but a submitted search with only the IC dates set is not in a capture.
+
+---
+
+## 23. Scheduled downloads (Phase 1: Bill Status, CRN, R-NOTE, MA, PO, IC)
+
+Downloads that run by themselves for each IREPS account, shared by every DocLink user of that account: Bill
+Status, CRN and R-NOTE once a morning; MA, POs and ICs every hour, each run fetching only what is new. The design, decisions and API contract are in `schedular_implementation_plan.md`
+(Appendix A is the contract with the Recon Engine).
+
+**Switch.** `config.json` (or `config.local.json`, which replaces the whole block):
+
+```json
+"schedular_phase1": { "enabled": true, "documents": ["BillStatus", "CRN", "RNote", "MA", "PO", "IC"] }
+```
+
+* Scheduling is on only when `enabled` is the JSON value `true` and `documents` names at least one known type.
+  Anything else (false, missing, `"true"`, an empty list, an unreadable config) is off: no alarm, no request,
+  no Schedule view.
+* `documents` names what this DocLink may trigger: `IC` covers ICs by IC date and ICs from notifications, `PO` is
+  POs by PO date. Remove a name and that type is never triggered automatically; manual downloads are unchanged.
+  Names ignore case; an unknown name is ignored and shown in the Schedule view, and it stops a build.
+* The repo ships `"enabled": false`. A build that schedules sets it to `true` once the Recon Engine has the
+  schedule endpoints. The build log prints the setting.
+* This block is the one documented exception to "no new config.json keys" (asked for on 2026-11-16).
+
+**Schedules** are kept in the Recon Engine per IREPS account and type (`/api/doclink/schedules`): a daily
+window (IST), how often it runs (**once a day**, or once per period: every 30 min / hour / 2 hours / 3 hours), a
+retry interval for a run that has not happened yet (10 / 15 / 30 / 60 min), weekdays (default every day) and a
+look-back in days (the date range a run searches: Bill Status 90 = "Last 90 Days", CRN / R-NOTE 30, MA / PO /
+IC 2). A new schedule starts with these timings:
+
+| Type | Window (IST) | Runs | Retry until done |
+|---|---|---|---|
+| Bill Status, CRN, R-NOTE | 09:00-10:00 | once a day | every 10 min |
+| MA, POs by PO date, ICs by IC date, ICs from notifications | 09:00-18:00 | every hour (09:00, 10:00, … 18:00) | every 15 min within the hour |
+
+Admins (`doclink.schedule.manage`) edit them in the panel's **Scheduled downloads** view (clock icon in the
+header); everyone sees what ran today. An hourly type shows its latest run, the next run, and the earlier runs
+of the day folded into one line ("Earlier today: 3 of 4 runs done, 12 saved").
+
+**Each slot once, by one DocLink.** A once-a-day schedule makes one slot per day; an hourly one makes one slot
+per hour (09:00-10:00, 10:00-11:00, …): for a repeating schedule the window's end is the start of the last
+run, so the 18:00 run is the last one and may run until 19:00. A DocLink may run a slot only when its user
+holds `doclink.schedule.run`, is signed in to the Recon Engine, and is logged in to IREPS on that account. The
+Recon Engine hands each slot to exactly one DocLink (an atomic claim with a 10-minute lease, renewed by a
+heartbeat every 2 minutes) and runs one slot per account at a time, so the hourly types run one after the
+other. When a slot is `done`, no DocLink triggers it again: a once-a-day type waits for tomorrow, an hourly type
+for the next hour. A slot not done by its end is `missed`. Each hourly run searches the look-back range and the
+reservations skip every document already saved, so a run downloads only what is new, and a missed hour is
+caught up by the next run.
+
+**Order of checks** (`services/scheduler/scheduler.js`): config on → Recon signed in with
+`doclink.schedule.run` → last verified IREPS account known → `GET /schedule/due` → no manual job running here →
+an IREPS page loaded in this browser in the last 4 minutes → claim → **one** IREPS check (the home page: logged
+in, same account) → run. Nothing is sent to IREPS before the claim is won, and never on a timer: twenty DocLinks
+waking at 09:00 send one IREPS request between them. A run starts at the alarm, when an IREPS page finishes
+loading (a user who logs in at 09:07 runs the 09:00 slot at once; without a page load the next check is 09:10), when the panel's IREPS check passes, after a
+Recon sign-in, or when a manual job ends.
+
+**Never twice, never local** (`services/scheduler/shared-run-hooks.js`):
+
+* Before anything is fetched, every document key (`downloadKey`) is reserved for the run's claim
+  (`/api/doclink/documents/reserve`). A key anyone already saved for the account and destination (scheduled or
+  manual, from the download log) is skipped without a question: "Already saved by Priya on 2026-11-17 at 09:08".
+  A reservation that fails downloads nothing.
+* Exports go to the Recon Engine (S3), PDFs to the ECM, whatever the panel's Save to switch says. There is no
+  local fallback: a refused upload is a failed document, the slot ends `partial`, and the next check fetches
+  only what is missing. The IC notifications manifest file is not written.
+* Every saved document is reported with its download-log record (`/api/doclink/documents/complete`), so the next
+  reservation by anyone sees it at once. If that report cannot be sent, the records go to the normal download-log
+  queue.
+* Before each upload the run must still hold its claim (a heartbeat within the lease); a run that lost its claim
+  stops, and the DocLink that took over skips what is already done.
+
+**Outcomes.** `done` (saved, or nothing new); `partial` (some documents failed: retried at the next check);
+`failed` (retried at the next check; an expired IREPS session or a busy local job gives the slot back without
+counting an attempt); `failed_final` (a setting a retry cannot fix); `missed`. The toolbar icon shows `!` while a
+slot of this account waits for an IREPS login in this browser.
+
+**Code.** `services/scheduler/` (`schedule-types.js` setting and types, `schedule-api.js` Recon client,
+`local-signals.js` IREPS activity / account, `scheduler.js` the checks and claims, `runners.js` outcomes,
+`shared-run-hooks.js` reserve / save / report), `background/scheduler-job.js` (alarm, tabs, badge, Schedule view
+messages), `popup/popup-schedule.js`. The worker's jobs are started through `launch*` functions whose `done`
+promise the scheduler awaits; a panel click uses the same functions. Tests: `test/scheduler-tests.js`
+(`npm test -- browser --only=scheduler`).
+
+**Not in Phase 1:** tender documents and correspondence (they run in the side panel; Phase 2), single PO / IC
+downloads by PO number, and anything while Chrome is closed.
+

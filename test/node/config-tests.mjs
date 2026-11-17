@@ -82,3 +82,15 @@ test('loadIrepsConfig (M6): a valid config.json still selects the portal; outsid
   const outside = await import('../../services/ireps-api.js?outside-extension');
   assert.equal(outside.IREPS_CONFIG.baseUrl, 'http://localhost:8765', 'test pages and Node keep the mock default');
 });
+
+test('schedular_phase1: config.local.json replaces the whole block, and only enabled: true with a known type turns scheduling on', async () => {
+  const { mergeConfig } = await import('../../utils/config.js');
+  const { parseSchedulerConfig } = await import('../../services/scheduler/schedule-types.js');
+  const base = { schedular_phase1: { enabled: false, documents: ['BillStatus', 'CRN', 'RNote', 'MA', 'PO', 'IC'] } };
+  assert.equal(parseSchedulerConfig(base).enabled, false, 'the shipped config.json is off');
+  const local = mergeConfig(base, { schedular_phase1: { enabled: true, documents: ['CRN'] } });
+  const on = parseSchedulerConfig(local);
+  assert.equal(on.enabled, true);
+  assert.deepEqual(on.types, ['crn'], 'the local block replaces documents too (top-level keys replace)');
+  assert.equal(parseSchedulerConfig(mergeConfig(base, { schedular_phase1: { enabled: true } })).enabled, false, 'a local block without documents is off');
+});

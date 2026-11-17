@@ -1421,3 +1421,59 @@ body[data-gate="on"] #view-redownload {
 .bill-confirm input {
   margin-top: 2px;
 }
+
+/* Scheduled downloads (popup-schedule.js) */
+.schedule-status {
+  margin-top: -4px;
+  font-size: 13px;
+}
+.schedule-list {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+}
+.schedule-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.schedule-type {
+  font-weight: 600;
+}
+.schedule-text {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.schedule-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.schedule-editor {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.schedule-editor-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.schedule-days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 12px;
+  margin: 4px 0;
+}
+.schedule-days label {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+}

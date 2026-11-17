@@ -47,6 +47,7 @@ import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compileMatchPatterns } from "../utils/url-scope.js";
+import { parseSchedulerConfig } from "../services/scheduler/schedule-types.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DIST = join(ROOT, "dist");
@@ -261,6 +262,7 @@ function checkConfig({ allowMock }) {
       );
     }
   }
+  checkSchedulerConfig(config);
   const ecm = config.ecm || {};
   if (config.ecmBackendAws !== true && (isPlaceholder(ecm.clientId) || isPlaceholder(ecm.clientSecret))) {
     log(
@@ -270,6 +272,22 @@ function checkConfig({ allowMock }) {
     );
   }
   return config;
+}
+
+/**
+ * Scheduled downloads (config.json "schedular_phase1"): the build log says whether this build
+ * schedules and which types, and a misspelt document name stops the build (unpacked, DocLink
+ * would only ignore it, and that type would quietly never run).
+ */
+function checkSchedulerConfig(config) {
+  const scheduler = parseSchedulerConfig(config);
+  if (scheduler.unknown.length) {
+    throw new Error(
+      `config.json "schedular_phase1.documents" names unknown document types: ${scheduler.unknown.join(", ")}. ` +
+        "Use BillStatus, CRN, RNote, MA, PO, IC.",
+    );
+  }
+  log(`  scheduled downloads    ${scheduler.enabled ? `on: ${scheduler.types.join(", ")}` : `off (${scheduler.reason})`}`);
 }
 
 /**
