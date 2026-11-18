@@ -99,8 +99,9 @@ export function stateCodeOf(text) {
 
 /**
  * An ECM invoice date as IREPS writes it, dd/mm/yyyy, from "2026-08-18 00:00:00.000", "2026-08-18T..", "18/08/2026",
- * "18-08-2026", "18-Aug-2026" or epoch ms; null when it is not a real calendar date. (The panel's date inputs use
- * utils/dates.js toIrepsDate, which takes only an <input type="date"> value.)
+ * "18-08-2026", "18-Aug-2026" or epoch ms (a number, or the digit string live RetrieveInvoiceData sends); null when
+ * it is not a real calendar date. (The panel's date inputs use utils/dates.js toIrepsDate, which takes only an
+ * <input type="date"> value.)
  */
 export function invoiceDateToIreps(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -109,11 +110,13 @@ export function invoiceDateToIreps(value) {
     const date = new Date(Date.UTC(y, m - 1, d));
     return date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d ? `${pad(d)}/${pad(m)}/${y}` : null;
   };
-  if (typeof value === "number") {
-    const date = new Date(value);
+  const t = String(value).trim();
+  if (typeof value === "number" || /^\d{12,13}$/.test(t)) {
+    // The ECM stores the invoice day as a midnight that is not UTC (1793314800000 = 2026-10-29T23:00Z, midnight
+    // 30 Oct in UTC+1), so the UTC day can be the day before. Read the day in IST, the invoice's own time zone.
+    const date = new Date(Number(t) + IST_OFFSET_MS);
     return Number.isFinite(date.getTime()) ? valid(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()) : null;
   }
-  const t = String(value).trim();
   let m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T].*)?$/.exec(t);
   if (m) return valid(+m[1], +m[2], +m[3]);
   m = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(t);
@@ -122,6 +125,8 @@ export function invoiceDateToIreps(value) {
   if (m && MONTHS[m[2].toLowerCase()]) return valid(+m[3], MONTHS[m[2].toLowerCase()], +m[1]);
   return null;
 }
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 function irepsDateValue(ddmmyyyy) {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(ddmmyyyy || "");

@@ -344,6 +344,10 @@ export async function runBillUploadTests({ test, assert, eq, rejects, fixture })
     eq(invoiceDateToIreps("8/9/2026"), "08/09/2026");
     eq(invoiceDateToIreps("18-Aug-2026"), "18/08/2026");
     eq(invoiceDateToIreps("31/02/2026"), null);
+    // live RetrieveInvoiceData sends epoch ms, as a string: 2026-10-29T23:00Z is midnight 30 Oct in UTC+1, 04:30 IST
+    eq(invoiceDateToIreps("1793314800000"), "30/10/2026");
+    eq(invoiceDateToIreps(1793314800000), "30/10/2026");
+    eq(invoiceDateToIreps("20261030"), null);
     eq(stateCodeOf("TN"), "33");
     eq(stateCodeOf("Uttar Pradesh"), "09");
     eq(stateCodeOf("ODISHA"), "21");

@@ -209,7 +209,7 @@ its sample rows):
 | ECM column | Example | Used for |
 |---|---|---|
 | `invoiceNumber` | `1331000660`, `1061000617` | Tax invoice no. (header), challan match (step 4), ECM document fetch |
-| `salesInvoiceDate` | `2026-08-18 00:00:00.000` | Tax invoice date. Convert to `dd/mm/yyyy`. |
+| `salesInvoiceDate` | `2026-08-18 00:00:00.000` | Tax invoice date. Convert to `dd/mm/yyyy`. The live `RetrieveInvoiceData` answer (18 Nov 2026) sends epoch ms as a string, e.g. `"1793314800000"` (2026-10-29T23:00Z): DocLink reads its day in IST (30/10/2026). |
 | `onivla` | `63749.91` | Invoice amount incl. GST (header) and item-wise claim (step 7) |
 | `quantity`, `offeredQuantity`, `orderQuantity` | `15` | Match key (`invoiceQuantity`) and check against receipt qty |
 | `rate` | `3601.69` | Check against IREPS PO rate |
@@ -692,7 +692,7 @@ shown raw.
 | 15–16 | Paying railway / authority | `payingRly`, `payingAuthorityCode`, `ipasAUCode` | IREPS (#109), one option | Yes |
 | 17–18 | PVC / SVC | `pvc=N`, `svcFlag=Y` | page script | Yes |
 | 19 | Tax invoice no. | `invoiceNo` | ECM `invoiceNumber` | Yes (≤ 16 chars; only `-` `/`) |
-| 20 | Tax invoice date | `invoiceDate` (dd/mm/yyyy) | ECM `salesInvoiceDate` (`yyyy-mm-dd hh:mm:ss.sss`) | Yes |
+| 20 | Tax invoice date | `invoiceDate` (dd/mm/yyyy) | ECM `salesInvoiceDate` (`yyyy-mm-dd hh:mm:ss.sss`, or epoch ms read in IST) | Yes |
 | 21 | Invoice amount | `invoiceAmount` | ECM `onivla` (incl. GST) | Yes |
 | 22 | Payment % | `paymentPercent` | default 100; ECM `paymentTerm` (not present); PO payment terms in the page script | Yes for normal bills; advance/retrofit open |
 | 23 | Payment type | `paymentType` (`A` / `F`) | default `F` | Yes for normal bills; advance/retrofit open |
