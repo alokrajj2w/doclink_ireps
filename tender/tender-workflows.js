@@ -255,6 +255,21 @@ async function reserveForSharedRun(shared, run, result, items) {
   return { checked: true, skip, warnings: [] };
 }
 
+/**
+ * A scheduled run (tender-shared-run.js) hears why a document failed, so the Schedule view can name the
+ * document and the reason. Reporting never fails the category.
+ */
+function reportSharedFailure(run, result, outcome, build) {
+  const shared = sharedRun();
+  if (!shared || !shared.documentFailed) return;
+  try {
+    const title = build(outcome.item).meta?.title || outcome.item.id || result.category;
+    shared.documentFailed({ key: downloadKey.tender(result.category, run.ctx.tenderNo, outcome.item.id), doc: `Tender ${run.ctx.tenderNo} - ${title}`, code: outcome.error.code || '', detail: outcome.error.message });
+  } catch (e) {
+    log(result.category, `the failure of ${outcome.item.id || ''} was not reported to the scheduler: ${e.message}`);
+  }
+}
+
 async function downloadItems(run, result, items, build) {
   items = dedupeItems(items);
   const bucket = LEDGER_BUCKET[result.category];
@@ -311,6 +326,7 @@ async function downloadItems(run, result, items, build) {
       result.failed++;
       result.files.push({ fileName: '', id: o.item.id || '', status: 'FAILED', error: o.error.message, code: o.error.code || '' });
       log(result.category, `failed ${o.item.id || ''}: ${o.error.message}`);
+      reportSharedFailure(run, result, o, build);
     }
   }
   result.warnings = [...new Set(result.warnings)];

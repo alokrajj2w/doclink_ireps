@@ -7,11 +7,19 @@
  * schedule - always to S3 / ECM (background/scheduler-job.js).
  * This view only shows and edits; it never starts a download itself. The header icon appears only
  * when config.json "schedular_phase1" switches scheduling on for this DocLink.
+ *
+ * A row of Today opens to say what its run searched, who ran it and when, why it stopped, and which
+ * documents it could not save, each with its reason (the slot's result, kept by the Recon Engine for
+ * every user; this browser's own runs in full). A slot that did not run shows what this browser's
+ * scheduler noted during its window. "Run log of this browser" lists every run and decision of this
+ * DocLink's scheduler, and copies or saves it as text.
  */
 
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
 import { readConfigFiles } from "../utils/config.js";
 import { parseSchedulerConfig, SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL, SCHEDULE_DEFAULT_TIMING } from "../services/scheduler/schedule-types.js";
+import { FIXED_LOOKBACK, NO_RANGE_TYPES } from "../services/scheduler/run-details.js";
+import { runLogText, istDateTime, countsText } from "../services/scheduler/run-log.js";
 import { logger } from "../utils/logger.js";
 
 const $ = (id) => document.getElementById(id);
@@ -28,19 +36,38 @@ const REPEATS = [
   [120, "every 2 hours"],
   [180, "every 3 hours"]
 ];
-// the Recon Engine's defaults (schedules.py LOOKBACK_DEFAULT); tabulations go by closing date and appear days later
+// the Recon Engine's defaults (schedules.py LOOKBACK_DEFAULT); tabulations go by closing date and appear days later.
+// Bill Status, CRN and R-NOTE always search 90 days (run-details.js FIXED_LOOKBACK): their look-back is not editable.
 const DEFAULT_LOOKBACK = {
-  billStatus: 90, crn: 30, rnote: 30, ma: 2, poDate: 2, icDate: 2, icNotifications: 1,
+  billStatus: 90, crn: 90, rnote: 90, ma: 2, poDate: 2, icDate: 2, icNotifications: 1,
   tenderNit: 2, tenderCounterOffer: 2, tenderLoa: 2, tenderTabulations: 15, tenderCorrespondence: 1, tenderNegotiation: 2
 };
 /** Types whose run takes no date range (what IREPS lists now). */
-const NO_LOOKBACK = new Set(["icNotifications", "tenderCorrespondence"]);
+const NO_LOOKBACK = new Set(NO_RANGE_TYPES);
+/** Failed documents shown under a row (the run log's text has them all). */
+const SHOWN_FAILURES = 50;
+/** Runs and events shown in "Run log of this browser" (Copy / Save give all of them). */
+const SHOWN_RUNS = 30;
+const SHOWN_EVENTS = 60;
+/** Saved / skipped documents shown per run in the run log. */
+const SHOWN_DOCS = 25;
 
 let el = null;
 let ctx = null;
 let loading = false;
+/** The last view drawn: what Copy / Save write. */
+let lastView = null;
 /** Types whose schedule box the admin opened: kept open when the list is drawn again (after a save). */
 const openEditors = new Set();
+/** Today rows and run-log runs the user opened: kept open when the view is drawn again. */
+const openRows = new Set();
+/**
+ * The schedule boxes drawn, by type, and the types whose box has changes not saved yet. The worker's
+ * state messages redraw the view every few minutes while downloads run: a box being edited (or holding
+ * the focus, e.g. an open dropdown) is kept as it is, so a Save never sends the old values.
+ */
+const editorBoxes = new Map();
+const dirtyEditors = new Set();
 
 /** "2026-11-16T04:38:00+00:00" -> "10:08" (IST), "" when not a time. */
 export function istTime(iso) {
@@ -75,6 +102,101 @@ const STATUS_CHIP = {
 
 /** A slot of a repeating schedule (one per period, e.g. hourly), not the day's only slot. */
 const isPeriodSlot = (slot) => Boolean(slot.period) && slot.period !== "day";
+
+/** A slot's window in IST: "09:00-10:00". */
+const slotWindow = (slot) => `${istTime(slot.window_start_at)}-${istTime(slot.window_end_at)}`;
+
+/** "10:15" for a time today (IST), "2026-11-18 10:15" for an earlier day. */
+function whenText(iso, now = Date.now()) {
+  const full = istDateTime(iso);
+  return full && full.slice(0, 10) === istDateTime(new Date(now).toISOString()).slice(0, 10) ? full.slice(11) : full;
+}
+
+/** "09:02" or "09:02-09:50 (6 checks)" for a run-log event. */
+function eventTime(event, now = Date.now()) {
+  const first = event.first || event.at;
+  const span = first && first !== event.at ? `${whenText(first, now)}-${istTime(event.at)}` : whenText(event.at, now);
+  return `${span}${Number(event.count) > 1 ? ` (${event.count} checks)` : ""}`;
+}
+
+/** How far this browser's clock may be from the Recon Engine's when a run of the log is matched to a slot's run. */
+const CLOCK_SLACK_MS = 10 * 60000;
+
+/**
+ * This browser's run of `slot` from its run log, when it is the slot's latest run (started when the slot
+ * says its run started: another DocLink may have run the slot again since), or null.
+ */
+function localRunOf(slot, log) {
+  const started = Date.parse(slot.started_at || "");
+  const runs = (log && Array.isArray(log.runs) ? log.runs : []).filter((r) => r.slotId === slot.id && r.outcome !== "running");
+  const run = runs[0] || null;
+  return run && Number.isFinite(started) && Math.abs(Date.parse(run.startedAt || "") - started) < CLOCK_SLACK_MS ? run : null;
+}
+
+/**
+ * The run-log events of this browser that fall in `slot`'s window and concern its type (an event
+ * without types, such as "not signed in to the Recon Engine", concerns every type).
+ */
+function windowEvents(slot, log) {
+  const start = Date.parse(slot.window_start_at || "");
+  const end = Date.parse(slot.window_end_at || "");
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return [];
+  return (log && Array.isArray(log.events) ? log.events : []).filter((e) => {
+    const first = Date.parse(e.first || e.at || "");
+    const last = Date.parse(e.at || "");
+    const ofType = !Array.isArray(e.types) || e.types.length === 0 || e.types.includes(slot.doc_type);
+    return ofType && first <= end && last >= start && e.kind !== "schedule";
+  });
+}
+
+/**
+ * What a Today row shows when it is opened, beyond its one line: the facts of its run (range searched,
+ * when and by whom, file saved, why it stopped), every document it could not save with the reason, the
+ * warnings, the earlier runs of the day that did not end clean, and, for a slot that has not run, what
+ * this browser's scheduler noted during its window. Nothing (null) when there is nothing to add.
+ * Failed documents come from this browser's run log when it ran the slot (the full list), else from the
+ * slot's result (the first 20, kept by the Recon Engine for every user).
+ * @param {object} slot
+ * @param {{ earlier?: object[], log?: { runs: object[], events: object[] }|null, now?: number }} [context]
+ * @returns {{ facts: string[], failures: object[], failuresMore: number, fromLog: boolean, warnings: string[], earlier: { text: string, failures: object[] }[], events: string[] }|null}
+ *          fromLog: the failures come from this browser's run log (all of them), not the slot's result
+ */
+export function slotDetails(slot, { earlier = [], log = null, now = Date.now() } = {}) {
+  const r = slot.result && typeof slot.result === "object" ? slot.result : {};
+  const local = localRunOf(slot, log);
+  const facts = [];
+  if (r.range || (local && local.range)) facts.push(`Searched: ${r.range || local.range}`);
+  if (slot.started_at && slot.status !== "pending") {
+    const by = slot.status === "done" ? slot.done_by : slot.holder;
+    const byText = local ? "this browser" : by && by.name ? by.name : "";
+    facts.push(`Ran ${istTime(slot.started_at)}${slot.ended_at ? ` to ${istTime(slot.ended_at)}` : ""}${byText ? ` (${byText})` : ""}`);
+  }
+  const counts = countsText({ found: r.found, records: r.records, notReported: r.notReported });
+  if (counts) facts.push(`Counts: ${counts}`);
+  if (r.file) facts.push(`Saved to: ${r.file}`);
+  if (slot.code && slot.status !== "done" && (r.detail || slot.code !== "SCHEDULE_DOWNLOAD_FAILED")) facts.push(`Why: ${describeError(slot.code).title}${r.detail ? ` (${r.detail})` : ""}`);
+  if (Number(slot.attempts) > 0 && slot.status !== "done") facts.push(`Attempts so far: ${slot.attempts}`);
+
+  const fromLog = Boolean(local && local.failures && local.failures.length);
+  const failures = fromLog ? local.failures : Array.isArray(r.failures) ? r.failures : [];
+  const failuresMore = fromLog ? Number((local.more && local.more.failures) || 0) : Number(r.failuresMore || 0);
+  const warnings = (Array.isArray(r.warnings) ? r.warnings : (local && local.warnings) || []).filter((w) => typeof w === "string");
+
+  const notClean = earlier.filter((s) => ["partial", "failed", "failed_final", "missed"].includes(s.status) || (s.result && Array.isArray(s.result.failures) && s.result.failures.length));
+  const earlierRuns = notClean.map((s) => ({
+    text: `${isPeriodSlot(s) ? `${s.period} run` : "Earlier run"}: ${(STATUS_CHIP[s.status] || [s.status])[0]}${slotText(s, null, now) ? ` - ${slotText(s, null, now)}` : ""}`,
+    failures: (localRunOf(s, log) && localRunOf(s, log).failures) || (s.result && Array.isArray(s.result.failures) ? s.result.failures : [])
+  }));
+
+  const notRun = slot.status === "missed" || (slot.status === "pending" && Date.parse(slot.window_start_at || "") <= now);
+  let events = [];
+  if (notRun || slot.status === "failed") {
+    events = windowEvents(slot, log).map((e) => `${eventTime(e, now)}: ${e.text}`);
+    if (events.length === 0 && slot.status === "missed") events = [`This browser noted nothing during ${slotWindow(slot)}: Chrome was closed, or its scheduler was not checking this account then.`];
+  }
+  const empty = facts.length + failures.length + warnings.length + earlierRuns.length + events.length === 0;
+  return empty ? null : { facts, failures, failuresMore, fromLog, warnings, earlier: earlierRuns, events };
+}
 
 /**
  * Today's slots as one row per type, in run order: the type's latest slot, and the earlier
@@ -114,7 +236,7 @@ export function earlierText(earlier) {
  * (no IREPS login, a busy DocLink, an error) is in the status line, from this DocLink's scheduler.
  */
 export function slotText(slot, schedule = null, now = Date.now()) {
-  const window = `${istTime(slot.window_start_at)}–${istTime(slot.window_end_at)}`;
+  const window = slotWindow(slot);
   const reason = slot.code ? describeError(slot.code).title : "";
   switch (slot.status) {
     case "done": {
@@ -124,7 +246,7 @@ export function slotText(slot, schedule = null, now = Date.now()) {
       return [`Done by ${who(slot.done_by)} at ${istTime(slot.ended_at)}`, resultText(slot.result), more].filter(Boolean).join(" · ");
     }
     case "in_progress":
-      return `Running – ${who(slot.holder)}`;
+      return `Running - ${who(slot.holder)}`;
     case "pending":
       return Date.parse(slot.window_start_at || "") > now ? `Scheduled ${window}` : `Due ${window}, not run yet`;
     case "partial":
@@ -170,6 +292,65 @@ function statusLine(view) {
   return [`IREPS account ${account}. This DocLink runs: ${runs}.${unknown}`, waitingText(view.waitingFor), lastErrorText(view.lastError)].filter(Boolean).join(" ");
 }
 
+const node = (tag, className, text) => Object.assign(document.createElement(tag), { className, ...(text !== undefined ? { textContent: text } : {}) });
+
+/** A list of documents under a row: "doc: reason", the first `max` of them, then how many more (and where they are). */
+function docList(items, text, max, more = 0, where = "") {
+  const ul = node("ul", "schedule-docs");
+  for (const item of items.slice(0, max)) ul.append(node("li", "", text(item)));
+  const rest = Math.max(0, items.length - max) + Number(more || 0);
+  if (rest > 0) ul.append(node("li", "schedule-docs-more", `... and ${rest} more${where ? ` (${where})` : ""}`));
+  return ul;
+}
+
+/** Where the documents a list leaves out can be read. */
+const SAVE_LOG_HAS_ALL = "Save log lists them all";
+const OTHER_LOG_HAS_ALL = "the run log of the browser that ran it lists them all";
+
+/** One failed document as the panel shows it: its name, then why. */
+function failureLine(f) {
+  return `${f.doc}: ${describeError(f.code).title}${f.detail ? ` (${f.detail})` : ""}`;
+}
+
+/** The opened part of a Today row (slotDetails). */
+function detailsBody(details) {
+  const body = node("div", "schedule-run-body");
+  if (details.facts.length) {
+    const facts = node("ul", "schedule-facts");
+    for (const fact of details.facts) facts.append(node("li", "", fact));
+    body.append(facts);
+  }
+  if (details.failures.length) {
+    body.append(node("div", "schedule-docs-title schedule-docs-failed", `Not saved (${details.failures.length + details.failuresMore})`));
+    body.append(docList(details.failures, failureLine, SHOWN_FAILURES, details.failuresMore, details.fromLog ? SAVE_LOG_HAS_ALL : OTHER_LOG_HAS_ALL));
+  }
+  if (details.warnings.length) {
+    body.append(node("div", "schedule-docs-title", "Warnings"));
+    body.append(docList(details.warnings, (w) => w, 10));
+  }
+  for (const run of details.earlier) {
+    body.append(node("div", "schedule-docs-title", run.text));
+    if (run.failures.length) body.append(docList(run.failures, failureLine, 10));
+  }
+  if (details.events.length) {
+    body.append(node("div", "schedule-docs-title", "This browser's scheduler during the window"));
+    body.append(docList(details.events, (e) => e, 10));
+  }
+  return body;
+}
+
+/** A row that opens: its line is the summary, slotDetails under it. `key` keeps it open across redraws. */
+function openableRow(li, key, head, body) {
+  const box = node("details", "schedule-run");
+  box.open = openRows.has(key);
+  box.addEventListener("toggle", () => (box.open ? openRows.add(key) : openRows.delete(key)));
+  const summary = document.createElement("summary");
+  summary.append(...head);
+  box.append(summary, body);
+  li.classList.add("schedule-row-open");
+  li.append(box);
+}
+
 function renderToday(view) {
   el.today.replaceChildren();
   const rows = todayRows(view.slots);
@@ -178,20 +359,90 @@ function renderToday(view) {
   for (const { slot, earlier } of rows) {
     const li = document.createElement("li");
     li.className = "schedule-row";
-    const name = document.createElement("span");
-    name.className = "schedule-type";
-    name.textContent = typeLabel(slot.doc_type);
+    const name = node("span", "schedule-type", typeLabel(slot.doc_type));
     const [chipText, chipClass] = STATUS_CHIP[slot.status] || [slot.status, ""];
-    const chip = document.createElement("span");
-    chip.className = `chip ${chipClass}`;
-    chip.textContent = chipText;
-    const text = document.createElement("span");
-    text.className = "schedule-text";
+    const chip = node("span", `chip ${chipClass}`, chipText);
+    const text = node("span", "schedule-text");
     const notHere = view.config.enabled && !view.config.types.includes(slot.doc_type) && ["pending", "failed", "partial"].includes(slot.status);
     text.textContent = [slotText(slot, scheduleOf.get(slot.doc_type)), notHere ? "Not scheduled in this DocLink" : "", earlierText(earlier)].filter(Boolean).join(" · ");
-    li.append(name, chip, text);
+    const details = slotDetails(slot, { earlier, log: view.log });
+    if (details) openableRow(li, `today:${slot.doc_type}`, [name, chip, text], detailsBody(details));
+    else li.append(name, chip, text);
     el.today.append(li);
   }
+}
+
+const RUN_CHIP = { running: STATUS_CHIP.in_progress, done: STATUS_CHIP.done, partial: STATUS_CHIP.partial, failed: ["Failed", "chip-failed"] };
+
+/** One run of this browser's run log, as a row that opens to its document lists. */
+function runRow(run) {
+  const li = document.createElement("li");
+  li.className = "schedule-row";
+  const period = run.period && run.period !== "day" ? ` (${run.period} run)` : "";
+  const name = node("span", "schedule-type", `${whenText(run.startedAt)} ${typeLabel(run.docType)}${period}`);
+  const [chipText, chipClass] = RUN_CHIP[run.outcome] || [run.outcome, ""];
+  const chip = node("span", `chip ${chipClass}`, chipText);
+  const why = run.code && run.outcome !== "done" && run.outcome !== "partial" ? describeError(run.code).title : "";
+  const text = node("span", "schedule-text", [countsText(run.counts || {}), why, run.range].filter(Boolean).join(" · ") || "No documents");
+  const body = node("div", "schedule-run-body");
+  const facts = node("ul", "schedule-facts");
+  if (run.range) facts.append(node("li", "", `Searched: ${run.range}`));
+  facts.append(node("li", "", `Ran ${istDateTime(run.startedAt)}${run.endedAt ? ` to ${istTime(run.endedAt)}` : ""}${run.user ? ` (${run.user})` : ""}, IREPS account ${run.account || "?"}`));
+  if (run.code && run.outcome !== "done") facts.append(node("li", "", `Why: ${describeError(run.code).title}${run.detail ? ` (${run.detail})` : ""}`));
+  if (run.file) facts.append(node("li", "", `Saved to: ${run.file}`));
+  body.append(facts);
+  const more = run.more || {};
+  const section = (title, items, count, text, className = "") => {
+    if (!items || items.length === 0) return;
+    body.append(node("div", `schedule-docs-title ${className}`.trim(), `${title} (${items.length + Number(count || 0)})`));
+    body.append(docList(items, text, title === "Not saved" ? SHOWN_FAILURES : SHOWN_DOCS, count, SAVE_LOG_HAS_ALL));
+  };
+  for (const w of run.warnings || []) facts.append(node("li", "", `Warning: ${w}`));
+  section("Not saved", run.failures, more.failures, failureLine, "schedule-docs-failed");
+  section("Already saved, skipped", run.skipped, more.skipped, (d) => `${d.doc}${d.note ? `: ${d.note}` : ""}`);
+  section("Saved", run.saved, more.saved, (d) => `${d.doc}${d.note ? `: ${d.note}` : ""}`);
+  openableRow(li, `run:${run.id}`, [name, chip, text], body);
+  return li;
+}
+
+/** "Run log of this browser": its runs and the scheduler's events, newest first. */
+function renderLog(view) {
+  if (!el.logRuns) return;
+  const log = view.log && typeof view.log === "object" ? view.log : { runs: [], events: [] };
+  const runs = Array.isArray(log.runs) ? log.runs : [];
+  const events = Array.isArray(log.events) ? log.events : [];
+  el.logSummary.textContent = `${runs.length} run${runs.length === 1 ? "" : "s"} · ${events.length} event${events.length === 1 ? "" : "s"}`;
+  el.logRuns.replaceChildren(...runs.slice(0, SHOWN_RUNS).map(runRow));
+  el.logRunsEmpty.hidden = runs.length > 0;
+  el.logEvents.replaceChildren(...events.slice(0, SHOWN_EVENTS).map((e) => node("li", `schedule-event schedule-event-${e.kind}`, `${eventTime(e)}: ${e.text}`)));
+  el.logEventsEmpty.hidden = events.length > 0;
+}
+
+/** The run log as a text file's content (Copy / Save). */
+function logText() {
+  const view = lastView || {};
+  return runLogText(view.log, { account: view.account, version: view.version, savedAt: new Date().toISOString() });
+}
+
+/** Copy the run log; the button says whether it worked. */
+async function copyLog() {
+  const label = el.btnLogCopy.textContent;
+  try {
+    await navigator.clipboard.writeText(logText());
+    el.btnLogCopy.textContent = "Copied";
+  } catch (error) {
+    logger.warn("Scheduler run log not copied", error);
+    el.btnLogCopy.textContent = "Not copied: use Save log";
+  }
+  setTimeout(() => (el.btnLogCopy.textContent = label), 2500);
+}
+
+/** Save the run log as a .txt file in Downloads. */
+function saveLog() {
+  const url = URL.createObjectURL(new Blob([logText()], { type: "text/plain" }));
+  const a = Object.assign(document.createElement("a"), { href: url, download: `DocLink_scheduler_log_${new Date().toISOString().replace(/[:.]/g, "-")}.txt` });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 function field(labelText, input) {
@@ -280,7 +531,7 @@ async function whileBusy(busyButton, buttons, request) {
 /** A saved schedule's timing for its box's summary line: ["09:00–10:00", "once a day"]. */
 function timingParts(s) {
   const repeat = REPEATS.find(([m]) => m === (s.repeat_every_minutes ?? null));
-  return [`${s.window_start}–${s.window_end}`, repeat ? repeat[1] : `every ${s.repeat_every_minutes} min`];
+  return [`${s.window_start}-${s.window_end}`, repeat ? repeat[1] : `every ${s.repeat_every_minutes} min`];
 }
 
 /**
@@ -309,6 +560,10 @@ function editor(type, schedule) {
   box.className = "options schedule-editor";
   box.open = openEditors.has(type);
   box.addEventListener("toggle", () => (box.open ? openEditors.add(type) : openEditors.delete(type)));
+  // a change not saved yet: the box is kept as it is when the view is drawn again (renderManage)
+  const touched = () => dirtyEditors.add(type);
+  box.addEventListener("input", touched);
+  box.addEventListener("change", touched);
   const summary = document.createElement("summary");
   summary.append(Object.assign(document.createElement("span"), { className: "schedule-editor-name", textContent: typeLabel(type) }), editorSummary(schedule));
   const body = document.createElement("div");
@@ -330,10 +585,12 @@ function editor(type, schedule) {
   const fields = document.createElement("div");
   fields.className = "schedule-fields";
   fields.append(group("From", from.element), group("To", to.element), field("Runs", runs), field("Retry", every));
-  if (!NO_LOOKBACK.has(type)) {
-    const look = field("Look back (days)", lookback);
-    if (type === "billStatus") look.append(Object.assign(document.createElement("span"), { className: "field-hint", textContent: '90 = IREPS "Last 90 Days"' }));
-    fields.append(look);
+  if (FIXED_LOOKBACK[type]) {
+    // Bill Status, CRN and R-NOTE always search the last 90 days: shown, not editable
+    const range = type === "billStatus" ? 'Last 90 days (IREPS "Last 90 Days")' : "Last 90 days, up to today";
+    fields.append(group("Date range", node("span", "schedule-fixed", range)));
+  } else if (!NO_LOOKBACK.has(type)) {
+    fields.append(field("Look back (days)", lookback));
   }
 
   const dayBoxes = DAYS.map((d, i) => Object.assign(document.createElement("input"), { type: "checkbox", checked: s.days.includes(i) }));
@@ -355,13 +612,13 @@ function editor(type, schedule) {
         check_every_minutes: Number(every.value),
         repeat_every_minutes: runs.value === "" ? null : Number(runs.value),
         days: dayBoxes.map((b, i) => (b.checked ? i : -1)).filter((i) => i >= 0),
-        lookback_days: Number(lookback.value) || DEFAULT_LOOKBACK[type]
+        lookback_days: FIXED_LOOKBACK[type] || Number(lookback.value) || DEFAULT_LOOKBACK[type]
       })
     )
   );
   actions.append(save);
   if (remove) {
-    remove.addEventListener("click", () => whileBusy(remove, buttons, () => deleteSchedule(schedule.id)));
+    remove.addEventListener("click", () => whileBusy(remove, buttons, () => deleteSchedule(schedule.id, type)));
     actions.append(remove);
   }
   body.append(fields, days, actions);
@@ -385,10 +642,21 @@ export function editorTypes(config, schedules) {
 function renderManage(view) {
   const canManage = Boolean(view.user && view.user.canManage && view.account && view.config.enabled);
   el.manage.hidden = !canManage;
-  el.editors.replaceChildren();
-  if (!canManage) return;
+  if (!canManage) {
+    el.editors.replaceChildren();
+    editorBoxes.clear();
+    return;
+  }
   const byType = new Map((view.schedules || []).map((s) => [s.doc_type, s]));
-  for (const type of editorTypes(view.config, view.schedules)) el.editors.append(editor(type, byType.get(type)));
+  const boxes = editorTypes(view.config, view.schedules).map((type) => {
+    // a box with unsaved changes, or one being used (an open dropdown), stays as it is
+    const current = editorBoxes.get(type);
+    const keep = current && (dirtyEditors.has(type) || current.contains(document.activeElement));
+    const box = keep ? current : editor(type, byType.get(type));
+    editorBoxes.set(type, box);
+    return box;
+  });
+  el.editors.replaceChildren(...boxes);
 }
 
 function showError(described) {
@@ -398,40 +666,91 @@ function showError(described) {
   el.errorMessage.textContent = described.message;
 }
 
+/** A line under the status after a save ("" hides it). */
+function showNotice(text) {
+  if (!el.notice) return;
+  el.notice.hidden = !text;
+  el.notice.textContent = text || "";
+}
+
+/**
+ * After a once-a-day schedule is saved: when today's slot did not take the new time (it already ran,
+ * runs now, or stayed missed: a Recon Engine that does not reopen a missed slot), say when the new time
+ * applies, so the change never looks lost. "" when today's slot has the new time, or there is none.
+ * @param {{ doc_type: string, window_start: string, window_end: string, repeat_every_minutes: number|null, enabled?: boolean }} schedule
+ * @param {{ slots?: object[] }} view   the view loaded after the save
+ */
+export function savedNotice(schedule, view) {
+  if (!schedule || schedule.repeat_every_minutes != null || schedule.enabled === false) return "";
+  const slots = (view && view.slots ? view.slots : []).filter((s) => s.doc_type === schedule.doc_type && !isPeriodSlot(s));
+  const slot = slots[slots.length - 1];
+  if (!slot) return "";
+  const window = slotWindow(slot);
+  const wanted = `${schedule.window_start}-${schedule.window_end}`;
+  if (window === wanted) return "";
+  const label = typeLabel(schedule.doc_type);
+  if (slot.status === "done") return `Saved. ${label} already ran today (${window}): the new time ${wanted} applies from tomorrow.`;
+  if (slot.status === "in_progress") return `Saved. ${label} is running now (${window}): the new time ${wanted} applies from tomorrow.`;
+  if (slot.status === "missed" || slot.status === "failed_final") return `Saved. Today's ${label} slot (${window}) has ended and was not reopened by the Recon Engine: the new time ${wanted} applies from tomorrow.`;
+  return `Saved. Today's ${label} slot still shows ${window}: refresh in a minute; if it does not change, the new time applies from tomorrow.`;
+}
+
 function render(view) {
+  lastView = view;
   el.status.textContent = statusLine(view);
   showError(view.error || null);
   renderToday(view);
+  renderLog(view);
   renderManage(view);
 }
 
+/** Load and draw the view; resolves with the view drawn (null when none came). */
 async function load() {
-  if (loading) return;
-  loading = true;
+  if (loading) return loading;
   el.btnRefresh.disabled = true;
+  loading = (async () => {
+    try {
+      const view = await ctx.send(MESSAGE_TYPES.SCHEDULE_GET_STATE);
+      if (view && view.config) {
+        render(view);
+        return view;
+      }
+      showError(describeError("UNKNOWN", { detail: "no answer from DocLink's background worker" }));
+    } catch (error) {
+      logger.warn("Schedule view could not be loaded", error);
+      showError(describeError("UNKNOWN", { detail: String((error && error.message) || error) }));
+    }
+    return null;
+  })();
   try {
-    const view = await ctx.send(MESSAGE_TYPES.SCHEDULE_GET_STATE);
-    if (view && view.config) render(view);
-    else showError(describeError("UNKNOWN", { detail: "no answer from DocLink's background worker" }));
-  } catch (error) {
-    logger.warn("Schedule view could not be loaded", error);
-    showError(describeError("UNKNOWN", { detail: String((error && error.message) || error) }));
+    return await loading;
   } finally {
     loading = false;
     el.btnRefresh.disabled = false;
   }
 }
 
-async function saveSchedule(schedule) {
-  const answer = await ctx.send(MESSAGE_TYPES.SCHEDULE_SAVE, { schedule });
-  if (answer && answer.ok === false) return showError(answer.error);
-  await load();
+/** Load once more after a load that was already running ends: a save must be drawn from a load made after it. */
+async function reload() {
+  if (loading) await loading;
+  return load();
 }
 
-async function deleteSchedule(id) {
-  const answer = await ctx.send(MESSAGE_TYPES.SCHEDULE_DELETE, { id });
+async function saveSchedule(schedule) {
+  showNotice("");
+  const answer = await ctx.send(MESSAGE_TYPES.SCHEDULE_SAVE, { schedule });
   if (answer && answer.ok === false) return showError(answer.error);
-  await load();
+  dirtyEditors.delete(schedule.doc_type);
+  const view = await reload();
+  showNotice(view ? savedNotice(schedule, view) : "");
+}
+
+async function deleteSchedule(id, docType) {
+  showNotice("");
+  const answer = await ctx.send(MESSAGE_TYPES.SCHEDULE_DELETE, { id, docType });
+  if (answer && answer.ok === false) return showError(answer.error);
+  dirtyEditors.delete(docType);
+  await reload();
 }
 
 function open() {
@@ -462,12 +781,22 @@ export async function initSchedule(context) {
     errorMessage: $("schedule-error-message"),
     today: $("schedule-today"),
     todayEmpty: $("schedule-today-empty"),
+    notice: $("schedule-notice"),
+    logSummary: $("schedule-log-summary"),
+    logRuns: $("schedule-log-runs"),
+    logRunsEmpty: $("schedule-log-runs-empty"),
+    logEvents: $("schedule-log-events"),
+    logEventsEmpty: $("schedule-log-events-empty"),
+    btnLogCopy: $("btn-schedule-log-copy"),
+    btnLogSave: $("btn-schedule-log-save"),
     manage: $("schedule-manage"),
     editors: $("schedule-editors")
   };
   el.btnOpen.addEventListener("click", () => (el.view.hidden ? open() : ctx.showView("main")));
   el.btnBack.addEventListener("click", () => ctx.showView("main"));
   el.btnRefresh.addEventListener("click", () => load());
+  if (el.btnLogCopy) el.btnLogCopy.addEventListener("click", () => copyLog());
+  if (el.btnLogSave) el.btnLogSave.addEventListener("click", () => saveLog());
   const files = await readConfigFiles();
   el.btnOpen.hidden = !parseSchedulerConfig(files && files.config).enabled;
 }

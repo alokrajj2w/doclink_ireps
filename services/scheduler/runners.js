@@ -8,11 +8,16 @@
  *     saved to the ECM and reported by the shared hooks.
  * `start(ctx, hooks)` is the worker's launcher, adapted in background/scheduler-job.js; it answers
  * { started, error?, done } where `done` settles with
- *   export runs:   { ok, code?, summary? }
- *   document runs: { ok, code?, items, sessionExpired }.
+ *   export runs:   { ok, code?, detail?, summary? }
+ *   document runs: { ok, code?, detail?, items, sessionExpired }.
+ *
+ * The slot's result says what the run searched (`range`), why it stopped (`detail`) and the first
+ * documents it could not save (`failures`, `failuresMore`); the outcome's `log` has the full lists for
+ * this browser's run log (run-details.js).
  */
 
 import { createSharedRunHooks } from "./shared-run-hooks.js";
+import { scheduledSearch, resultFailures } from "./run-details.js";
 
 /** A manual run of the same kind holds the job: the slot is given back without counting an attempt. */
 const BUSY_CODES = new Set(["BUSY", "DOCUMENT_BUSY", "MA_BUSY", "BATCH_BUSY"]);
@@ -37,6 +42,15 @@ function notStarted(launched) {
   return failedOutcome(code);
 }
 
+/** The run's range and its first failed documents, for the slot's result. */
+function resultBase(ctx, details) {
+  const range = scheduledSearch(ctx && ctx.slot && ctx.slot.doc_type, ctx && ctx.params).text;
+  return { ...(range ? { range } : {}), ...resultFailures(details.failures) };
+}
+
+/** A failed run's result, with the reason the job gave (one line). */
+const withDetail = (result, detail) => (typeof detail === "string" && detail.trim() ? { ...result, detail: detail.replace(/\s+/g, " ").trim().slice(0, 200) } : result);
+
 /**
  * @param {object} deps
  * @param {object} deps.api                       services/scheduler/schedule-api.js
@@ -54,10 +68,11 @@ export function createRunnerFactory(deps) {
       if (!launched.started) return notStarted(launched);
       const res = await launched.done;
       const stats = shared.stats();
-      const result = { saved: stats.saved, skipped: stats.skipped, failed: stats.failed, notReported: stats.notReported };
-      if (!res.ok) return failedOutcome(res.code, result);
+      const details = shared.details();
+      const result = { saved: stats.saved, skipped: stats.skipped, failed: stats.failed, notReported: stats.notReported, ...resultBase(ctx, details) };
+      if (!res.ok) return { ...failedOutcome(res.code, withDetail(result, res.detail)), log: details };
       const s = res.summary || {};
-      return { outcome: "done", result: { ...result, records: s.recordCount ?? null, file: s.storedPath || s.filename || null } };
+      return { outcome: "done", result: { ...result, records: s.recordCount ?? null, file: s.storedPath || s.filename || null }, log: details };
     };
   }
 
@@ -70,12 +85,14 @@ export function createRunnerFactory(deps) {
       const res = await launched.done;
       // always report what was saved / failed, whatever the end, so nothing is fetched twice
       const counts = await shared.finishDocuments(res.items || []);
-      const result = { found: (res.items || []).length, saved: counts.saved, skipped: counts.skipped, failed: counts.failed, notReported: counts.notReported };
-      if (!res.ok) return failedOutcome(res.code, result);
-      if (counts.aborted) return failedOutcome(counts.aborted, result);
-      if (res.sessionExpired) return failedOutcome("IREPS_SESSION_EXPIRED", result);
-      if (counts.failed > 0) return { outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result };
-      return { outcome: "done", result };
+      const details = shared.details();
+      const result = { found: (res.items || []).length, saved: counts.saved, skipped: counts.skipped, failed: counts.failed, notReported: counts.notReported, ...resultBase(ctx, details) };
+      const withLog = (outcome) => ({ ...outcome, log: details });
+      if (!res.ok) return withLog(failedOutcome(res.code, withDetail(result, res.detail)));
+      if (counts.aborted) return withLog(failedOutcome(counts.aborted, result));
+      if (res.sessionExpired) return withLog(failedOutcome("IREPS_SESSION_EXPIRED", result));
+      if (counts.failed > 0) return withLog({ outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result });
+      return withLog({ outcome: "done", result });
     };
   }
 

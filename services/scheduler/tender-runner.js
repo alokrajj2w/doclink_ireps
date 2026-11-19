@@ -16,6 +16,9 @@
  */
 
 import { failedOutcome } from "./runners.js";
+import { failureEntry, docEntry, resultFailures, capped, shortText, tenderCode, RESULT_FAILURES_MAX } from "./run-details.js";
+
+export { tenderCode };
 
 export const RUNNER_PAGE = "tender/schedule-runner.html";
 /** The longest a tender run may take before it counts as failed. */
@@ -25,7 +28,20 @@ export const RUNNER_PING_MS = 20000;
 export const RUNNER_LIVE_MS = 60000;
 
 const OUTCOMES = new Set(["done", "partial", "failed"]);
-const RESULT_KEYS = ["found", "saved", "skipped", "failed", "notReported", "tenders"];
+const RESULT_KEYS = ["found", "saved", "skipped", "failed", "notReported", "tenders", "failuresMore"];
+const WARNINGS_MAX = 5;
+
+/** The run log's lists from a runner tab, each entry rebuilt by run-details.js (short, redacted). */
+function cleanLog(log) {
+  const l = log && typeof log === "object" ? log : {};
+  const list = (items, clean) => capped(Array.isArray(items) ? items.filter((x) => x && typeof x === "object") : []).map(clean);
+  return {
+    failures: list(l.failures, failureEntry),
+    saved: list(l.saved, (d) => docEntry(d.doc, d.note)),
+    skipped: list(l.skipped, (d) => docEntry(d.doc, d.note)),
+    more: Object.fromEntries(["failures", "saved", "skipped"].filter((k) => l.more && Number.isFinite(l.more[k]) && l.more[k] > 0).map((k) => [k, l.more[k]]))
+  };
+}
 
 /**
  * The outcome a runner tab reported, kept to known fields: the page is DocLink's own, but what reaches
@@ -36,7 +52,14 @@ export function cleanOutcome(reported) {
   const r = reported && typeof reported === "object" ? reported : {};
   if (!OUTCOMES.has(r.outcome)) return { outcome: "failed", code: "SCHEDULE_TENDER_FAILED" };
   const code = typeof r.code === "string" && /^[A-Z0-9_]{1,64}$/.test(r.code) ? r.code : null;
-  const result = r.result && typeof r.result === "object" ? Object.fromEntries(RESULT_KEYS.filter((k) => Number.isFinite(r.result[k])).map((k) => [k, r.result[k]])) : null;
+  let result = null;
+  if (r.result && typeof r.result === "object") {
+    result = Object.fromEntries(RESULT_KEYS.filter((k) => Number.isFinite(r.result[k])).map((k) => [k, r.result[k]]));
+    for (const k of ["range", "detail"]) if (shortText(r.result[k])) result[k] = shortText(r.result[k]);
+    if (Array.isArray(r.result.failures) && r.result.failures.length) result.failures = r.result.failures.slice(0, RESULT_FAILURES_MAX).map(failureEntry);
+    const warnings = Array.isArray(r.result.warnings) ? r.result.warnings.map(shortText).filter(Boolean).slice(0, WARNINGS_MAX) : [];
+    if (warnings.length) result.warnings = warnings;
+  }
   return {
     outcome: r.outcome,
     code,
@@ -44,33 +67,31 @@ export function cleanOutcome(reported) {
     permanent: r.permanent === true,
     sessionExpired: r.sessionExpired === true,
     stopWake: r.stopWake === true,
-    result
+    result,
+    ...(r.log ? { log: cleanLog(r.log) } : {})
   };
 }
 
-/** Tender error codes (tender/tender-core.js TenderError) -> slot codes (utils/messages.js). */
-const TENDER_CODES = Object.freeze({
-  SESSION_EXPIRED: "IREPS_SESSION_EXPIRED",
-  ACCOUNT_CHANGED: "SCHEDULE_ACCOUNT_MISMATCH",
-  ACCOUNT_MISMATCH: "SCHEDULE_ACCOUNT_MISMATCH",
-  TIMEOUT: "IREPS_REQUEST_FAILED",
-  UNREACHABLE: "IREPS_REQUEST_FAILED"
-});
-
-/** The slot code of a tender job's error code (a SCHEDULE_* / ECM_* code passes as it is). */
-export function tenderCode(code) {
-  const c = String(code || "");
-  if (TENDER_CODES[c]) return TENDER_CODES[c];
-  if (/^(SCHEDULE|ECM|RECON|IREPS)_[A-Z0-9_]+$/.test(c)) return c;
-  return "SCHEDULE_TENDER_FAILED";
-}
-
-/** Whether a tender job's result says it stopped early ({ aborted } of the job, or of its letters / tabulations part). */
-function abortedCode(result) {
-  const r = result || {};
-  const a = r.aborted || (r.letters && r.letters.aborted) || (r.tabulations && r.tabulations.aborted) || null;
+/**
+ * The code a tender job stopped with: its error's, else the { aborted } of the job or of its letters /
+ * tabulations part; null when it ran to the end.
+ * @param {object|null} result
+ * @param {{ code?: string }|null} [error]
+ */
+export function stoppedCode(result, error = null) {
+  if (error) return error.code || "UNKNOWN";
+  const a = abortedOf(result);
   return a ? a.code || "SESSION_EXPIRED" : null;
 }
+
+/** The { aborted } of a tender job's result, or of its letters / tabulations part. */
+function abortedOf(result) {
+  const r = result || {};
+  return r.aborted || (r.letters && r.letters.aborted) || (r.tabulations && r.tabulations.aborted) || null;
+}
+
+/** Why the job stopped early, in its own words ("" when it did not). */
+const abortedMessage = (result) => (abortedOf(result) && abortedOf(result).message) || "";
 
 /** Tenders a job could not handle (not found, failed): a reason to look again at the next check. */
 function failedTenders(result) {
@@ -81,16 +102,22 @@ function failedTenders(result) {
 
 /**
  * How a tender run ended, for the slot: from the job's result (or the error it threw) and the shared
- * hooks' counts (services/scheduler/shared-run-hooks.js finishTenderRun).
- * @param {{ result?: object, error?: { code?: string }|null, counts: { saved: number, skipped: number, failed: number, notReported: number, aborted: string|null } }} run
+ * hooks' counts and lists (services/scheduler/shared-run-hooks.js finishTenderRun / details). The slot's
+ * result carries the searched `range`, the stop reason (`detail`) and the first failed documents; the
+ * outcome's `log` carries the full lists for this browser's run log.
+ * @param {{ result?: object, error?: { code?: string, message?: string }|null, range?: string,
+ *           counts: { saved: number, skipped: number, failed: number, notReported: number, aborted: string|null },
+ *           details?: { failures: object[], saved: object[], skipped: object[] } }} run
  */
-export function tenderRunOutcome({ result = null, error = null, counts }) {
-  const summary = { saved: counts.saved, skipped: counts.skipped, failed: counts.failed, notReported: counts.notReported };
-  if (counts.aborted) return failedOutcome(counts.aborted, summary);
-  const stopped = error ? error.code || "UNKNOWN" : abortedCode(result);
-  if (stopped) return failedOutcome(tenderCode(stopped), summary);
-  if (counts.failed > 0 || failedTenders(result) > 0) return { outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result: summary };
-  return { outcome: "done", result: summary };
+export function tenderRunOutcome({ result = null, error = null, counts, range = "", details = null }) {
+  const summary = { saved: counts.saved, skipped: counts.skipped, failed: counts.failed, notReported: counts.notReported, ...(range ? { range } : {}), ...resultFailures(details && details.failures) };
+  const withLog = (outcome) => (details ? { ...outcome, log: details } : outcome);
+  if (counts.aborted) return withLog(failedOutcome(counts.aborted, summary));
+  const stopped = stoppedCode(result, error);
+  const detail = shortText(error ? error.message : stopped && abortedMessage(result));
+  if (stopped) return withLog(failedOutcome(tenderCode(stopped), detail ? { ...summary, detail } : summary));
+  if (counts.failed > 0 || failedTenders(result) > 0) return withLog({ outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result: summary });
+  return withLog({ outcome: "done", result: summary });
 }
 
 /**

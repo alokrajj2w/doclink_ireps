@@ -8,14 +8,16 @@
  */
 
 import { parseSchedulerConfig, SCHEDULE_TYPES, SCHEDULE_DEFAULT_TIMING, TENDER_SCHEDULE_TYPES } from "../services/scheduler/schedule-types.js";
-import { createTenderRunner, tenderRunOutcome, cleanOutcome, tenderCode, RUNNER_PAGE } from "../services/scheduler/tender-runner.js";
+import { createTenderRunner, tenderRunOutcome, cleanOutcome, tenderCode, stoppedCode, RUNNER_PAGE } from "../services/scheduler/tender-runner.js";
 import { createScheduler, LEASE_MS, HEARTBEAT_MS, RUNNING_POLL_MS, DEBOUNCE_MS } from "../services/scheduler/scheduler.js";
 import { createRunnerFactory, failedOutcome } from "../services/scheduler/runners.js";
 import { createSharedRunHooks, istParts, RESERVE_CHUNK } from "../services/scheduler/shared-run-hooks.js";
 import { createScheduleApi, ScheduleApiError } from "../services/scheduler/schedule-api.js";
 import { createLocalSignals, IREPS_ACTIVITY_MS } from "../services/scheduler/local-signals.js";
-import { isIrepsActivityUrl } from "../background/scheduler-job.js";
-import { slotText, istTime, todayRows, earlierText, editorTypes, lastErrorText, initSchedule } from "../popup/popup-schedule.js";
+import { scheduledSearch, labelFromKey, failureEntry, fitResult, RESULT_FAILURES_MAX, RESULT_MAX_CHARS, FIXED_LOOKBACK } from "../services/scheduler/run-details.js";
+import { createRunLog, runLogText, MAX_RUNS } from "../services/scheduler/run-log.js";
+import { isIrepsActivityUrl, exportLaunchOptions } from "../background/scheduler-job.js";
+import { slotText, istTime, todayRows, earlierText, editorTypes, lastErrorText, initSchedule, slotDetails, savedNotice, handleScheduleMessage } from "../popup/popup-schedule.js";
 import { describeSkip, SKIP_REASON } from "../services/download-log.js";
 import { EcmError } from "../services/ecm-service.js";
 import { WorkflowError } from "../services/export-save-service.js";
@@ -97,6 +99,7 @@ function harness(options = {}) {
     },
     runners: Object.fromEntries(SCHEDULE_TYPES.map((t) => [t, runnerFor(t)])),
     alarms: { set: async (when) => void calls.alarmsSet.push(when), clear: async () => void calls.alarmsCleared++ },
+    ...(options.runLog ? { runLog: options.runLog } : {}),
     now: () => clock,
     random: () => 0,
     uuid: (() => {
@@ -141,6 +144,8 @@ function hooksApi({ taken = {}, reserveError = null, completeErrors = 0 } = {}) 
 }
 
 const pdfItem = (n) => ({ id: `it-${n}`, log: { docType: "ic", key: `ic:PO${n}|1|C${n}` }, ecm: { kind: "inspectionCertificate", fields: { ic_number: `IC${n}` } } });
+/** The shared hooks' details() of a run that listed nothing. */
+const noDetails = () => ({ failures: [], saved: [], skipped: [], more: {} });
 
 export async function runSchedulerTests({ test, assert, eq }) {
   /* ------------------------------------------------------------ settings */
@@ -367,11 +372,69 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(h.calls.runs.length, 0);
   });
 
+  /** A run log on fakes: what the scheduler wrote. */
+  const fakeRunLog = () => {
+    const log = { events: [], started: [], finished: [] };
+    return { log, event: (kind, text, types) => void log.events.push({ kind, text, types }), runStarted: (run) => void log.started.push(run), runFinished: (id, outcome) => void log.finished.push({ id, outcome }) };
+  };
+
+  await test("Scheduler: why a due download did not run here goes to the run log, in plain words, with its types", async () => {
+    const due = { due: [slot(2, "crn"), slot(1, "billStatus")], running: null, next_check_at: null, slots: [] };
+    const notOnIreps = fakeRunLog();
+    await harness({ irepsReady: false, dues: [due], runLog: notOnIreps }).scheduler.wake("alarm", { force: true });
+    const ireps = notOnIreps.log.events.at(-1);
+    eq(ireps.kind, "ireps");
+    assert(/^Due now: Bill Status, CRN\. Waiting for IREPS/.test(ireps.text), ireps.text);
+    eq(ireps.types.join(), "billStatus,crn");
+
+    const busy = fakeRunLog();
+    await harness({ busy: true, dues: [due], runLog: busy }).scheduler.wake("alarm", { force: true });
+    eq(busy.log.events.at(-1).kind, "busy");
+
+    const other = fakeRunLog();
+    await harness({ dues: [due], runLog: other, claim: () => conflict("SCHEDULE_ACCOUNT_BUSY", { holder: { user_id: 4, name: "Rahul" }, docType: "ma" }) }).scheduler.wake("ireps page");
+    eq(other.log.events.at(-1).text, "MA copies: being run by Rahul; this browser looks again in a few minutes.");
+
+    const handedBack = fakeRunLog();
+    await harness({ check: { ok: true, account: { irepsAccountId: "60828" } }, dues: [{ due: [slot(1, "ma")], running: null, next_check_at: null, slots: [] }], runLog: handedBack }).scheduler.wake("ireps page");
+    assert(/^MA copies: claimed, but IREPS account 60828 is logged in here, not 833; given back/.test(handedBack.log.events.at(-1).text), handedBack.log.events.at(-1).text);
+
+    const signedOut = fakeRunLog();
+    await harness({ who: { signedIn: false }, runLog: signedOut }).scheduler.wake("alarm", { force: true });
+    eq(signedOut.log.events.at(-1).kind, "recon");
+  });
+
+  await test("Scheduler: each run goes to the run log with its range, how it ended and the documents it could not save", async () => {
+    const runLog = fakeRunLog();
+    const failures = [{ doc: "Tender 1 - NIT", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer" }];
+    const h = harness({
+      runLog,
+      dues: [{ due: [slot(1, "billStatus"), slot(2, "tenderNit", { period: "10:30" })], running: null, next_check_at: null, slots: [] }, { due: [slot(2, "tenderNit", { period: "10:30" })], running: null, next_check_at: null, slots: [] }, { due: [], running: null, next_check_at: null, slots: [] }],
+      outcomes: { tenderNit: { outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result: { saved: 3, failed: 1, failures }, log: { failures, saved: [], skipped: [] } } }
+    });
+    await h.scheduler.wake("ireps page");
+    eq(runLog.log.started.map((r) => `${r.docType}|${r.range}|${r.account}|${r.period || ""}`).join(), "billStatus|Last 90 Days|833|,tenderNit|16/11/2026 - 17/11/2026|833|10:30");
+    eq(runLog.log.finished.map((f) => `${f.id}|${f.outcome.outcome}`).join(), "claim-1|done,claim-2|partial");
+    eq(runLog.log.finished[1].outcome.log.failures[0].doc, "Tender 1 - NIT", "the full list goes to the run log");
+    assert(!("log" in h.calls.finish[1]), "the run log's lists are not sent to the Recon Engine");
+    eq(h.calls.finish[1].result.failures[0].code, "ECM_UNAVAILABLE", "the slot's result names the failed document for every user");
+  });
+
+  await test("Scheduler: the result sent with finish never exceeds what the Recon Engine accepts", async () => {
+    const long = "x".repeat(400);
+    const failures = Array.from({ length: 60 }, (_, i) => ({ doc: `PO ${i} ${long}`, code: "ECM_UNAVAILABLE", detail: long }));
+    const h = harness({ dues: [{ due: [slot(1, "poDate")], running: null, next_check_at: null, slots: [] }, { due: [], running: null, next_check_at: null, slots: [] }], outcomes: { poDate: { outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result: { saved: 1, failed: 60, failures } } } });
+    await h.scheduler.wake("ireps page");
+    const sent = h.calls.finish[0].result;
+    assert(JSON.stringify(sent).length <= RESULT_MAX_CHARS, `${JSON.stringify(sent).length} characters`);
+    eq(sent.failures.length + sent.failuresMore, 60, "what does not fit is counted");
+  });
+
   /* -------------------------------------------------------------- runners */
 
   await test("Runners: an export saved -> done; an identical export already saved -> done (skipped), never retried", async () => {
     const statsFor = { saved: 1, skipped: 0, failed: 0, notReported: 0 };
-    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => statsFor }) });
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => statsFor, details: noDetails }) });
     const run = factory.exportRunner(async () => ({ started: true, done: Promise.resolve({ ok: true, summary: { recordCount: 12, storedPath: "s3://x" } }) }));
     const done = await run({});
     eq(done.outcome, "done");
@@ -383,7 +446,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
   });
 
   await test("Runners: a manual run holds the job -> given back without an attempt; a lost session -> no attempt", async () => {
-    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => ({}) }) });
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => ({}), details: noDetails }) });
     const busy = await factory.exportRunner(async () => ({ started: false, error: { code: "DOCUMENT_BUSY" } }))({});
     eq(busy.outcome, "failed");
     eq(busy.countsAsAttempt, false);
@@ -396,7 +459,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
 
   await test("Runners: documents with failures -> partial; all saved -> done; a lost claim -> failed", async () => {
     let counts = { saved: 3, skipped: 1, failed: 1, notReported: 0, aborted: null };
-    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ documentHooks: {}, finishDocuments: async () => counts }) });
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ documentHooks: {}, finishDocuments: async () => counts, details: noDetails }) });
     const run = factory.documentRunner(async () => ({ started: true, done: Promise.resolve({ ok: true, items: [{}, {}, {}, {}, {}] }) }));
     eq((await run({})).outcome, "partial");
     counts = { ...counts, failed: 0 };
@@ -405,6 +468,21 @@ export async function runSchedulerTests({ test, assert, eq }) {
     const lost = await run({});
     eq(lost.outcome, "failed");
     eq(lost.code, "SCHEDULE_CLAIM_LOST");
+  });
+
+  await test("Runners: the result names the failed documents (the first 20, then how many more) and the range; the log has them all", async () => {
+    const failures = Array.from({ length: 25 }, (_, i) => ({ doc: `PO ${i}`, code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time" }));
+    const details = () => ({ failures, saved: [{ doc: "PO 99", note: "PO_99.pdf in the ECM" }], skipped: [], more: {} });
+    const docs = createRunnerFactory({ api: {}, makeHooks: () => ({ documentHooks: {}, finishDocuments: async () => ({ saved: 1, skipped: 0, failed: 25, notReported: 0, aborted: null }), details }) });
+    const ctx = { slot: { doc_type: "poDate" }, params: { dateFrom: "17/11/2026", dateTo: "18/11/2026" } };
+    const partial = await docs.documentRunner(async () => ({ started: true, done: Promise.resolve({ ok: true, items: new Array(26).fill({}) }) }))(ctx);
+    eq(partial.outcome, "partial");
+    eq(JSON.stringify([partial.result.range, partial.result.failures.length, partial.result.failuresMore, partial.result.failures[0].doc]), JSON.stringify(["17/11/2026 - 18/11/2026", RESULT_FAILURES_MAX, 5, "PO 0"]));
+    eq(partial.log.failures.length, 25, "the run log keeps every failed document");
+
+    const exports = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => ({ saved: 0, skipped: 0, failed: 0, notReported: 0 }), details: noDetails }) });
+    const failed = await exports.exportRunner(async () => ({ started: true, done: Promise.resolve({ ok: false, code: "IREPS_REQUEST_FAILED", detail: "IREPS did not respond in time" }) }))({ slot: { doc_type: "crn" }, params: { dateTo: "18/11/2026" } });
+    eq(JSON.stringify([failed.outcome, failed.code, failed.result.detail, failed.result.range]), JSON.stringify(["failed", "IREPS_REQUEST_FAILED", "IREPS did not respond in time", "21/08/2026 - 18/11/2026"]));
   });
 
   /* --------------------------------------------------------- shared hooks */
@@ -471,6 +549,47 @@ export async function runSchedulerTests({ test, assert, eq }) {
     const failed = api.calls.complete.at(-1).failed;
     eq(failed[0].code, "ECM_REJECTED", "the ECM's own code is reported, not the downloader's");
     eq(failed[1].code, "SCHEDULE_CLAIM_LOST");
+  });
+
+  await test("Shared hooks: each document not saved is named with its code and reason; skipped and saved ones are listed", async () => {
+    const item = (n, label) => ({ ...pdfItem(n), label });
+    const items = [item(1, "IC C1 (PO PO1 Sr. 1)"), item(2, "IC C2 (PO PO2 Sr. 1)"), item(3, "IC C3 (PO PO3 Sr. 1)"), item(4, "IC C4 (PO PO4 Sr. 1)")];
+    const api = hooksApi({ taken: { [items[3].log.key]: { status: "done", by: { user_id: 4, name: "Rahul" }, at: "2026-11-16T09:32:00+00:00" } } });
+    let uploads = 0;
+    const hooks = createSharedRunHooks({
+      api,
+      claimId: "c1",
+      account: ACCOUNT,
+      isClaimLive: () => true,
+      uploadEcm: async () => {
+        if (++uploads === 1) throw new EcmError("ECM_UNAVAILABLE", { status: 503, detail: "the ECM did not answer in time" });
+        return { uid: "u3", path: "/ECM/Hosur/IC", site: "hosur", deduplicated: false };
+      }
+    });
+    await hooks.documentHooks.preflight(items);
+    await hooks.documentHooks.saveFile(new Uint8Array([1]), "x/IC_C1.pdf", items[0]).catch(() => {});
+    const done = await hooks.documentHooks.saveFile(new Uint8Array([1]), "x/IC_C3.pdf", items[2]);
+    await hooks.documentHooks.onSaved(items[2], done);
+    await hooks.finishDocuments([
+      // the downloader's own code ("Chrome could not save the file") must not hide the ECM's reason
+      { id: "it-1", label: items[0].label, status: DOCUMENT_DOWNLOAD_STATUS.FAILED, error: { code: "IREPS_IC_DOWNLOAD_FAILED", detail: "Chrome could not save the file" } },
+      { id: "it-2", label: items[1].label, status: DOCUMENT_DOWNLOAD_STATUS.FAILED, error: { code: "IREPS_IC_DOWNLOAD_FAILED", detail: "IREPS returned HTTP 500", status: 500 } },
+      { id: "it-3", label: items[2].label, status: DOCUMENT_DOWNLOAD_STATUS.COMPLETED },
+      { id: "it-4", label: items[3].label, status: DOCUMENT_DOWNLOAD_STATUS.SKIPPED }
+    ]);
+    const d = hooks.details();
+    eq(JSON.stringify(d.failures), JSON.stringify([
+      { doc: "IC C1 (PO PO1 Sr. 1)", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time" },
+      { doc: "IC C2 (PO PO2 Sr. 1)", code: "IREPS_IC_DOWNLOAD_FAILED", detail: "IREPS returned HTTP 500" }
+    ]));
+    eq(JSON.stringify(d.skipped), JSON.stringify([{ doc: "IC C4 (PO PO4 Sr. 1)", note: "Already saved by Rahul on 2026-11-16 at 15:02" }]));
+    eq(JSON.stringify(d.saved), JSON.stringify([{ doc: "IC C3 (PO PO3 Sr. 1)", note: "IC_C3.pdf in ECM /ECM/Hosur/IC" }]));
+    eq(api.calls.complete.at(-1).failed.map((f) => f.code).join(), "ECM_UNAVAILABLE,IREPS_IC_DOWNLOAD_FAILED", "the Recon Engine gets the same codes");
+
+    const exportApi = hooksApi();
+    const exp = createSharedRunHooks({ api: exportApi, claimId: "c2", account: ACCOUNT, isClaimLive: () => true, uploadExport: async () => { throw new WorkflowError("RECON_UNAVAILABLE", { detail: "could not reach the Recon Engine" }); } });
+    await exp.saveExport({ bytes: new Uint8Array([1]), format: "xlsx" }, { docType: "crn", records: [{ a: 1 }, { a: 2 }], label: "CRN", filename: "CRN.xlsx" }).catch(() => {});
+    eq(JSON.stringify(exp.details().failures), JSON.stringify([{ doc: "CRN export (2 records)", code: "RECON_UNAVAILABLE", detail: "could not reach the Recon Engine" }]));
   });
 
   await test("Shared hooks: saved documents are reported in batches of 10 with the account; complete retried, then the log queue", async () => {
@@ -643,14 +762,17 @@ export async function runSchedulerTests({ test, assert, eq }) {
   await test("Schedule view: slot lines say who did what, in IST", () => {
     eq(istTime("2026-11-17T04:38:00+00:00"), "10:08");
     eq(slotText({ status: "done", done_by: { name: "Priya" }, ended_at: "2026-11-17T04:38:00+00:00", result: { saved: 1, skipped: 2 } }), "Done by Priya at 10:08 · 1 saved, 2 already saved");
-    eq(slotText({ status: "in_progress", holder: { name: "Rahul" } }), "Running – Rahul");
+    eq(slotText({ status: "in_progress", holder: { name: "Rahul" } }), "Running - Rahul");
     const nineToNoon = { window_start_at: "2026-11-17T03:30:00+00:00", window_end_at: "2026-11-17T06:30:00+00:00" }; // 09:00-12:00 IST
-    eq(slotText({ status: "pending", ...nineToNoon }, null, T0 - 60000), "Scheduled 09:00–12:00", "before its window");
-    eq(slotText({ status: "pending", ...nineToNoon }, null, T0 + 60000), "Due 09:00–12:00, not run yet", "inside its window");
-    eq(slotText({ status: "missed", ...nineToNoon }), "Not run during 09:00–12:00");
-    eq(slotText({ status: "missed", code: "IREPS_SESSION_EXPIRED", ...nineToNoon }), `Not run during 09:00–12:00 (last: ${describeError("IREPS_SESSION_EXPIRED").title})`);
+    eq(slotText({ status: "pending", ...nineToNoon }, null, T0 - 60000), "Scheduled 09:00-12:00", "before its window");
+    eq(slotText({ status: "pending", ...nineToNoon }, null, T0 + 60000), "Due 09:00-12:00, not run yet", "inside its window");
+    eq(slotText({ status: "missed", ...nineToNoon }), "Not run during 09:00-12:00");
+    eq(slotText({ status: "missed", code: "IREPS_SESSION_EXPIRED", ...nineToNoon }), `Not run during 09:00-12:00 (last: ${describeError("IREPS_SESSION_EXPIRED").title})`);
     for (const status of ["pending", "missed"]) {
       assert(!/logged in/i.test(slotText({ status, ...nineToNoon }, null, T0)), `a ${status} slot claims nothing about IREPS logins`);
+    }
+    for (const status of ["pending", "missed", "in_progress", "done", "partial", "failed"]) {
+      assert(!/[–—]/.test(slotText({ status, holder: { name: "R" }, done_by: { name: "P" }, ...nineToNoon }, null, T0)), `${status}: only the plain "-" in the panel, never an en or em dash`);
     }
   });
 
@@ -770,9 +892,9 @@ export async function runSchedulerTests({ test, assert, eq }) {
       assert(card.scrollWidth <= card.clientWidth && sticking.length === 0, `nothing is pushed past the panel's edge: ${sticking.map((n) => `<${n.tagName.toLowerCase()} class="${n.className}"> "${n.textContent.trim().slice(0, 30)}"`).join(", ")}`);
 
       const summary = (i) => boxes()[i].querySelector("summary").textContent;
-      eq(summary(0), "Bill Status09:00–10:00 · once a day");
+      eq(summary(0), "Bill Status09:00-10:00 · once a day");
       eq(summary(1), "CRNNot scheduled");
-      eq(summary(3), "MA copiesOff08:07–18:00 · every hour");
+      eq(summary(3), "MA copiesOff08:07-18:00 · every hour");
       const buttons = [...host.querySelectorAll("#schedule-editors button")];
       assert(buttons.length > 0 && buttons.every((b) => b.classList.contains("btn") && !b.classList.contains("btn-link")), "Add schedule / Save / Delete are buttons, not links");
       eq(boxes()[0].querySelector(".btn-primary").textContent, "Save");
@@ -803,6 +925,130 @@ export async function runSchedulerTests({ test, assert, eq }) {
       await until(() => answerSave);
       const added = sent.filter((s) => s.type === MESSAGE_TYPES.SCHEDULE_SAVE)[1].payload.schedule;
       eq(JSON.stringify([added.id, added.doc_type, added.enabled, added.window_start, added.window_end]), JSON.stringify([undefined, "crn", true, "09:00", "10:00"]), "a new schedule is added switched on, from the defaults");
+      answerSave();
+    } finally {
+      host.remove();
+    }
+  });
+
+  await test("Schedule view: a state message while an admin edits keeps the edited time; Save sends it; rows and the run log open to what failed", async () => {
+    const host = document.createElement("div");
+    host.className = "app-main";
+    host.style.cssText = "position: absolute; left: -10000px; top: 0; width: 320px";
+    host.innerHTML = `<section id="view-schedule" class="view" hidden><article class="card">
+      <div class="card-heading"><h2>Scheduled downloads</h2><button id="btn-schedule-back" class="btn btn-secondary btn-back" type="button">Back</button></div>
+      <p class="card-text schedule-status" id="schedule-status"></p>
+      <p class="schedule-notice" id="schedule-notice" role="status" hidden></p>
+      <div id="schedule-error" class="result result-error" hidden><div class="result-title" id="schedule-error-title"></div><p id="schedule-error-message" class="result-text"></p></div>
+      <ul class="schedule-list" id="schedule-today"></ul><p class="schedule-empty" id="schedule-today-empty" hidden></p>
+      ${panelHtml.querySelector("#schedule-log").outerHTML}
+      <div id="schedule-manage" hidden><div class="schedule-editors" id="schedule-editors"></div></div>
+      <button id="btn-schedule-refresh" class="btn btn-primary" type="button">Refresh</button>
+    </article></section><button id="btn-schedule-open" type="button"></button>`;
+    document.body.append(host);
+    const nineToTen = { window_start_at: "2026-11-19T03:30:00+00:00", window_end_at: "2026-11-19T04:30:00+00:00" };
+    const longDetail = "the ECM did not answer in time: https://wctsrvecmtstsn1.wabtec.com:8080/nuxeo/api/v1/path/default-domain/workspaces/Hosur/Tenders/a-very-long-folder-name-without-spaces";
+    const failures = [{ doc: "Tender 10263703 - Annexure 4 with a long title", code: "ECM_UNAVAILABLE", detail: longDetail }, { doc: "Tender 10263703 - My Offer", code: "SCHEDULE_TENDER_FAILED", detail: "The file was not a valid PDF." }];
+    const view = {
+      config: { enabled: true, types: ["billStatus", "crn", "rnote", "tenderNit"], unknown: [], reason: null },
+      account: "833",
+      user: { name: "Priya", canRun: true, canManage: true },
+      waitingFor: null,
+      lastError: null,
+      version: "1.6.3",
+      slots: [
+        { id: 1, doc_type: "billStatus", period: "day", status: "missed", ...nineToTen },
+        { id: 3, doc_type: "tenderNit", period: "10:30", status: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", attempts: 1, started_at: "2026-11-19T05:15:00+00:00", ended_at: "2026-11-19T05:22:00+00:00", window_start_at: "2026-11-19T05:00:00+00:00", window_end_at: "2026-11-19T06:00:00+00:00", next_try_at: "2026-11-19T05:45:00+00:00", result: { saved: 35, skipped: 18, failed: 2, range: "17/11/2026 - 18/11/2026", failures } }
+      ],
+      schedules: [{ id: 1, doc_type: "billStatus", enabled: true, window_start: "09:00", window_end: "10:00", check_every_minutes: 10, repeat_every_minutes: null, days: [0, 1, 2, 3, 4, 5, 6], lookback_days: 30 }],
+      log: {
+        runs: [{ id: "c7", docType: "tenderNit", slotId: 9, period: "09:30", account: "833", range: "17/11/2026 - 18/11/2026", startedAt: "2026-11-19T04:00:00Z", endedAt: "2026-11-19T04:06:00Z", outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", counts: { saved: 3, failed: 5 }, failures: new Array(5).fill(failures[0]), saved: [{ doc: "Tender 1 tender PDF", note: "T1.pdf in the ECM" }], skipped: [], more: {} }],
+        events: [{ kind: "ireps", first: "2026-11-19T03:32:00Z", at: "2026-11-19T04:20:00Z", count: 6, text: "Due now: Bill Status, CRN, R-NOTE. Waiting for IREPS: no IREPS page has loaded in this browser in the last 4 minutes.", types: ["billStatus", "crn", "rnote"] }]
+      },
+      error: null
+    };
+    const sent = [];
+    let answerSave = null;
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    const until = async (check) => {
+      for (let i = 0; i < 100 && !check(); i++) await tick();
+    };
+    const states = () => sent.filter((s) => s.type === MESSAGE_TYPES.SCHEDULE_GET_STATE).length;
+    try {
+      await initSchedule({
+        send: async (type, payload) => {
+          sent.push({ type, payload });
+          if (type === MESSAGE_TYPES.SCHEDULE_SAVE) return new Promise((resolve) => (answerSave = () => resolve({ ok: true })));
+          return JSON.parse(JSON.stringify(view));
+        },
+        showView: (name) => {
+          host.querySelector("#view-schedule").hidden = name !== "schedule";
+        }
+      });
+      host.querySelector("#btn-schedule-open").click();
+      await until(() => host.querySelector("#schedule-editors > *"));
+
+      // Today: the partly done row opens to the documents not saved, each with why
+      const rows = [...host.querySelectorAll("#schedule-today > li")];
+      const nit = rows[1].querySelector("details.schedule-run");
+      assert(nit, "a row with something to say opens");
+      nit.open = true;
+      const nitText = nit.textContent;
+      for (const part of ["Searched: 17/11/2026 - 18/11/2026", "Not saved (2)", `Tender 10263703 - My Offer: ${describeError("SCHEDULE_TENDER_FAILED").title} (The file was not a valid PDF.)`]) assert(nitText.includes(part), `"${part}" in: ${nitText}`);
+      const missed = rows[0].querySelector("details.schedule-run");
+      missed.open = true;
+      assert(missed.textContent.includes("09:02-09:50 (6 checks): Due now: Bill Status"), missed.textContent);
+      // the run log: the run opens to its five documents; the event is listed
+      const log = host.querySelector("#schedule-log");
+      log.open = true;
+      const run = host.querySelector("#schedule-log-runs details.schedule-run");
+      run.open = true;
+      assert(run.textContent.includes("Not saved (5)") && run.textContent.includes("Saved (1)"), run.textContent);
+      eq(getComputedStyle(run.querySelector("summary"), "::before").content, "none", "a run of the run log has its own marker only, not the option box's too");
+      assert(host.querySelector("#schedule-log-events").textContent.includes("Waiting for IREPS"), "the scheduler's events are listed");
+      eq(host.querySelector("#schedule-log-summary").textContent, "1 run · 1 event");
+      await tick();
+      const card = host.querySelector(".card");
+      const style = getComputedStyle(card);
+      const edge = card.getBoundingClientRect().right - parseFloat(style.borderRightWidth) - parseFloat(style.paddingRight);
+      const sticking = [...card.querySelectorAll("*")].filter((n) => {
+        const box = n.getBoundingClientRect();
+        return box.width > 0 && box.right > edge + 0.5;
+      });
+      assert(card.scrollWidth <= card.clientWidth && sticking.length === 0, `long reasons wrap inside a 320 px panel: ${sticking.map((n) => `<${n.tagName.toLowerCase()} class="${n.className}">`).join(", ")}`);
+
+      // the admin edits Bill Status's From; a state message from the worker arrives before Save
+      const boxes = () => [...host.querySelectorAll("#schedule-editors > details.options")];
+      const bill = boxes()[0];
+      bill.open = true;
+      assert(!bill.querySelector('input[type="number"]') && bill.textContent.includes("Last 90 days"), "Bill Status: a fixed 90-day range, no look-back to edit");
+      const fromHour = bill.querySelector(".schedule-time select");
+      fromHour.value = "11";
+      fromHour.dispatchEvent(new Event("change", { bubbles: true }));
+      const toHour = bill.querySelectorAll(".schedule-time select")[2];
+      toHour.value = "12";
+      toHour.dispatchEvent(new Event("change", { bubbles: true }));
+      const before = states();
+      handleScheduleMessage({ type: MESSAGE_TYPES.SCHEDULE_STATE });
+      await until(() => states() > before);
+      await tick();
+      eq(boxes()[0], bill, "the box being edited is kept when the view is drawn again");
+      eq(boxes()[0].querySelector(".schedule-time select").value, "11", "the edited hour is still there");
+      bill.querySelector(".btn-primary").click();
+      await until(() => answerSave);
+      const saved = sent.find((s) => s.type === MESSAGE_TYPES.SCHEDULE_SAVE).payload.schedule;
+      eq(JSON.stringify([saved.id, saved.window_start, saved.window_end, saved.lookback_days]), JSON.stringify([1, "11:00", "12:00", 90]), "Save sends the edited time, and 90 days");
+      answerSave();
+      await until(() => !host.querySelector("#schedule-notice").hidden);
+      assert(/Today's Bill Status slot \(09:00-10:00\) has ended .*applies from tomorrow/.test(host.querySelector("#schedule-notice").textContent), host.querySelector("#schedule-notice").textContent);
+      assert(boxes()[0] !== bill, "after the save the box is drawn from the saved schedule");
+      // CRN, not scheduled yet: added with the 90-day range
+      answerSave = null;
+      const crn = boxes()[1];
+      assert(crn.textContent.includes("Last 90 days"), "CRN: a fixed 90-day range");
+      crn.querySelector(".btn-primary").click();
+      await until(() => answerSave);
+      eq(sent.filter((s) => s.type === MESSAGE_TYPES.SCHEDULE_SAVE)[1].payload.schedule.lookback_days, 90);
       answerSave();
     } finally {
       host.remove();
@@ -1064,5 +1310,156 @@ export async function runSchedulerTests({ test, assert, eq }) {
     }
     eq(thrown && thrown.code, "SCHEDULE_CLAIM_LOST");
     eq((await down.finishTenderRun()).aborted, "SCHEDULE_CLAIM_LOST");
+  });
+
+  /* ------------------------------------------------- what a run tells (logs) */
+
+  await test("Shared hooks (tender): a failure the tender code reports is released with its code and named; one never reached says the run stopped", async () => {
+    const api = hooksApi();
+    const hooks = createSharedRunHooks({ api, claimId: "c1", account: ACCOUNT, isClaimLive: () => true });
+    const t = hooks.tenderHooks;
+    const keys = ["tender:TENDER_PDF|T7|-", "tender:ATTACHMENTS|T7|a1", "tender:CORRIGENDA|T7|c1"];
+    await t.reserveDocuments(keys);
+    await t.documentSaved({ doc_type: "tender_nit", doc_key: keys[0], filename: "T7.pdf", destination: "ecm", ecm: { status: "stored", path: "/ECM/Hosur/Tenders" } });
+    t.documentFailed({ key: keys[1], doc: "Tender T7 - Annexure A", code: "NOT_PDF", detail: "The file was not a valid PDF." });
+    await hooks.finishTenderRun({ stopped: "SESSION_EXPIRED" });
+    const sent = api.calls.complete.at(-1).failed;
+    eq(sent.map((f) => `${f.doc_key}|${f.code}`).join(), `${keys[1]}|SCHEDULE_TENDER_FAILED,${keys[2]}|IREPS_SESSION_EXPIRED`);
+    const d = hooks.details();
+    eq(JSON.stringify(d.failures), JSON.stringify([
+      { doc: "Tender T7 - Annexure A", code: "SCHEDULE_TENDER_FAILED", detail: "The file was not a valid PDF." },
+      { doc: "Tender T7 corrigendum c1", code: "IREPS_SESSION_EXPIRED", detail: "not downloaded: the run stopped before it" }
+    ]));
+    eq(JSON.stringify(d.saved), JSON.stringify([{ doc: "Tender T7 tender PDF", note: "T7.pdf in ECM /ECM/Hosur/Tenders" }]));
+  });
+
+  await test("Tender runner: the tab's failures, warnings and lists reach the worker short and redacted", async () => {
+    const long = `upload refused: token=SECRET123 ${"y".repeat(400)}`;
+    const cleaned = cleanOutcome({
+      outcome: "partial",
+      code: "SCHEDULE_DOWNLOAD_FAILED",
+      result: { saved: 2, failed: 1, range: "17/11/2026 - 18/11/2026", failures: [{ doc: "Tender 1 - NIT", code: "ECM_UNAVAILABLE", detail: long }], warnings: ["a", "b", "c", "d", "e", "f"], html: "<html>" },
+      log: { failures: [{ doc: "Tender 1 - NIT", code: "bad code!", detail: long }], saved: [{ doc: "Tender 2 - LOA", note: "LOA.pdf in the ECM" }], skipped: "not a list" }
+    });
+    const f = cleaned.result.failures[0];
+    assert(!f.detail.includes("SECRET123") && f.detail.length <= 200, f.detail);
+    eq(cleaned.result.range, "17/11/2026 - 18/11/2026");
+    eq(cleaned.result.warnings.length, 5);
+    assert(!("html" in cleaned.result), "unknown fields are dropped");
+    eq(cleaned.log.failures[0].code, "SCHEDULE_DOWNLOAD_FAILED", "a code that is not one becomes the generic one");
+    eq(JSON.stringify([cleaned.log.saved.length, cleaned.log.skipped.length]), "[1,0]");
+  });
+
+  await test("Tender run outcome: the result carries the failed documents, the range and why the job stopped", () => {
+    const counts = { saved: 1, skipped: 0, failed: 2, notReported: 0, aborted: null };
+    const details = { failures: [{ doc: "Tender 5 LOA 9", code: "IREPS_SESSION_EXPIRED", detail: "not downloaded: the run stopped before it" }], saved: [], skipped: [], more: {} };
+    const stopped = tenderRunOutcome({ result: { letters: { aborted: { code: "SESSION_EXPIRED", message: "IREPS logged this session out." } } }, counts, details, range: "17/11/2026 - 18/11/2026" });
+    eq(JSON.stringify([stopped.outcome, stopped.code, stopped.result.detail, stopped.result.range, stopped.result.failures.length]), JSON.stringify(["failed", "IREPS_SESSION_EXPIRED", "IREPS logged this session out.", "17/11/2026 - 18/11/2026", 1]));
+    eq(stopped.log, details, "the full lists go to this browser's run log");
+    eq(stoppedCode(null, { code: "TIMEOUT" }), "TIMEOUT");
+    eq(stoppedCode({ tabulations: { aborted: { code: "ACCOUNT_CHANGED" } } }), "ACCOUNT_CHANGED");
+    eq(stoppedCode({ summary: { failed: 1 } }), null);
+  });
+
+  await test("90 days: Bill Status, CRN and R-NOTE always search the last 90 days, whatever the schedule's look-back", () => {
+    const thirtyDays = { lookbackDays: 30, dateFrom: "20/10/2026", dateTo: "18/11/2026" };
+    eq(JSON.stringify(exportLaunchOptions("billStatus", thirtyDays)), JSON.stringify({ mode: "last90Days", destination: "recon" }), 'Bill Status: IREPS "Last 90 Days", to S3');
+    for (const type of ["crn", "rnote"]) {
+      eq(JSON.stringify(exportLaunchOptions(type, thirtyDays)), JSON.stringify({ dateFrom: "21/08/2026", dateTo: "18/11/2026", destination: "recon", format: "xlsx" }), `${type}: 90 days up to the claim's today, .xlsx to S3`);
+    }
+    eq(scheduledSearch("crn", { dateTo: "15/01/2027" }).dateFrom, "18/10/2026", "across the year end");
+    eq(scheduledSearch("rnote", {}, Date.parse("2026-11-18T20:00:00Z")).text, "22/08/2026 - 19/11/2026", "no date in the claim: today in IST");
+    eq(scheduledSearch("ma", { dateFrom: "17/11/2026", dateTo: "18/11/2026" }).text, "17/11/2026 - 18/11/2026", "the other types keep the claim's range");
+    eq(scheduledSearch("icNotifications", { dateFrom: "17/11/2026", dateTo: "18/11/2026" }).text, "");
+    eq(JSON.stringify(FIXED_LOOKBACK), JSON.stringify({ billStatus: 90, crn: 90, rnote: 90 }));
+  });
+
+  await test("Run details: document keys read as the panel's names; an entry is short and keeps no secret", () => {
+    eq(labelFromKey("po:1234|NFR"), "PO 1234 (NFR)");
+    eq(labelFromKey("ic:PO1|2|C3"), "IC C3 (PO PO1 Sr. 2)");
+    eq(labelFromKey("ma:PO1|007327"), "MA 007327 (PO PO1)");
+    eq(labelFromKey("tender:LOA|10263703|1503282"), "Tender 10263703 LOA 1503282");
+    eq(labelFromKey("pending:833|101|55|9001|letter"), "Correspondence letter 9001");
+    eq(labelFromKey("export:crn:abc123"), "CRN export");
+    const entry = failureEntry({ key: "po:1", code: "lower", detail: `Authorization: Bearer abc.def ${"z".repeat(300)}` });
+    eq(entry.doc, "PO 1");
+    eq(entry.code, "SCHEDULE_DOWNLOAD_FAILED");
+    assert(!entry.detail.includes("abc.def") && entry.detail.length <= 200, entry.detail);
+    const big = { saved: 1, failures: Array.from({ length: 40 }, (_, i) => ({ doc: `PO ${i}`, code: "X", detail: "d".repeat(500) })) };
+    const fitted = fitResult(big);
+    assert(JSON.stringify(fitted).length <= RESULT_MAX_CHARS && fitted.failures.length + fitted.failuresMore === 40, "cut to fit, the rest counted");
+    eq(fitResult({ saved: 1 }).saved, 1, "a small result is left as it is");
+  });
+
+  await test("Run log: runs with their documents and the scheduler's events; a repeated event is one line with a count; capped", async () => {
+    let clock = Date.parse("2026-11-19T03:32:00Z"); // 09:02 IST
+    const area = memoryArea();
+    const runLog = createRunLog({ storage: area, now: () => clock });
+    for (let i = 0; i < 3; i++) {
+      await runLog.event("ireps", "Due now: Bill Status. Waiting for IREPS: no IREPS page has loaded.", ["billStatus"]);
+      clock += 10 * 60000;
+    }
+    await runLog.event("other", "MA copies: being run by Rahul.", ["ma"]);
+    await runLog.runStarted({ id: "c9", docType: "tenderNit", slotId: 7, period: "10:30", account: "833", range: "17/11/2026 - 18/11/2026" });
+    const failures = Array.from({ length: 5 }, (_, i) => ({ doc: `Tender ${i} tender PDF`, code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time" }));
+    await runLog.runFinished("c9", { outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result: { saved: 35, skipped: 18, failed: 5 }, log: { failures, saved: [{ doc: "Tender 9 tender PDF", note: "T9.pdf in the ECM" }], skipped: [], more: { saved: 34 } } });
+    const log = await runLog.read();
+    eq(log.events.length, 2);
+    eq(JSON.stringify([log.events[1].count, log.events[1].first, log.events[1].at]), JSON.stringify([3, "2026-11-19T03:32:00.000Z", "2026-11-19T03:52:00.000Z"]));
+    const run = log.runs[0];
+    eq(JSON.stringify([run.outcome, run.counts, run.failures.length, run.more]), JSON.stringify(["partial", { saved: 35, skipped: 18, failed: 5 }, 5, { saved: 34 }]));
+    const text = runLogText(log, { account: "833", version: "1.6.3", savedAt: "2026-11-19T05:00:00Z" });
+    for (const line of ["IREPS account 833", "Tender NIT documents (10:30 run)  PARTLY DONE", "Searched: 17/11/2026 - 18/11/2026", "Counts: 35 saved, 18 already saved, 5 failed", "Not saved (5):", `- Tender 0 tender PDF: ${describeError("ECM_UNAVAILABLE").title} (the ECM did not answer in time) [ECM_UNAVAILABLE]`, "Saved (35):", "... and 34 more", "2026-11-19 09:02 to 09:22 (3 times)  Due now: Bill Status."]) {
+      assert(text.includes(line), `the text has "${line}"\n${text}`);
+    }
+    assert(!/[–—]/.test(text), "no en or em dash");
+    for (let i = 0; i < MAX_RUNS + 5; i++) await runLog.runStarted({ id: `r${i}`, docType: "ma" });
+    eq((await runLog.read()).runs.length, MAX_RUNS, "the oldest runs go");
+    const broken = createRunLog({ storage: { get: async () => { throw new Error("quota"); }, set: async () => { throw new Error("quota"); } } });
+    await broken.event("ireps", "x");
+    eq(JSON.stringify(await broken.read()), JSON.stringify({ runs: [], events: [] }), "a storage that fails never throws");
+  });
+
+  await test("Schedule view: an opened row names every document not saved and why; a missed slot says what this browser noted in its window", () => {
+    const nineToTen = { window_start_at: "2026-11-19T03:30:00+00:00", window_end_at: "2026-11-19T04:30:00+00:00" }; // 09:00-10:00 IST
+    const now = Date.parse("2026-11-19T05:00:00Z");
+    const partial = { id: 3, doc_type: "tenderNit", period: "10:30", status: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", attempts: 1, started_at: "2026-11-19T05:15:00+00:00", ended_at: "2026-11-19T05:22:00+00:00", ...nineToTen,
+      result: { saved: 35, skipped: 18, failed: 5, range: "17/11/2026 - 18/11/2026", failures: [{ doc: "Tender 1 - NIT", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time" }], failuresMore: 4 } };
+    const d = slotDetails(partial, { now });
+    assert(d.facts.includes("Searched: 17/11/2026 - 18/11/2026") && d.facts.includes("Attempts so far: 1"), d.facts.join(" | "));
+    eq(JSON.stringify([d.failures.length, d.failuresMore, d.failures[0].doc]), JSON.stringify([1, 4, "Tender 1 - NIT"]));
+    // this browser ran it: its run log has all five, and the row says so
+    const local = { runs: [{ id: "c1", slotId: 3, startedAt: "2026-11-19T05:15:02Z", outcome: "partial", failures: new Array(5).fill({ doc: "Tender X", code: "ECM_UNAVAILABLE", detail: null }), more: {} }], events: [] };
+    const mine = slotDetails(partial, { log: local, now });
+    eq(JSON.stringify([mine.failures.length, mine.failuresMore]), "[5,0]");
+    assert(mine.facts.some((f) => f.includes("(this browser)")), mine.facts.join(" | "));
+
+    const missed = { id: 1, doc_type: "billStatus", period: "day", status: "missed", ...nineToTen };
+    const log = { runs: [], events: [
+      { kind: "ireps", first: "2026-11-19T03:32:00Z", at: "2026-11-19T04:20:00Z", count: 6, text: "Due now: Bill Status, CRN, R-NOTE. Waiting for IREPS.", types: ["billStatus", "crn", "rnote"] },
+      { kind: "other", first: "2026-11-19T03:40:00Z", at: "2026-11-19T03:40:00Z", text: "MA copies: being run by Rahul.", types: ["ma"] },
+      { kind: "ireps", first: "2026-11-19T06:00:00Z", at: "2026-11-19T06:00:00Z", text: "Later.", types: ["billStatus"] }
+    ] };
+    eq(JSON.stringify(slotDetails(missed, { log, now }).events), JSON.stringify(["09:02-09:50 (6 checks): Due now: Bill Status, CRN, R-NOTE. Waiting for IREPS."]));
+    assert(/noted nothing during 09:00-10:00/.test(slotDetails(missed, { log: { runs: [], events: [] }, now }).events[0]), "nothing noted is said too");
+    eq(slotDetails({ id: 2, doc_type: "crn", status: "pending", window_start_at: "2026-11-19T06:00:00+00:00", window_end_at: "2026-11-19T07:00:00+00:00" }, { now }), null, "a slot still to come has nothing to open");
+    // an hourly type: an earlier run that failed shows under the latest one
+    const earlier = [{ id: 4, doc_type: "ma", period: "09:00", status: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", ...nineToTen, result: { saved: 1, failed: 1, failures: [{ doc: "MA 7 (PO 1)", code: "IREPS_MA_DOWNLOAD_FAILED", detail: "HTTP 500" }] } }];
+    const hourly = slotDetails({ id: 5, doc_type: "ma", period: "10:00", status: "done", done_by: { name: "Priya" }, started_at: "2026-11-19T04:35:00+00:00", ended_at: "2026-11-19T04:36:00+00:00", window_start_at: "2026-11-19T04:30:00+00:00", window_end_at: "2026-11-19T05:30:00+00:00", result: { saved: 2, found: 3 } }, { earlier, now });
+    eq(hourly.earlier.length, 1);
+    eq(hourly.earlier[0].failures[0].doc, "MA 7 (PO 1)");
+    assert(hourly.facts.includes("Ran 10:05 to 10:06 (Priya)") && hourly.facts.includes("Counts: 3 found"), hourly.facts.join(" | "));
+  });
+
+  await test("Schedule view: after a save, a once-a-day slot that kept its old time says when the new time applies", () => {
+    const schedule = { doc_type: "billStatus", window_start: "11:00", window_end: "12:00", repeat_every_minutes: null, enabled: true };
+    const slotAt = (status, from, to) => ({ doc_type: "billStatus", period: "day", status, window_start_at: from, window_end_at: to });
+    const old = ["2026-11-19T03:30:00+00:00", "2026-11-19T04:30:00+00:00"]; // 09:00-10:00
+    const moved = ["2026-11-19T05:30:00+00:00", "2026-11-19T06:30:00+00:00"]; // 11:00-12:00
+    assert(/applies from tomorrow/.test(savedNotice(schedule, { slots: [slotAt("missed", ...old)] })), "missed and not reopened");
+    assert(/already ran today/.test(savedNotice(schedule, { slots: [slotAt("done", ...old)] })), "done today");
+    eq(savedNotice(schedule, { slots: [slotAt("pending", ...moved)] }), "", "the slot took the new time: nothing to say");
+    eq(savedNotice(schedule, { slots: [] }), "", "no slot today yet");
+    eq(savedNotice({ ...schedule, doc_type: "ma", repeat_every_minutes: 60 }, { slots: [slotAt("missed", ...old)] }), "", "hourly types make the right slot at the next look");
   });
 }

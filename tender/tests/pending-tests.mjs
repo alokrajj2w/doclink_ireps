@@ -657,3 +657,22 @@ test('Scheduled run: each pending letter is reserved; one already saved is not o
   assert.ok(calls.saved.every((r) => r.destination === 'ecm' && r.doc_type === dlog.TENDER_DOC_TYPE.PENDING_CORRESPONDENCE));
   assert.ok(Object.keys(store).some((k) => k.endsWith('#scheduled')), 'its own ledger');
 });
+test('Scheduled run: a letter the ECM refuses is reported to the scheduler with its key, its name and the reason', async () => {
+  scenario();
+  const failed = [];
+  sharedRun.beginSharedRun({
+    reserveDocuments: async (keys) => ({ granted: new Set(keys), taken: new Map() }),
+    ecmSink: { save: async () => { throw Object.assign(new Error('the ECM did not answer in time'), { code: 'ECM_UNAVAILABLE' }); } },
+    documentSaved: async () => { throw new Error('nothing is saved'); },
+    documentFailed: (f) => { failed.push(f); },
+  });
+  try {
+    await go();
+  } finally {
+    sharedRun.endSharedRun();
+  }
+  assert.ok(failed.length >= 2, `every letter that failed is reported (${failed.length})`);
+  assert.ok(failed.every((f) => f.key.startsWith('pending:') && f.key.endsWith('|letter')), failed.map((f) => f.key).join());
+  assert.ok(failed.every((f) => f.code === 'ECM_UNAVAILABLE' && f.detail === 'the ECM did not answer in time'));
+  assert.ok(failed.some((f) => /^Tender L1265428 - letter 777\/B$/.test(f.doc)), failed.map((f) => f.doc).join());
+});

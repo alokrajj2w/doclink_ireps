@@ -824,7 +824,8 @@ code is fixed.
 - **Defaults on create** (2026-11-17): billStatus, crn, rnote: window 09:00-10:00, every 10 min, once a day;
   ma, poDate, icDate, icNotifications: window 09:00-18:00, every 15 min, repeat every 60 min. All: all 7 days;
   enabled. `lookback_days` defaults by type:
-  billStatus 90, crn 30, rnote 30, ma 2, poDate 2, icDate 2, icNotifications 1 (unused).
+  billStatus 90, crn 90, rnote 90, ma 2, poDate 2, icDate 2, icNotifications 1 (unused). DocLink searches 90 days
+  for billStatus, crn and rnote whatever the stored look-back (19 Nov 2026; crn and rnote were 30 before).
 - **Validation (400 `SCHEDULE_INVALID`):**
   - `ireps_account_id` matches `^\d{1,16}$`;
   - `doc_type` is a known type;
@@ -868,12 +869,12 @@ Then each slot is closed when it can no longer run:
 |---|---|---|---|
 | `GET /api/doclink/schedules?account=` | read | | `{ "schedules": [schedule] }` |
 | `POST /api/doclink/schedules` | manage | schedule fields (defaults above) | `201 { "schedule" }`; 400 / 409 |
-| `PUT /api/doclink/schedules/{id}` | manage | any of: window_start, window_end, check_every_minutes, repeat_every_minutes (`null` allowed), days, lookback_days, enabled | `{ "schedule" }`; today's `pending` day slot takes the new window; any other `pending` slot of today is deleted and the next look makes the right one |
+| `PUT /api/doclink/schedules/{id}` | manage | any of: window_start, window_end, check_every_minutes, repeat_every_minutes (`null` allowed), days, lookback_days, enabled | `{ "schedule" }`; today's day slot of a once-a-day schedule takes the new window when it has not run: `pending`; `failed` / `partial` (its `next_try_at` cleared: it retries in the new window); `missed`, reopened as `pending` (code, result, claim and times cleared) when the new window has not ended, the schedule is on and today is one of its days. `done`, `in_progress` and `failed_final` are not touched. Any other `pending` slot of today is deleted and the next look makes the right one (19 Nov 2026: before, only a `pending` slot moved) |
 | `DELETE /api/doclink/schedules/{id}` | manage | | `204`; `pending` slots removed, others kept |
 | `GET /api/doclink/schedule/due?account=&types=a,b` | run | `types` optional (default all); unknown names ignored | `{ "now", "due": [slot], "running": slot\|null, "next_check_at": iso\|null, "slots": [today's slots of those types] }` |
 | `POST /api/doclink/schedule/claim` | run | `{ "slot_id", "claim_id", "ireps_account_id" }` (`claim_id`: 8-64 chars `[A-Za-z0-9-]`, made by the client) | `200 { "slot", "claim_id", "lease_until", "params": { "lookbackDays", "dateFrom": "DD/MM/YYYY", "dateTo": "DD/MM/YYYY" } }`; 404 `SLOT_NOT_FOUND`; 409 `WRONG_ACCOUNT` / `NOT_DUE` / `SLOT_DONE` / `SLOT_TAKEN` / `ACCOUNT_BUSY` |
 | `POST /api/doclink/schedule/heartbeat` | run | `{ "claim_id" }` | `{ "lease_until" }`; 409 `CLAIM_LOST` |
-| `POST /api/doclink/schedule/finish` | run | `{ "claim_id", "outcome": "done"\|"partial"\|"failed", "code": str\|null, "counts_as_attempt": true, "permanent": false, "result": object\|null }` | `{ "slot" }`; 409 `CLAIM_LOST` |
+| `POST /api/doclink/schedule/finish` | run | `{ "claim_id", "outcome": "done"\|"partial"\|"failed", "code": str\|null, "counts_as_attempt": true, "permanent": false, "result": object\|null }`. `result` (at most 16,000 characters of JSON; DocLink keeps it under 12,000): the counts (`found`, `saved`, `skipped`, `failed`, `notReported`, `records`), `file`, `range` (what the run searched), `detail` (why it stopped), `failures` (the first 20 documents not saved: `{ doc, code, detail }`), `failuresMore` and `warnings` (at most 5). Document numbers, codes and DocLink's texts only | `{ "slot" }`; 409 `CLAIM_LOST` |
 | `POST /api/doclink/documents/reserve` | run | `{ "claim_id", "ireps_account_id", "destination": "ecm"\|"s3", "keys": [1..100] }` | `{ "granted": [key], "taken": { key: { "status": "done"\|"in_progress", "by": {user_id,name}\|null, "at": iso\|null } } }`; 409 `CLAIM_LOST` |
 | `POST /api/doclink/documents/complete` | run | `{ "claim_id", "done": [log record as in POST /api/doclink/downloads], "failed": [{ "doc_key", "destination", "code" }] }` (≤ 500 each) | `{ "done": n, "failed": n }`; 409 `CLAIM_LOST` |
 | `GET /api/doclink/schedule/today?account=&types=` | read | | `{ "date", "slots": [slot], "schedules": [schedule] }` |
@@ -974,6 +975,23 @@ an admin and two tendering users). 22 of 22 checks passed:
 - a key saved by one user was taken for the other;
 - a lost IREPS session gave the slot back without an attempt;
 - `today` showed who ran it.
+
+**Logs and 90 days (2026-11-19)**, asked for after a day of live runs ("5 failed" with no way to see which):
+- **Each failed document is named, with its reason.** The shared hooks keep the real reason of a save (the ECM's
+  code and text, not the downloader's "Chrome could not save the file"); the tender code reports each failure
+  (`documentFailed`); a document a stopped run never reached says so. `finish.result` carries `range`, `detail`,
+  the first 20 `failures` and `failuresMore` (Appendix A), so every user of the account sees them in Today.
+- **This browser's run log** (`services/scheduler/run-log.js`): each run with what it saved, skipped and could not
+  save, and the scheduler's decisions (why a due slot did not run here). The Schedule view lists it, and copies or
+  saves it as text.
+- **Bill Status, CRN and R-NOTE search the last 90 days** whatever the look-back (Bill Status: IREPS "Last 90
+  Days"; CRN / R-NOTE: 90 days up to the claim's `dateTo`). The Recon Engine's default look-back for crn / rnote is
+  90 too.
+- **A time changed after a missed window runs today.** The Recon Engine's `PUT` reopens today's missed day slot
+  (Appendix A). The Schedule view also kept redrawing a box being edited when the worker's state changed, so a Save
+  could send the old time: a box with unsaved changes is now kept as it is.
+- The Recon Engine part is a patch on `user/alok/doclink_schedule` (`Wabtec/docs/patches/2026-11-19-recon-schedule-time-change-and-90-days.patch`),
+  not committed: 38 backend tests pass (3 Postgres variants skipped).
 
 **Not yet done:**
 - the end-to-end run in two Chrome profiles (TESTING.md, "Scheduled downloads");

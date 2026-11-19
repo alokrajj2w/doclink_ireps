@@ -700,6 +700,8 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
             entry.code = e.code || '';
             entry.unavailable = ['NO_DOCUMENT', 'NOT_DOCUMENT', 'EMPTY'].includes(e.code);
             log('Pending', `letter ${entry.letterId} failed: ${e.message}`);
+            // a scheduled run reports why, so the Schedule view can name the letter and the reason
+            sharedRun()?.documentFailed?.({ key: downloadKey.pending(entry.key, 'letter'), doc: `Tender ${rec.tenderNo} - letter ${entry.letterNo || entry.letterId}`, code: e.code || '', detail: e.message });
           }
         }
         emitLetter(entry);

@@ -9,7 +9,8 @@
 import { MESSAGE_TYPES } from '../utils/messages.js';
 import { createScheduleApi } from '../services/scheduler/schedule-api.js';
 import { createSharedRunHooks } from '../services/scheduler/shared-run-hooks.js';
-import { tenderRunOutcome, RUNNER_PING_MS, RUNNER_LIVE_MS } from '../services/scheduler/tender-runner.js';
+import { tenderRunOutcome, stoppedCode, RUNNER_PING_MS, RUNNER_LIVE_MS } from '../services/scheduler/tender-runner.js';
+import { scheduledSearch, failureEntry } from '../services/scheduler/run-details.js';
 import { beginSharedRun, endSharedRun } from './tender-shared-run.js';
 import { TenderError, log } from './tender-core.js';
 import { runAutomatic, runLetterType } from './tender-auto.js';
@@ -44,6 +45,28 @@ const JOBS = {
   },
   tenderCorrespondence: (r) => downloadPendingCorrespondence({ mode: 'all', onProgress: r.onProgress, onAccount: r.onAccount }),
 };
+
+const LIST_LABEL = { MyNegotiation: 'Negotiation letter list', MyCounterOffer: 'Counter Offer letter list', MyAdvanceAcceptanceLetter: 'LOA letter list' };
+
+/**
+ * What a tender job could not do beyond single documents, for the run's report: whole tenders it could not
+ * open (failures) and IREPS lists it could not read in full (warnings). Documents are reported by the hooks.
+ */
+function jobProblems(result) {
+  const failures = [];
+  const warnings = [];
+  const r = result || {};
+  for (const part of [r, r.letters, r.tabulations].filter(Boolean)) {
+    for (const t of part.tenders || []) {
+      if (t && t.error && (t.status === 'FAILED' || t.status === 'NOT_FOUND')) failures.push(failureEntry({ doc: `Tender ${t.tenderNo}`, code: 'SCHEDULE_TENDER_FAILED', detail: t.error }));
+    }
+    for (const [status, message] of Object.entries(part.listErrors || {})) warnings.push(`${LIST_LABEL[status] || status}: ${message}`);
+    if (part.incomplete) warnings.push(String(part.incomplete));
+    if (part.messages && part.messages.incomplete) warnings.push(String(part.messages.incomplete));
+    if (Array.isArray(part.review) && part.review.length) warnings.push(`${part.review.length} IREPS message(s) could not be matched to a tender: open NIT Documents in the panel to review them.`);
+  }
+  return { failures, warnings: warnings.map((w) => w.slice(0, 200)).slice(0, 5) };
+}
 
 async function main() {
   const claimId = new URL(location.href).searchParams.get('claim') || '';
@@ -95,10 +118,14 @@ async function main() {
     closePrintTabs();
     clearInterval(pinger);
   }
-  const counts = await hooks.finishTenderRun();
-  const outcome = error && error.code === 'SCHEDULE_TYPE_NOT_SUPPORTED'
+  const counts = await hooks.finishTenderRun({ stopped: stoppedCode(result, error) });
+  const problems = jobProblems(result);
+  const listed = hooks.details();
+  const details = { ...listed, failures: [...listed.failures, ...problems.failures] };
+  let outcome = error && error.code === 'SCHEDULE_TYPE_NOT_SUPPORTED'
     ? { outcome: 'failed', code: 'SCHEDULE_TYPE_NOT_SUPPORTED', permanent: true }
-    : tenderRunOutcome({ result, error, counts });
+    : tenderRunOutcome({ result, error, counts, details, range: scheduledSearch(job.docType, job.params).text });
+  if (problems.warnings.length) outcome = { ...outcome, result: { ...(outcome.result || {}), warnings: problems.warnings } };
   show(`Finished: ${counts.saved} saved, ${counts.skipped} already saved, ${counts.failed} failed.`);
   await send(MESSAGE_TYPES.SCHEDULE_RUNNER_DONE, { claimId, outcome }).catch(() => {});
 }

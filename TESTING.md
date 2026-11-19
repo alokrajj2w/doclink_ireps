@@ -851,17 +851,32 @@ End to end, with the mock portal and a local Recon Engine:
    09:00-10:00, once a day, retry every 10 min; ICs every hour 09:00-18:00, retry every 15 min). Add Bill Status
    with a window from now to now + 45 min, and ICs from notifications with a window from now to now + 2 h, runs
    every 30 min. With `schedular_phase2` off, the list offers no tender type. Before its window a slot reads
-   "Scheduled HH:MM–HH:MM"; inside it, "Due HH:MM–HH:MM, not run yet". Narrow the side panel as far as it goes:
+   "Scheduled HH:MM-HH:MM"; inside it, "Due HH:MM-HH:MM, not run yet". Narrow the side panel as far as it goes:
    every field of an opened schedule box stays inside the panel, and Add schedule / Save / Delete are buttons that
-   show a spinner until the Recon Engine answers.
-4. Load a mock IREPS page in both profiles. Exactly one runs; the other shows "Running – A", then "Done by A".
+   show a spinner until the Recon Engine answers. Bill Status, CRN and R-NOTE show "Date range: Last 90 days" and no
+   look-back field.
+4. Load a mock IREPS page in both profiles. Exactly one runs; the other shows "Running - A", then "Done by A".
    `chrome://extensions` shows no "Scheduler: wake failed" error for DocLink.
    The Recon Engine's `doclink_downloads` has one row per document. At the next two checks neither profile claims
    or sends anything to IREPS (the mock server log shows no request).
 5. Set A's Save to switch to **Local** and let A run a slot: every file still goes to S3 / ECM, nothing appears in
    A's Downloads folder.
 6. Make the mock ECM refuse one IC: it is saved nowhere, the slot shows "Partly done", and the next check fetches
-   only that IC.
+   only that IC. Open the row (▸): "Not saved (1)" names the IC ("IC … (PO … Sr. …)") with the ECM's own reason, not
+   "Chrome could not save the file". In the other profile the same row lists it too (from the slot's result). In
+   A's **Run log of this browser** the run opens to the same IC, the ICs already saved ("Already saved by …") and the
+   ones saved ("… in ECM /…"); **Save log** writes `DocLink_scheduler_log_<time>.txt` with all of it.
+6a. 90 days: let a CRN and an R-NOTE slot run. Their rows say "Searched: <today - 89 days> - <today>", and the mock
+   server's request log shows that `dateFrom` / `dateTo` in the searchPO request. Bill Status says "Searched: Last
+   90 Days" and sends IREPS's own "Last 90 Days" search. Each `.xlsx` goes to the Recon Engine's
+   `/api/documents` with doc_type `crn` / `rnote` / `bill_status` (the row's "Saved to: s3://…/bronze/<customer>/crn/…").
+6b. Missed, then a new time: give Bill Status a window that ends in 5 minutes and keep IREPS closed in both
+   profiles. The row turns "Missed"; opened, it shows what each browser's scheduler noted ("Due now: Bill Status.
+   Waiting for IREPS: …"). Now, as admin, set a window starting 5 minutes from now and Save. With the Recon Engine
+   patch of 19 Nov 2026 the row reads "Scheduled HH:MM-HH:MM" and runs at that time; without it, the view says the
+   new time applies from tomorrow.
+6c. Edit while downloads run: open a schedule box, change From, wait until a run in the other profile ends (the
+   view redraws), then Save: the summary line shows the new time, not the old one.
 7. Close A's Chrome during a long IC run (`/mock/scenario/slow`): about 10 minutes later B takes over and saves only
    what A did not.
 8. Choose scenario `login` in A's browser: A wins a claim, fails its IREPS check and gives the slot back; B runs it.
@@ -888,6 +903,9 @@ End to end, with the setup of the Phase 1 section (mock portal, local Recon Engi
 4. At the next hour the other profile may win: it skips every letter already saved ("already saved ... by A") and
    fetches only new ones (add a letter to the mock between the two runs).
 5. Close the runner tab mid-run: the slot shows "Will retry" without an attempt counted, and the other profile can run it.
+5a. Make the mock ECM refuse one NIT attachment: the NIT row shows "Partly done"; opened, "Not saved" names it
+   ("Tender <no> - <title>: ECM refused the document (…)"). A document the run never reached because IREPS logged
+   out says "not downloaded: the run stopped before it".
 6. Have A download a letter manually with Save to: Local, then let a scheduled run come: the letter still goes to the
    ECM (the scheduled run's own ledger and the reservations decide, not A's local history).
 7. Log in to another IREPS account in the winner's browser: the runner tab stops before any download.

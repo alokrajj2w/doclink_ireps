@@ -1629,6 +1629,97 @@ body[data-gate="on"] #view-redownload {
   color: var(--text-muted);
   font-size: 13px;
 }
+/* After a save: when the new time applies (savedNotice) */
+.schedule-notice {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 12px;
+}
+/* A Today row (or a run of the run log) that opens: its line is the summary, the details under it */
+.schedule-row.schedule-row-open {
+  display: block;
+}
+.schedule-run > summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  align-items: center;
+  cursor: pointer;
+  list-style: none;
+}
+.schedule-run > summary::-webkit-details-marker {
+  display: none;
+}
+/* a run inside the run log's option box: not that box's summary style (padding, colour, its own ▸ marker) */
+.options .schedule-run > summary {
+  padding: 0;
+  color: inherit;
+  font-weight: inherit;
+}
+.options .schedule-run > summary::before {
+  content: none;
+}
+.schedule-run > summary .schedule-type::before {
+  content: "▸ ";
+  color: var(--text-muted);
+}
+.schedule-run[open] > summary .schedule-type::before {
+  content: "▾ ";
+}
+.schedule-run-body {
+  margin: 6px 0 0 12px;
+  font-size: 12px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.schedule-facts,
+.schedule-docs {
+  margin: 0 0 6px;
+  padding-left: 16px;
+}
+.schedule-facts li,
+.schedule-docs li {
+  margin: 2px 0;
+}
+.schedule-docs-title {
+  margin: 6px 0 2px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.schedule-docs-failed {
+  color: var(--danger);
+}
+.schedule-docs-more {
+  color: var(--text-muted);
+  list-style: none;
+}
+/* Run log of this browser */
+.schedule-log {
+  margin-top: 4px;
+}
+.schedule-events {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.schedule-events li {
+  margin: 3px 0;
+}
+.schedule-event-error,
+.schedule-event-backend {
+  color: var(--danger);
+}
+/* Date range of Bill Status, CRN and R-NOTE: fixed at 90 days, shown in place of the look-back */
+.schedule-fixed {
+  display: block;
+  padding: 7px 0;
+  font-size: 12px;
+  color: var(--text);
+}
 .schedule-hint {
   margin: 0 0 8px;
   color: var(--text-muted);

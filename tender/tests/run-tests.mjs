@@ -2191,7 +2191,7 @@ test('L12: a GET that cannot reach IREPS is tried again (1s, then 3s); a POST is
 const sharedRun = await import('../tender-shared-run.js');
 /** Fake hooks of services/scheduler/shared-run-hooks.js tenderHooks: `taken` keys are skipped, `refuse` makes the ECM refuse. */
 function fakeShared({ taken = [], failReserve = false, refuse = false } = {}) {
-  const calls = { reserved: [], ecm: [], saved: [] };
+  const calls = { reserved: [], ecm: [], saved: [], failed: [] };
   const hooks = {
     reserveDocuments: async (keys) => {
       calls.reserved.push(...keys);
@@ -2206,6 +2206,7 @@ function fakeShared({ taken = [], failReserve = false, refuse = false } = {}) {
       },
     },
     documentSaved: async (record) => { calls.saved.push(record); },
+    documentFailed: (failure) => { calls.failed.push(failure); },
   };
   return { hooks, calls };
 }
@@ -2247,6 +2248,21 @@ test('Scheduled run: an ECM refusal fails the letter; it is never saved locally'
   await scheduled(shared, coRun);
   assert.equal(shared.calls.ecm.length, 1);
   assert.deepEqual([saved.length, shared.calls.saved.length], [0, 0]);
+});
+test('Scheduled run: a document that fails is reported to the scheduler with its key, its name and the reason', async () => {
+  scheduledCo();
+  const shared = fakeShared({ refuse: true });
+  await scheduled(shared, coRun);
+  assert.equal(shared.calls.failed.length, 1);
+  const f = shared.calls.failed[0];
+  assert.deepEqual([f.key, f.code, f.detail], [coKey, 'ECM_REFUSED', 'ECM refused']);
+  assert.match(f.doc, /^Tender 29263265 - /, f.doc);
+});
+test('Scheduled run: a document saved is never reported as failed', async () => {
+  scheduledCo();
+  const shared = fakeShared();
+  await scheduled(shared, coRun);
+  assert.deepEqual(shared.calls.failed, []);
 });
 test('Scheduled run: a reservation that cannot be made fetches nothing', async () => {
   scheduledCo();

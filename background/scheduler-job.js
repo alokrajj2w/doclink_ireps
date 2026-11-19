@@ -9,7 +9,9 @@
  *   - runs a claimed tender slot (Phase 2) in a background DocLink tab (services/scheduler/tender-runner.js,
  *     tender/schedule-runner.js) and answers that tab's READY / PING / DONE;
  *   - shows "!" on the toolbar icon while a slot of this account waits for an IREPS login;
- *   - answers the Schedule view (state, today's slots, schedules).
+ *   - keeps this browser's run log (services/scheduler/run-log.js): every run with the documents it
+ *     saved, skipped and could not save (and why), and why a due slot did not run;
+ *   - answers the Schedule view (state, today's slots, schedules, the run log).
  *
  * Off unless config.json "schedular_phase1" / "schedular_phase2" say otherwise (services/scheduler/schedule-types.js).
  */
@@ -18,7 +20,9 @@ import { createScheduler, RUN_PERMISSION, MANAGE_PERMISSION } from "../services/
 import { createScheduleApi, ScheduleApiError } from "../services/scheduler/schedule-api.js";
 import { createLocalSignals } from "../services/scheduler/local-signals.js";
 import { createRunnerFactory } from "../services/scheduler/runners.js";
-import { parseSchedulerConfig, TENDER_SCHEDULE_TYPES } from "../services/scheduler/schedule-types.js";
+import { createRunLog } from "../services/scheduler/run-log.js";
+import { scheduledSearch, FIXED_LOOKBACK } from "../services/scheduler/run-details.js";
+import { parseSchedulerConfig, TENDER_SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL } from "../services/scheduler/schedule-types.js";
 import { createTenderRunner } from "../services/scheduler/tender-runner.js";
 import { holdWorker } from "./keep-alive.js";
 import { readConfigFiles } from "../utils/config.js";
@@ -35,6 +39,25 @@ const BADGE_COLOR = "#d97706";
 
 /** Schedule fields the panel may set (the backend validates them again). */
 const EDITABLE = ["window_start", "window_end", "check_every_minutes", "repeat_every_minutes", "days", "lookback_days", "enabled"];
+
+/**
+ * The options a scheduled export run (Bill Status, CRN, R-NOTE) is launched with: always the last
+ * 90 days (services/scheduler/run-details.js scheduledSearch), saved as .xlsx to the Recon Engine's
+ * S3, the same place an "ECM / S3" run of the panel saves it (bronze/<customer>/<bill_status|crn|rnote>/).
+ * @param {"billStatus"|"crn"|"rnote"} docType
+ * @param {{ dateFrom?: string, dateTo?: string }} params   the claim's (the Recon Engine's today, IST)
+ */
+export function exportLaunchOptions(docType, params) {
+  const search = scheduledSearch(docType, params);
+  if (docType === "billStatus") return { mode: search.mode, destination: SAVE_DESTINATION.RECON };
+  return { dateFrom: search.dateFrom, dateTo: search.dateTo, destination: SAVE_DESTINATION.RECON, format: EXPORT_FORMAT.XLSX };
+}
+
+/** A saved schedule in one line for the run log: "Bill Status: 11:00-12:00, once a day, on". */
+function scheduleText(type, s) {
+  const runs = s.repeat_every_minutes ? `every ${s.repeat_every_minutes} min` : "once a day";
+  return `${SCHEDULE_TYPE_LABEL[type] || type}: ${s.window_start}-${s.window_end}, ${runs}, retry every ${s.check_every_minutes} min, ${s.enabled === false ? "off" : "on"}`;
+}
 
 /**
  * A page load on IREPS that says the user is active there: the configured IREPS origin, and not
@@ -67,20 +90,21 @@ export function isIrepsActivityUrl(url, irepsBaseUrl) {
 export function createSchedulerJob(deps) {
   const api = createScheduleApi();
   const signals = createLocalSignals();
+  const runLog = createRunLog();
   const { exportRunner, documentRunner } = createRunnerFactory({ api });
   const toS3OrEcm = SAVE_DESTINATION.RECON;
 
   const loadConfig = async () => parseSchedulerConfig(((await readConfigFiles()) || {}).config);
 
-  /** Bill Status: "Last 90 Days" when the look-back covers it, else the claim's date range. */
-  const billStatusOptions = (p) => (Number(p.lookbackDays) >= 90 ? { mode: "last90Days" } : { mode: "dateRange", dateFrom: p.dateFrom, dateTo: p.dateTo });
+  /** The reason a failed job gave, for the slot's result (the job's described message). */
+  const reasonOf = (error) => (error && (error.detail || error.message)) || null;
 
   /** A batch launch whose `done` (the final batch state) becomes a document run's result. */
   function asDocumentRun(launched) {
     if (!launched.started) return launched;
     const done = launched.done.then((state) =>
       state && state.phase === "error"
-        ? { ok: false, code: (state.error && state.error.code) || "UNKNOWN", items: state.items || [] }
+        ? { ok: false, code: (state.error && state.error.code) || "UNKNOWN", detail: reasonOf(state.error), items: state.items || [] }
         : { ok: true, items: (state && state.items) || [], sessionExpired: Boolean(state && state.sessionExpired) }
     );
     return { ...launched, done };
@@ -92,22 +116,23 @@ export function createSchedulerJob(deps) {
     const found = await search.done;
     // no MA in the range is what IREPS said, not a failure: nothing to save today
     if (!found.ok && found.code === MA_ERROR.NOT_FOUND) return { started: true, done: Promise.resolve({ ok: true, items: [] }) };
-    if (!found.ok) return { started: true, done: Promise.resolve({ ok: false, code: found.code, items: [] }) };
+    if (!found.ok) return { started: true, done: Promise.resolve({ ok: false, code: found.code, detail: reasonOf(found.error), items: [] }) };
     const download = await deps.launch.maDownload("all", toS3OrEcm, null, hooks);
     if (!download.started) return download;
-    const done = download.done.then((r) => (r.ok ? { ok: true, items: r.summary.items || [], sessionExpired: Boolean(r.summary.sessionExpired) } : { ok: false, code: r.code, items: [] }));
+    const done = download.done.then((r) => (r.ok ? { ok: true, items: r.summary.items || [], sessionExpired: Boolean(r.summary.sessionExpired) } : { ok: false, code: r.code, detail: reasonOf(r.error), items: [] }));
     return { started: true, done };
   }
 
-  const searchPoExport = (criteria) => (ctx, hooks) =>
-    deps.launch.document(criteria, { dateFrom: ctx.params.dateFrom, dateTo: ctx.params.dateTo, destination: toS3OrEcm, format: EXPORT_FORMAT.XLSX }, null, hooks);
+  /** A Bill Status / CRN / R-NOTE launch whose failure carries the job's reason. */
+  const withReason = (launched) => (launched.started ? { ...launched, done: launched.done.then((r) => (r.ok ? r : { ...r, detail: reasonOf(r.error) })) } : launched);
+  const searchPoExport = (criteria, docType) => async (ctx, hooks) => withReason(await deps.launch.document(criteria, exportLaunchOptions(docType, ctx.params), null, hooks));
   const batch = (kind, withDates) => async (ctx, hooks) =>
     asDocumentRun(await deps.launch.batch({ kind, destination: toS3OrEcm, ...(withDates ? { dateFrom: ctx.params.dateFrom, dateTo: ctx.params.dateTo } : {}) }, hooks));
 
   const runners = {
-    billStatus: exportRunner((ctx, hooks) => deps.launch.billStatus({ ...billStatusOptions(ctx.params), destination: toS3OrEcm }, null, hooks)),
-    crn: exportRunner(searchPoExport(SEARCH_PO_CRITERIA.CRN)),
-    rnote: exportRunner(searchPoExport(SEARCH_PO_CRITERIA.RNOTE)),
+    billStatus: exportRunner(async (ctx, hooks) => withReason(await deps.launch.billStatus(exportLaunchOptions("billStatus", ctx.params), null, hooks))),
+    crn: exportRunner(searchPoExport(SEARCH_PO_CRITERIA.CRN, "crn")),
+    rnote: exportRunner(searchPoExport(SEARCH_PO_CRITERIA.RNOTE, "rnote")),
     ma: documentRunner(runMa),
     poDate: documentRunner(batch("po-date", true)),
     icDate: documentRunner(batch("ic-date", true)),
@@ -154,6 +179,7 @@ export function createSchedulerJob(deps) {
     },
     runners,
     alarms,
+    runLog,
     onState: (state) => {
       showBadge(state);
       deps.broadcast(MESSAGE_TYPES.SCHEDULE_STATE, { state });
@@ -207,6 +233,8 @@ export function createSchedulerJob(deps) {
       nextCheckAt: st.nextCheckAt,
       slots: today ? today.slots || [] : st.slots,
       schedules: today ? today.schedules || [] : [],
+      log: await runLog.read(),
+      version: chrome.runtime.getManifest().version,
       error
     };
   }
@@ -222,7 +250,11 @@ export function createSchedulerJob(deps) {
       withAccount(async (account) => {
         const s = message.schedule || {};
         const changes = Object.fromEntries(EDITABLE.filter((k) => s[k] !== undefined).map((k) => [k, s[k]]));
+        // Bill Status, CRN and R-NOTE always search 90 days: the stored look-back says so too
+        if (FIXED_LOOKBACK[s.doc_type]) changes.lookback_days = FIXED_LOOKBACK[s.doc_type];
         const answer = s.id ? await api.updateSchedule(s.id, changes) : await api.createSchedule({ ...changes, ireps_account_id: account, doc_type: s.doc_type });
+        const saved = answer.schedule || { ...changes, doc_type: s.doc_type };
+        runLog.event("schedule", `Schedule ${s.id ? "changed" : "added"}: ${scheduleText(s.doc_type, saved)}.`, [s.doc_type]);
         await signals.setQuietUntil(0);
         scheduler.wake("schedule saved", { force: true });
         return { ok: true, schedule: answer.schedule };
@@ -230,6 +262,7 @@ export function createSchedulerJob(deps) {
     [MESSAGE_TYPES.SCHEDULE_DELETE]: (message) =>
       withAccount(async () => {
         await api.deleteSchedule(message.id);
+        if (message.docType) runLog.event("schedule", `Schedule deleted: ${SCHEDULE_TYPE_LABEL[message.docType] || message.docType}.`, [message.docType]);
         return { ok: true };
       }),
     // the runner tab of a tender slot (only the tab this run opened is answered)

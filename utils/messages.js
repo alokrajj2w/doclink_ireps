@@ -885,7 +885,9 @@ export const STORAGE_KEYS = Object.freeze({
   // tender documents go to the ECM, Bill Status, CRN and R-NOTE to the Recon Engine's S3)
   SAVE_DESTINATION: "doclink.saveDestination",
   // scheduled downloads: the last verified IREPS account id ({ id, at }), never page content
-  SCHEDULER_ACCOUNT: "doclink.scheduler.account"
+  SCHEDULER_ACCOUNT: "doclink.scheduler.account",
+  // scheduled downloads: this browser's run log ({ runs, events }: document numbers, codes, reasons)
+  SCHEDULER_RUN_LOG: "doclink.scheduler.runLog"
 });
 
 /** chrome.storage.session keys (memory only, cleared when Chrome closes). */

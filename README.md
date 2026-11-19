@@ -1718,8 +1718,15 @@ Status, CRN and R-NOTE once a morning; MA, POs and ICs every hour, each run fetc
 **Schedules** are kept in the Recon Engine per IREPS account and type (`/api/doclink/schedules`): a daily
 window (IST), how often it runs (**once a day**, or once per period: every 30 min / hour / 2 hours / 3 hours), a
 retry interval for a run that has not happened yet (10 / 15 / 30 / 60 min), weekdays (default every day) and a
-look-back in days (the date range a run searches: Bill Status 90 = "Last 90 Days", CRN / R-NOTE 30, MA / PO /
-IC 2). A new schedule starts with these timings:
+look-back in days (the date range a run searches: MA / PO / IC 2).
+
+**Bill Status, CRN and R-NOTE always search the last 90 days** (since 19 Nov 2026), whatever look-back a
+schedule holds: Bill Status with IREPS's own "Last 90 Days", CRN and R-NOTE with the 90 days up to the claim's
+today (the Recon Engine's date, IST; `scheduledSearch` in `services/scheduler/run-details.js`). Their box shows
+"Date range: Last 90 days" instead of a look-back field, and a save stores 90. Each export is saved where an
+"ECM / S3" export of the panel goes: the Recon Engine's `POST /api/documents` with its `doc_type`, stored under
+`bronze/<customer>/bill_status/`, `.../crn/` or `.../rnote/` and loaded into the reconciliation data. A new
+schedule starts with these timings:
 
 | Type | Window (IST) | Runs | Retry until done |
 |---|---|---|---|
@@ -1727,14 +1734,52 @@ IC 2). A new schedule starts with these timings:
 | MA, POs by PO date, ICs by IC date, ICs from notifications | 09:00-18:00 | every hour (09:00, 10:00, … 18:00) | every 15 min within the hour |
 
 Admins (`doclink.schedule.manage`) edit them in the panel's **Scheduled downloads** view (clock icon in the
-header). Each type is a box like the panel's other option boxes, its title line showing the timing ("09:00–10:00 ·
+header). Each type is a box like the panel's other option boxes, its title line showing the timing ("09:00-10:00 ·
 once a day") or "Off" / "Not scheduled"; opened, it holds On / Off, From and To (hour and minute dropdowns, IST),
-Runs, Retry, Look back and the days, with **Save** and **Delete** (or **Add schedule**). A new schedule can be added only for a type this DocLink runs
-(tender types only with `schedular_phase2` on), and an existing schedule of any type stays editable. Everyone sees what ran today. An hourly type shows its
+Runs, Retry, Look back (a fixed "Last 90 days" for Bill Status, CRN and R-NOTE) and the days, with **Save** and
+**Delete** (or **Add schedule**). A new schedule can be added only for a type this DocLink runs
+(tender types only with `schedular_phase2` on), and an existing schedule of any type stays editable. The view is
+drawn again whenever the scheduler's state changes (every few minutes while downloads run); a box with changes
+not saved yet, or one being used (an open dropdown), is kept as it is, so a Save always sends what the admin set.
+
+**A time changed during the day.** Today's slot of a once-a-day schedule takes the new window when it has not
+run: pending, waiting for a retry, or missed in its old window; a missed slot whose new window has not ended is
+open again, so the new time runs today. A slot that is done (or running) keeps its day: the new time applies from
+tomorrow. This is the Recon Engine's rule (`PUT /api/doclink/schedules/{id}`); a Recon Engine that only moves a
+pending slot (before the 19 Nov 2026 patch, `Wabtec/docs/patches/2026-11-19-recon-schedule-time-change-and-90-days.patch`)
+leaves a missed slot as it is, and the view then says "Saved. Today's Bill Status slot (09:00-10:00) has ended
+and was not reopened by the Recon Engine: the new time 11:00-12:00 applies from tomorrow."
+
+Everyone sees what ran today. An hourly type shows its
 latest run, the next run, and the earlier runs of the day folded into one line ("Earlier today: 3 of 4 runs
-done, 12 saved"). A slot that has not run reads "Scheduled 18:00–19:00" before its window, "Due 18:00–19:00, not
-run yet" inside it, and "Not run during 09:00–10:00" once missed. What this DocLink waits for (an IREPS login, a
+done, 12 saved"). A slot that has not run reads "Scheduled 18:00-19:00" before its window, "Due 18:00-19:00, not
+run yet" inside it, and "Not run during 09:00-10:00" once missed. What this DocLink waits for (an IREPS login, a
 manual run, the Recon Engine) and its last failed check ("Last check failed: …") are in the line at the top.
+
+**What failed, and why.** A row of Today opens (▸) to the details of its run:
+* the range it searched ("Searched: Last 90 Days", "Searched: 21/08/2026 - 18/11/2026"), when it ran and who ran it
+  ("this browser" for this DocLink's own runs), the counts, the file it saved ("Saved to: s3://…"), why it
+  stopped ("Why: IREPS session expired (…)") and the attempts so far;
+* **every document not saved, with its reason**: "Tender 10263703 - Annexure 4: ECM unavailable (the ECM did not
+  answer in time)", "PO 1234: PO download failed (IREPS returned HTTP 500)", "IC 45 (PO 123 Sr. 1): ECM refused the
+  document (No such property: …)". The reason is the real one: an upload the ECM refused is not reported as a
+  download error. The slot's result (kept by the Recon Engine, seen by every user of the account) carries the
+  first 20 and how many more; this browser's own runs show them all;
+* warnings of a tender run (an IREPS letter list it could not read, messages it could not match to a tender);
+* for an hourly type, the earlier runs of the day that did not end clean, each with its failed documents;
+* for a slot that did not run (missed, or due and waiting), what this browser's scheduler noted during its window,
+  for example "09:02-09:50 (6 checks): Due now: Bill Status, CRN, R-NOTE. Waiting for IREPS: no IREPS page has
+  loaded in this browser in the last 4 minutes".
+
+**Run log of this browser** (a box under Today, `services/scheduler/run-log.js`, `chrome.storage.local`
+`doclink.scheduler.runLog`): every scheduled run this DocLink made (the last 60), each opening to the documents it
+could not save (with why), skipped ("Already saved by Priya on …") and saved (where: "IC_45.pdf in ECM /…", the
+S3 path of an export), and the scheduler's decisions (the last 200: waiting for IREPS, for a manual run, for the
+Recon Engine; another DocLink running the account; a claim given back; a schedule changed). A decision repeated at
+every check is one line with its count. **Copy log** and **Save log** give the whole log as text (IST times) for
+support. The DocLink log (`doclinkLog.dump()`) has the same decisions and one line per document not saved.
+Only document numbers, error codes and DocLink's own texts are kept, cut short and redacted: never a URL, an
+IREPS page, a token or a cookie.
 
 **Each slot once, by one DocLink.** A once-a-day schedule makes one slot per day; an hourly one makes one slot
 per hour (09:00-10:00, 10:00-11:00, …): for a repeating schedule the window's end is the start of the last
@@ -1777,7 +1822,8 @@ slot of this account waits for an IREPS login in this browser.
 
 **Code.** `services/scheduler/` (`schedule-types.js` setting and types, `schedule-api.js` Recon client,
 `local-signals.js` IREPS activity / account, `scheduler.js` the checks and claims, `runners.js` outcomes,
-`shared-run-hooks.js` reserve / save / report), `background/scheduler-job.js` (alarm, tabs, badge, Schedule view
+`shared-run-hooks.js` reserve / save / report, `run-details.js` the searched range and the failure entries,
+`run-log.js` this browser's run log), `background/scheduler-job.js` (alarm, tabs, badge, Schedule view
 messages), `popup/popup-schedule.js`. The worker's jobs are started through `launch*` functions whose `done`
 promise the scheduler awaits; a panel click uses the same functions. Tests: `test/scheduler-tests.js`
 (`npm test -- browser --only=scheduler`).

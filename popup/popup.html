@@ -548,13 +548,31 @@
           <button id="btn-schedule-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
         <p class="card-text schedule-status" id="schedule-status"></p>
+        <p class="schedule-notice" id="schedule-notice" role="status" hidden></p>
         <div id="schedule-error" class="result result-error" hidden>
           <div class="result-title" id="schedule-error-title"></div>
           <p id="schedule-error-message" class="result-text"></p>
         </div>
         <div class="group-title">Today</div>
+        <p class="schedule-hint">Open a row to see what it searched, when it ran and which documents were not saved, with the reason.</p>
         <ul class="schedule-list" id="schedule-today"></ul>
         <p class="schedule-empty" id="schedule-today-empty" hidden>No scheduled download for this IREPS account today.</p>
+        <details class="options schedule-log" id="schedule-log">
+          <summary><span>Run log of this browser</span><span class="options-summary" id="schedule-log-summary"></span></summary>
+          <div class="options-body">
+            <p class="schedule-hint">Every scheduled download this DocLink ran, with the documents it saved, skipped and could not save (and why), and why a due download did not run here. Times are IST. Copy or save it to send it to support.</p>
+            <div class="result-actions">
+              <button id="btn-schedule-log-copy" class="btn btn-link" type="button">Copy log</button>
+              <button id="btn-schedule-log-save" class="btn btn-link" type="button">Save log</button>
+            </div>
+            <div class="group-title">Runs</div>
+            <ul class="schedule-list schedule-log-runs" id="schedule-log-runs"></ul>
+            <p class="schedule-empty" id="schedule-log-runs-empty" hidden>No scheduled download has run in this browser yet.</p>
+            <div class="group-title">Scheduler events</div>
+            <ul class="schedule-events" id="schedule-log-events"></ul>
+            <p class="schedule-empty" id="schedule-log-events-empty" hidden>Nothing noted yet.</p>
+          </div>
+        </details>
         <div id="schedule-manage" hidden>
           <div class="group-title">Schedules (admin)</div>
           <p class="schedule-hint">Times are IST. A schedule runs once in its window, or once per period when it repeats, by the first DocLink whose user is active on IREPS, and is retried at its Retry interval until done. Always saved to S3 / ECM.</p>

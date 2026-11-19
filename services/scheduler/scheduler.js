@@ -9,10 +9,18 @@
  * total (the winner's). Only one slot of an account runs at a time; the rest follow one by one.
  *
  * No chrome.* here: the wiring (background/scheduler-job.js) passes the API, the local signals,
- * the runners, the alarm and the clock, so every rule is tested with fakes (test/scheduler-tests.js).
+ * the runners, the alarm, the clock and the run log, so every rule is tested with fakes
+ * (test/scheduler-tests.js).
+ *
+ * Every decision that leaves a due slot unrun (waiting for an IREPS page, a manual run, the Recon
+ * Engine; another DocLink running the account; a claim given back) is written to this browser's run
+ * log and the DocLink log, in plain words, with the types it concerns. Each run's start and end go to
+ * the run log too, with every document it could not save and why.
  */
 
-import { SCHEDULE_TYPES } from "./schedule-types.js";
+import { SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL } from "./schedule-types.js";
+import { scheduledSearch, fitResult } from "./run-details.js";
+import { describeError } from "../../utils/messages.js";
 import { logger } from "../../utils/logger.js";
 
 export const HEARTBEAT_MS = 120000;
@@ -37,6 +45,14 @@ const NEXT_SLOT = new Set(["SCHEDULE_SLOT_DONE", "SCHEDULE_NOT_DUE", "SCHEDULE_S
 const SOMEONE_ELSE = new Set(["SCHEDULE_ACCOUNT_BUSY", "SCHEDULE_SLOT_TAKEN"]);
 
 const order = (slot) => SCHEDULE_TYPES.indexOf(slot.doc_type);
+const labelOf = (type) => SCHEDULE_TYPE_LABEL[type] || type;
+/** Failed documents written one per line to the DocLink log for a run (the run log keeps them all). */
+const LOGGED_FAILURES_MAX = 50;
+/** No run log: the scheduler still runs (tests, or a storage that cannot be written). */
+const NO_RUN_LOG = Object.freeze({ event: () => {}, runStarted: () => {}, runFinished: () => {} });
+
+/** "RECON_UNAVAILABLE: could not reach ..." -> "Recon Engine unavailable (could not reach ...)". */
+const problemText = (code, detail) => `${describeError(code).title}${detail ? ` (${detail})` : ""}`;
 
 /**
  * @param {object} deps
@@ -54,6 +70,7 @@ const order = (slot) => SCHEDULE_TYPES.indexOf(slot.doc_type);
  * @param {() => number} [deps.random]
  * @param {() => string} [deps.uuid]
  * @param {{ setInterval: Function, clearInterval: Function, setTimeout: Function, clearTimeout: Function }} [deps.timers]
+ * @param {{ event: Function, runStarted: Function, runFinished: Function }} [deps.runLog]   services/scheduler/run-log.js
  */
 export function createScheduler(deps) {
   const now = deps.now || (() => Date.now());
@@ -67,6 +84,36 @@ export function createScheduler(deps) {
     clearTimeout: (id) => clearTimeout(id)
   };
   const onState = deps.onState || (() => {});
+  const runLog = deps.runLog || NO_RUN_LOG;
+  let lastNote = "";
+
+  /**
+   * One decision of the scheduler, in plain words: to the run log (a repeat only moves its time) and,
+   * when it differs from the last one, to the DocLink log. Never throws.
+   * @param {string} kind
+   * @param {string} text
+   * @param {string[]} [types]   the schedule types it concerns
+   */
+  function note(kind, text, types = []) {
+    if (text !== lastNote) {
+      (kind === "error" ? logger.warn : logger.info)(`Scheduler: ${text}`);
+      lastNote = text;
+    }
+    try {
+      Promise.resolve(runLog.event(kind, text, types)).catch(() => {});
+    } catch (error) {
+      logger.debug("Scheduler: run log event not kept", error);
+    }
+  }
+
+  /** A run-log write that is awaited (run start and end) but never fails the run. */
+  async function logRun(write) {
+    try {
+      await write();
+    } catch (error) {
+      logger.debug("Scheduler: run log not written", error);
+    }
+  }
 
   const state = {
     enabled: false,
@@ -145,7 +192,9 @@ export function createScheduler(deps) {
     waking = runWake(trigger)
       .catch((error) => {
         logger.error("Scheduler: wake failed", error);
-        publish({ lastError: { code: "UNKNOWN", detail: String((error && error.message) || error) } });
+        const detail = String((error && error.message) || error);
+        note("error", `The scheduler stopped with an error: ${detail}.`);
+        publish({ lastError: { code: "UNKNOWN", detail } });
       })
       .finally(() => {
         waking = null;
@@ -171,22 +220,35 @@ export function createScheduler(deps) {
     try {
       who = await deps.whoAmI();
     } catch (error) {
-      return waitFor("backend", { lastError: { code: (error && error.code) || "RECON_UNAVAILABLE", detail: (error && error.detail) || null } });
+      const code = (error && error.code) || "RECON_UNAVAILABLE";
+      const detail = (error && error.detail) || null;
+      note("backend", `The Recon Engine could not be reached: ${problemText(code, detail)}. No scheduled download runs from this browser until it answers.`);
+      return waitFor("backend", { lastError: { code, detail } });
     }
-    if (!who || !who.signedIn) return waitFor("recon", { user: null });
+    if (!who || !who.signedIn) {
+      note("recon", "Not signed in to the Recon Engine: this browser runs no scheduled download until someone signs in.");
+      return waitFor("recon", { user: null });
+    }
     const permissions = (who.user && who.user.permissions) || [];
     const user = { name: (who.user && who.user.name) || "", canRun: permissions.includes(RUN_PERMISSION), canManage: permissions.includes(MANAGE_PERMISSION) };
     state.user = user;
-    if (!user.canRun) return waitFor("permission");
+    if (!user.canRun) {
+      note("permission", `The signed-in Recon Engine user has no ${RUN_PERMISSION} permission: this browser runs no scheduled download.`);
+      return waitFor("permission");
+    }
 
     let account = await deps.signals.account();
     let verified = null;
     if (!account) {
       // the first time: the account is read from IREPS, but only while the user is active there
-      if (deps.isBusy() || !(await deps.signals.irepsReady())) return waitFor("account", { account: null });
+      if (deps.isBusy() || !(await deps.signals.irepsReady())) {
+        note("account", deps.isBusy() ? "The IREPS account is not known yet: waiting for the DocLink run in this browser to end." : "The IREPS account is not known yet: open any IREPS page (logged in) in this browser.");
+        return waitFor("account", { account: null });
+      }
       const check = await deps.checkIreps();
       if (!check.ok || !check.account) {
         await deps.signals.recordIrepsCheckFailed();
+        note("account", `The IREPS account could not be read: ${problemText(check.code || "SCHEDULE_ACCOUNT_UNVERIFIED")}.`);
         return waitFor("account", { account: null, lastError: check.code ? { code: check.code, detail: null } : state.lastError });
       }
       account = String(check.account.irepsAccountId);
@@ -200,9 +262,18 @@ export function createScheduler(deps) {
       try {
         due = await deps.api.due(account, cfg.types);
       } catch (error) {
-        if (error && error.code === "RECON_AUTH_REQUIRED") return waitFor("recon", { user: null });
-        if (error && error.code === "SCHEDULE_NO_PERMISSION") return waitFor("permission");
-        return waitFor("backend", { lastError: { code: (error && error.code) || "SCHEDULE_BACKEND_UNAVAILABLE", detail: (error && error.detail) || null } });
+        if (error && error.code === "RECON_AUTH_REQUIRED") {
+          note("recon", "Not signed in to the Recon Engine: this browser runs no scheduled download until someone signs in.");
+          return waitFor("recon", { user: null });
+        }
+        if (error && error.code === "SCHEDULE_NO_PERMISSION") {
+          note("permission", `The signed-in Recon Engine user has no ${RUN_PERMISSION} permission: this browser runs no scheduled download.`);
+          return waitFor("permission");
+        }
+        const code = (error && error.code) || "SCHEDULE_BACKEND_UNAVAILABLE";
+        const detail = (error && error.detail) || null;
+        note("backend", `The Recon Engine's schedules could not be reached: ${problemText(code, detail)}.`);
+        return waitFor("backend", { lastError: { code, detail } });
       }
       const running = due.running ? { slotId: due.running.id, docType: due.running.doc_type, holder: due.running.holder || null, mine: false } : null;
       const othersRun = running !== null;
@@ -214,12 +285,22 @@ export function createScheduler(deps) {
       const quietUntil = Math.min(Date.parse(due.next_check_at) || Infinity, now() + IDLE_RECHECK_MS);
       await deps.signals.setQuietUntil(candidates.length === 0 && !othersRun ? quietUntil : 0);
       if (candidates.length === 0) return;
-      if (deps.isBusy()) return publish({ waitingFor: "busy" });
-      if (!verified && !(await deps.signals.irepsReady())) return publish({ waitingFor: "ireps" });
+      const dueTypes = [...new Set(candidates.map((s) => s.doc_type))];
+      const dueText = `Due now: ${dueTypes.map(labelOf).join(", ")}`;
+      if (deps.isBusy()) {
+        note("busy", `${dueText}. Waiting for the DocLink run in this browser to end.`, dueTypes);
+        return publish({ waitingFor: "busy" });
+      }
+      if (!verified && !(await deps.signals.irepsReady())) {
+        note("ireps", `${dueText}. Waiting for IREPS: no IREPS page has loaded in this browser in the last 4 minutes (log in to IREPS and open any IREPS page).`, dueTypes);
+        return publish({ waitingFor: "ireps" });
+      }
 
       const claimed = await claimFirst(candidates, account);
       if (!claimed) return;
       if (claimed.someoneElse) {
+        const other = claimed.someoneElse;
+        note("other", `${labelOf(other.docType)}: being run by ${(other.holder && other.holder.name) || "another DocLink user"}; this browser looks again in a few minutes.`, [other.docType]);
         await setAlarm([Date.parse(due.next_check_at), now() + RUNNING_POLL_MS]);
         return publish({ running: claimed.someoneElse });
       }
@@ -230,6 +311,8 @@ export function createScheduler(deps) {
         if (!sameAccount) {
           const code = check.ok ? "SCHEDULE_ACCOUNT_MISMATCH" : check.code || "IREPS_SESSION_EXPIRED";
           logger.info(`Scheduler: claim given back (${code}); another DocLink may run it`);
+          const why = check.ok ? `IREPS account ${check.account ? check.account.irepsAccountId : "?"} is logged in here, not ${account}` : `IREPS is not logged in here (${describeError(code).title})`;
+          note("ireps", `${labelOf(claimed.slot.doc_type)}: claimed, but ${why}; given back so that another DocLink can run it.`, [claimed.slot.doc_type]);
           await finish(claimed, { outcome: "failed", code, countsAsAttempt: false });
           await deps.signals.recordIrepsCheckFailed();
           if (check.ok && check.account) await deps.signals.recordAccount(check.account.irepsAccountId);
@@ -256,7 +339,9 @@ export function createScheduler(deps) {
         const code = error && error.code;
         if (NEXT_SLOT.has(code)) continue;
         if (SOMEONE_ELSE.has(code)) return { someoneElse: { slotId: slot.id, docType: error.docType || slot.doc_type, holder: error.holder || null, mine: false } };
-        publish({ waitingFor: "backend", lastError: { code: code || "SCHEDULE_BACKEND_UNAVAILABLE", detail: (error && error.detail) || null } });
+        const detail = (error && error.detail) || null;
+        note("backend", `${labelOf(slot.doc_type)}: the Recon Engine did not hand this browser the download: ${problemText(code || "SCHEDULE_BACKEND_UNAVAILABLE", detail)}.`, [slot.doc_type]);
+        publish({ waitingFor: "backend", lastError: { code: code || "SCHEDULE_BACKEND_UNAVAILABLE", detail } });
         return null;
       }
     }
@@ -271,7 +356,8 @@ export function createScheduler(deps) {
         code: outcome.code || null,
         countsAsAttempt: outcome.countsAsAttempt !== false,
         permanent: outcome.permanent === true,
-        result: outcome.result || null
+        // never so long that the Recon Engine refuses it (a refused finish would leave the slot to its lease)
+        result: fitResult(outcome.result || null)
       });
     } catch (error) {
       // CLAIM_LOST: another DocLink took the slot over; anything else: the lease ends it
@@ -294,6 +380,9 @@ export function createScheduler(deps) {
     }, HEARTBEAT_MS);
     const isClaimLive = () => !lost && now() - lastBeat < LEASE_MS - HEARTBEAT_MS;
     publish({ running: { slotId: slot.id, docType: slot.doc_type, holder: null, mine: true, since: new Date(now()).toISOString() } });
+    const range = scheduledSearch(slot.doc_type, claimed.params).text;
+    logger.info(`Scheduler: running ${slot.doc_type}${slot.period && slot.period !== "day" ? ` (${slot.period} run)` : ""} for account ${account.irepsAccountId}: ${range || "no date range"}`);
+    await logRun(() => runLog.runStarted({ id: claimId, docType: slot.doc_type, slotId: slot.id, slotDate: slot.slot_date || null, period: slot.period || null, account: String(account.irepsAccountId), range, user: (state.user && state.user.name) || null }));
 
     let outcome;
     try {
@@ -303,16 +392,29 @@ export function createScheduler(deps) {
         : { outcome: "failed", code: "SCHEDULE_TYPE_NOT_SUPPORTED", permanent: true };
     } catch (error) {
       logger.error(`Scheduler: ${slot.doc_type} run failed`, error);
-      outcome = { outcome: "failed", code: (error && error.code) || "UNKNOWN" };
+      outcome = { outcome: "failed", code: (error && error.code) || "UNKNOWN", result: { detail: String((error && error.message) || error).slice(0, 200) } };
     } finally {
       timers.clearInterval(beat);
     }
     if (lost) outcome = { ...outcome, code: outcome.code || "SCHEDULE_CLAIM_LOST" };
     await finish(claimed, outcome);
-    logger.info(`Scheduler: ${slot.doc_type} ${outcome.outcome}${outcome.code ? ` (${outcome.code})` : ""}`, outcome.result || {});
+    logOutcome(slot, outcome);
+    await logRun(() => runLog.runFinished(claimId, outcome));
     publish({ running: null, lastRun: { docType: slot.doc_type, outcome: outcome.outcome, code: outcome.code || null, result: outcome.result || null, at: new Date(now()).toISOString() } });
     // an expired IREPS session or a lost claim ends this wake; the next trigger starts afresh
     return { stopWake: outcome.sessionExpired === true || lost || outcome.stopWake === true };
+  }
+
+  /**
+   * How a run ended, in the DocLink log: one line (a warning unless it is done), then one info line per
+   * document it could not save, so the stored log names them without filling Chrome's Errors page.
+   */
+  function logOutcome(slot, outcome) {
+    const { log: lists, ...rest } = outcome;
+    (outcome.outcome === "done" ? logger.info : logger.warn)(`Scheduler: ${slot.doc_type} ${outcome.outcome}${outcome.code ? ` (${outcome.code})` : ""}`, rest.result || {});
+    const failures = (lists && lists.failures) || (outcome.result && outcome.result.failures) || [];
+    for (const f of failures.slice(0, LOGGED_FAILURES_MAX)) logger.info(`Scheduler: ${slot.doc_type}: not saved: ${f.doc} - ${f.code}${f.detail ? ` (${f.detail})` : ""}`);
+    if (failures.length > LOGGED_FAILURES_MAX) logger.info(`Scheduler: ${slot.doc_type}: ${failures.length - LOGGED_FAILURES_MAX} more not saved (the Schedule view's run log lists them all)`);
   }
 
   return { wake, getState };

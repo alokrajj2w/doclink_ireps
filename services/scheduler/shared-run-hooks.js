@@ -14,14 +14,19 @@
  *
  * Phase 2 (tender documents) uses the same pieces through `tenderHooks`, installed in the tender code
  * by tender/tender-shared-run.js: reserveDocuments before a category or letter is fetched, an ECM sink
- * that never saves locally, and documentSaved for each file the ECM took.
+ * that never saves locally, documentSaved for each file the ECM took, and documentFailed for each
+ * document that could not be saved, with its reason.
+ *
+ * `details()` lists what the run saved, skipped and could not save (with the code and reason of each),
+ * for the slot's result and this browser's run log (run-details.js, run-log.js).
  */
 
-import { downloadKey, exportFingerprint, downloadRecord, logDownload, SKIP_REASON, LOG_DESTINATION } from "../download-log.js";
+import { downloadKey, exportFingerprint, downloadRecord, logDownload, describeSkip, SKIP_REASON, LOG_DESTINATION } from "../download-log.js";
 import { uploadToEcm, ECM_OUTCOME, EcmError } from "../ecm-service.js";
 import { saveExportFileTo, WorkflowError } from "../export-save-service.js";
 import { SAVE_DESTINATION } from "../recon-service.js";
 import { DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
+import { failureEntry, docEntry, labelFromKey, tenderCode, LOG_DOCS_MAX } from "./run-details.js";
 import { logger } from "../../utils/logger.js";
 
 /** Keys per reserve request (the backend takes up to 100). */
@@ -52,6 +57,12 @@ function takenSkip(taken) {
   return { reason: SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT, by, inProgress: taken && taken.status === "in_progress", ...istParts(taken && taken.at) };
 }
 
+/** Where a saved PDF went, for the run log: "IC_45.pdf in ECM /Hosur/IC" (" - already there" when the ECM had it). */
+function ecmNote(filename, ecm) {
+  const where = ecm && ecm.path ? ` in ECM ${ecm.path}` : " in the ECM";
+  return `${filename || "file"}${where}${ecm && ecm.status === ECM_OUTCOME.ALREADY_STORED ? " - already there" : ""}`;
+}
+
 /**
  * @param {object} deps
  * @param {object} deps.api                 services/scheduler/schedule-api.js
@@ -75,14 +86,26 @@ export function createSharedRunHooks(deps) {
 
   /** item id -> its document key, for the documents this run reserved */
   const granted = new Map();
-  /** item id -> the code a scheduled save failed with (the downloader only keeps its own code) */
-  const failureCodes = new Map();
+  /** item id -> the code and reason a scheduled save failed with (the downloader only keeps its own code) */
+  const failureInfo = new Map();
+  /** item id -> its name in the run's lists ("PO 123", "IC 45 (PO 123 Sr. 1)") */
+  const labels = new Map();
   let pendingDone = [];
   const stats = { saved: 0, skipped: 0, failed: 0, notReported: 0 };
   let aborted = null;
-  /** tender runs: keys this run reserved, and keys it saved */
+  /** tender runs: keys this run reserved, keys it saved, and the reason of each key that failed */
   const grantedKeys = new Set();
   const savedKeys = new Set();
+  const tenderFailures = new Map();
+  /** what the run did, document by document (details()) */
+  const lists = { failures: [], saved: [], skipped: [] };
+  const more = { failures: 0, saved: 0, skipped: 0 };
+
+  /** Add an entry to one of the run's lists, counting what does not fit. */
+  function note(list, entry) {
+    if (lists[list].length < LOG_DOCS_MAX) lists[list].push(entry);
+    else more[list]++;
+  }
 
   function assertClaim() {
     if (aborted) throw new SharedRunError(aborted);
@@ -137,15 +160,22 @@ export function createSharedRunHooks(deps) {
     const byKey = new Map();
     for (const item of items) {
       const key = item.log && item.log.key;
-      if (!key) skip.set(item.id, { reason: SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT, by: "", note: "no document key" });
-      else byKey.set(item.id, key);
+      labels.set(item.id, item.label || labelFromKey(key) || String(item.id));
+      if (!key) {
+        skip.set(item.id, { reason: SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT, by: "", note: "no document key" });
+        note("skipped", docEntry(labels.get(item.id), "not downloaded: no document number to reserve it by"));
+      } else byKey.set(item.id, key);
     }
     try {
       assertClaim();
       const answer = await reserve([...new Set(byKey.values())], LOG_DESTINATION.ECM);
       for (const [id, key] of byKey) {
         if (answer.granted.has(key)) granted.set(id, key);
-        else skip.set(id, takenSkip(answer.taken.get(key)));
+        else {
+          const taken = takenSkip(answer.taken.get(key));
+          skip.set(id, taken);
+          note("skipped", docEntry(labels.get(id), describeSkip(taken)));
+        }
       }
     } catch (error) {
       // a reservation that cannot be made must not turn into "download everything"
@@ -168,7 +198,9 @@ export function createSharedRunHooks(deps) {
       const ecm = { status: stored.deduplicated ? ECM_OUTCOME.ALREADY_STORED : ECM_OUTCOME.STORED, site: stored.site, uid: stored.uid, path: stored.path };
       return { filename, downloadId: null, ecm };
     } catch (error) {
-      failureCodes.set(item.id, error instanceof EcmError || error instanceof SharedRunError ? error.code : "SCHEDULE_DESTINATION_REFUSED");
+      // the downloader reports any saver error as "Chrome could not save the file": keep the real reason
+      const known = error instanceof EcmError || error instanceof SharedRunError;
+      failureInfo.set(item.id, { code: known ? error.code : "SCHEDULE_DESTINATION_REFUSED", detail: (error && (error.detail || error.message)) || null });
       throw error;
     }
   }
@@ -178,19 +210,25 @@ export function createSharedRunHooks(deps) {
     if (!item.log || !granted.has(item.id)) return;
     pendingDone.push(downloadRecord(item.log, { filename: done.filename, ecm: done.ecm, account }));
     stats.saved++;
+    note("saved", docEntry(labels.get(item.id) || item.label, ecmNote(done.filename, done.ecm)));
     if (pendingDone.length >= COMPLETE_BATCH) await flushDone();
   }
 
   /**
    * After a PDF run: report what was saved and release what failed. `items` are the run's final
-   * item states ({ id, status, error }). Returns the counts for the slot's result.
+   * item states ({ id, label, status, error }). Returns the counts for the slot's result; details()
+   * then names each failed document with its code and reason.
    */
   async function finishDocuments(items) {
     const failed = [];
     for (const item of items || []) {
       const key = granted.get(item.id);
       if (!key || item.status === DOCUMENT_DOWNLOAD_STATUS.COMPLETED) continue;
-      failed.push({ doc_key: key, destination: LOG_DESTINATION.ECM, code: failureCodes.get(item.id) || (item.error && item.error.code) || "SCHEDULE_DOWNLOAD_FAILED" });
+      const info = failureInfo.get(item.id) || {};
+      const error = item.error || {};
+      const code = info.code || error.code || "SCHEDULE_DOWNLOAD_FAILED";
+      failed.push({ doc_key: key, destination: LOG_DESTINATION.ECM, code });
+      note("failures", failureEntry({ doc: labels.get(item.id) || item.label, key, code, detail: info.detail || error.detail || (error.status ? `HTTP ${error.status}` : null) }));
     }
     stats.failed += failed.length;
     const done = pendingDone;
@@ -208,20 +246,26 @@ export function createSharedRunHooks(deps) {
   async function saveExport(file, target) {
     if (!Array.isArray(target.records)) throw new TypeError(`saveExport: ${target.label || target.docType} records must be an array`);
     const log = { docType: target.docType, key: downloadKey.export(target.docType, await exportFingerprint(file.format || file.extension, target.records)) };
+    const doc = `${target.label || labelFromKey(log.key)} export (${target.records.length} record${target.records.length === 1 ? "" : "s"})`;
+    const failedWith = (code, detail) => note("failures", failureEntry({ doc, code, detail }));
     try {
       assertClaim();
     } catch (error) {
+      failedWith(error.code, error.detail);
       throw new WorkflowError(error.code);
     }
     let answer;
     try {
       answer = await reserve([log.key], LOG_DESTINATION.S3);
     } catch (error) {
-      throw new WorkflowError((error && error.code) || "SCHEDULE_BACKEND_UNAVAILABLE", { detail: error && error.detail });
+      const code = (error && error.code) || "SCHEDULE_BACKEND_UNAVAILABLE";
+      failedWith(code, `not reserved: ${(error && error.detail) || code}`);
+      throw new WorkflowError(code, { detail: error && error.detail });
     }
     if (!answer.granted.has(log.key)) {
       const skip = takenSkip(answer.taken.get(log.key));
       stats.skipped++;
+      note("skipped", docEntry(doc, `the same rows: ${describeSkip(skip)}`));
       logger.info(`${target.label}: identical export already saved for account ${accountId}; not saved again`, { by: skip.by, date: skip.date });
       return { destination: SAVE_DESTINATION.RECON, downloadId: null, filename: null, storedPath: null, deduplicated: false, ingestStats: null, skipped: true, skip, warnings: [] };
     }
@@ -232,10 +276,12 @@ export function createSharedRunHooks(deps) {
     } catch (error) {
       stats.failed++;
       const code = (error && error.code) || "SCHEDULE_DESTINATION_REFUSED";
+      failedWith(code, (error && (error.detail || (error.details && error.details.detail))) || null);
       await complete([], [{ doc_key: log.key, destination: LOG_DESTINATION.S3, code }]);
       throw error instanceof WorkflowError ? error : new WorkflowError(code, { detail: error && error.detail });
     }
     stats.saved++;
+    note("saved", docEntry(doc, `${saved.filename || target.filename} to S3${saved.storedPath ? ` (${saved.storedPath})` : ""}${saved.deduplicated ? " - the same file was already there" : ""}`));
     await complete([downloadRecord(log, { filename: saved.filename, destination: LOG_DESTINATION.S3, account })], []);
     return { ...saved, skipped: false, warnings: [] };
   }
@@ -258,6 +304,7 @@ export function createSharedRunHooks(deps) {
     for (const k of answer.granted) grantedKeys.add(k);
     const taken = new Map([...answer.taken].map(([k, v]) => [k, takenSkip(v)]));
     stats.skipped += taken.size;
+    for (const [k, skip] of taken) note("skipped", docEntry(labelFromKey(k), describeSkip(skip)));
     return { granted: answer.granted, taken };
   }
 
@@ -276,12 +323,36 @@ export function createSharedRunHooks(deps) {
     pendingDone.push(record);
     savedKeys.add(record.doc_key);
     stats.saved++;
+    const ecm = record.ecm || null;
+    note("saved", docEntry(labelFromKey(record.doc_key), ecmNote(record.filename, ecm && { status: ecm.status, path: ecm.path })));
     if (pendingDone.length >= COMPLETE_BATCH) await flushDone();
   }
 
-  /** After a tender run: report what was saved and release what was reserved but not saved. */
-  async function finishTenderRun() {
-    const failed = [...grantedKeys].filter((k) => !savedKeys.has(k)).map((k) => ({ doc_key: k, destination: LOG_DESTINATION.ECM, code: "SCHEDULE_DOWNLOAD_FAILED" }));
+  /**
+   * A tender document the run could not save, with why (the tender code's error). Only a reserved key
+   * counts: it is released with this code when the run ends.
+   * @param {{ key: string, doc?: string, code?: string, detail?: string }} failure
+   */
+  function documentFailed({ key, doc, code, detail } = {}) {
+    if (!key) return;
+    tenderFailures.set(key, failureEntry({ doc: doc || labelFromKey(key), key, code: tenderCode(code), detail }));
+  }
+
+  /**
+   * After a tender run: report what was saved and release what was reserved but not saved, each with
+   * the reason the tender code gave (documentFailed). `stopped` is the code the job stopped with: the
+   * documents it never reached are listed with it.
+   * @param {{ stopped?: string|null }} [run]
+   */
+  async function finishTenderRun({ stopped = null } = {}) {
+    const failed = [];
+    for (const key of grantedKeys) {
+      if (savedKeys.has(key)) continue;
+      const entry = tenderFailures.get(key)
+        || failureEntry({ key, code: stopped ? tenderCode(stopped) : "SCHEDULE_DOWNLOAD_FAILED", detail: stopped ? "not downloaded: the run stopped before it" : "reserved, but no file was saved and no error was reported" });
+      failed.push({ doc_key: key, destination: LOG_DESTINATION.ECM, code: entry.code });
+      note("failures", entry);
+    }
     stats.failed += failed.length;
     const done = pendingDone;
     pendingDone = [];
@@ -289,14 +360,20 @@ export function createSharedRunHooks(deps) {
     return { ...stats, aborted };
   }
 
+  /** What the run did, document by document: { failures, saved, skipped } (and how many more did not fit). */
+  function details() {
+    return { failures: [...lists.failures], saved: [...lists.saved], skipped: [...lists.skipped], more: Object.fromEntries(Object.entries(more).filter(([, n]) => n > 0)) };
+  }
+
   return {
     /** deps for tender runs (tender/tender-shared-run.js) */
-    tenderHooks: { reserveDocuments, ecmSink, documentSaved },
+    tenderHooks: { reserveDocuments, ecmSink, documentSaved, documentFailed },
     finishTenderRun,
     /** deps for MA / PO-by-date / IC runs (document-downloader.js) */
     documentHooks: { preflight, saveFile, onSaved },
     finishDocuments,
     saveExport,
-    stats: () => ({ ...stats, aborted })
+    stats: () => ({ ...stats, aborted }),
+    details
   };
 }
