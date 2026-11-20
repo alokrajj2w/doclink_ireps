@@ -40,6 +40,11 @@ node test/mock/switch-target.mjs mock|real|status   # same as editing config.jso
 # Sample PDF from the dependency-free PDF writer
 node test/make-sample-pdf.mjs /tmp/sample.pdf
 
+# Every ECM_FIELDS property and ECM kind against the live ECM's schema and type vocabulary (read-only;
+# uses the client id / secret in config.local.json and prints neither). Run it on TEST and PROD before
+# a build that sends a new field. Exit code 0 = all present, 1 = something missing, 2 = no check made.
+node scripts/check-ecm-schema.mjs
+
 # Shareable build: bundles + minifies + obfuscates each entry point into dist/doclink/ and zips it.
 npm install && npm run build                       # production build (see below)
 npm run build -- --allow-mock                      # test build: may run against the mock portal
@@ -133,7 +138,11 @@ After code changes, reload DocLink in `chrome://extensions`.
 
     Both are built from the LOA list row (`loaFields` in `tender/tender-ecm.js`; "Dept/Rly. Unit" is found by its header), and DocLink sends both or neither.
   - The correspondence tender date is the "Closing Date" next to the tender number on the correspondence page. That is the tender's closing date; the letter's own deadline is "Last date for submission of reply".
-- The ECM's live schema and type vocabulary are the source of truth. Check them with `GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema` and `GET /nuxeo/api/v1/directory/invoice_certificate_document_types` before adding a field or kind. A property the schema lacks makes Nuxeo answer HTTP 400 "No such property".
+- **IC details.** The ECM added Customer PO Serial Number and Passed Quantity to the IC on 16 Nov 2026, and the tech lead decided that DocLink sends them. `icFiling` (`services/inspection-certificate/ic-service.js`) sends the IC list row's "PO Sr." as `customer_po_serial_number` and its "Passed Qty." as `passed_quantity`, verbatim, in all three IC flows.
+  - They are the kind's `details` in `ecm-catalog.js`. `matchFields` leaves details out of the download check (`findInEcm`) and the upload's duplicate search (`existingDocumentQuery`). So an IC stored before 16 Nov 2026, which has neither, is still found and never stored twice.
+  - A field that describes a document without identifying it goes in `details`. Otherwise every document stored before the field existed stops matching.
+  - The Recon gateway's `document_kinds.toml` must learn the two fields before `ecmBackendAws: true`.
+- The ECM's live schema and type vocabulary are the source of truth. Check them with `GET /nuxeo/api/v1/config/schemas/InvoiceCertificateSchema` and `GET /nuxeo/api/v1/directory/invoice_certificate_document_types` before adding a field or kind; `node scripts/check-ecm-schema.mjs` makes both calls and compares them with the catalog. A property the schema lacks makes Nuxeo answer HTTP 400 "No such property".
 
 **Two logins.** Login 1 is IREPS (manual, security key). DocLink only checks it. Login 2 is the Recon Engine (password or Okta via `chrome.identity`; `services/recon-auth.js`, `popup/popup-recon-auth.js`). The Recon login is required for every run while `downloadLog.enabled` is true. When the Recon Engine cannot be reached at all (as opposed to nobody being signed in), the sign-in page also offers "Download without the Recon Engine": the run saves locally and its log records wait in the queue.
 

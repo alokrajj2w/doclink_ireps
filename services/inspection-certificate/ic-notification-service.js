@@ -158,6 +158,7 @@ function addRows(state, note, rows) {
       callId: row.callId,
       icNumber: row.icNumber || icNumberFromUrl(url),
       icDate: row.icDate || null,
+      passedQty: row.passedQty || null,
       refIdMatchesCallId: row.refIdMatchesCallId === true,
       url,
       path: null,

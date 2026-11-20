@@ -224,6 +224,20 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     eq(JSON.stringify(result), JSON.stringify({ uid: "doc-1", path: "/x/3480517 - IC", title: "3480517 - IC", site: "hosur", deduplicated: false }), "same answer as the gateway");
   });
 
+  await test("ECM direct: an IC is created with its PO serial and passed quantity, and its dedup search leaves them out (an IC stored without them is found)", async () => {
+    fresh();
+    const fetch = fakeNuxeo();
+    await uploadToNuxeo({ ...IC, fields: { ...IC.fields, customer_po_serial_number: "001", passed_quantity: "36" } }, { fetch, hostPermissions: HOSTS });
+    const props = JSON.parse(fetch.creates()[0].body).properties;
+    eq(JSON.stringify([props["InvoiceCertificateSchema:customerPOSrNumber"], props["InvoiceCertificateSchema:passedQuantity"]]), JSON.stringify(["001", "36"]), "both stored with the new document");
+
+    fresh();
+    const plain = fakeNuxeo();
+    await uploadToNuxeo(IC, { fetch: plain, hostPermissions: HOSTS });
+    const searches = (f) => f.of("/nuxeo/api/v1/search/").map((c) => c.query).join("\n");
+    eq(searches(fetch), searches(plain), "the same dedup search as an IC without them");
+  });
+
   await test("ECM direct: a document the ECM cannot serve in full is ECM_FILE_DAMAGED (new or found by dedup) and saved locally", async () => {
     // TEST ECM, 30/10/2026: IC 6709630 recorded as 63238 bytes, file readable only to byte 61980
     fresh();

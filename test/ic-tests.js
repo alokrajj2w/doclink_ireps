@@ -311,7 +311,8 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
     eq(items[0].url, records[0].icPdfUrl);
     eq(items[0].label, "IC 6038184070 (PO Sr. 001)");
     eq(items[0].ecm.kind, "inspectionCertificate");
-    eq(JSON.stringify(items[0].ecm.fields), JSON.stringify({ ic_number: "3480517", customer_po_number: "27253922100240", ic_date: records[0].icDate }), "ECM filing: IC number, PO number, IC date");
+    eq(JSON.stringify(items[0].ecm.fields), JSON.stringify({ ic_number: "3480517", customer_po_number: "27253922100240", ic_date: records[0].icDate, customer_po_serial_number: "001", passed_quantity: "106" }),
+      "ECM filing: IC number, PO number, IC date, and the row's PO Sr. and Passed Qty. as IREPS shows them");
   });
 
   await test("downloadInspectionCertificates: an ECM save hook gets each item; its outcome lands on the item", async () => {

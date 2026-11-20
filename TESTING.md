@@ -651,8 +651,13 @@ node test/mock/switch-target.mjs status
     folder, with the TEST ECM client id and secret in `config.local.json` (a
     built zip has no `config.local.json`, so it saves locally). The TEST
     ECM's Tenders folder must exist.
+    0. Run `node scripts/check-ecm-schema.mjs`. Every line must say `ok`,
+       `customer_po_serial_number` and `passed_quantity` included. A
+       `MISSING` line means the ECM names that property differently: find
+       its name under "Its other properties", and change it in
+       `services/ecm-catalog.js` `ECM_FIELDS` before you go on.
     1. Download one tender's NIT, an LOA, a Negotiation or Counter Offer
-       letter, and a Pending Correspondence letter.
+       letter, a Pending Correspondence letter, and the ICs of one PO.
     2. In the ECM, check the documents:
        - each one shows **Tender Number** and **Tender Date**. The date is the
          tender's closing date, the "Due Date/Time" of IREPS's Search Tender;
@@ -661,7 +666,11 @@ node test/mock/switch-target.mjs status
          Date** as the letter's "Dated";
        - a correspondence document's Tender Date is the "Closing Date" next to
          the tender number on its Tender Related Correspondence page, not the
-         reply deadline.
+         reply deadline;
+       - each `<IC no> - IC` document shows **Customer PO Serial Number** and
+         **Passed Quantity**, the same as that IC's "PO Sr." and "Passed Qty."
+         in IREPS's My Inspection Calls list. An IC stored before 16 Nov 2026
+         is found as "Already in ECM" and keeps its old fields.
     3. If the ECM refuses a document with "No such property", the TEST ECM
        lacks that field; the document is saved locally, and its row says why.
        Tell the ECM team which field it named.

@@ -119,10 +119,14 @@ export async function searchInspectionCertificates(poNumber, deps = {}) {
   };
 }
 
-/** How an IC is filed under Save to: ECM / S3 and recorded in the download log (one rule for every IC flow). */
-export function icFiling({ icNumber, poNo, poSerial, callId, icDate }) {
+/**
+ * How an IC is filed under Save to: ECM / S3 and recorded in the download log (one rule for every
+ * IC flow). The PO serial and passed quantity are the row's "PO Sr." and "Passed Qty." as IREPS
+ * shows them.
+ */
+export function icFiling({ icNumber, poNo, poSerial, callId, icDate, passedQty }) {
   return {
-    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: icNumber, customer_po_number: poNo, ic_date: icDate } },
+    ecm: { kind: ECM_KIND.INSPECTION_CERTIFICATE, fields: { ic_number: icNumber, customer_po_number: poNo, ic_date: icDate, customer_po_serial_number: poSerial, passed_quantity: passedQty } },
     log: logInfo(LOG_DOC_TYPE.IC, downloadKey.ic({ poNo, poSerial, callId, icNumber }))
   };
 }

@@ -17,6 +17,8 @@ import { createLocalSignals, IREPS_ACTIVITY_MS } from "../services/scheduler/loc
 import { scheduledSearch, labelFromKey, failureEntry, fitResult, RESULT_FAILURES_MAX, RESULT_MAX_CHARS, FIXED_LOOKBACK } from "../services/scheduler/run-details.js";
 import { createRunLog, runLogText, MAX_RUNS } from "../services/scheduler/run-log.js";
 import { isIrepsActivityUrl, exportLaunchOptions } from "../background/scheduler-job.js";
+import { icDateItems } from "../services/inspection-certificate/ic-date-service.js";
+import { icFiling } from "../services/inspection-certificate/ic-service.js";
 import { slotText, istTime, todayRows, earlierText, editorTypes, lastErrorText, initSchedule, slotDetails, savedNotice, handleScheduleMessage } from "../popup/popup-schedule.js";
 import { describeSkip, SKIP_REASON } from "../services/download-log.js";
 import { EcmError } from "../services/ecm-service.js";
@@ -955,7 +957,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
       user: { name: "Priya", canRun: true, canManage: true },
       waitingFor: null,
       lastError: null,
-      version: "1.6.3",
+      version: "1.6.4",
       slots: [
         { id: 1, doc_type: "billStatus", period: "day", status: "missed", ...nineToTen },
         { id: 3, doc_type: "tenderNit", period: "10:30", status: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", attempts: 1, started_at: "2026-11-19T05:15:00+00:00", ended_at: "2026-11-19T05:22:00+00:00", window_start_at: "2026-11-19T05:00:00+00:00", window_end_at: "2026-11-19T06:00:00+00:00", next_try_at: "2026-11-19T05:45:00+00:00", result: { saved: 35, skipped: 18, failed: 2, range: "17/11/2026 - 18/11/2026", failures } }
@@ -1283,6 +1285,19 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(cleanOutcome({ outcome: "done", code: "not a code!" }).code, null);
   });
 
+  await test("Shared hooks: a scheduled IC reaches the ECM with the IREPS row's PO Sr. and Passed Qty.", async () => {
+    // the IC list row as IREPS shows it (IC 5445639, TEST ECM 16/11/2026), through the IC flows' own filing
+    const row = { poNo: "27253922100240", poSerial: "003", callId: "C1", icNumber: "5445639", icDate: "12/11/2026", passedQty: "4", icPdfUrl: "https://ireps.example/ic.pdf" };
+    const [item] = icDateItems([row]).map((i) => ({ id: i.id, url: i.url, path: i.path, label: i.label, ...icFiling(i) }));
+    const uploads = [];
+    const hooks = createSharedRunHooks({ api: hooksApi(), claimId: "c1", account: ACCOUNT, isClaimLive: () => true, uploadEcm: async (doc) => (uploads.push(doc), { uid: "u1", site: "hosur", path: "/x", deduplicated: false }) });
+    await hooks.documentHooks.preflight([item]);
+    await hooks.documentHooks.saveFile(new Uint8Array([1]), item.path, item);
+    eq(uploads.length, 1);
+    eq(uploads[0].kind, "inspectionCertificate");
+    eq(JSON.stringify(uploads[0].fields), JSON.stringify({ ic_number: "5445639", customer_po_number: "27253922100240", ic_date: "12/11/2026", customer_po_serial_number: "003", passed_quantity: "4" }), "PO Sr. with its leading zeros, Passed Qty. as IREPS gives it");
+  });
+
   await test("Shared hooks (tender): reserve -> granted / taken; a failed reservation throws; ECM only; unsaved keys released", async () => {
     const api = hooksApi({ taken: { "tender:LOA|T1|2": { status: "done", by: { user_id: 4, name: "Rahul" }, at: "2026-11-16T09:32:00+00:00" } } });
     const uploads = [];
@@ -1408,7 +1423,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(JSON.stringify([log.events[1].count, log.events[1].first, log.events[1].at]), JSON.stringify([3, "2026-11-19T03:32:00.000Z", "2026-11-19T03:52:00.000Z"]));
     const run = log.runs[0];
     eq(JSON.stringify([run.outcome, run.counts, run.failures.length, run.more]), JSON.stringify(["partial", { saved: 35, skipped: 18, failed: 5 }, 5, { saved: 34 }]));
-    const text = runLogText(log, { account: "833", version: "1.6.3", savedAt: "2026-11-19T05:00:00Z" });
+    const text = runLogText(log, { account: "833", version: "1.6.4", savedAt: "2026-11-19T05:00:00Z" });
     for (const line of ["IREPS account 833", "Tender NIT documents (10:30 run)  PARTLY DONE", "Searched: 17/11/2026 - 18/11/2026", "Counts: 35 saved, 18 already saved, 5 failed", "Not saved (5):", `- Tender 0 tender PDF: ${describeError("ECM_UNAVAILABLE").title} (the ECM did not answer in time) [ECM_UNAVAILABLE]`, "Saved (35):", "... and 34 more", "2026-11-19 09:02 to 09:22 (3 times)  Due now: Bill Status."]) {
       assert(text.includes(line), `the text has "${line}"\n${text}`);
     }

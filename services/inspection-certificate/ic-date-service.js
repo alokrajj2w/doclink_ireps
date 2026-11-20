@@ -137,6 +137,7 @@ export function icDateItems(records) {
       callId: r.callId,
       icNumber: r.icNumber || icNumberFromUrl(url),
       icDate: r.icDate || null,
+      passedQty: r.passedQty || null,
       tpiAgency: r.tpiAgency || null,
       url,
       path,
