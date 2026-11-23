@@ -43,7 +43,7 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
   document attached to the counter offer is never downloaded in its place. A per-account
   ledger (`chrome.storage.local`) skips documents already downloaded, so
   "Retry failed" is safe. Financial and Commercial Tabulations are downloaded
-  by the tenders' Closing Date from IREPS Closed Tenders (section 19); the
+  by the tenders' Closing Date from IREPS Search Tender (section 19); the
   Techno-Commercial Tabulation is never requested (blocked at the request
   layer). The feature
   runs in the side panel only; it has its own node tests (section 10).
@@ -1164,7 +1164,7 @@ no setting to switch them.
 | Document | Source of the tender date |
 |---|---|
 | NIT and corrigendum | The tender search row's "Due Date/Time"; when the search gives none, the NIT message's "due on" date. |
-| Financial and Commercial Tabulation | The Closed Tenders row's "Closing Date/Time". |
+| Financial and Commercial Tabulation | The Search Tender row's "Due Date/Time" (one tender found through Closed Tenders: that row's "Closing Date/Time"). |
 | Negotiation, Counter Offer and LOA | A tender search by tender number, once per tender in a run. |
 
 Railways reuse tender numbers: 10263703 is both a N F RLY and an EAST CENTRAL RLY tender. When
@@ -1480,35 +1480,69 @@ plus the `find_in_folder` tests in the recon-engine repo.
 ## 19. Financial and Commercial Tabulation
 
 "ECM - Download speci-v1" columns L and M (ECM types `vft` / `vct`). IREPS
-shows both on a tender's row in **Closed Tenders** (Vendor inbox, Tenders ›
-Closed Tenders) once the bids are opened, next to My Offer
-(`01_api_data/finncial and commercial documentation response.har`, and the
+shows both, once the bids are opened, next to My Offer on the tender's row in
+**Search Tender** (`/epsn/search/advancedSearch.do`: `Financial Download.txt`,
+11 Sep 2026, and the Search Tender HAR of 20 Nov 2026) and in **Closed
+Tenders** (Vendor inbox, Tenders › Closed Tenders:
+`01_api_data/finncial and commercial documentation response.har`, and the
 29 Oct capture `financial and commercial documentation response_29oct.har`).
-The tabulation opens in a popup window, so neither capture holds its response:
+The tabulation opens in a popup window, so no capture holds its response:
 
-| Link | Request (POST, as `postRequestNewWindow` sends it) |
-|---|---|
-| View Financial Tabulation | `/epsn/tbo/commTboPdfAction.do?tenderOID=<oid>&pdfType=financialTabulation&accountID=<acct>` |
-| View Commercial Tabulation | `/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=<oid>&accountID=<acct>` |
+| Link | Search Tender row (GET, `window.open`) | Closed Tenders row (POST, as `postRequestNewWindow` sends it) |
+|---|---|---|
+| Financial Tabulation | `/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=<oid>` | `/epsn/tbo/commTboPdfAction.do?tenderOID=<oid>&pdfType=financialTabulation&accountID=<acct>` |
+| Commercial Tabulation | `/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=<oid>` | `/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=<oid>&accountID=<acct>` |
 
-The list itself is `POST /epsn/vendorInboxLink.do` with `menuLink=Tenders`,
-`status` = `listType` = `MyBidsClosed`, `tenderNo`, `startDate` / `endDate`
-(the **Closing Date**, dd/mm/yyyy) and `pageNo`; each row gives Dept/Rly. Unit,
-Tender No. (Bid Id), Tender Title and Closing Date/Time
-(`parseClosedTenders`, `scanClosedTenders` in `tender/tender-workflows.js`).
+DocLink finds a link by its path and `pdfType`, never by its title, and sends
+it the way the row does.
+
+**By closing date: Search Tender** (`scanTenderSearch` in
+`tender/tender-workflows.js`). Search Tender lists every tender, not only this
+vendor's, so DocLink searches one closing day at a time, as the 20 Nov 2026
+capture does:
+
+* the form is opened once (`POST searchParam=showPage`; it has no Struts
+  token), then each day is one `POST /epsn/search/advancedSearch.do` with the
+  browser's 21 fields in the browser's order (`closingDaySearchBody`,
+  `tender/tender-search.js`): a Tender Number search with the number empty (or
+  the optional Tender Number), `selectDate=TENDER_OPENING_DATE` (the page's
+  "Tender Closing Date") from that day to that day, Custom Date, the Stores
+  department (`division=19`) and all railways;
+* every result page (25 rows) is read through the page link IREPS shows on the
+  page before (`GET ...advancedSearch.do?...&count=<N>&pageNo=<n>`), followed
+  as given: IREPS keeps the search in the session, and page 2's links carry
+  `railwayzone=` where page 1's carry `railwayzone=-1`;
+* the rows read are compared with IREPS's own count ("Tender search results
+  N"). Fewer rows, a page DocLink does not recognise or an HTTP error say that
+  the day was not read to the end (`TENDER_SEARCH_SHORT`,
+  `TENDER_PAGE_NOT_RECOGNISED`, `TENDER_LIST_FAILED`); what was read is still
+  downloaded;
+* only the tenders this vendor bid on count (the row shows My Offer, or a
+  tabulation link), and each row's own "Due Date/Time" decides;
+* each day's search and result pages run under the IREPS form lock
+  (`withIrepsFormLock`), released between days.
+
+On 19 Nov 2026 one closing day was 1214 tenders (Stores, all railways), 49
+result pages, so a range costs about that many page requests per day.
 
 * **Panel.** "Download Tender Documents" › **Financial Tabulation** /
-  **Commercial Tabulation**: every tender that closed between From and To (the
-  optional Tender Number narrows it) and shows the link is downloaded to
-  `Downloads/DocLink/<unit>/Tender_<no>/Tabulation/`; a closed tender without
-  it reads "not available yet" (re-run the range later). A range longer than
-  90 days is read in 90-day windows (`downloadTabulationsByDate`,
-  `tender/tender-jobs.js`; `runTabulations`, `tender/tender-auto.js`).
+  **Commercial Tabulation**: every tender of this vendor that closed between
+  From and To (the optional Tender Number narrows it) and shows the link is
+  downloaded to `Downloads/DocLink/<unit>/Tender_<no>/Tabulation/`; one that
+  shows My Offer but not the link yet reads "not available yet" (re-run the
+  range later) (`downloadTabulationsByDate`, `tender/tender-jobs.js`;
+  `runTabulations`, `tender/tender-auto.js`).
+* **Scheduled.** The `tenderTabulations` schedule (section 23) runs the same
+  `downloadTabulationsByDate`, for both tabulations.
 * **Single tender.** `downloadTenderDocuments` has the two categories
   `financialTabulation` / `commercialTabulation`: from the tender's search row,
-  else from its Closed Tenders row (one scan, closing date ± 1 day).
-* **Checks.** The link's `accountID` must be the active IREPS account; what was
-  downloaded before is skipped (download log types `financial_tabulation` /
+  else from its Closed Tenders row (one scan, closing date ± 1 day;
+  `scanClosedTenders`, `parseClosedTenders`): `POST /epsn/vendorInboxLink.do`
+  with `menuLink=Tenders`, `status` = `listType` = `MyBidsClosed`, `tenderNo`,
+  `startDate` / `endDate` (the Closing Date, dd/mm/yyyy) and `pageNo`.
+* **Checks.** A Closed Tenders link carries an `accountID`, which must be the
+  active IREPS account; a Search Tender link carries none, and the active
+  account is checked before each tender. What was downloaded before is skipped (download log types `financial_tabulation` /
   `commercial_tabulation`, else the ledger). The tabulation must be a PDF. A
   PDF behind a viewer page (iframe / embed, a self-submitting form, a
   `window.open` / `location` target) is followed. A web page that leads to no
@@ -1864,7 +1898,7 @@ ships it off.
 | `NIT` | `tenderNit` | "NIT Documents" (automatic mode): My Messages in the range → each tender's NIT, attachments, My Offer and its corrigenda | hourly, 10:30 … 18:30 |
 | `CounterOffer` | `tenderCounterOffer` | Counter Offer letters by Letter Date | hourly, 10:30 … 18:30 |
 | `LOA` | `tenderLoa` | Advance Acceptance (LOA) letters by Letter Date. Sends IREPS's own "LOA viewed" request first, as a manual LOA download does, with nobody clicking | hourly, 10:30 … 18:30 |
-| `Tabulation` | `tenderTabulations` | Financial and Commercial Tabulation of tenders closing in the range (look-back 15 days: a tabulation appears days after closing) | hourly, 10:30 … 18:30 |
+| `Tabulation` | `tenderTabulations` | Financial and Commercial Tabulation of tenders closing in the range, from IREPS Search Tender one closing day at a time, as the panel's buttons (section 19; look-back 15 days: a tabulation appears days after closing) | hourly, 10:30 … 18:30 |
 | `Correspondence` | `tenderCorrespondence` | Every letter IREPS lists as pending (no date range) | hourly, 10:30 … 18:30 |
 | `Negotiation` | `tenderNegotiation` | Negotiation letters by Letter Date. Its own schedule because IREPS opens these pages very slowly | 12:30, 15:30, 18:30 (retry every 30 min) |
 

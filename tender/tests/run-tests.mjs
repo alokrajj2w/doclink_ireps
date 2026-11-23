@@ -3,7 +3,7 @@
 import { createRequire } from 'node:module';
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeIreps, PDF, corresPage, fakeChromeDebugger, LOA_SCRIPT } from './fake-ireps.js';
+import { FakeIreps, PDF, corresPage, fakeChromeDebugger, LOA_SCRIPT, resultsPage, resultRow } from './fake-ireps.js';
 
 const req = createRequire((process.env.JSDOM_ROOT || process.cwd()) + '/');
 const { JSDOM } = req('jsdom');
@@ -1624,8 +1624,18 @@ test('Download log: cancelling the Recon sign-in stops the run before anything i
 const { readFileSync } = await import('node:fs');
 const CLOSED_FIXTURE = readFileSync(new URL('./fixtures/closed-tenders.html', import.meta.url), 'utf8');
 const closed = (no, o = {}) => ({ no, nitId: `55${no.slice(-5)}`, oid: `107${no.slice(-6)}`, bidId: `208${no.slice(-5)}`, title: `Item ${no}`, closing: new Date(2026, 9, 20), tab: true, ...o });
-const tabPosts = () => server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do');
+const tabRequests = () => server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do');
 const closedPosts = () => server.log.filter((l) => l.path === '/epsn/vendorInboxLink.do' && l.body.status === 'MyBidsClosed' && l.body.startDate);
+// Search Tender rows (fake-ireps.js resultRow): a tender this vendor bid on (My Offer, and both tabulations unless
+// tab: false), and a tender of another vendor on the same result pages (neither)
+const bid = (no, o = {}) => T({ no, nitId: `55${no.slice(-5)}`, oid: `107${no.slice(-6)}`, title: `Item ${no}`, status: 'Tender Finalized', closing: new Date(2026, 9, 20), offer: true, ...o });
+const other = (no, o = {}) => T({ no, nitId: `66${no.slice(-5)}`, oid: `108${no.slice(-6)}`, title: `Other ${no}`, status: 'Tender Box Open', closing: new Date(2026, 9, 20), offer: false, ...o });
+const searchPosts = () => server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do' && l.method === 'POST' && l.body.submit);
+const searchPageGets = () => server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do' && l.method === 'GET' && l.query.pageNo);
+/** IREPS Closed Tenders read directly: the one-tender fallback (closedTenderRow) still reads it. */
+const closedScan = (from, to, tenderNo = '') => wf.scanClosedTenders({ base: 'https://www.ireps.gov.in', ctx: { tenderNo: '' }, inboxCache: new Map(), onProgress: () => {} }, { from, to, tenderNo });
+/** The fields of the Search Tender search in the order the browser sends them (20 Nov 2026 capture). */
+const BROWSER_SEARCH_FIELDS = ['searchOption', 'searchOptorOption', 'advancedSearch', 'organization', 'workArea', 'changezone', 'railwayZone', 'division', 'unit', 'tenderStage', 'tenderType', 'bidding', 'selectDate', 'dateFrom', 'dateTo', 'direction', 'noMonthDay', 'monthDay', 'radioDuration', 'submit', 'searchParam'];
 
 test('Tabulation: parseClosedTenders reads every row of the captured Closed Tenders page (HAR entry 82)', () => {
   const rows = wf.parseClosedTenders(core.parseHtml(CLOSED_FIXTURE));
@@ -1648,53 +1658,80 @@ test('Tabulation: a POSTed commTboPdfAction.do is checked on its body - My Offer
   await assert.rejects(() => core.irepsFetch('https://www.ireps.gov.in', '/epsn/tbo/commTboPdfAction.do', { method: 'POST', form: { tenderOID: '1' } }), (e) => e.code === 'EXCLUDED');
   assert.ok(!server.excludedHit);
 });
-test('Tabulation by closing date: every closed tender with the link is downloaded across pages, one without is "not available yet", another account is refused', async () => {
-  mk({ closed: [closed('42263731'), closed('24261658', { tab: false }), closed('69261051', { page: 2 }), closed('03263926B', { tabAcct: '60828' }), closed('11111111', { closing: new Date(2026, 8, 1) })] });
-  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+test('Tabulation by closing date: every tender this vendor bid on that shows the link is downloaded from Search Tender across result pages; one without is "not available yet"; other vendors\' tenders are not listed', async () => {
+  mk({ searchPageSize: 2, tenders: [bid('42263731'), other('51111111'), bid('24261658', { tab: false }), other('52222222'), bid('69261051'), bid('11111111', { closing: new Date(2026, 8, 1) })] });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
   const t = r.tabulations;
-  assert.deepEqual([r.range, t.listed, t.summary], [{ from: '15/10/2026', to: '23/10/2026' }, 4, { downloaded: 2, withTabulation: 3, notAvailable: 1 }]);
+  assert.deepEqual([r.range, t.listed, t.summary, t.incomplete], [{ from: '20/10/2026', to: '20/10/2026' }, 3, { downloaded: 2, withTabulation: 2, notAvailable: 1 }, '']);
   const by = Object.fromEntries(t.tenders.map((x) => [x.tenderNo, x]));
-  assert.equal(by['24261658'].notAvailable, true);
+  assert.equal(by['24261658'].notAvailable, true, 'My Offer without the tabulation: not available yet');
   assert.equal(by['42263731'].categories.financialTabulation.status, 'DOWNLOADED');
-  assert.equal(by['69261051'].categories.financialTabulation.status, 'DOWNLOADED', 'page 2 is read');
-  assert.match(by['03263926B'].categories.financialTabulation.files[0].error, /Account mismatch: .*60828/);
+  assert.equal(by['69261051'].categories.financialTabulation.status, 'DOWNLOADED', 'page 3 is read');
+  assert.ok(!by['51111111'] && !by['52222222'], 'tenders this vendor did not bid on are not listed');
   assert.deepEqual(savedNames().sort(), ['DocLink/HOSUR/Tender_42263731/Tabulation/Financial_Tabulation_42263731.pdf', 'DocLink/HOSUR/Tender_69261051/Tabulation/Financial_Tabulation_69261051.pdf']);
-  assert.ok(tabPosts().every((l) => l.method === 'POST' && l.body.pdfType === 'financialTabulation'), 'only the chosen tabulation, POSTed as IREPS does');
-  assert.ok(closedPosts().every((l) => l.body.menuLink === 'Tenders' && l.body.listType === 'MyBidsClosed' && l.body.startDate === '15/10/2026' && l.body.endDate === '23/10/2026'));
+  assert.ok(tabRequests().every((l) => l.method === 'GET' && l.query.pdfType === 'financialTabulation'), 'only the chosen tabulation, opened as the search row opens it (GET)');
+  assert.deepEqual(searchPageGets().map((l) => l.query.pageNo), ['2', '3']);
+  assert.ok(!server.log.some((l) => l.path === '/epsn/vendorInboxLink.do'), 'Closed Tenders is not read');
+  assert.ok(!paths().some((x) => /billSubmission/i.test(x)), 'Bill Tracking on the row is never requested');
   // the same range again: the ledger skips what was downloaded
   saved.length = 0;
-  const again = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  const again = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
   assert.equal(again.tabulations.summary.downloaded, 0);
   assert.equal(again.tabulations.tenders.find((x) => x.tenderNo === '42263731').categories.financialTabulation.alreadyDownloaded, 1);
   assert.equal(saved.length, 0);
 });
-test('Tabulation by closing date: a range longer than 90 days is read in windows; the Tender Number narrows it', async () => {
-  mk({ closed: [closed('42263731', { closing: new Date(2026, 5, 10) }), closed('69261051', { closing: new Date(2026, 9, 20) })] });
-  const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 5, 1), to: new Date(2026, 9, 23) });
+test('Tabulation by closing date: a range of days is searched one closing day at a time; the Tender Number narrows the search', async () => {
+  mk({ tenders: [bid('42263731', { closing: new Date(2026, 9, 18) }), bid('69261051', { closing: new Date(2026, 9, 20) })] });
+  const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 18), to: new Date(2026, 9, 20) });
   assert.equal(r.tabulations.summary.downloaded, 2);
-  assert.deepEqual(closedPosts().map((l) => [l.body.startDate, l.body.endDate]), [['01/06/2026', '29/08/2026'], ['30/08/2026', '23/10/2026']]);
+  assert.deepEqual(searchPosts().map((l) => [l.body.dateFrom, l.body.dateTo]), [['18/10/2026', '18/10/2026'], ['19/10/2026', '19/10/2026'], ['20/10/2026', '20/10/2026']]);
+  assert.equal(r.tabulations.incomplete, '', 'a day IREPS answers "No Results Found" is a day nothing closed');
   assert.ok(savedNames().includes('DocLink/HOSUR/Tender_42263731/Tabulation/Commercial_Tabulation_42263731.pdf'));
-  mk({ closed: [closed('42263731'), closed('69261051')] });
-  const one = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23), tenderNo: ' 69261051 ' });
+  mk({ tenders: [bid('42263731'), bid('69261051')] });
+  const one = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20), tenderNo: ' 69261051 ' });
   assert.deepEqual([one.tabulations.listed, one.tabulations.summary.downloaded], [1, 1]);
-  assert.ok(closedPosts().every((l) => l.body.tenderNo === '69261051'));
+  assert.ok(searchPosts().every((l) => l.body.advancedSearch === '69261051'));
+});
+test('Tabulation by closing date: the Search Tender search is sent as the browser sends it (20 Nov 2026 capture), the form opened once for all the days', async () => {
+  mk({ tenders: [bid('42263731')] });
+  await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 19), to: new Date(2026, 9, 20) });
+  const posts = searchPosts();
+  assert.equal(posts.length, 2);
+  for (const l of posts) assert.deepEqual(Object.keys(l.body), BROWSER_SEARCH_FIELDS, 'the browser\'s field order');
+  const b = posts[1].body;
+  assert.deepEqual([b.searchOption, b.searchOptorOption, b.advancedSearch, b.organization, b.workArea, b.railwayZone, b.division, b.unit, b.selectDate, b.dateFrom, b.dateTo, b.radioDuration, b.submit],
+    ['1', '0', '', '01', 'PT', '-1', '19', '-1', 'TENDER_OPENING_DATE', '20/10/2026', '20/10/2026', '0', 'Show Results']);
+  assert.equal(server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do' && l.body.searchParam === 'showPage').length, 1, 'the form (no Struts token) is opened once');
+});
+test('Tabulation by closing date: every result page is read through the link IREPS shows on the page before, exactly as shown', async () => {
+  mk({ searchPageSize: 2, tenders: [other('51111111'), other('52222222'), other('53333333'), other('54444444'), bid('42263731')] });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  assert.equal(r.tabulations.summary.downloaded, 1, 'the tender on the last page');
+  assert.deepEqual(searchPageGets().map((l) => [l.query.pageNo, l.query.railwayzone, l.query.count, l.query.linkVal]), [['2', '-1', '5', 'department'], ['3', '', '5', 'department']],
+    'page 2 through page 1\'s link (railwayzone=-1), page 3 through page 2\'s (railwayzone=)');
+  assert.equal(r.tabulations.incomplete, '');
+});
+test('Tabulation by closing date: the scheduled run (no button: both tabulations) searches Search Tender the same way', async () => {
+  mk({ tenders: [bid('42263731'), other('51111111')] });
+  const t = await jobs.downloadTabulationsByDate({ from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  assert.deepEqual([t.listed, t.summary.downloaded, Object.keys(t.tenders[0].categories).sort()], [1, 2, ['commercialTabulation', 'financialTabulation']]);
+  assert.deepEqual(tabRequests().map((l) => `${l.method} ${l.query.pdfType}`).sort(), ['GET commercialTabulation', 'GET financialTabulation']);
+  assert.ok(!server.log.some((l) => l.path === '/epsn/vendorInboxLink.do'), 'Closed Tenders is not read');
 });
 // 40 closed tenders, one a day back from 23/10/2026, for an IREPS that returns the whole list whatever the dates
 const closedDaily = () => Array.from({ length: 40 }, (_, i) => closed(`4226${String(i).padStart(4, '0')}`, { closing: new Date(2026, 9, 23 - i) }));
-test('Tabulation by closing date: when IREPS ignores the dates, only tenders whose own Closing Date is in the range are downloaded, and paging stops', async () => {
+test('Closed Tenders (read by the one-tender fallback): when IREPS ignores the dates, only rows whose own Closing Date is in the range are kept, and paging stops', async () => {
   mk({ closed: closedDaily(), closedIgnoresDates: true });
-  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 16) });
-  assert.deepEqual(r.tabulations.tenders.map((t) => [t.tenderNo, t.closingDate]), [['42260007', '16/10/2026 11:30'], ['42260008', '15/10/2026 11:30']]);
-  assert.equal(r.tabulations.summary.downloaded, 2);
-  assert.deepEqual(savedNames().sort(), ['DocLink/HOSUR/Tender_42260007/Tabulation/Financial_Tabulation_42260007.pdf', 'DocLink/HOSUR/Tender_42260008/Tabulation/Financial_Tabulation_42260008.pdf']);
+  const { rows } = await closedScan(new Date(2026, 9, 15), new Date(2026, 9, 16));
+  assert.deepEqual(rows.map((t) => [t.tenderNo, t.closingDate]), [['42260007', '16/10/2026 11:30'], ['42260008', '15/10/2026 11:30']]);
   assert.deepEqual(server.listPages.map((l) => l.pageNo), ['1', '2', '3'], 'page 1 has the range, pages 2-3 closed earlier, page 4 is never read');
   assert.match(core.getLogTail(), /Pages 2-3 all closed before 15\/10\/2026; stopping/);
   assert.match(core.getLogTail(), /2 closed tender\(s\) closing 15\/10\/2026\.\.16\/10\/2026 .*; 28 outside the dates skipped/);
 });
-test('Tabulation by closing date: a range over 90 days does not re-read the same list when IREPS ignores the dates', async () => {
+test('Closed Tenders (read by the one-tender fallback): a range over 90 days does not re-read the same list when IREPS ignores the dates', async () => {
   mk({ closed: closedDaily(), closedIgnoresDates: true });
-  const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 5, 1), to: new Date(2026, 9, 23) });
-  assert.equal(r.tabulations.summary.downloaded, 40);
+  const { rows } = await closedScan(new Date(2026, 5, 1), new Date(2026, 9, 23));
+  assert.equal(rows.length, 40);
   assert.deepEqual(closedPosts().map((l) => `${l.body.startDate}..${l.body.endDate} p${l.body.pageNo}`), ['01/06/2026..29/08/2026 p1', '01/06/2026..29/08/2026 p2', '01/06/2026..29/08/2026 p3', '01/06/2026..29/08/2026 p4', '30/08/2026..23/10/2026 p1']);
 });
 test('Tabulation: a single tender whose row has no tabulation link finds it in Closed Tenders around its closing date (one scan for both)', async () => {
@@ -1709,8 +1746,17 @@ test('Tabulation: a single tender whose row has no tabulation link finds it in C
   assert.equal(none.categories.financialTabulation.status, 'NOT_AVAILABLE');
   assert.match(none.categories.financialTabulation.note, /no Financial Tabulation for this tender yet/);
 });
+test('Tabulation: a Closed Tenders link (one-tender fallback) whose accountID is another IREPS account is refused, nothing is saved', async () => {
+  const closing = new Date(2026, 10, 9);
+  mk({ tenders: [T({ offer: false, closing })], closed: [closed('29263265', { nitId: '5569207', oid: '107200478', closing, tabAcct: '60828' })] });
+  const r = await run('29263265', { only: ['financialTabulation'] });
+  assert.equal(r.categories.financialTabulation.status, 'FAILED');
+  assert.match(r.categories.financialTabulation.files[0].error, /Account mismatch: .*60828/);
+  assert.equal(tabRequests().length, 0, 'the tabulation is not requested');
+  assert.deepEqual(savedNames(), []);
+});
 test('Tabulation: a web page with no PDF behind it fails with what IREPS showed; nothing is saved as the tabulation', async () => {
-  mk({ closed: [closed('42263731')], tabulationAsHtml: true });
+  mk({ tenders: [bid('42263731')], tabulationAsHtml: true });
   const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
   assert.equal(r.tabulations.summary.downloaded, 0);
   const cat = r.tabulations.tenders[0].categories.financialTabulation;
@@ -1719,7 +1765,7 @@ test('Tabulation: a web page with no PDF behind it fails with what IREPS showed;
   assert.deepEqual(savedNames(), []);
 });
 test('Tabulation: the real IREPS answer (a page that opens the PDF from <body onload>) gives the FIN-TAB PDF, saved as the Financial Tabulation', async () => {
-  mk({ closed: [closed('42263731')], tabulationAs: 'onload' });
+  mk({ tenders: [bid('42263731')], tabulationAs: 'onload' });
   const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
   assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
   assert.ok(paths().includes('/ireps/supply/pdfdocs//112026/107263731/FIN-TAB-42263731-107263731.pdf'), paths().join('\n'));
@@ -1729,7 +1775,7 @@ test('Tabulation: the real IREPS answer (a page that opens the PDF from <body on
 });
 for (const [pdfType, own, other] of [['financialTabulation', 'FIN-TAB', 'TECH-TAB'], ['commercialTabulation', 'TECH-TAB', 'FIN-TAB']]) {
   test(`Tabulation: the ${pdfType} button downloads that tabulation only, never the other one (both links on the row)`, async () => {
-    mk({ closed: [closed('42263731'), closed('69261051')], tabulationAs: 'onload' });
+    mk({ tenders: [bid('42263731'), bid('69261051')], tabulationAs: 'onload' });
     const r = await auto.runTabulations({ pdfType, from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
     assert.equal(r.tabulations.summary.downloaded, 2);
     const asked = server.log.filter((l) => l.path === '/epsn/tbo/commTboPdfAction.do').map((l) => l.body.pdfType || l.query.pdfType);
@@ -1741,7 +1787,7 @@ for (const [pdfType, own, other] of [['financialTabulation', 'FIN-TAB', 'TECH-TA
   });
 }
 test('Tabulation: the real IREPS Commercial answer opens TECH-TAB-<no>-<oid>.pdf from <body onload>; it is saved as the Commercial Tabulation', async () => {
-  mk({ closed: [closed('42263731')], tabulationAs: 'onload' });
+  mk({ tenders: [bid('42263731')], tabulationAs: 'onload' });
   const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
   assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
   assert.deepEqual(server.tabFileHits, ['/ireps/supply/pdfdocs//112026/107263731/TECH-TAB-42263731-107263731.pdf']);
@@ -1750,12 +1796,12 @@ test('Tabulation: the real IREPS Commercial answer opens TECH-TAB-<no>-<oid>.pdf
   assert.match(new TextDecoder().decode(f.bytes), /^%PDF/);
 });
 test('File names: a tabulation IREPS names in Content-Disposition keeps that name; without one it gets DocLink\'s name', async () => {
-  mk({ closed: [closed('42263731')], tabulationDisposition: 'attachment; filename="FinTab 42263731.pdf"' });
+  mk({ tenders: [bid('42263731')], tabulationDisposition: 'attachment; filename="FinTab 42263731.pdf"' });
   await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
   assert.deepEqual(savedNames(), ['DocLink/HOSUR/Tender_42263731/Tabulation/FinTab 42263731.pdf'], 'spaces and case are kept');
-  mk({ closed: [closed('42263731')] });
+  mk({ tenders: [bid('42263731')] });
   await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
-  assert.deepEqual(savedNames(), ['DocLink/HOSUR/Tender_42263731/Tabulation/Financial_Tabulation_42263731.pdf'], 'a POST to commTboPdfAction.do names no file');
+  assert.deepEqual(savedNames(), ['DocLink/HOSUR/Tender_42263731/Tabulation/Financial_Tabulation_42263731.pdf'], 'commTboPdfAction.do names no file');
 });
 test('File names: two different attachments with one IREPS name are both kept, the later one as "_2" - locally and in the "<T> - NIT" ECM document', async () => {
   const twins = [{ name: 'Spec.pdf', desc: 'SPEC A', href: '/ireps/upload/att/a/Spec.pdf' }, { name: 'Spec.pdf', desc: 'SPEC B', href: '/ireps/upload/att/b/Spec.pdf' }];
@@ -1787,7 +1833,7 @@ test('Tabulation: a TECH-TAB file passes only inside a Commercial Tabulation res
 });
 for (const [mode, file] of [['iframe', '/ireps/upload/tbo/Tabulation_'], ['form', '/epsn/tbo/showTabulation.do'], ['open', '/ireps/upload/tbo/view'], ['onload', '/ireps/supply/pdfdocs//112026/107263731/TECH-TAB-']]) {
   test(`Tabulation: the PDF behind a viewer page (${mode}) is downloaded; Techno-Commercial links in it are never requested`, async () => {
-    mk({ closed: [closed('42263731')], tabulationAs: mode });
+    mk({ tenders: [bid('42263731')], tabulationAs: mode });
     const r = await auto.runTabulations({ pdfType: 'commercialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
     assert.equal(r.tabulations.summary.downloaded, 1, JSON.stringify(r.tabulations.tenders[0]));
     const f = saved.find((x) => x.filename.includes('/Tabulation/'));
@@ -1807,8 +1853,27 @@ test('Tabulation: the 29 Oct capture of Closed Tenders lists the seven tenders w
   assert.deepEqual(withTab.map((r) => r.tenderNo), ['24260725', '61266411', '61262196', '82261482', '26261089', 'LN265570', 'LF265194']);
   assert.deepEqual([withTab[0].closingDate, withTab[0].tenderOid, withTab[0].links.financialTabulation.method], ['29/10/2026 11:30', '107120554', 'POST']);
 });
-test('Tabulation: Save to ECM files the Financial Tabulation as "<tender no> - Result" (tenderResult) and the Commercial one as vct, with the tender number and the Closed Tenders closing date', async () => {
-  mk({ closed: [closed('42263731', { closing: new Date(2026, 9, 23) })] });
+test('Tabulation: the 20 Nov capture of Search Tender (page 2) reads 25 rows, one with My Offer and both tabulations as GETs, its count and its page links', () => {
+  const doc = core.parseHtml(readFileSync(new URL('./fixtures/search-tender-20nov.html', import.meta.url), 'utf8'));
+  assert.equal(search.classifySearchResponse(doc), 'results');
+  const rows = wf.parseSearchTenderRows(doc);
+  assert.equal(rows.length, 25);
+  assert.deepEqual(rows.filter((r) => r.offer).map((r) => r.tenderNo), ['LK265182'], 'only the tender this vendor bid on shows My Offer');
+  assert.ok(rows.filter((r) => !r.offer).every((r) => !r.links.financialTabulation && !r.links.commercialTabulation));
+  const r = rows.find((x) => x.offer);
+  assert.deepEqual([r.nitId, r.tenderOid, r.dept, r.title, r.status, r.closingDate], ['5613388', '107238095', 'ELS/KAZIPET/SOUTH CENTRAL RLY', 'Repair kit for PR switch MCS 11', 'Tender Finalized', '19/11/2026 10:30']);
+  assert.deepEqual([r.links.financialTabulation.method, r.links.financialTabulation.url], ['GET', '/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=107238095']);
+  assert.deepEqual([r.links.commercialTabulation.method, r.links.commercialTabulation.url], ['GET', '/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=107238095']);
+  assert.ok(rows.every((x) => /^19\/11\/2026 /.test(x.closingDate)), 'Due Date/Time, not Opening Date/Time');
+  const cut = rows.find((x) => x.tenderNo === '04261123A');
+  assert.equal(cut.title, 'Upper Bearing Arrangement of Entrance Door for LHB coaches to RCF Drg No. LA51150 alt. a or latest.', 'a cut title ("......") is read whole from its image title');
+  assert.equal(search.searchResultsTotal(doc), 1214);
+  assert.equal(search.nextResultPage(doc, 2), '/epsn/search/advancedSearch.do?advancedSearch=&railwayzone=&dateFrom=19/11/2026&linkVal=department&dateTo=19/11/2026&selectDate=TENDER_OPENING_DATE&count=1214&pageNo=3');
+  assert.equal(search.nextResultPage(doc, 10), '/epsn/search/advancedSearch.do?advancedSearch=&railwayzone=&dateFrom=19/11/2026&linkVal=department&dateTo=19/11/2026&selectDate=TENDER_OPENING_DATE&count=1214&pageNo=11', '"next"');
+  assert.equal(search.nextResultPage(doc, 11), '', 'no link beyond what the page shows');
+});
+test('Tabulation: Save to ECM files the Financial Tabulation as "<tender no> - Result" (tenderResult) and the Commercial one as vct, with the tender number and the search row\'s closing date (Due Date/Time)', async () => {
+  mk({ tenders: [bid('42263731', { closing: new Date(2026, 9, 23) })] });
   store['doclink.saveDestination'] = 'recon';
   await withDirectEcm(async ({ creates }) => {
     await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
@@ -1959,12 +2024,45 @@ test('H4: NIT Documents - a first My Messages page that is not the inbox is an e
   assert.deepEqual(r.tenders.map((t) => [t.tenderNo, t.status]), [['Z1', 'DOWNLOADED']], 'the NIT of page 1 is downloaded, as before');
   assert.match(r.messages.incomplete, /My Messages page 2/);
 });
-test('H4: Closed Tenders - an empty page that is not the list keeps the tenders read and says so', async () => {
+test('H4: Closed Tenders (one-tender fallback) - an empty page that is not the list keeps the tenders read and says so', async () => {
   mk({ closed: [closed('42263731'), closed('69261051', { page: 2 })] });
   intercept((m, u, b) => b.get('status') === 'MyBidsClosed' && b.get('pageNo') === '2', html200('Busy', 'The server is busy.'));
-  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 15), to: new Date(2026, 9, 23) });
+  const { rows, incomplete } = await closedScan(new Date(2026, 9, 15), new Date(2026, 9, 23));
+  assert.deepEqual(rows.map((r) => r.tenderNo), ['42263731']);
+  assert.match(incomplete, /does not recognise .*Closed Tenders/);
+});
+test('H4: Search Tender - a result page that is not one keeps the tenders read, downloads them and says the day was not read to the end', async () => {
+  mk({ searchPageSize: 1, tenders: [bid('42263731'), bid('69261051')] });
+  intercept((m, u) => m === 'GET' && /advancedSearch\.do\?.*pageNo=2/.test(u), html200('Busy', 'The server is busy.'));
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  assert.deepEqual([r.tabulations.listed, r.tabulations.summary.downloaded], [1, 1]);
+  assert.match(r.tabulations.incomplete, /does not recognise .*Search Tender 20\/10\/2026 page 2/);
+});
+test('H4: Search Tender - fewer tenders read than IREPS counts is said out loud, never taken as the whole day', async () => {
+  mk({ tenders: [bid('42263731')] });
+  intercept((m, u, b) => m === 'POST' && b.get('submit') === 'Show Results', () => ({ status: 200, type: 'text/html', bytes: resultsPage([resultRow(bid('42263731'))], { total: 3 }) }));
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  assert.equal(r.tabulations.summary.downloaded, 1, 'what was read is still downloaded');
+  assert.match(r.tabulations.incomplete, /DocLink read fewer tenders than IREPS listed \(Search Tender 20\/10\/2026: IREPS lists 3 tender\(s\), 1 were read\)/);
+});
+test('H4: Search Tender - a day IREPS does not answer (HTTP error) is said, and the other days are still read', async () => {
+  mk({ tenders: [bid('42263731', { closing: new Date(2026, 9, 21) })] });
+  intercept((m, u, b) => m === 'POST' && b.get('dateFrom') === '20/10/2026', () => ({ status: 500, type: 'text/html', bytes: enc8('<html><body>error</body></html>') }));
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 21) });
   assert.equal(r.tabulations.summary.downloaded, 1);
-  assert.match(r.tabulations.incomplete, /does not recognise .*Closed Tenders/);
+  assert.match(r.tabulations.incomplete, /Search Tender 20\/10\/2026 page 1: IREPS returned HTTP 500/);
+});
+test('M2: each day\'s Search Tender search and result pages wait for the IREPS form lock', async () => {
+  const formLock = await import('../../services/ireps-form-lock.js');
+  mk({ tenders: [bid('42263731')] });
+  let release;
+  const held = formLock.withIrepsFormLock(() => new Promise((r) => { release = r; }));
+  const p = auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  await sleepMs(50);
+  assert.ok(!server.log.some((l) => l.path === '/epsn/search/advancedSearch.do'), 'nothing is searched while another IREPS form sequence holds the lock');
+  release();
+  await held;
+  assert.equal((await p).tabulations.summary.downloaded, 1);
 });
 test('H4: a tender search IREPS does not answer (HTTP errors) is "search incomplete", never "not found"', async () => {
   mk({ tenders: [T({})] });

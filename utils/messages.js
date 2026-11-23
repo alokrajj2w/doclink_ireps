@@ -505,6 +505,10 @@ export const ERROR_CATALOG = Object.freeze({
     title: "Tender search incomplete",
     message: "DocLink could not tell whether the tender is in IREPS ({detail}). Retry the download."
   },
+  TENDER_SEARCH_SHORT: {
+    title: "Tender search not read in full",
+    message: "DocLink read fewer tenders than IREPS listed ({detail}). Tabulations of the tenders not read may be missing: retry the download."
+  },
   TENDER_REQUEST_BLOCKED: {
     title: "Request refused",
     message: "DocLink did not send this request to IREPS because it looks like an action that changes something in IREPS ({detail}). DocLink only reads and downloads."

@@ -148,7 +148,7 @@ export async function runLetterType({ status, from, to, tenderNo = '', onProgres
 }
 
 /**
- * Financial or Commercial Tabulation of the tenders CLOSING on the selected dates (IREPS Closed Tenders),
+ * Financial or Commercial Tabulation of the tenders CLOSING on the selected dates (IREPS Search Tender),
  * optionally for one Tender Number. Only the published tabulation is downloaded - nothing is changed.
  * @param pdfType  'financialTabulation' | 'commercialTabulation'
  */

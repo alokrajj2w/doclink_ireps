@@ -1340,6 +1340,25 @@ const server = createServer(async (req, res) => {
     return res.end(pdf);
   }
 
+  /* ---------------------------------------------------- Tender: Search Tender (tabulations by closing date) */
+
+  if (path === "/epsn/search/advancedSearch.do") {
+    if (!hasSession(req)) return html(res, 200, pages.login);
+    const form = new URLSearchParams(req.method === "POST" ? await readBody(req) : url.search);
+    const sid = parseCookies(req).get(SESSION_COOKIE);
+    if (req.method === "GET" && form.get("pageNo")) {
+      // a page link: a page of the search this session made last (IREPS keeps the search in the session)
+      const last = lastTenderSearches.get(sid);
+      console.log(`[mock-ireps] GET advancedSearch.do page ${form.get("pageNo")} railwayzone=${form.get("railwayzone")} (last search: ${last ? last.hits.length : 0} tenders)`);
+      return html(res, 200, last && last.hits.length ? renderTenderSearchResults(last, Number(form.get("pageNo"))) : renderTenderSearchForm());
+    }
+    if (req.method === "GET" || form.get("searchParam") === "showPage") return html(res, 200, renderTenderSearchForm());
+    const search = searchMockTenders(form);
+    lastTenderSearches.set(sid, search);
+    console.log(`[mock-ireps] POST advancedSearch.do closing ${search.dateFrom}..${search.dateTo} division=${form.get("division")} no=${search.term || "-"} -> ${search.hits.length} tenders`);
+    return html(res, 200, search.hits.length ? renderTenderSearchResults(search, 1) : renderTenderSearchForm("No Results Found"));
+  }
+
   /* ---------------------------------------------------- Tender: Closed Tenders tabulations, LOA letters */
 
   if (path === "/epsn/vendorInboxLink.do") {
@@ -1427,6 +1446,76 @@ const MOCK_CLOSED = [
 ];
 
 const MOCK_LOA = [{ no: "29263265", oid: "107200478", letter: "1461928", date: daysAgo(0) }];
+
+/* Search Tender (advancedSearch.do), as captured on 20 Nov 2026: a search by "Tender Closing Date" lists every tender
+   closing that day, 25 a page, with page links (hrefs) and IREPS's count. The vendor's own tenders are the
+   MOCK_CLOSED ones: My Offer, and once the bids are opened both tabulations and Bill Tracking. */
+
+const TENDER_SEARCH_PAGE_SIZE = 25;
+const lastTenderSearches = new Map(); // JSESSIONID -> the last search, which the page links read
+
+/** Tenders of other vendors closing on `day` (no My Offer): 30 a day, so every day has two result pages. */
+function otherTenders(day) {
+  const dd = dmy(day).slice(0, 5).replace("/", "");
+  return Array.from({ length: 30 }, (_, i) => ({ no: `M${dd}${String(i + 1).padStart(2, "0")}`, nitId: `9${dd}${String(i + 1).padStart(2, "0")}`, oid: `8${dd}${String(i + 1).padStart(3, "0")}`, title: `Other vendors' tender ${i + 1}`, closing: day, status: "Tender Box Open", other: true }));
+}
+
+/** The tenders a search finds: closing between dateFrom and dateTo, numbered starting with advancedSearch. */
+function searchMockTenders(form) {
+  const parse = (s) => { const [d, m, y] = String(s || "").split("/").map(Number); return new Date(y, m - 1, d); };
+  const day = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const to = parse(form.get("dateTo"));
+  const term = form.get("advancedSearch") || "";
+  const hits = [];
+  for (let d = parse(form.get("dateFrom")); d <= to; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) {
+    hits.push(...otherTenders(d), ...MOCK_CLOSED.filter((t) => day(t.closing).getTime() === d.getTime()));
+  }
+  return { hits: hits.filter((t) => t.no.startsWith(term)), term, dateFrom: form.get("dateFrom") || "", dateTo: form.get("dateTo") || "" };
+}
+
+/** The Search Tender form (the fields DocLink reads), with `message` under it ("No Results Found"). */
+function renderTenderSearchForm(message = "") {
+  const opts = (name, list, selected) => `<select name="${name}">${list.map(([v, l]) => `<option value="${v}"${v === selected ? " selected" : ""}>${l}</option>`).join("")}</select>`;
+  return `<html><head><title>Search-Indian Railways tenders</title></head><body>
+<form name="advancedSearchForm" method="post" action="/epsn/search/advancedSearch.do">
+${opts("searchOption", [["1", "Tender Number"], ["2", "Name Of Work"], ["3", "Item Code"], ["4", "Item Description"]], "1")}
+<select name="searchOptorOption" id="searchOptorOption"></select>
+<input type="text" name="advancedSearch" maxlength="19" value="">
+${opts("organization", [["01", "Indian Railway"]], "01")} ${opts("workArea", [["PT", "Goods &amp; Services"]], "PT")}
+<input type="hidden" name="changezone" id="changezone">
+${opts("railwayZone", [["-1", "All"], ["561", "Mock Railway"]], "-1")}
+${opts("division", [["-1", "All"], ["19", "Stores"], ["06", "Mechanical"]], "19")}
+${opts("unit", [["-1", "All"]], "-1")} ${opts("tenderStage", [["-1", "All"]], "-1")} ${opts("tenderType", [["-1", "All"]], "-1")} ${opts("bidding", [["-1", "All"]], "-1")}
+${opts("selectDate", [["TENDER_OPENING_DATE", "Tender Closing Date"], ["TENDER_PUBLISHING_DATE", "Tender Uploading Date"]], "TENDER_OPENING_DATE")}
+<input type="text" name="dateFrom" value="${dmy(daysAgo(90))}" readonly><input type="text" name="dateTo" value="${dmy(daysAgo(0))}" readonly>
+${opts("direction", [["P", "Previous"], ["L", "Later"]], "P")}<input type="text" name="noMonthDay" value="">${opts("monthDay", [["M", "Month(s)"], ["D", "Day(s)"]], "M")}
+<input type="radio" name="radioDuration" value="-3"> Last 3 months <input type="radio" name="radioDuration" value="0" checked> Custom Date
+<input type="submit" name="submit" value="Show Results"><input type="hidden" name="searchParam" id="searchParam">
+</form>${message ? `<p>${message}</p>` : ""}</body></html>`;
+}
+
+/** Result page `pageNo` of a search: IREPS's count, the results table and the page links (page 1's say railwayzone=-1, later ones railwayzone=). */
+function renderTenderSearchResults(search, pageNo) {
+  const pagesCount = Math.ceil(search.hits.length / TENDER_SEARCH_PAGE_SIZE);
+  const open = (u) => `window.open('${u}', '', 'toolbar=0,titlebar=0,scrollbars=1,location=0,statusbar=0,menubar=0,resizable=1,width=275,height=250')`;
+  const row = (t) => `<tr height="20">
+<td bgcolor="white" style="color:black;">STORES/MOCK RLY&nbsp;</td>
+<td bgcolor="white"> <a title="View Tender Document / Corrigendum" class="linkStyle" style="color:#4A4AFB;" href=# onclick="window.open('/epsn/supply/rfq/nitPublish.do?nitId=${t.nitId}&activity=viewNIT', '', 'toolbar=0')">${t.no}</a>&nbsp;</td>
+<td bgcolor="white" style="color:black;"><span class = "dataText">${t.title}</span></td>
+<td align="center" bgcolor="#00CCFF" style="color:black;">${t.status || (t.tab ? "Tender Finalized" : "Tender Box Open")}&nbsp;</td>
+<td bgcolor="white" style="color:black;">${dmy(t.closing)} 11:47&nbsp;</td>
+<td bgcolor="white" style="color:black;"> ${dmy(t.closing)} 11:30&nbsp;</td>
+<td bgcolor="white" style="color:black;"> LAPSED&nbsp;</td>
+<td bgcolor="white" style="color:black;"> &nbsp;<a title="View Tender Document / Corrigendum" href="#" onclick="window.open('/ireps/supply/pdfdocs/112026/${t.oid}/viewNitPdf_${t.nitId}.pdf', '', 'toolbar=0')"><img src="/ireps/images/common/viewTndrDoc.gif"></a>&nbsp;<a title="View Published Corrigendum" class=linkStyle href=/epsn/works/rfq/viewCorrigendum.do?nitId=${t.nitId}><img src="/ireps/images/common/View_Corrigendum.gif"></a>&nbsp;${t.other ? "" : `<a title="My Offer" href=# onclick="${open(`/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=${t.oid}&accountID=833`)}"><img src="/ireps/images/common/view_f_offer.png"></a>&nbsp;${t.tab ? `<a title="Financial Tabulation" href=# onclick="${open(`/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=${t.oid}`)}"><img src="/ireps/images/common/barchart.jpg"></a>&nbsp;<a title="View Commercial Tabulation" href=# onclick="${open(`/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=${t.oid}`)}"><img src="/ireps/images/common/techEval.jpg"></a>&nbsp;<a title="Bill Tracking" class=linkStyle href=/epsn/works/bills/billSubmission.do?activity=display&oid=${t.oid}><img src="/ireps/images/common/Submit Pending Bill Details.png"></a>&nbsp;` : ""}`}</td>
+</tr>`;
+  const link = (n) => `<a href="/epsn/search/advancedSearch.do?advancedSearch=${search.term}&railwayzone=${pageNo === 1 ? "-1" : ""}&dateFrom=${search.dateFrom}&linkVal=department&dateTo=${search.dateTo}&selectDate=TENDER_OPENING_DATE&count=${search.hits.length}&pageNo=${n}">${n}</a>`;
+  const links = pagesCount > 1 ? `<table><tr><td align="center">${Array.from({ length: pagesCount }, (_, i) => link(i + 1)).join("&nbsp;")}</td></tr></table>` : "";
+  return `${renderTenderSearchForm().replace("</body></html>", "")}
+<table width="100%" border="0" cellspacing="0" cellpadding="2"><tr><td width="55%" height="20" align="left" class="formLabel"><b>&nbsp;Tender search results &nbsp;</b><B>${search.hits.length}</B></td></tr></table>
+<table width="100%" border="1"><tr height="20" class="table_head" align="center"><td class="formLabel">Deptt./Rly. Unit&nbsp;</td><td class="formLabel">Tender No&nbsp;</td><td class="formLabel">Tender Title&nbsp;</td><td class="formLabel">Status&nbsp;</td><td class="formLabel">Opening Date/Time&nbsp;</td><td class="formLabel">Due Date/Time&nbsp;</td><td class="formLabel">Due Days&nbsp;</td><td class="formLabel">Actions&nbsp;</td></tr>
+${search.hits.slice((pageNo - 1) * TENDER_SEARCH_PAGE_SIZE, pageNo * TENDER_SEARCH_PAGE_SIZE).map(row).join("\n")}
+</table>${links}</body></html>`;
+}
 
 function renderClosedTenders(form) {
   const from = form.get("startDate");

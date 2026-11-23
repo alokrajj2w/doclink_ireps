@@ -43,16 +43,22 @@ export function searchFormPage() {
 
 const TH = `<tr class="table_head"><td class="formLabel">Deptt./Rly. Unit&nbsp;</td><td class="formLabel">Tender No&nbsp;</td><td class="formLabel">Tender Title&nbsp;</td><td class="formLabel">Status&nbsp;</td><td class="formLabel">Opening Date/Time&nbsp;</td><td class="formLabel">Due Date/Time&nbsp;</td><td class="formLabel">Due Days&nbsp;</td><td class="formLabel">Actions&nbsp;</td></tr>`;
 
+/**
+ * A Search Tender result row. t.offer: this vendor bid (My Offer), and then the tabulation links and Bill
+ * Tracking follow unless t.tab === false (bids not opened yet), as on the 20 Nov 2026 capture.
+ */
 export function resultRow(t) {
   return `<tr><td>${t.dept}&nbsp;</td>
 <td><a title="View Tender Document / Corrigendum" class="linkStyle" href=# onclick="window.open('/epsn/supply/rfq/nitPublish.do?nitId=${t.nitId}&activity=viewNIT', '', 'toolbar=0,titlebar=0,scrollbars=1,location=1,resizable=1,width=950,height=600')">${t.no}</a>&nbsp;</td>
 <td><span class="dataText">${t.title}</span></td><td>${t.status}&nbsp;</td><td>NOT OPENED</td><td>${fmt(t.closing)}&nbsp;</td><td>34&nbsp;</td>
 <td>&nbsp;<a title="View Tender Document / Corrigendum" href="#" onclick="window.open('/ireps/supply/pdfdocs/112026/${t.oid}/viewNitPdf_${t.nitId}.pdf', '', 'toolbar=0')"><img src="/x.gif"></a>&nbsp;<a title="View Published Corrigendum" class=linkStyle href=/epsn/works/rfq/viewCorrigendum.do?nitId=${t.nitId}><img src="/y.gif"></a>&nbsp;${
-  t.offer ? `<a title="My Offer" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=${t.oid}&accountID=${t.offerAcct || '833'}', '', 'toolbar=0')">o</a><a title="Financial Tabulation" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=${t.oid}', '', 'toolbar=0')">f</a><a title="View Commercial Tabulation" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=${t.oid}', '', 'toolbar=0')">c</a>` : ''
+  t.offer ? `<a title="My Offer" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=${t.oid}&accountID=${t.offerAcct || '833'}', '', 'toolbar=0')">o</a>${t.tab === false ? '' : `<a title="Financial Tabulation" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=${t.oid}', '', 'toolbar=0')">f</a><a title="View Commercial Tabulation" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=${t.oid}', '', 'toolbar=0')">c</a>&nbsp;<a title="Bill Tracking" class=linkStyle href=/epsn/works/bills/billSubmission.do?activity=display&oid=${t.oid}><img src="/ireps/images/common/Submit Pending Bill Details.png"></a>`}` : ''
 }<a title="Bid Process" class=linkStyle href=/epsn/supply/bid/bidProcess.do?oid=${t.oid}&bidStartDate=>b</a></td></tr>`;
 }
 
-export const resultsPage = (rows) => html(`<form><table>${TH}${rows.join('')}</table></form><div>Tender search results ${rows.length}</div>`, 'Search');
+/** A Search Tender result page: the rows, IREPS's count as captured ("Tender search results <B>N</B>") and the page links. */
+export const resultsPage = (rows, { total = rows.length, links = '' } = {}) => html(`<table><tr><td class="formLabel"><b>&nbsp;Tender search results &nbsp;</b><B>${total}</B></td></tr></table>
+<form><table>${TH}${rows.join('')}</table></form>${links}`, 'Search');
 export const noResultsPage = () => html('<form>No Results Found <input type="button" value="Print Results"></form>', 'Search');
 
 export function nitPage(t) {
@@ -280,9 +286,24 @@ export class FakeIreps {
     };
     this.log = [];
     this.listPages = []; // every Post Tenders list page requested: { status, startDate, endDate, pageNo }
+    this.lastSearch = null; // IREPS keeps the last Search Tender search in the session; its page links read it
   }
 
   tenderBy(f, v) { return this.s.tenders.find((t) => String(t[f]) === String(v)); }
+
+  /**
+   * Result page `pageNo` of the last search, s.searchPageSize rows a page (25, as IREPS), with IREPS's page links:
+   * hrefs to advancedSearch.do with count= and pageNo=, page 1's with railwayzone=-1 and later pages' with
+   * railwayzone= (20 Nov 2026 capture).
+   */
+  searchPage(pageNo) {
+    const s = this.lastSearch;
+    const per = this.s.searchPageSize || 25;
+    const pages = Math.ceil(s.hits.length / per);
+    const link = (n) => `<a href="/epsn/search/advancedSearch.do?advancedSearch=${s.term}&railwayzone=${pageNo === 1 ? '-1' : ''}&dateFrom=${s.dateFrom}&linkVal=department&dateTo=${s.dateTo}&selectDate=TENDER_OPENING_DATE&count=${s.hits.length}&pageNo=${n}">${n}</a>`;
+    const links = pages > 1 ? `<table><tr><td>${Array.from({ length: pages }, (_, i) => link(i + 1)).join('&nbsp;')}</td></tr></table>` : '';
+    return resultsPage(s.hits.slice((pageNo - 1) * per, pageNo * per).map(resultRow), { total: s.hits.length, links });
+  }
 
   async handle(method, urlStr, bodyStr) {
     const u = new URL(urlStr);
@@ -299,6 +320,8 @@ export class FakeIreps {
     if (p === '/epsn/home/showHome.do') return ok(this.s.homeOverride ? html(this.s.homeOverride) : homePage({ id: this.s.account.id, company: this.s.account.company, scriptId: this.s.account.scriptId }));
 
     if (p === '/epsn/search/advancedSearch.do') {
+      // a page link (GET ...&count=N&pageNo=n): a page of the search this session made last
+      if (method === 'GET' && q.get('pageNo')) return ok(this.lastSearch && this.lastSearch.hits.length ? this.searchPage(Number(q.get('pageNo'))) : searchFormPage());
       if (method === 'GET' || body.get('searchParam') === 'showPage') return ok(searchFormPage());
       const term = body.get('advancedSearch');
       const dept = body.get('division');
@@ -307,7 +330,8 @@ export class FakeIreps {
       const to = parseD(body.get('dateTo'));
       if ((to - from) / DAY > 186) return ok(html('<form>Date range should be within 6 months</form>'));
       const hits = this.s.tenders.filter((t) => t.no.startsWith(term) && t.closing >= from && t.closing <= to && (dept === '-1' || dept === (t.deptCode || '19')));
-      return ok(hits.length ? resultsPage(hits.map(resultRow)) : noResultsPage());
+      this.lastSearch = { hits, term, dateFrom: body.get('dateFrom'), dateTo: body.get('dateTo') };
+      return ok(hits.length ? this.searchPage(1) : noResultsPage());
     }
 
     if (p === '/epsn/supply/rfq/nitPublish.do') { const t = this.tenderBy('nitId', q.get('nitId')); return ok(t ? nitPage(t) : html('none')); }
@@ -341,7 +365,7 @@ export class FakeIreps {
       const type = arg('pdfType');
       if (!['offer', 'financialTabulation', 'commercialTabulation'].includes(type)) { this.excludedHit = true; return pdf('FORBIDDEN'); }
       if (type !== 'offer' && this.s.tabulationAsHtml) return ok(letterHtml(`${type} ${arg('tenderOID')}`));
-      if (type !== 'offer' && this.s.tabulationAs) return ok(tabulationViewer(this.s.tabulationAs, type, arg('tenderOID'), (this.s.closed || []).find((c) => c.oid === arg('tenderOID'))?.no));
+      if (type !== 'offer' && this.s.tabulationAs) return ok(tabulationViewer(this.s.tabulationAs, type, arg('tenderOID'), [...(this.s.closed || []), ...this.s.tenders].find((c) => c.oid === arg('tenderOID'))?.no));
       // s.tabulationDisposition: IREPS names the file it serves in Content-Disposition
       if (type !== 'offer' && this.s.tabulationDisposition) return { ...pdf(type + arg('tenderOID')), disposition: this.s.tabulationDisposition };
       return pdf(type + arg('tenderOID'));

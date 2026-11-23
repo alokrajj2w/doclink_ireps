@@ -2,8 +2,9 @@
 // Every identifier (nitId, nitOid, tenderOID, letter ids, tokens, dates...) is read from the live
 // IREPS responses; nothing captured from a previous session is baked in.
 //
-// Financial and Commercial Tabulation are downloaded from the tender's row (or its row in IREPS "Closed
-// Tenders"); OUT OF SCOPE (never requested, enforced in tender-core.isExcludedUrl):
+// Financial and Commercial Tabulation are downloaded from the tender's row: by closing date from IREPS "Search
+// Tender" (scanTenderSearch), for one tender from its search row (or its row in IREPS "Closed Tenders");
+// OUT OF SCOPE (never requested, enforced in tender-core.isExcludedUrl):
 //   any other commTboPdfAction.do pdfType (e.g. a Techno-Commercial Tabulation). "TECH-TAB-<no>-<oid>.pdf" is
 //   IREPS's name for the Commercial Tabulation itself, not a Techno-Commercial one; it passes only inside a
 //   commercialTabulation response.
@@ -19,7 +20,11 @@ import { describeError } from '../utils/messages.js';
 import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { printPageToPdf } from './tender-print.js';
 import { sharedRun } from './tender-shared-run.js';
-import { searchTender, findTenderRows, findTenderRowsLoose, fmtDate } from './tender-search.js';
+import {
+  searchTender, findTenderRows, findTenderRowsLoose, fmtDate,
+  describeRow, loadForm, classifySearchResponse, closingDaySearchBody, nextResultPage, searchResultsTotal,
+} from './tender-search.js';
+import { withIrepsFormLock } from '../services/ireps-form-lock.js';
 import { ecmDocumentFor, ecmCheckDocumentFor, ecmFileName, tenderEcmSink, CATEGORY_ECM_KIND } from './tender-ecm.js';
 import { loadDownloadLogConfig, preflightDownloads, confirmRedownload, logDownload, flushDownloadLog, downloadRecord, downloadKey, TENDER_DOC_TYPE, LOG_DESTINATION, SKIP_REASON } from '../services/download-log.js';
 
@@ -728,6 +733,8 @@ export const TABULATIONS = Object.freeze({
 });
 const CLOSED_STATUS = 'MyBidsClosed';
 const CLOSED_WINDOW_DAYS = 90; // the Closed Tenders page's own default range
+/** Search Tender shows 25 rows a page; one closing day was 49 pages (19 Nov 2026, Stores), read to its end within this. */
+const MAX_SEARCH_PAGES = 100;
 const CLOSING_RE = /^(\d{2}\/\d{2}\/\d{4})(?:\s+\d{1,2}:\d{2})?$/;
 /** "23/10/2026 11:30" or "23/10/2026" -> that day (local), or null. */
 const closingDay = (text) => {
@@ -866,6 +873,135 @@ function closedTenderRow(run) {
     });
   }
   return run.closedRowP;
+}
+
+/**
+ * The rows of a Search Tender result page (advancedSearch.do, 20 Nov 2026 capture):
+ *   Deptt./Rly. Unit | Tender No | Tender Title | Status | Opening Date/Time | Due Date/Time | Due Days | Actions
+ * -> [{ tenderNo, nitId, tenderOid, dept, title, status, closingDate, offer, links: { financialTabulation, commercialTabulation } }]
+ * Search Tender lists every tender, not only this vendor's: `offer` says the row shows My Offer (this vendor bid).
+ * The closing date is "Due Date/Time" ("Opening Date/Time" is when the tender box was opened). A link is the
+ * request ({ method, url }), a window.open GET without an accountID, or null when IREPS does not show it (yet).
+ */
+export function parseSearchTenderRows(doc) {
+  const rows = [];
+  for (const tr of doc.querySelectorAll('tr')) {
+    if (tr.querySelector('tr')) continue;
+    const nitLink = [...tr.querySelectorAll('a')].find((a) => /nitPublish\.do/i.test(`${a.getAttribute('onclick') || ''} ${a.getAttribute('href') || ''}`) && norm(a.textContent));
+    if (!nitLink) continue;
+    const actions = elementActions(tr);
+    const reqs = allReqs(actions);
+    const info = describeRow(tr);
+    const offer = reqs.find((x) => /commTboPdfAction\.do/i.test(pathOf(x.url)) && qparam(x.url, 'pdfType').toLowerCase() === 'offer') || null;
+    const links = Object.fromEntries(Object.keys(TABULATIONS).map((t) => [t, tabulationReq(actions, t)]));
+    rows.push({
+      tenderNo: norm(nitLink.textContent),
+      nitId: reqs.map((x) => qparam(x.url, 'nitId')).find(Boolean) || '',
+      tenderOid: [offer, ...Object.values(links)].filter(Boolean).map((x) => qparam(x.url, 'tenderOID')).find(Boolean) || '',
+      dept: [info.department, info.railwayUnit].filter(Boolean).join('/'),
+      // a long title is cut ("......"); the whole one is the title of the image after it
+      title: norm(tr.querySelector('.dataText img[title]')?.getAttribute('title')) || info.tenderTitle,
+      status: info.tenderStatus,
+      closingDate: info.closingDate,
+      offer: !!offer,
+      links,
+    });
+  }
+  return rows;
+}
+
+/** Each day from `from` to `to` (Dates, both included), at local midnight. */
+function closingDays(from, to) {
+  const last = new Date(to.getFullYear(), to.getMonth(), to.getDate());
+  const out = [];
+  for (let d = new Date(from.getFullYear(), from.getMonth(), from.getDate()); d <= last; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) out.push(d);
+  return out;
+}
+
+/**
+ * One closing day of Search Tender: the search, then every result page through the links IREPS shows.
+ * -> { rows (this vendor's tenders closing that day, + pageUrl), pages, read (rows read), problem }
+ * `problem`: why the day was not read to its end (a page DocLink does not recognise, an HTTP error, fewer rows
+ * read than IREPS's own total); the rows read before it are still returned.
+ */
+async function readClosingDay(run, form, day, { tenderNo = '', label = '' } = {}) {
+  const what = `Search Tender ${fmtDate(day)}`;
+  const out = { rows: [], pages: 0, read: 0, problem: '' };
+  let res = await irepsFetch(run.base, form.action, { method: 'POST', form: closingDaySearchBody(form, day, { tenderNo }), relativeTo: form.pageUrl || undefined });
+  let total = null;
+  let perPage = 0;
+  let prevSig = '';
+  let outside = 0;
+  for (let pageNo = 1; ; pageNo++) {
+    assertSession(res);
+    if (res.status !== 200) { out.problem = listFailed(`${what} page ${pageNo}`, res.status).message; break; }
+    out.pages++;
+    const doc = parseHtml(res.text());
+    const kind = classifySearchResponse(doc);
+    if (kind === 'none' && pageNo === 1) break; // IREPS's own "No Results Found": nothing closed that day
+    const found = kind === 'results' ? parseSearchTenderRows(doc) : [];
+    if (!found.length) { out.problem = pageNotRecognised(`${what} page ${pageNo}`, doc).message; break; }
+    const sig = found.map((r) => `${r.tenderNo}|${r.nitId}`).join(',');
+    if (sig === prevSig) break; // the same page again: the count check below says what was not read
+    prevSig = sig;
+    const shown = searchResultsTotal(doc);
+    if (pageNo === 1) [total, perPage] = [shown, found.length];
+    else if (shown !== null && total !== null && shown !== total) {
+      // another search in this IREPS session replaced this one: its pages are not this day's
+      out.problem = describeError('TENDER_SEARCH_SHORT', { detail: `${what} page ${pageNo}: IREPS's count changed from ${total} to ${shown} while its pages were read` }).message;
+      break;
+    }
+    out.read += found.length;
+    for (const r of found) {
+      const d = closingDay(r.closingDate);
+      if (!d || d.getTime() !== day.getTime()) { outside++; continue; }
+      if (r.offer || r.links.financialTabulation || r.links.commercialTabulation) out.rows.push({ ...r, pageUrl: res.url });
+    }
+    run.onProgress?.(`Searching IREPS tenders closing on ${fmtDate(day)}${label}: page ${pageNo}${total && perPage ? ` of ${Math.ceil(total / perPage)}` : ''}...`);
+    const next = nextResultPage(doc, pageNo);
+    if (!next) break;
+    if (pageNo >= MAX_SEARCH_PAGES) { log('Search', `${what}: stopped at the ${MAX_SEARCH_PAGES}-page limit`, 'warn'); break; }
+    res = await irepsFetch(run.base, next, { relativeTo: res.url });
+  }
+  if (!out.problem && total !== null && out.read < total) {
+    out.problem = describeError('TENDER_SEARCH_SHORT', { detail: `${what}: IREPS lists ${total} tender(s), ${out.read} were read` }).message;
+  }
+  log('Search', `${what}: ${out.read}${total !== null ? ` of ${total}` : ''} tender(s) over ${out.pages} page(s), ${out.rows.length} of this vendor${outside ? `; ${outside} with another closing date skipped` : ''}`);
+  return out;
+}
+
+/**
+ * IREPS Search Tender for the tenders CLOSING between `from` and `to` (Dates, both included), optionally of one
+ * tender number: one search per closing day, as the browser searches in the 20 Nov 2026 capture
+ * (closingDaySearchBody), each day read to its last result page. Search Tender lists every tender, so only those
+ * this vendor bid on (My Offer, or a tabulation link) are returned, and each row's own Due Date/Time decides.
+ * IREPS keeps the search in the session and the page links depend on it, so each day's search and pages run
+ * under the IREPS form lock, released between days for DocLink's other searches.
+ * -> { rows (see parseSearchTenderRows, + pageUrl), pages, searched (rows read), incomplete }
+ * `incomplete`: a day not read to its end (H4); what was read is still returned.
+ */
+export async function scanTenderSearch(run, { from, to, tenderNo = '' }) {
+  const days = closingDays(from, to);
+  const rows = [];
+  const problems = [];
+  let form = null;
+  let pages = 0;
+  let searched = 0;
+  for (const [i, day] of days.entries()) {
+    const label = days.length > 1 ? ` (day ${i + 1} of ${days.length})` : '';
+    const got = await withIrepsFormLock(async () => {
+      if (!form || form.hasToken) form = await loadForm(run.base); // a form with a Struts token is single use
+      return readClosingDay(run, form, day, { tenderNo, label });
+    });
+    pages += got.pages;
+    searched += got.read;
+    rows.push(...got.rows);
+    if (got.problem) problems.push(got.problem);
+  }
+  const incomplete = problems.length ? `${problems[0]}${problems.length > 1 ? ` (${problems.length - 1} more day(s) not read to the end)` : ''}` : '';
+  log('Search', `${rows.length} tender(s) of this vendor closing ${fmtDate(from)}..${fmtDate(to)} in ${searched} result row(s) over ${pages} page(s), ${rows.filter((r) => r.links.financialTabulation || r.links.commercialTabulation).length} with a tabulation`);
+  if (incomplete) log('Search', `Search Tender not fully read: ${incomplete}`, 'warn');
+  return { rows, pages, searched, incomplete };
 }
 
 /** Download one tabulation from its request (a tender row or a Closed Tenders row): one category result. */

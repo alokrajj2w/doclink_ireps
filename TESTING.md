@@ -829,15 +829,25 @@ downloaded, and so is the real IREPS answer (03 Nov 2026): a page that opens
 response; Techno-Commercial links inside the viewer are never requested; a
 web page with no PDF fails with its title and nothing is saved. The 29 Oct
 Closed Tenders capture (`tender/tests/fixtures/closed-tenders-29oct.html`) lists
-the 7 tenders with both tabulations.
+the 7 tenders with both tabulations. By closing date, Search Tender is searched
+one day at a time with the browser's fields in the browser's order (20 Nov 2026
+capture), every result page is read through the link the page before shows
+(also its `railwayzone=`), only the tenders with My Offer count, fewer rows than
+IREPS's count, a page not recognised or an HTTP error say the day was not read
+to the end, and each day waits for the IREPS form lock. The 20 Nov capture
+(`tender/tests/fixtures/search-tender-20nov.html`, result page 2) reads 25 rows,
+LK265182 with My Offer and both tabulations as GETs.
 
 Manual check against the mock (`node test/mock/mock-ireps-server.mjs`, log in on
 the mock home page): in Download Tender Documents, with From = 2 days ago and
 To = today,
 
-* **Financial Tabulation** / **Commercial Tabulation**: 24260725 (direct PDF)
-  and 61266411 (PDF behind a viewer page) download to
-  `Tender_<no>/Tabulation/`; 88265708 reads "not available yet".
+* **Financial Tabulation** / **Commercial Tabulation**: the mock's Search
+  Tender has 30 tenders of other vendors a day, so every day is two result
+  pages (the mock console shows one `POST advancedSearch.do` a day and a
+  `GET ... page 2`). 24260725 (direct PDF) and 61266411 (PDF behind a viewer
+  page) download to `Tender_<no>/Tabulation/`; 88265708 (My Offer, bids not
+  opened) reads "not available yet"; no other tender is listed.
 * **Advance Acceptance Letter**: one `Tender_29263265/Advance_Acceptance_LOA/LOA_29263265.pdf`.
   The mock console must not show any `/mock/loa/...` request (those are the
   files inside the letter).

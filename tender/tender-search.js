@@ -4,7 +4,7 @@
 
 import {
   TenderError, log, norm,
-  irepsFetch, assertSession, parseHtml, formParams, findForm, elementActions,
+  irepsFetch, assertSession, parseHtml, formParams, findForm, elementActions, qparam,
 } from './tender-core.js';
 import { describeError } from '../utils/messages.js';
 
@@ -131,7 +131,64 @@ export function classifySearchResponse(doc) {
   return 'other';
 }
 
-async function loadForm(base) {
+/** The fields of a search, in the order the browser sends them (Search Tender, 20 Nov 2026 capture). */
+const BROWSER_FIELD_ORDER = Object.freeze(['searchOption', 'searchOptorOption', 'advancedSearch', 'organization', 'workArea', 'changezone', 'railwayZone',
+  'division', 'unit', 'tenderStage', 'tenderType', 'bidding', 'selectDate', 'dateFrom', 'dateTo', 'direction', 'noMonthDay', 'monthDay', 'radioDuration', 'submit', 'searchParam']);
+
+/**
+ * The search for the tenders CLOSING on `day`, as the browser sends it in the 20 Nov 2026 capture: Tender Number
+ * search with the number left empty (or `tenderNo`), "Tender Closing Date" (TENDER_OPENING_DATE) from `day` to
+ * `day`, Custom Date, the Stores department (all departments only if the form has no Stores), and every other
+ * field at the live form's own value. The fields keep the browser's order: the page script fills
+ * searchOptorOption and the pressed button goes as submit=Show Results, so neither is where the form's own
+ * serialisation puts it. A field the live form has beyond the capture follows them, in the form's order.
+ * @param {{ defaults: URLSearchParams, maxLen: number, divisions: { value: string }[] }} formInfo  readSearchForm
+ * @param {Date} day
+ * @param {{ tenderNo?: string }} [opts]
+ * @returns {URLSearchParams}
+ */
+export function closingDaySearchBody(formInfo, day, { tenderNo = '' } = {}) {
+  const { defaults } = formInfo;
+  const sample = defaults.get('dateFrom') || defaults.get('dateTo') || '';
+  const no = norm(tenderNo);
+  const chosen = {
+    searchOption: '1', // Tender Number, as captured also when no number is given
+    searchOptorOption: '0', // Starting with
+    advancedSearch: formInfo.maxLen && no.length > formInfo.maxLen ? no.slice(0, formInfo.maxLen) : no,
+    division: formInfo.divisions.some((d) => d.value === '19') ? '19' : '-1', // Stores, as captured
+    dateFrom: fmtDate(day, sample),
+    dateTo: fmtDate(day, sample),
+    radioDuration: '0', // Custom Date
+    submit: 'Show Results',
+  };
+  const ifEmpty = { railwayZone: '-1', unit: '-1', tenderStage: '-1', tenderType: '-1', bidding: '-1', selectDate: 'TENDER_OPENING_DATE' };
+  const body = new URLSearchParams();
+  for (const k of BROWSER_FIELD_ORDER) body.append(k, k in chosen ? chosen[k] : defaults.get(k) || ifEmpty[k] || '');
+  for (const [k, v] of defaults) if (!BROWSER_FIELD_ORDER.includes(k)) body.append(k, v);
+  return body;
+}
+
+/** IREPS's own count on a Search Tender result page ("Tender search results 1214"), or null when it shows none. */
+export function searchResultsTotal(doc) {
+  const m = /Tender\s+search\s+results\s*(\d+)/i.exec(norm(doc.body?.textContent));
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * The link to result page `pageNo + 1` as this page shows it (an href to advancedSearch.do with count= and pageNo=),
+ * or '' on the last page. It is followed as given, as the browser would: IREPS keeps the rest of the search in the
+ * session, and its links are not all alike (page 2's say railwayzone= where page 1's say railwayzone=-1).
+ */
+export function nextResultPage(doc, pageNo) {
+  for (const a of doc.querySelectorAll('a[href]')) {
+    const href = a.getAttribute('href') || '';
+    if (/advancedSearch\.do/i.test(href) && Number(qparam(href, 'pageNo')) === pageNo + 1) return href;
+  }
+  return '';
+}
+
+/** Open the live Search Tender form (POST searchParam=showPage, as IREPS does; else a GET): readSearchForm + pageUrl. */
+export async function loadForm(base) {
   // IREPS opens the form with POST searchParam=showPage; fall back to a plain GET.
   for (const method of ['POST', 'GET']) {
     const res = await irepsFetch(base, SEARCH_PATH, method === 'POST' ? { method, form: { searchParam: 'showPage' } } : {});

@@ -5,7 +5,7 @@
 //   downloadTodaysCorrigenda() once a day   - corrigendum published today (only that document)
 //   downloadLettersByDate()    3-4x a day   - negotiation / counter offer / LOA letters published on a date
 //   downloadTabulationsByDate()                - Financial / Commercial Tabulation of tenders CLOSING on the dates
-//                                            (IREPS Closed Tenders); a tabulation shows up some days after closing
+//                                            (IREPS Search Tender); a tabulation shows up some days after closing
 
 import { IREPS_DOWN_CODES, log, norm } from './tender-core.js';
 import { assertSameAccount, startTenderJob } from './tender-account.js';
@@ -14,7 +14,7 @@ import { openLedger } from './tender-ledger.js';
 import { ledgerIdFor } from './tender-shared-run.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
-  scanClosedTenders, downloadTabulation, TABULATIONS,
+  scanTenderSearch, downloadTabulation, TABULATIONS,
 } from './tender-workflows.js';
 import { tenderEcmSink, ECM_TAKES_TENDER_DATE } from './tender-ecm.js';
 
@@ -284,8 +284,10 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
 
 /**
  * Financial / Commercial Tabulations of the tenders that CLOSED between `from` and `to` (Dates, both included),
- * optionally of one Tender Number. IREPS Closed Tenders is read once; each row that shows a wanted
- * tabulation is downloaded straight from it, with the row's closing date as the ECM tender date. A row
+ * optionally of one Tender Number: the panel's Financial / Commercial Tabulation buttons and the scheduled
+ * tenderTabulations run (both tabulations) both come here. IREPS Search Tender is searched one closing day at
+ * a time (scanTenderSearch); each tender this vendor bid on that shows a wanted tabulation is downloaded straight
+ * from its row, with the row's closing date (Due Date/Time) as the ECM tender date. A tender of this vendor
  * without the link is reported as "not available yet" (IREPS adds it once the bids are opened), and what
  * was downloaded before is skipped (download log, or the ledger), so the same range can be re-run.
  * @param pdfTypes  keys of TABULATIONS (default both)
@@ -293,10 +295,9 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
 export async function downloadTabulationsByDate({ from, to, pdfTypes = Object.keys(TABULATIONS), tenderNo: onlyTender = '', onProgress = () => {}, onAccount = () => {}, job: sharedJob = null } = {}) {
   const job = sharedJob || (await beginJob({ onProgress, onAccount }));
   const range = { from: ddmmyyyy(from), to: ddmmyyyy(to) };
-  const probe = { base: job.base, ctx: { tenderNo: '' }, inboxCache: new Map(), onProgress };
   const wantTender = norm(onlyTender);
-  onProgress(`Reading Closed Tenders (closing date ${range.from} - ${range.to})...`);
-  const { rows, pages, incomplete } = await scanClosedTenders(probe, { from, to, tenderNo: wantTender });
+  onProgress(`Searching IREPS tenders closing ${range.from} - ${range.to}...`);
+  const { rows, pages, incomplete } = await scanTenderSearch({ base: job.base, onProgress }, { from, to, tenderNo: wantTender });
   const listed = rows.filter((r) => !wantTender || norm(r.tenderNo).toLowerCase() === wantTender.toLowerCase());
 
   let ecm;

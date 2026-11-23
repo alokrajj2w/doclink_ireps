@@ -177,8 +177,8 @@ function renderTabulationResult(pdfType, r) {
   $('btn-tender-show').hidden = true;
   $('tender-result').hidden = false;
   $('btn-auto-retry').hidden = true;
-  // Closed Tenders not read to its end (H4): tenders on the part not read were not looked at
-  const problems = [t.aborted ? `Stopped early: ${t.aborted.message}` : '', t.incomplete ? `Closed Tenders was not read to the end: ${t.incomplete}` : ''].filter(Boolean);
+  // the IREPS tender search not read to its end (H4): tenders on the part not read were not looked at
+  const problems = [t.aborted ? `Stopped early: ${t.aborted.message}` : '', t.incomplete ? `The IREPS tender search was not read to the end: ${t.incomplete}` : ''].filter(Boolean);
   if (problems.length) {
     $('tender-error-message').textContent = problems.join('\n');
     $('tender-error').hidden = false;
