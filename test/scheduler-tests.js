@@ -957,7 +957,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
       user: { name: "Priya", canRun: true, canManage: true },
       waitingFor: null,
       lastError: null,
-      version: "1.6.4",
+      version: "1.6.5",
       slots: [
         { id: 1, doc_type: "billStatus", period: "day", status: "missed", ...nineToTen },
         { id: 3, doc_type: "tenderNit", period: "10:30", status: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", attempts: 1, started_at: "2026-11-19T05:15:00+00:00", ended_at: "2026-11-19T05:22:00+00:00", window_start_at: "2026-11-19T05:00:00+00:00", window_end_at: "2026-11-19T06:00:00+00:00", next_try_at: "2026-11-19T05:45:00+00:00", result: { saved: 35, skipped: 18, failed: 2, range: "17/11/2026 - 18/11/2026", failures } }
@@ -1423,7 +1423,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(JSON.stringify([log.events[1].count, log.events[1].first, log.events[1].at]), JSON.stringify([3, "2026-11-19T03:32:00.000Z", "2026-11-19T03:52:00.000Z"]));
     const run = log.runs[0];
     eq(JSON.stringify([run.outcome, run.counts, run.failures.length, run.more]), JSON.stringify(["partial", { saved: 35, skipped: 18, failed: 5 }, 5, { saved: 34 }]));
-    const text = runLogText(log, { account: "833", version: "1.6.4", savedAt: "2026-11-19T05:00:00Z" });
+    const text = runLogText(log, { account: "833", version: "1.6.5", savedAt: "2026-11-19T05:00:00Z" });
     for (const line of ["IREPS account 833", "Tender NIT documents (10:30 run)  PARTLY DONE", "Searched: 17/11/2026 - 18/11/2026", "Counts: 35 saved, 18 already saved, 5 failed", "Not saved (5):", `- Tender 0 tender PDF: ${describeError("ECM_UNAVAILABLE").title} (the ECM did not answer in time) [ECM_UNAVAILABLE]`, "Saved (35):", "... and 34 more", "2026-11-19 09:02 to 09:22 (3 times)  Due now: Bill Status."]) {
       assert(text.includes(line), `the text has "${line}"\n${text}`);
     }
