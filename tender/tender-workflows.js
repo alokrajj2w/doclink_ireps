@@ -22,7 +22,7 @@ import { printPageToPdf } from './tender-print.js';
 import { sharedRun } from './tender-shared-run.js';
 import {
   searchTender, findTenderRows, findTenderRowsLoose, fmtDate,
-  describeRow, loadForm, classifySearchResponse, closingDaySearchBody, nextResultPage, searchResultsTotal,
+  describeRow, loadForm, classifySearchResponse, closingDaySearchBody, nextResultPage, resultPageLink, resultPageLinks, searchResultsTotal,
 } from './tender-search.js';
 import { withIrepsFormLock } from '../services/ireps-form-lock.js';
 import { ecmDocumentFor, ecmCheckDocumentFor, ecmFileName, tenderEcmSink, CATEGORY_ECM_KIND } from './tender-ecm.js';
@@ -735,6 +735,12 @@ const CLOSED_STATUS = 'MyBidsClosed';
 const CLOSED_WINDOW_DAYS = 90; // the Closed Tenders page's own default range
 /** Search Tender shows 25 rows a page; one closing day was 49 pages (19 Nov 2026, Stores), read to its end within this. */
 const MAX_SEARCH_PAGES = 100;
+/**
+ * Search Tender requests of one closing day under way at once: the result page read next and up to two after it,
+ * as PO Search reads its pages (PAGE_FETCH_CONCURRENCY). IREPS takes about 13 s over each page (23 Nov 2026: 76
+ * pages in 16.5 min, one at a time), and three at a time stays gentle on it.
+ */
+const SEARCH_PAGES_AT_ONCE = 3;
 const CLOSING_RE = /^(\d{2}\/\d{2}\/\d{4})(?:\s+\d{1,2}:\d{2})?$/;
 /** "23/10/2026 11:30" or "23/10/2026" -> that day (local), or null. */
 const closingDay = (text) => {
@@ -920,53 +926,120 @@ function closingDays(from, to) {
 
 /**
  * One closing day of Search Tender: the search, then every result page through the links IREPS shows.
- * -> { rows (this vendor's tenders closing that day, + pageUrl), pages, read (rows read), problem }
- * `problem`: why the day was not read to its end (a page DocLink does not recognise, an HTTP error, fewer rows
- * read than IREPS's own total); the rows read before it are still returned.
+ * -> { rows (this vendor's tenders closing that day, + pageUrl), pages, read (different tenders read), problem }
+ * The pages after the one being read are asked for ahead, up to SEARCH_PAGES_AT_ONCE requests under way, each
+ * through a link IREPS showed on a page read before (it shows ten page links and "next"; a page with no link shown
+ * yet waits for one). They are still read in order, so every check below works as with one page at a time.
+ * The list of a closing day can change while its pages are read (on that day tenders are extended or withdrawn),
+ * so IREPS's count moves a little between pages (23 Nov 2026: 1894, 1893, 1892, 1885 in half an hour):
+ *   - it drops by up to a page: a tender left the list before the page being read and the rows after it moved up,
+ *     so a row can have slipped onto the page read before. That page is read again, and the day carries on;
+ *   - it rises by up to a page: the rows moved down, and a tender read already repeats; it is taken once;
+ *   - it changes by more than a page, or a page has no tender closing that day: that is another search in this
+ *     IREPS session, not this day's list. The day stops there, and says so.
+ * At the end the different tenders read are compared with IREPS's last count.
+ * `problem`: why the day was not read to its end (a page DocLink does not recognise, an HTTP error, another search,
+ * fewer tenders read than IREPS's count); the rows read before it are still returned.
  */
 async function readClosingDay(run, form, day, { tenderNo = '', label = '' } = {}) {
   const what = `Search Tender ${fmtDate(day)}`;
   const out = { rows: [], pages: 0, read: 0, problem: '' };
-  let res = await irepsFetch(run.base, form.action, { method: 'POST', form: closingDaySearchBody(form, day, { tenderNo }), relativeTo: form.pageUrl || undefined });
+  const seen = new Set();
+  let outside = 0;
+  /** A page's rows: each tender once; this vendor's tenders that close that day are kept. */
+  const take = (found, pageUrl) => {
+    for (const r of found) {
+      const key = `${r.tenderNo}|${r.nitId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const d = closingDay(r.closingDate);
+      if (!d || d.getTime() !== day.getTime()) { outside++; continue; }
+      if (r.offer || r.links.financialTabulation || r.links.commercialTabulation) out.rows.push({ ...r, pageUrl });
+    }
+    out.read = seen.size;
+  };
+  const anotherSearch = (detail) => describeError('TENDER_SEARCH_SHORT', { detail: `${detail}, so another search in this IREPS session replaced this one` }).message;
+  /** Read result page `pageNo` again through `doc`'s page links: true when its rows were taken. */
+  const readAgain = async (doc, pageNo, relativeTo) => {
+    const url = resultPageLink(doc, pageNo);
+    if (!url) return false;
+    const again = await irepsFetch(run.base, url, { relativeTo });
+    assertSession(again);
+    out.pages++;
+    if (again.status !== 200) return false;
+    const againDoc = parseHtml(again.text());
+    const rows = classifySearchResponse(againDoc) === 'results' ? parseSearchTenderRows(againDoc) : [];
+    if (rows.length) take(rows, again.url);
+    return rows.length > 0;
+  };
+  const pageLinks = new Map(); // page number -> { url, relativeTo }: the page links IREPS showed on the pages read
+  const ahead = new Map(); // page number -> its answer (a promise), asked for before the page is read
+  /** Ask for result page `n` before it is read, through a link IREPS showed: with no link shown yet, it waits. */
+  const askAhead = (n, link = pageLinks.get(n)) => {
+    if (ahead.has(n) || !link || n > MAX_SEARCH_PAGES) return;
+    const answer = irepsFetch(run.base, link.url, { relativeTo: link.relativeTo });
+    answer.catch(() => {}); // the answer of a page after the one the day stops at is not read: no error
+    ahead.set(n, answer);
+  };
+  const started = Date.now();
   let total = null;
   let perPage = 0;
   let prevSig = '';
-  let outside = 0;
-  for (let pageNo = 1; ; pageNo++) {
-    assertSession(res);
-    if (res.status !== 200) { out.problem = listFailed(`${what} page ${pageNo}`, res.status).message; break; }
-    out.pages++;
-    const doc = parseHtml(res.text());
-    const kind = classifySearchResponse(doc);
-    if (kind === 'none' && pageNo === 1) break; // IREPS's own "No Results Found": nothing closed that day
-    const found = kind === 'results' ? parseSearchTenderRows(doc) : [];
-    if (!found.length) { out.problem = pageNotRecognised(`${what} page ${pageNo}`, doc).message; break; }
-    const sig = found.map((r) => `${r.tenderNo}|${r.nitId}`).join(',');
-    if (sig === prevSig) break; // the same page again: the count check below says what was not read
-    prevSig = sig;
-    const shown = searchResultsTotal(doc);
-    if (pageNo === 1) [total, perPage] = [shown, found.length];
-    else if (shown !== null && total !== null && shown !== total) {
-      // another search in this IREPS session replaced this one: its pages are not this day's
-      out.problem = describeError('TENDER_SEARCH_SHORT', { detail: `${what} page ${pageNo}: IREPS's count changed from ${total} to ${shown} while its pages were read` }).message;
-      break;
+  try {
+    let res = await irepsFetch(run.base, form.action, { method: 'POST', form: closingDaySearchBody(form, day, { tenderNo }), relativeTo: form.pageUrl || undefined });
+    for (let pageNo = 1; ; pageNo++) {
+      assertSession(res);
+      if (res.status !== 200) { out.problem = listFailed(`${what} page ${pageNo}`, res.status).message; break; }
+      out.pages++;
+      const doc = parseHtml(res.text());
+      const kind = classifySearchResponse(doc);
+      if (kind === 'none' && pageNo === 1) break; // IREPS's own "No Results Found": nothing closed that day
+      const found = kind === 'results' ? parseSearchTenderRows(doc) : [];
+      if (!found.length) { out.problem = pageNotRecognised(`${what} page ${pageNo}`, doc).message; break; }
+      const sig = found.map((r) => `${r.tenderNo}|${r.nitId}`).join(',');
+      if (sig === prevSig) break; // the same page again: the count check below says what was not read
+      prevSig = sig;
+      const dated = found.map((r) => closingDay(r.closingDate)).filter(Boolean);
+      if (dated.length && !dated.some((d) => d.getTime() === day.getTime())) {
+        out.problem = anotherSearch(`${what} page ${pageNo}: none of its tenders closes on ${fmtDate(day)}`);
+        break;
+      }
+      const shown = searchResultsTotal(doc);
+      if (pageNo === 1) [total, perPage] = [shown, found.length];
+      else if (shown !== null && total !== null && shown !== total) {
+        if (Math.abs(shown - total) > perPage) {
+          out.problem = anotherSearch(`${what} page ${pageNo}: IREPS's count changed from ${total} to ${shown}`);
+          break;
+        }
+        log('Search', `${what} page ${pageNo}: IREPS's count changed from ${total} to ${shown} while its pages were read${shown < total ? `; page ${pageNo - 1} is read again` : ''}`);
+        if (shown < total && !(await readAgain(doc, pageNo - 1, res.url))) {
+          // carry on with the day, but a tender that slipped onto the page before may not have been read
+          out.problem = out.problem || describeError('TENDER_SEARCH_SHORT', { detail: `${what}: page ${pageNo - 1} could not be read again after IREPS's count changed from ${total} to ${shown}` }).message;
+        }
+        total = shown;
+      }
+      take(found, res.url);
+      for (const [n, url] of resultPageLinks(doc)) pageLinks.set(n, { url, relativeTo: res.url });
+      run.onProgress?.(`Searching IREPS tenders closing on ${fmtDate(day)}${label}: page ${pageNo}${total && perPage ? ` of ${Math.ceil(total / perPage)}` : ''}...`);
+      const next = nextResultPage(doc, pageNo);
+      if (!next) break;
+      if (pageNo >= MAX_SEARCH_PAGES) { log('Search', `${what}: stopped at the ${MAX_SEARCH_PAGES}-page limit`, 'warn'); break; }
+      // the next page through the link this page shows (unless it was asked for already), and the pages after it
+      // whose links IREPS has shown, up to SEARCH_PAGES_AT_ONCE under way
+      askAhead(pageNo + 1, { url: next, relativeTo: res.url });
+      for (let n = pageNo + 2; n <= pageNo + SEARCH_PAGES_AT_ONCE; n++) askAhead(n);
+      res = await ahead.get(pageNo + 1);
+      ahead.delete(pageNo + 1);
     }
-    out.read += found.length;
-    for (const r of found) {
-      const d = closingDay(r.closingDate);
-      if (!d || d.getTime() !== day.getTime()) { outside++; continue; }
-      if (r.offer || r.links.financialTabulation || r.links.commercialTabulation) out.rows.push({ ...r, pageUrl: res.url });
-    }
-    run.onProgress?.(`Searching IREPS tenders closing on ${fmtDate(day)}${label}: page ${pageNo}${total && perPage ? ` of ${Math.ceil(total / perPage)}` : ''}...`);
-    const next = nextResultPage(doc, pageNo);
-    if (!next) break;
-    if (pageNo >= MAX_SEARCH_PAGES) { log('Search', `${what}: stopped at the ${MAX_SEARCH_PAGES}-page limit`, 'warn'); break; }
-    res = await irepsFetch(run.base, next, { relativeTo: res.url });
+  } finally {
+    // a page asked for after the one the day stopped at is waited for, its answer unread: the IREPS form lock is
+    // released only when none of this day's requests is still under way
+    await Promise.allSettled(ahead.values());
   }
   if (!out.problem && total !== null && out.read < total) {
     out.problem = describeError('TENDER_SEARCH_SHORT', { detail: `${what}: IREPS lists ${total} tender(s), ${out.read} were read` }).message;
   }
-  log('Search', `${what}: ${out.read}${total !== null ? ` of ${total}` : ''} tender(s) over ${out.pages} page(s), ${out.rows.length} of this vendor${outside ? `; ${outside} with another closing date skipped` : ''}`);
+  log('Search', `${what}: ${out.read}${total !== null ? ` of ${total}` : ''} tender(s) over ${out.pages} page(s) in ${Math.round((Date.now() - started) / 1000)} s, ${out.rows.length} of this vendor${outside ? `; ${outside} with another closing date skipped` : ''}`);
   return out;
 }
 

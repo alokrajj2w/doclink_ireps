@@ -175,16 +175,37 @@ export function searchResultsTotal(doc) {
 }
 
 /**
- * The link to result page `pageNo + 1` as this page shows it (an href to advancedSearch.do with count= and pageNo=),
- * or '' on the last page. It is followed as given, as the browser would: IREPS keeps the rest of the search in the
- * session, and its links are not all alike (page 2's say railwayzone= where page 1's say railwayzone=-1).
+ * The result page links this page shows, by page number: hrefs to advancedSearch.do with count= and pageNo=, the
+ * first one of each number. IREPS shows the ten page links around this page and "next" to the first of the next ten
+ * (20 Nov 2026 capture: page 2 shows 1-10 and next = 11).
  */
-export function nextResultPage(doc, pageNo) {
+export function resultPageLinks(doc) {
+  const links = new Map();
   for (const a of doc.querySelectorAll('a[href]')) {
     const href = a.getAttribute('href') || '';
-    if (/advancedSearch\.do/i.test(href) && Number(qparam(href, 'pageNo')) === pageNo + 1) return href;
+    const n = Number(qparam(href, 'pageNo'));
+    if (/advancedSearch\.do/i.test(href) && n > 0 && !links.has(n)) links.set(n, href);
   }
-  return '';
+  return links;
+}
+
+/**
+ * The link to result page `pageNo + 1` as this page shows it, or '' on the last page. It is followed as given, as
+ * the browser would: IREPS keeps the rest of the search in the session, and its links are not all alike (page 2's
+ * say railwayzone= where page 1's say railwayzone=-1).
+ */
+export function nextResultPage(doc, pageNo) {
+  return resultPageLinks(doc).get(pageNo + 1) || '';
+}
+
+/**
+ * The link to result page `n` from this page: the one IREPS shows, else one of its page links with only the page
+ * number changed (IREPS shows ten page links at a time), or '' when the page shows no page link at all.
+ */
+export function resultPageLink(doc, n) {
+  const links = resultPageLinks(doc);
+  const first = links.values().next().value;
+  return links.get(n) || (first ? first.replace(/([?&]pageNo=)\d+/i, `$1${n}`) : '');
 }
 
 /** Open the live Search Tender form (POST searchParam=showPage, as IREPS does; else a GET): readSearchForm + pageUrl. */

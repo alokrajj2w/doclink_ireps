@@ -947,7 +947,7 @@ export function htmlToLines(doc) {
   return lines;
 }
 
-const CHAR_MAP = { '–': '-', '—': '-', '‘': "'", '’': "'", '“': '"', '”': '"', '•': '*', '₹': 'Rs.', '…': '...' };
+const CHAR_MAP = { '\u2013': '-', '\u2014': '-', '‘': "'", '’': "'", '“': '"', '”': '"', '•': '*', '₹': 'Rs.', '…': '...' };
 const PAGE_W = 595;
 const PAGE_H = 842;
 const MARGIN = 40;

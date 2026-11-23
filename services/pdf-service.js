@@ -47,9 +47,9 @@ const FONTS = {
 /** Characters outside WinAnsi that get a readable substitute. */
 const SUBSTITUTIONS = {
   "₹": "Rs.", // ₹
-  "–": "-",
-  "—": "-",
-  "―": "-",
+  "\u2013": "-", // en dash
+  "\u2014": "-", // em dash
+  "\u2015": "-", // horizontal bar
   "‘": "'",
   "’": "'",
   "‚": "'",

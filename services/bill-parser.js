@@ -72,7 +72,7 @@ export const BILL_BLOCK_SELECTOR = "table#table_id";
 export function normalizeIrepsValue(value) {
   const cleaned = normaliseText(value);
   if (!cleaned) return null;
-  if (/^[-–—]+$/.test(cleaned)) return null;
+  if (/^[-\u2013\u2014]+$/.test(cleaned)) return null;
   const upper = cleaned.toUpperCase();
   if (upper === "NA" || upper === "N/A" || upper === "N.A." || upper === "NIL" || upper === "NULL") return null;
   return cleaned;

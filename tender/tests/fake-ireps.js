@@ -287,6 +287,10 @@ export class FakeIreps {
     this.log = [];
     this.listPages = []; // every Post Tenders list page requested: { status, startDate, endDate, pageNo }
     this.lastSearch = null; // IREPS keeps the last Search Tender search in the session; its page links read it
+    this.shownLinks = new Set(); // every Search Tender page link a result page showed
+    this.unshownPageGets = []; // the page numbers asked for through a link no result page showed before
+    this.pagesInFlight = 0; // Search Tender page requests being answered (s.searchPageMs makes them take time)
+    this.maxPagesInFlight = 0;
   }
 
   tenderBy(f, v) { return this.s.tenders.find((t) => String(t[f]) === String(v)); }
@@ -294,14 +298,29 @@ export class FakeIreps {
   /**
    * Result page `pageNo` of the last search, s.searchPageSize rows a page (25, as IREPS), with IREPS's page links:
    * hrefs to advancedSearch.do with count= and pageNo=, page 1's with railwayzone=-1 and later pages' with
-   * railwayzone= (20 Nov 2026 capture).
+   * railwayzone=, the ten around this page and "next" to the first of the next ten (20 Nov 2026 capture).
    */
   searchPage(pageNo) {
     const s = this.lastSearch;
+    // s.searchChanges: [{ beforePage, remove: '<tender no>' } | { beforePage, add: tender, at }]: the day's list changes
+    // just before that page is served, as on the closing day itself (IREPS runs the search again for every page)
+    for (const c of this.s.searchChanges || []) {
+      if (c.beforePage !== pageNo || c.done) continue;
+      c.done = true;
+      if (c.remove) s.hits = s.hits.filter((t) => t.no !== c.remove);
+      if (c.add) s.hits.splice(c.at || 0, 0, c.add);
+    }
     const per = this.s.searchPageSize || 25;
     const pages = Math.ceil(s.hits.length / per);
-    const link = (n) => `<a href="/epsn/search/advancedSearch.do?advancedSearch=${s.term}&railwayzone=${pageNo === 1 ? '-1' : ''}&dateFrom=${s.dateFrom}&linkVal=department&dateTo=${s.dateTo}&selectDate=TENDER_OPENING_DATE&count=${s.hits.length}&pageNo=${n}">${n}</a>`;
-    const links = pages > 1 ? `<table><tr><td>${Array.from({ length: pages }, (_, i) => link(i + 1)).join('&nbsp;')}</td></tr></table>` : '';
+    const link = (n, text = n) => {
+      const href = `/epsn/search/advancedSearch.do?advancedSearch=${s.term}&railwayzone=${pageNo === 1 ? '-1' : ''}&dateFrom=${s.dateFrom}&linkVal=department&dateTo=${s.dateTo}&selectDate=TENDER_OPENING_DATE&count=${s.hits.length}&pageNo=${n}`;
+      this.shownLinks.add(href);
+      return `<a href="${href}">${text}</a>`;
+    };
+    const first = Math.floor((pageNo - 1) / 10) * 10 + 1;
+    const shown = Array.from({ length: Math.max(0, Math.min(10, pages - first + 1)) }, (_, i) => link(first + i));
+    if (first + 10 <= pages) shown.push(link(first + 10, 'next'));
+    const links = pages > 1 ? `<table><tr><td>${shown.join('&nbsp;')}</td></tr></table>` : '';
     return resultsPage(s.hits.slice((pageNo - 1) * per, pageNo * per).map(resultRow), { total: s.hits.length, links });
   }
 
@@ -321,7 +340,15 @@ export class FakeIreps {
 
     if (p === '/epsn/search/advancedSearch.do') {
       // a page link (GET ...&count=N&pageNo=n): a page of the search this session made last
-      if (method === 'GET' && q.get('pageNo')) return ok(this.lastSearch && this.lastSearch.hits.length ? this.searchPage(Number(q.get('pageNo'))) : searchFormPage());
+      if (method === 'GET' && q.get('pageNo')) {
+        if (!this.shownLinks.has(p + u.search)) this.unshownPageGets.push(Number(q.get('pageNo')));
+        this.maxPagesInFlight = Math.max(this.maxPagesInFlight, ++this.pagesInFlight);
+        // s.searchPageMs (ms, or pageNo -> ms): IREPS takes its time over each page (about 13 s on 23 Nov 2026)
+        const ms = typeof this.s.searchPageMs === 'function' ? this.s.searchPageMs(Number(q.get('pageNo'))) : this.s.searchPageMs;
+        if (ms) await new Promise((r) => setTimeout(r, ms));
+        this.pagesInFlight--;
+        return ok(this.lastSearch && this.lastSearch.hits.length ? this.searchPage(Number(q.get('pageNo'))) : searchFormPage());
+      }
       if (method === 'GET' || body.get('searchParam') === 'showPage') return ok(searchFormPage());
       const term = body.get('advancedSearch');
       const dept = body.get('division');

@@ -1703,13 +1703,57 @@ test('Tabulation by closing date: the Search Tender search is sent as the browse
     ['1', '0', '', '01', 'PT', '-1', '19', '-1', 'TENDER_OPENING_DATE', '20/10/2026', '20/10/2026', '0', 'Show Results']);
   assert.equal(server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do' && l.body.searchParam === 'showPage').length, 1, 'the form (no Struts token) is opened once');
 });
-test('Tabulation by closing date: every result page is read through the link IREPS shows on the page before, exactly as shown', async () => {
-  mk({ searchPageSize: 2, tenders: [other('51111111'), other('52222222'), other('53333333'), other('54444444'), bid('42263731')] });
+test('Tabulation by closing date: every result page is asked for through a link IREPS showed on a page read before, exactly as shown', async () => {
+  // 13 pages: pages 1-10 show the links of pages 1-10 and "next" (11), pages 11-13 show 11-13
+  mk({ searchPageSize: 1, tenders: [bid('42263731'), ...Array.from({ length: 11 }, (_, i) => other(String(50000000 + i))), bid('69261051')] });
   const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
-  assert.equal(r.tabulations.summary.downloaded, 1, 'the tender on the last page');
-  assert.deepEqual(searchPageGets().map((l) => [l.query.pageNo, l.query.railwayzone, l.query.count, l.query.linkVal]), [['2', '-1', '5', 'department'], ['3', '', '5', 'department']],
-    'page 2 through page 1\'s link (railwayzone=-1), page 3 through page 2\'s (railwayzone=)');
-  assert.equal(r.tabulations.incomplete, '');
+  assert.deepEqual([r.tabulations.summary.downloaded, r.tabulations.incomplete], [2, ''], 'the tenders on the first and the last page');
+  const gets = searchPageGets();
+  assert.deepEqual(gets.map((l) => l.query.pageNo), ['2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13'], 'each page once');
+  assert.deepEqual(server.unshownPageGets, [], 'never a link no page showed: pages 12 and 13 wait for page 11, the first to show them');
+  assert.deepEqual(gets.map((l) => l.query.railwayzone), ['-1', '-1', '-1', '', '', '', '', '', '', '', '', ''],
+    'pages 2-4 through page 1\'s links (railwayzone=-1), the others through later pages\' links (railwayzone=)');
+  assert.ok(gets.every((l) => l.query.count === '13' && l.query.linkVal === 'department'));
+});
+test('Tabulation by closing date: a day\'s result pages are asked for three at a time and read in order', async () => {
+  mk({ searchPageSize: 1, searchPageMs: 25, tenders: [other('51111111'), bid('42263731'), other('52222222'), other('53333333'), bid('69261051'), other('54444444'), bid('24261658')] });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  assert.equal(server.maxPagesInFlight, 3, 'three result pages under way at once, never more');
+  assert.deepEqual(searchPageGets().map((l) => l.query.pageNo), ['2', '3', '4', '5', '6', '7']);
+  assert.deepEqual(r.tabulations.tenders.map((t) => t.tenderNo), ['42263731', '69261051', '24261658'], 'in page order');
+  assert.deepEqual([r.tabulations.summary.downloaded, r.tabulations.incomplete], [3, '']);
+  assert.match(core.getLogTail(), /Search Tender 20\/10\/2026: 7 of 7 tender\(s\) over 7 page\(s\) in \d+ s, 3 of this vendor/);
+});
+test('Tabulation by closing date: when a day stops at a page, the pages asked for after it are waited for and not read, so no request is left under way', async () => {
+  // two tenders join the top of the list before page 2 is served: IREPS's count goes from 5 to 7, more than a page
+  mk({ searchPageSize: 1, searchPageMs: (n) => (n === 2 ? 5 : 150), tenders: [bid('42263731'), other('51111111'), other('52222222'), bid('69261051'), other('53333333')],
+    searchChanges: [{ beforePage: 2, add: other('50000001'), at: 0 }, { beforePage: 2, add: other('50000002'), at: 0 }] });
+  const got = await wf.scanTenderSearch({ base: 'https://www.ireps.gov.in', onProgress: () => {} }, { from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  assert.equal(server.pagesInFlight, 0, 'nothing still under way when the day, and the IREPS form lock, is over');
+  assert.deepEqual(searchPageGets().map((l) => l.query.pageNo), ['2', '3', '4'], 'pages 3 and 4 were asked for with page 2');
+  assert.deepEqual(got.rows.map((r) => r.tenderNo), ['42263731'], 'only page 1 is taken: the day stopped at page 2');
+  assert.match(got.incomplete, /Search Tender 20\/10\/2026 page 2: IREPS's count changed from 5 to 7, so another search in this IREPS session replaced this one/);
+});
+test('Tabulation by closing date: a tender that leaves the day\'s list between two pages (IREPS\'s count drops by one, 23 Nov 2026) does not hide the tender that slides onto the page already read', async () => {
+  // page 1: 51111111, 52222222 | page 2: 42263731, 53333333 | page 3: 69261051; 51111111 leaves the list just before
+  // page 2 is served, so 42263731 moves up onto page 1 (read already) and page 2 is 53333333, 69261051
+  mk({ searchPageSize: 2, tenders: [other('51111111'), other('52222222'), bid('42263731'), other('53333333'), bid('69261051')], searchChanges: [{ beforePage: 2, remove: '51111111' }] });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  assert.deepEqual(r.tabulations.tenders.map((t) => t.tenderNo).sort(), ['42263731', '69261051']);
+  assert.equal(r.tabulations.summary.downloaded, 2);
+  assert.equal(r.tabulations.incomplete, '', 'the day is read to its end');
+  assert.deepEqual(searchPageGets().map((l) => l.query.pageNo), ['2', '3', '1'],
+    'pages 2 and 3 together (page 1 shows both), then page 1 again; page 2 now says it is the last, so page 3\'s answer is not read');
+  assert.match(core.getLogTail(), /Search Tender 20\/10\/2026 page 2: IREPS's count changed from 5 to 4 while its pages were read; page 1 is read again/);
+});
+test('Tabulation by closing date: a tender that joins the day\'s list between two pages (IREPS\'s count rises) repeats a tender, which is taken once; the day goes on, and its count says the new one was not read', async () => {
+  // page 1: 51111111, 52222222 | page 2: 42263731, 53333333; 50000000 joins at the top before page 2 is served,
+  // so page 2 is 52222222 (again), 42263731 and page 3 is 53333333
+  mk({ searchPageSize: 2, tenders: [other('51111111'), other('52222222'), bid('42263731'), other('53333333')], searchChanges: [{ beforePage: 2, add: other('50000000'), at: 0 }] });
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  assert.deepEqual([r.tabulations.listed, r.tabulations.summary.downloaded], [1, 1], '42263731 once');
+  assert.deepEqual(searchPageGets().map((l) => l.query.pageNo), ['2', '3'], 'no page is read again');
+  assert.match(r.tabulations.incomplete, /Search Tender 20\/10\/2026: IREPS lists 5 tender\(s\), 4 were read/);
 });
 test('Tabulation by closing date: the scheduled run (no button: both tabulations) searches Search Tender the same way', async () => {
   mk({ tenders: [bid('42263731'), other('51111111')] });
@@ -2051,6 +2095,20 @@ test('H4: Search Tender - a day IREPS does not answer (HTTP error) is said, and 
   const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 21) });
   assert.equal(r.tabulations.summary.downloaded, 1);
   assert.match(r.tabulations.incomplete, /Search Tender 20\/10\/2026 page 1: IREPS returned HTTP 500/);
+});
+test('H4: Search Tender - a page of another search (IREPS\'s count far off, or no tender closing that day) stops the day there and says so', async () => {
+  const page2 = (answer) => intercept((m, u) => m === 'GET' && /advancedSearch\.do\?.*pageNo=2/.test(u), () => ({ status: 200, type: 'text/html', bytes: answer }));
+  const run20 = () => auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  mk({ searchPageSize: 2, tenders: [bid('42263731'), other('51111111'), bid('69261051')] });
+  page2(resultsPage([resultRow(other('59999999'))], { total: 40 }));
+  let r = await run20();
+  assert.deepEqual([r.tabulations.listed, r.tabulations.summary.downloaded], [1, 1], 'what page 1 showed is still downloaded');
+  assert.match(r.tabulations.incomplete, /Search Tender 20\/10\/2026 page 2: IREPS's count changed from 3 to 40, so another search in this IREPS session replaced this one/);
+  mk({ searchPageSize: 2, tenders: [bid('42263731'), other('51111111'), bid('69261051')] });
+  page2(resultsPage([resultRow(bid('69261051', { closing: new Date(2026, 9, 25) }))], { total: 3 }));
+  r = await run20();
+  assert.deepEqual([r.tabulations.listed, r.tabulations.summary.downloaded], [1, 1], 'a tender of another day is not taken for this one');
+  assert.match(r.tabulations.incomplete, /Search Tender 20\/10\/2026 page 2: none of its tenders closes on 20\/10\/2026, so another search in this IREPS session replaced this one/);
 });
 test('M2: each day\'s Search Tender search and result pages wait for the IREPS form lock', async () => {
   const formLock = await import('../../services/ireps-form-lock.js');

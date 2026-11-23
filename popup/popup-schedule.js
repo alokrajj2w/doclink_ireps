@@ -528,7 +528,7 @@ async function whileBusy(busyButton, buttons, request) {
   }
 }
 
-/** A saved schedule's timing for its box's summary line: ["09:00–10:00", "once a day"]. */
+/** A saved schedule's timing for its box's summary line: ["09:00-10:00", "once a day"]. */
 function timingParts(s) {
   const repeat = REPEATS.find(([m]) => m === (s.repeat_every_minutes ?? null));
   return [`${s.window_start}-${s.window_end}`, repeat ? repeat[1] : `every ${s.repeat_every_minutes} min`];

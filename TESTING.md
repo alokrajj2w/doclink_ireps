@@ -1,4 +1,4 @@
-# DocLink — Testing Guide
+# DocLink: Testing Guide
 
 This guide explains how to test the DocLink Chrome extension step by step.
 You do **not** need access to the real IREPS portal for Parts A to C; a local
@@ -12,7 +12,7 @@ Requirements: Google Chrome 116 or newer, Node.js 22.22+ or 24.15+.
 
 ---
 
-## Part A — Automated tests (no browser setup)
+## Part A: Automated tests (no browser setup)
 
 Open a terminal in the repository folder and run:
 
@@ -80,7 +80,7 @@ Then open `DocLink-sample.pdf` in any PDF viewer.
 
 ---
 
-## Part B — Load the extension in Chrome
+## Part B: Load the extension in Chrome
 
 1. Open Chrome and go to `chrome://extensions`.
 2. Turn on **Developer mode** (toggle in the top-right corner).
@@ -94,7 +94,7 @@ icon on the DocLink card in `chrome://extensions`.
 
 ---
 
-## Part C — Full workflow test with the mock IREPS portal
+## Part C: Full workflow test with the mock IREPS portal
 
 The mock portal serves the same page path as IREPS
 (`/epsn/admin/viewBills.do`), answers the empty POST with the Bill Status
@@ -173,7 +173,7 @@ from any other page.
 
 ### C3. Test: logged out (Acceptance Test 2)
 
-1. Open a new tab at http://localhost:8765/ — it shows the IREPS-style login page
+1. Open a new tab at http://localhost:8765/, which shows the IREPS-style login page
    (User Id / Password are decorative; the real portal uses a security key).
 2. Click the DocLink toolbar icon.
 3. Header should show **IREPS ● Login Required**.
@@ -215,7 +215,7 @@ Open the PDF and check:
 | Bill #1 (REGISTERED) | CO7 No, CO7 Date and Payment Advice Date show "-" (IREPS printed `----` / `NA`) (Acceptance Test 6) |
 | Bill #2 (RETURNED) | Bill Number "-", Reason for Return "#VARY IN SCHEDULE B- …" |
 | Bill #3 (PAYMENT MADE) | CO7 filled, Recovery Details on three lines (GST TDS DEDUCTION / INCOME TAX / OTHER CHARGES) (Acceptance Test 7) |
-| Bill #3 and Bill #6 | Same Bill Number 9001000103 with different statuses — both present, nothing de-duplicated |
+| Bill #3 and Bill #6 | Same Bill Number 9001000103 with different statuses: both present, nothing de-duplicated |
 | Text | Selectable and searchable (Cmd+F for "13010326020001") |
 
 ### C4b. Test: search options
@@ -227,7 +227,7 @@ Open **Search options** in the popup (above the Download button).
 | Railway Zone = ICF (list comes from the IREPS page, 35 entries) | Mock log shows `zone=13 searchRange=3`; PDF filter "Railway Zone: ICF" |
 | Select Date, From 01/08/2026 To 31/08/2026 | Mock log shows `searchRange=2 dateFrom=01/08/2026 dateTo=31/08/2026` |
 | Select Date, range longer than 180 days | Popup shows **Invalid search options** before any request is sent |
-| Open the Railway Zone list (Chrome 135 or later) | The list opens in DocLink's style: white rounded panel, the chosen zone in teal, a pale teal row under the mouse. Chrome 116–134 shows its own list |
+| Open the Railway Zone list (Chrome 135 or later) | The list opens in DocLink's style: white rounded panel, the chosen zone in teal, a pale teal row under the mouse. Chrome 116-134 shows its own list |
 
 ### C5. Test: download twice (Acceptance Test 8)
 
@@ -251,14 +251,14 @@ foot of every mock page), click a scenario link, then open DocLink and click
 | `no-records` | **No Bill Records Found** notice | No |
 | `token-missing` | **IREPS form token not found** | No |
 | `token-invalid` | **Unable to recognise the IREPS response** (DocLink retried once with a fresh token; mock log shows two rejected searches) | No |
-| `http500` | **Unable to retrieve Bill Status** — "…(IREPS returned HTTP 500)…". Button is usable again (Test 4) | No |
+| `http500` | **Unable to retrieve Bill Status**: "…(IREPS returned HTTP 500)…". Button is usable again (Test 4) | No |
 | `slow` | Progress stays on "Retrieving Bill Status…" about 6 seconds, then completes | Yes |
 | `legacy` | Old single-table layout still downloads (3 records) | Yes |
-| `auto` | Back to normal cookie-driven behaviour | — |
+| `auto` | Back to normal cookie-driven behaviour | - |
 | `/mock/session/expire` (link on the home page) | Session timed out server-side while the browser still holds the cookie: **IREPS login required** view; log in again on the mock to continue | No |
 
 Network failure: stop the mock server with **Ctrl+C** in Terminal 1, then
-click Download. Expected: **Unable to retrieve Bill Status** — "…(IREPS could
+click Download. Expected: **Unable to retrieve Bill Status**: "…(IREPS could
 not be reached). Check your network connection and try again." Restart the
 server afterwards.
 
@@ -428,7 +428,7 @@ Open the workbook and check:
 | `expired` / `login` | Download CRN | **IREPS login required** view; no request beyond the first |
 | `token-missing` | Download CRN | **IREPS form token not found** |
 | `token-invalid` | Download CRN | **Unable to recognise the CRN results** (two rejected searches in the mock log = one retry) |
-| `http500` | Download CRN | **Unable to open IREPS PO Search — (IREPS returned HTTP 500)** |
+| `http500` | Download CRN | **Unable to open IREPS PO Search** (IREPS returned HTTP 500) |
 | `slow` | Download CRN | Progress stays on "Searching CRNs…" about 12 seconds, then completes |
 | Logged out (click Logout on the mock) | Download CRN | **IREPS login required**; no file |
 
@@ -511,7 +511,7 @@ number, PO, unit, PO date and MA date. Mock log:
 | Scenario link | Then | Expected |
 |---|---|---|
 | `crn-large` | Search MAs (All) | 200 MAs, Download All runs 3 at a time |
-| `ma-pdf-login` | Download All | First PDF fails with the session message, the rest are not attempted; **IREPS session expired — Please log in again and retry the MA download.** and **Retry failed downloads** |
+| `ma-pdf-login` | Download All | First PDF fails with the session message, the rest are not attempted; **IREPS session expired** ("Please log in again and retry the MA download.") and **Retry failed downloads** |
 | `ma-pdf-404` | Download All | Every MA Failed, tooltip "IREPS returned HTTP 404"; nothing saved |
 | `expired` / `login` | Search MAs | **IREPS login required** view |
 | `http500` | Search MAs | **Unable to open IREPS PO Search** |
@@ -579,7 +579,7 @@ node test/mock/switch-target.mjs status
 
 ---
 
-## Part D — Test with the real IREPS portal (when access is available)
+## Part D: Test with the real IREPS portal (when access is available)
 
 1. Point DocLink at the real portal - edit `config.json` and set
    `"target": "real"` (no terminal needed; a command is also available):
@@ -831,10 +831,16 @@ web page with no PDF fails with its title and nothing is saved. The 29 Oct
 Closed Tenders capture (`tender/tests/fixtures/closed-tenders-29oct.html`) lists
 the 7 tenders with both tabulations. By closing date, Search Tender is searched
 one day at a time with the browser's fields in the browser's order (20 Nov 2026
-capture), every result page is read through the link the page before shows
-(also its `railwayzone=`), only the tenders with My Offer count, fewer rows than
+capture), every result page is asked for through a link a page read before
+showed (also its `railwayzone=`; never a page link no page showed), up to three
+pages at a time and read in order, a page asked for after the one where the day
+stops is waited for and not read, only the tenders with My Offer count, fewer rows than
 IREPS's count, a page not recognised or an HTTP error say the day was not read
-to the end, and each day waits for the IREPS form lock. The 20 Nov capture
+to the end, and each day waits for the IREPS form lock. A tender leaving the
+day's list between two pages makes DocLink read the page before again (the
+tender that slid onto it is still found), one joining it is taken once, and a
+page of another search (count far off, or no tender closing that day) stops
+the day. The 20 Nov capture
 (`tender/tests/fixtures/search-tender-20nov.html`, result page 2) reads 25 rows,
 LK265182 with My Offer and both tabulations as GETs.
 
@@ -854,6 +860,9 @@ To = today,
 
 On the real portal, if a tabulation still fails, run `doclinkLog.download()`
 in the side panel console: the `Tabulation` lines show what IREPS answered.
+Each closing day's `Search` line says how long its pages took ("... over 76
+page(s) in <s> s ..."); read one page at a time, 76 pages took 990 s on
+23 Nov 2026.
 
 ## Scheduled downloads (Phase 1)
 

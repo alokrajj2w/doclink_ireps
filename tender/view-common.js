@@ -11,9 +11,9 @@ const $ = (id) => document.getElementById(id);
 export function renderAccountPanel(prefix, a) {
   const ok = !!(a && a.authenticated && a.verified);
   $(`${prefix}acc-connection`).textContent = a?.authenticated ? 'Connected' : 'Not connected';
-  $(`${prefix}acc-company`).textContent = ok || a?.companyName ? a.companyName : '—';
-  $(`${prefix}acc-unit`).textContent = ok ? a.operatingUnit || 'Not stated' : '—';
-  $(`${prefix}acc-id`).textContent = ok || a?.irepsAccountId ? a.irepsAccountId : '—';
+  $(`${prefix}acc-company`).textContent = ok || a?.companyName ? a.companyName : '-';
+  $(`${prefix}acc-unit`).textContent = ok ? a.operatingUnit || 'Not stated' : '-';
+  $(`${prefix}acc-id`).textContent = ok || a?.irepsAccountId ? a.irepsAccountId : '-';
   $(`${prefix}acc-status`).textContent = ok ? 'Verified' : 'Account not verified';
   $(`${prefix}acc-status`).className = ok ? 'tender-ok' : 'tender-bad';
   const w = $(`${prefix}acc-warning`);

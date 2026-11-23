@@ -1,4 +1,4 @@
-# DocLink — IREPS Document Automation (Chrome Extension, Manifest V3)
+# DocLink: IREPS Document Automation (Chrome Extension, Manifest V3)
 
 DocLink is a Chrome extension for users of the Indian Railways IREPS portal.
 Version 1.5.0 implements the downloads below. One **Save to: Local |
@@ -361,11 +361,11 @@ rules as the IREPS page script (both dates, DD/MM/YYYY, From ≤ To, ≤ 180 day
 
 ## 7. How parsing works
 
-`services/bill-parser.js` — `parseBillStatus(html, { filter })`:
+`parseBillStatus(html, { filter })` in `services/bill-parser.js`:
 
 1. Parse with `DOMParser` into a detached document; strip `script`, `style`,
    `iframe`, forms, media, event handlers and `javascript:` URLs.
-2. `document.querySelectorAll("table#table_id")` — the id is repeated for every
+2. `document.querySelectorAll("table#table_id")`: the id is repeated for every
    bill, so `querySelector` would only return the first.
 3. `parseBillBlock(table)` classifies rows by content, never by position:
    * a row whose cells are all field labels (e.g. `Contract No | Contract Date |
@@ -601,13 +601,13 @@ keeps only the real portal; a `--allow-mock` build keeps both, section 9.)
 | 1 | Logged into IREPS, click Download Bill Status | Stages run through; "✓ Download Complete", N records, filename shown; .xlsx in `Downloads/DocLink/IREPS/` |
 | 2 | Logged out | No file; "IREPS Login Required" view with Open IREPS button |
 | 3 | Session expired (login page returned with HTTP 200) | "IREPS Session Expired"; no file built from the login page |
-| 4 | IREPS returns HTTP 5xx (e.g. simulate with DevTools request blocking / override) | "Unable to Retrieve Bill Status — IREPS returned HTTP 500"; button usable again |
+| 4 | IREPS returns HTTP 5xx (e.g. simulate with DevTools request blocking / override) | "Unable to retrieve Bill Status" (IREPS returned HTTP 500); button usable again |
 | 5 | Very large Bill Status | All rows in the workbook (browser test covers 600 rows in the PDF writer) |
 | 6 | Bills with missing fields | Missing values shown as "-" |
 | 7 | Long Recovery Details | Text wraps, splits across pages with label repeated |
 | 8 | Download twice | Two files (timestamp differs; same-second collisions get " (1)") |
 
-Simulating 2–4 locally: use DevTools → Network → request blocking or a local
+Simulating 2-4 locally: use DevTools → Network → request blocking or a local
 override of `viewBills.do` with `test/fixtures/login-page.html`,
 `session-expired.html`, or a 500 response.
 
@@ -1508,22 +1508,37 @@ capture does:
   the optional Tender Number), `selectDate=TENDER_OPENING_DATE` (the page's
   "Tender Closing Date") from that day to that day, Custom Date, the Stores
   department (`division=19`) and all railways;
-* every result page (25 rows) is read through the page link IREPS shows on the
-  page before (`GET ...advancedSearch.do?...&count=<N>&pageNo=<n>`), followed
-  as given: IREPS keeps the search in the session, and page 2's links carry
-  `railwayzone=` where page 1's carry `railwayzone=-1`;
-* the rows read are compared with IREPS's own count ("Tender search results
-  N"). Fewer rows, a page DocLink does not recognise or an HTTP error say that
-  the day was not read to the end (`TENDER_SEARCH_SHORT`,
-  `TENDER_PAGE_NOT_RECOGNISED`, `TENDER_LIST_FAILED`); what was read is still
-  downloaded;
+* every result page (25 rows) is asked for through a page link IREPS showed on
+  a page read before (`GET ...advancedSearch.do?...&count=<N>&pageNo=<n>`),
+  followed as given: IREPS keeps the search in the session, and page 2's links
+  carry `railwayzone=` where page 1's carry `railwayzone=-1`. IREPS takes about
+  13 s over each page (23 Nov 2026: 76 pages in 16.5 min, one at a time), so up
+  to three pages are under way at once (`SEARCH_PAGES_AT_ONCE`, as PO Search):
+  the next page and the ones after it whose links IREPS has shown (it shows ten
+  page links and "next", so page 12 waits for page 11). The pages are still
+  read in order, and a page asked for after the one where the day stops is
+  waited for, not read, before the form lock is released. The day's log line
+  says how long it took ("... over <n> page(s) in <s> s ...");
+* the list of a closing day can change while its pages are read (on that day
+  tenders are extended or withdrawn: on 23 Nov 2026 the count went 1894, 1893,
+  1892, 1885 in half an hour), so IREPS's count can move between two pages.
+  When it drops by up to a page, the page before is read again, because a
+  tender can have slipped onto it; when it rises by up to a page, the tender
+  that repeats is taken once. A bigger change, or a page with no tender closing
+  that day, is another search in the IREPS session: the day stops there;
+* the different tenders read are compared with IREPS's last count ("Tender
+  search results N"). Fewer tenders, another search, a page DocLink does not
+  recognise or an HTTP error say that the day was not read to the end
+  (`TENDER_SEARCH_SHORT`, `TENDER_PAGE_NOT_RECOGNISED`, `TENDER_LIST_FAILED`);
+  what was read is still downloaded;
 * only the tenders this vendor bid on count (the row shows My Offer, or a
   tabulation link), and each row's own "Due Date/Time" decides;
 * each day's search and result pages run under the IREPS form lock
   (`withIrepsFormLock`), released between days.
 
 On 19 Nov 2026 one closing day was 1214 tenders (Stores, all railways), 49
-result pages, so a range costs about that many page requests per day.
+result pages, and on 23 Nov 2026 1885 tenders, 76 pages, so a range costs
+about that many page requests per day.
 
 * **Panel.** "Download Tender Documents" › **Financial Tabulation** /
   **Commercial Tabulation**: every tender of this vendor that closed between

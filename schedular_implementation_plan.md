@@ -276,7 +276,7 @@ runs them one after another; nobody else can start any of them (one run per acco
 |---|---|
 | 09:00:00-09:00:30 | 20 alarms fire, each with a random 0-30 s delay. Each DocLink checks locally: is Recon signed in, is no local job running, and did this browser load an IREPS page in the last 4 minutes on account 833? Nobody is on IREPS yet. All 20 just read `GET /due` and set their next alarm for 09:15. **No IREPS request is sent.** |
 | 09:07 | Priya logs in to IREPS. Her page load triggers her DocLink (D9). It claims Bill Status and **wins**: nobody else is trying. Her DocLink checks IREPS once (logged in, account 833) and runs Bill Status, then CRN, R-NOTE, MA, POs, ICs by date, ICs from notifications. Each slot ends with `finish(done)`. A heartbeat goes every 2 minutes. |
-| 09:10 | Rahul logs in to IREPS. His DocLink asks `GET /due`: everything is either `done` or held by Priya. It shows "Running – Priya" and claims nothing. |
+| 09:10 | Rahul logs in to IREPS. His DocLink asks `GET /due`: everything is either `done` or held by Priya. It shows "Running - Priya" and claims nothing. |
 | 09:15 | The 15-min check. 20 DocLinks call `GET /due`. Suppose ICs by date is still running: 6 of them are active on IREPS and try to claim → all get `409 ACCOUNT_BUSY (Priya)`. The rest is `done` → no claim. |
 | 09:21 | Priya's run ends. One IC failed because the ECM refused it, so ICs by date is `partial`. Everything else is `done`. |
 | 09:30 | The 15-min check. Rahul and 4 others are active and try to claim ICs by date. **One wins.** Its reservation grants only the one missing IC, which is saved → `done`. |
@@ -466,7 +466,7 @@ Anyone may claim again at once. Documents already `done` stay done.
 ### 8.6 Panel (`popup/popup-schedule.js`, Schedule view)
 
 - **Today:** one row per slot of the current account. It shows the type, the time and the status:
-  - "Waiting for an IREPS user", "Running – Priya", "Done by Priya at 10:06 – 1 saved, 2 already saved",
+  - "Waiting for an IREPS user", "Running - Priya", "Done by Priya at 10:06 - 1 saved, 2 already saved",
     "Missed", "Failed: <text>".
 - **Schedules:** for users with `manage`. Per document type: on/off, daily window (default 09:00-12:00),
   check interval (15 / 30 / 60 min, default 15), weekdays (default every day), look-back days. The destination
@@ -667,7 +667,7 @@ Section 7.4, plus the existing `test_doclink_downloads.py` stays green.
 3. As admin, create "Bill Status + ICs from notifications, window now → now + 45 min, every 15 min".
 4. At the slot time, both browsers have a recently loaded mock IREPS page. Check:
    - exactly one runs;
-   - the other shows "Running – A", then "Done by A";
+   - the other shows "Running - A", then "Done by A";
    - the backend's `doclink_downloads` has one row per document;
    - at the next two 15-min checks, neither browser claims or sends anything to IREPS.
 5. Close A's Chrome during the IC batch (`/mock/scenario/slow`). After about 10 minutes B takes over and saves

@@ -2,7 +2,7 @@
 // fake Recon Engine behind globalThis.fetch. Run with the other node suites (npm test -- node), or:
 //   node --test test/node/panel-tests.mjs
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -258,4 +258,23 @@ test('My downloads (L10): not signed in, not allowed, or the Recon Engine down: 
   } finally {
     who.signedIn = true;
   }
+});
+
+test('No em or en dash anywhere in DocLink: what the panel shows, the code, the tests and the docs use the plain "-"', () => {
+  // the code that turns a dash in IREPS data into "-" writes it as an escape (\u2013, \u2014); captured IREPS
+  // pages (fixtures) and the mock portal's third-party scripts stay as they are
+  const root = new URL('../../', import.meta.url);
+  const files = ['CLAUDE.md', 'README.md', 'TESTING.md', 'upload.md', 'schedular_implementation_plan.md', 'config.json', 'manifest.json', 'package.json', 'eslint.config.js'];
+  const walk = (dir) => {
+    for (const e of readdirSync(new URL(`${dir}/`, root), { withFileTypes: true })) {
+      const path = `${dir}/${e.name}`;
+      if (e.isDirectory()) {
+        if (e.name !== 'fixtures' && path !== 'test/mock/static') walk(path);
+      } else if (/\.(m?js|html|css|json|md)$/.test(e.name)) files.push(path);
+    }
+  };
+  ['assets', 'background', 'pages', 'popup', 'scripts', 'services', 'tender', 'test', 'utils'].forEach(walk);
+  const found = files.flatMap((f) => readFileSync(new URL(f, root), 'utf8').split('\n').flatMap((l, i) => (/[\u2013\u2014]/.test(l) ? [`${f}:${i + 1}`] : [])));
+  assert.ok(files.length > 100, 'every DocLink file is looked at');
+  assert.deepEqual(found, [], 'these lines have an em or en dash');
 });

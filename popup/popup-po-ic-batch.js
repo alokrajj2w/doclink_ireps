@@ -176,7 +176,7 @@ function renderPoDate(state) {
   const already = c.alreadyDownloaded || 0;
   const noLink = c.skipped - already;
   renderCounts("pod", [
-    ["Date range searched", `${state.dateFrom} – ${state.dateTo}`],
+    ["Date range searched", `${state.dateFrom} - ${state.dateTo}`],
     ["Matching PO records found", c.found],
     ["PDFs downloaded", c.downloaded],
     ["Already downloaded (skipped)", already],
@@ -255,7 +255,7 @@ function renderIcDate(state) {
   // "skipped" holds both: rows without an IC link, and ICs the user already has (not a problem)
   const already = c.alreadyDownloaded || 0;
   const noLink = c.skipped - already;
-  const range = `${state.dateFrom}${state.dateFrom === state.dateTo ? "" : " – " + state.dateTo}`;
+  const range = `${state.dateFrom}${state.dateFrom === state.dateTo ? "" : " - " + state.dateTo}`;
   renderCounts("icd", [
     ["IC dates searched", range],
     ["ICs issued in the range", c.found],

@@ -1,4 +1,4 @@
-# IREPS Supplier Bill Submission — API Study for DocLink Upload
+# IREPS Supplier Bill Submission: API Study for DocLink Upload
 
 What IREPS does when a vendor submits a supplier bill (spec: "Bill Upload"),
 which HTTP calls carry each step, where each input value comes from (IREPS,
@@ -23,7 +23,7 @@ share them.
 | Same workbook → **Oracle data available in ECM** | The 43 invoice columns ECM already holds (32 sample rows), plus the new `Sent to Doculink` column |
 | Same workbook → **Open Points**, **Downloads**, **Mohans mapping** | Open questions; document sizes and monthly volumes; how each document reaches ECM |
 | `Ireps_screen_upload.xlsx` | Bill-submission team's answers: the 13 steps, documents per inspection type, volumes, re-upload cases, IREPS limits |
-| `BILL SUBMISSION-Screen shot of IREPS.docx` | 12 screens (15 images) of the manual flow, Step 1 → Step 13, plus the file-size rule. Screens 3–10 follow one real Hosur bill (PO 57251305100639, invoice 3320260101270). Screen 11 is a different bill (TPI, CGST+SGST, 7 documents). |
+| `BILL SUBMISSION-Screen shot of IREPS.docx` | 12 screens (15 images) of the manual flow, Step 1 → Step 13, plus the file-size rule. Screens 3-10 follow one real Hosur bill (PO 57251305100639, invoice 3320260101270). Screen 11 is a different bill (TPI, CGST+SGST, 7 documents). |
 | `DocLink Docs/Upload/3_GENERATEPDF.txt` (HAR, 21 MB) | **Complete non-stock bill**: PO search → bill header → item → 5 document uploads → preview → sign & submit. PO 40265077101806, CRN 35294-26-66158, invoice 1061000262, bill reg 3744921 |
 | `upload_flow_before_uploading_file.har` (HAR, 4 MB) | **Stock bill up to the item save**: R-NOTE search → bill header → item. PO 02261018101611, R-Note 4826100504, bill reg 3816672. Stops before document upload. Also holds the page script `billFunctions.js` (#77) that computes the item amounts. |
 | `DocLink Docs/Upload/1_savebillheader.txt`, `www.ireps.gov.in.har`, `generatepdf.txt` | Subsets of the above (header save for bill 3744921; preview/sign for bill 3736795; a curl of `generatePDF.do`) |
@@ -40,7 +40,7 @@ same-state (CGST+SGST) TPI bill, but no HTTP capture of it. Multi-line POs,
 several receipts on one PO Sr, advance/retrofit bills and multi-invoice bills
 have not been captured.
 
-**Scope (bill-submission team):** 25–30 bills a day, 10–12 minutes each, one
+**Scope (bill-submission team):** 25-30 bills a day, 10-12 minutes each, one
 person. A consignee-inspection bill carries 6 documents and a third-party
 inspection (TPI) bill 7. Bills are re-submitted for stage payments and
 returned bills (about 75 returned bills a month, Downloads sheet).
@@ -52,7 +52,7 @@ returned bills (about 75 returned bills a month, Downloads sheet).
 | Spec step | Can DocLink automate it? |
 |---|---|
 | 1. Check R-Note / CRN availability | **Yes**, using IREPS search calls DocLink already makes |
-| 2–3. Download / collect documents | Not required (spec). The documents come from ECM in step 9. |
+| 2-3. Download / collect documents | Not required (spec). The documents come from ECM in step 9. |
 | 4. Match with ECM, open the bill form | **IREPS side yes.** The ECM call `RetrieveInvoiceData` is specified, but it needs the customer PO Sr no., which ECM does not store yet. |
 | 5. Bill header | **Mostly.** Supplier GSTIN and state of supply are not ECM columns yet, but both can be derived from existing ECM columns once the business confirms the rule (section 8). |
 | 6. Select PO Sr | **Yes** |
@@ -60,7 +60,7 @@ returned bills (about 75 returned bills a month, Downloads sheet).
 | 8. R-Note / CRN auto-attached | **Yes**, IREPS does it |
 | 9. Upload supporting documents | **Partly.** DocLink can fetch the files from ECM (`GetAttachmentFromInvoice`) and prepare them. Each file must still be picked and signed in the IREPS signing app (manual). |
 | 10. Generate preview | Yes (read-only) |
-| 11–13. Sign & submit | **Manual** (decision: signing stays manual) |
+| 11-13. Sign & submit | **Manual** (decision: signing stays manual) |
 
 Data gaps, in order of impact:
 
@@ -116,7 +116,7 @@ B. Match with ECM (J2W → ECM, Nuxeo automation, Bearer token)
         {invoiceNumber}                                      → the invoice's documents
 
 C. Prepare (DocLink only, nothing written yet)
-   build header + item values (sections 7–8), validate, fetch and check PDFs,
+   build header + item values (sections 7-8), validate, fetch and check PDFs,
    show everything to the user → user confirms
 
 D. Write to IREPS (same-origin AJAX from the IREPS tab)
@@ -171,7 +171,7 @@ Content-Type: application/json+nxrequest
 ```
 Spec rule (Bill Upload step 4): match on customer PO no + PO Sr no + qty +
 "Sent to Doculink"; **if more than one record matches, fail.** The business
-also notes that one PO Sr carries one invoice ("1 serial number – 1 invoice";
+also notes that one PO Sr carries one invoice ("1 serial number - 1 invoice";
 multi-line not applicable for IREPS).
 
 **2nd call: fetch the documents**
@@ -233,14 +233,14 @@ Columns requested from Oracle → ECM (not present yet):
 | GST % | `gstPercent` | Not needed: IREPS gives the PO rate; ECM `totalTaxValue` cross-checks it. |
 | Supplier GSTIN (bill-from) | `gstinSupplier` | Derivable from `division` meanwhile (to be confirmed) |
 | Payment % | `paymentTerm` | Arrives as a description; DocLink must extract the percentage (Open Points). |
-| Stock / Non-stock | — | Oracle will not add it (Open Points: "No"). Not needed: IREPS gives it. |
-| Guarantee months | — | Open; not used by the bill form |
+| Stock / Non-stock | - | Oracle will not add it (Open Points: "No"). Not needed: IREPS gives it. |
+| Guarantee months | - | Open; not used by the bill form |
 
 ---
 
 ## 6. Step by step
 
-### Step 1 — Check R-Note / CRN availability
+### Step 1: Check R-Note / CRN availability
 **Call:** `POST /epsn/searchPO.do` with `searchCriteria=RNOTE` (stock capture #11).
 For CRN-based bills use `searchCriteria=CRN` (`crn_BILLSTATUS_MA.txt` #293).
 
@@ -276,10 +276,10 @@ Other links in the row: PO PDF
 - PO Sr is always three digits, zero-padded (`001`, `043`).
 - The search covers the last 180 days (`searchRange=1`), or a date range.
 
-### Steps 2–3 — Download / collect documents
+### Steps 2-3: Download / collect documents
 Not required (spec). The documents are fetched from ECM in step 9.
 
-### Step 4 — Match with ECM and open the bill form
+### Step 4: Match with ECM and open the bill form
 **ECM:** `RetrieveInvoiceData` with customer PO no + PO Sr no + qty (section
 5.1). ECM has the PO no. and quantity, but not the PO Sr no. (Open Points 1,
 2, 7).
@@ -309,7 +309,7 @@ Returns the bill-entry page (~200 KB HTML). Values to read from it:
 | `vendorCode`, `companyName`, `poNumber`, `poDate` | hidden inputs | `:833`, `FAIVELEY … -HOSUR` |
 | `nitOid`, `paymentCode` | literals inside the page script that builds the header request | `nitOid:'107092947'`, `paymentCode:'000000'` |
 | PO payment terms | literals in `checkPaymentTerms()`: `advancePercent`, `finalPercent` | `'0'`, `'0'` in both captures |
-| Bank account, IFSC | pre-filled text inputs | — |
+| Bank account, IFSC | pre-filled text inputs | - |
 | Supplier GSTIN options | `<select name="supplierGSTIN">` | `06AAGCS8525B1ZI`, `02AAGCS8525B1ZQ`, `33AAGCS8525B1ZL` |
 | Paying railway options | `<select name="payingRly">` | one option |
 | Railway GSTIN options | `<select name="rlyGSTIN">` | all states, `AAAGM0289C…` (non-IRFC) and `AAACI0681C…` (IRFC) series |
@@ -320,7 +320,7 @@ bill. When the PO payment terms are non-zero, the page warns ("Please ensure to
 submit Bill as per PO Payment Terms") if Payment % does not match them. That
 makes them a possible IREPS source for Payment % (not yet seen with values).
 
-### Step 5 — Bill header ("15 entries")
+### Step 5: Bill header ("15 entries")
 **Calls**
 
 | # | Call | Request | Response (observed) |
@@ -347,7 +347,7 @@ rrlValueStr=  totalBalanceAmtWraDouble=0
 ```
 Real values from the other bills:
 
-| Field | Non-stock capture #369 (Rohtak invoice) | Screens 6–7 (Hosur invoice) |
+| Field | Non-stock capture #369 (Rohtak invoice) | Screens 6-7 (Hosur invoice) |
 |---|---|---|
 | `invoiceNo` / date | `1061000262` / `08/08/2026` | `3320260101270` / `21/02/2026` |
 | `invoiceAmount` | `485777` | `351994` |
@@ -370,20 +370,20 @@ Real values from the other bills:
   once saved is not editable" (Screen 6). DocLink must store the returned
   `billRegNo` and ask the user to confirm before calling it.
 - Page-side checks to repeat in DocLink: invoice no. ≤ 16 chars, only
-  `A–Z a–z 0–9 - /`; Payment % an integer ≤ 100; invoice amount ≤ 12 chars;
+  `A-Z a-z 0-9 - /`; Payment % an integer ≤ 100; invoice amount ≤ 12 chars;
   place of supply ≤ 20 chars; bill description ≤ 200 chars; supplier GSTIN
-  15 chars; IFSC and bank account `A–Z 0–9`.
+  15 chars; IFSC and bank account `A-Z 0-9`.
 - On failure the response is the error text itself (first `^^` field), which
   the page shows in an alert.
 - Field sources: section 8.
 
-### Step 6 — Select PO Sr
+### Step 6: Select PO Sr
 `populatePOSrList.do` (#111) → `success^^001`. Check that it equals the PO_SR
 from step 1. The list depends on `stockNonstock` and the paying authority; the
 page warns that a missing PO Sr means a different paying authority is needed
 (Screen 7).
 
-### Step 7 — Billing details ("5 entries")
+### Step 7: Billing details ("5 entries")
 **Calls**
 
 | # | Call | Request | Response |
@@ -424,18 +424,18 @@ success
 | 14 | `812656.56` | `485776.5` | max claim |
 | 15 | `…/MMIS/RN/2026/11/4826100504.pdf` | `…/MMIS/CONS/2026/05/643141/35294-26-66158_1.pdf` | receipt PDF URL |
 
-**Inputs the user (or DocLink) types on this screen** (Screens 8–9; page
+**Inputs the user (or DocLink) types on this screen** (Screens 8-9; page
 script `billFunctions.js`, stock #77):
 
 | Screen label | Request field | Spec | Source |
 |---|---|---|---|
 | R-Note / RO No. (drop-down) | `roNo`, `roDate`, `roQty`, `drrNumber`, `rNoteNumber`, `rNoteDate` | 7a | IREPS #115/#116 |
-| RO/CRN Qty Billed | `roQtyBilled` | — (not in spec) | receipt qty from #116; must be > 0 and ≤ RO qty |
-| RLY GSTIN (drop-down) | `rlyGSTIN` | — | consignee's GSTIN from #114 |
+| RO/CRN Qty Billed | `roQtyBilled` | - (not in spec) | receipt qty from #116; must be > 0 and ≤ RO qty |
+| RLY GSTIN (drop-down) | `rlyGSTIN` | - | consignee's GSTIN from #114 |
 | GST Category (drop-down) | `gstCategory` | 7b | `0` = "Regular GST (As per payment %)". Other values: `1` NIL Rated, `2` Non-GST Item, `3` Exempted, `4` Inclusive, `5` Full GST (100%), `7` Full GST with Full Freight |
 | HSN Code | `hsnCode` | 7c | ECM `serviceAccountingCode`; digits only, ≤ 8 |
 | IGST Rate or CGST Rate (drop-down) | `igstRate` or `cgstRate` (+`sgstRate`/`utgstRate` copied) | 7d | PO rate from #114 |
-| ITC Admissible | `itcFlagFinal` | — | `N` |
+| ITC Admissible | `itcFlagFinal` | - | `N` |
 | **Item-wise claim by vendor** | → `totalAmount` | **7e "Value"** | ECM `onivla`; must be > 0 and ≤ Max Claim |
 
 **How the page computes the amounts** (`calculateExpAmt`, `saveDtls` in
@@ -491,7 +491,7 @@ The non-stock capture (#373) differs mainly in `dispatchMode=NA`,
   a calculated 485776.50. IREPS will **not** stop an over-claim when the
   invoice amount is higher than the item value, because it raises `maxClaim`
   to the invoice amount, so DocLink must check this itself.
-- `stRate` / GST rate comes from the PO (#114, block 3). The spec's "GST % —
+- `stRate` / GST rate comes from the PO (#114, block 3). The spec's "GST % -
   ECM" is therefore available from IREPS; ECM `totalTaxValue` / `taxCode` are
   cross-checks.
 - The IGST/CGST choice follows the **header** state of supply, so a wrong
@@ -506,13 +506,13 @@ The non-stock capture (#373) differs mainly in `dispatchMode=NA`,
 - `saveBillDetails.do` returns `dispatchNo` (`3970712`), which the document
   upload needs, and the railway GSTIN IREPS stored.
 
-### Step 8 — R-Note / CRN auto-attached
+### Step 8: R-Note / CRN auto-attached
 IREPS attaches the receipt PDF itself; it appears in the `saveBillDetails.do`
 response as `RNOTE / CRN - SYSTEM UPLOAD`. Nothing to do.
 
-### Step 9 — Upload supporting documents ("7 entries")
+### Step 9: Upload supporting documents ("7 entries")
 Not in the stock capture (it stops before uploading). From the non-stock
-capture (#365 signer, #375–#384 uploads). Each document takes three actions:
+capture (#365 signer, #375-#384 uploads). Each document takes three actions:
 
 **1. Sign in the IREPS signing app** (eMudhra "IREPSSigner", local websocket
 `wss://127.0.0.1:2175`, pdfsigner v1.5; the page also connects to
@@ -576,23 +576,23 @@ site ids in section 5.1):
 
 | Spec document | ECM `InvoiceCertificateSchema:type` | When (spec) | Size (Downloads sheet) |
 |---|---|---|---|
-| a. Invoice | `generatedMerge` ("Generated Merge and not Tax invoice") | always | 200–400 KB |
-| b. GC/WC | `garrantyWarrantyCertificate` | always | 90–150 KB |
+| a. Invoice | `generatedMerge` ("Generated Merge and not Tax invoice") | always | 200-400 KB |
+| b. GC/WC | `garrantyWarrantyCertificate` | always | 90-150 KB |
 | c. Modvat declaration | `modvatDeclarationCertificate` | always | ~100 KB |
 | d. E-Declaration | `eDispatchNote` ("E-Dispatch Note") | optional; consignee inspection | ~3 MB |
-| e. DP/MA | `modificationAdvise` | optional | 100–500 KB |
-| f. WTC | `workCertificate` | always | 90–150 KB |
-| g. IC | `inspectionCertificate` | third-party inspection | 60–65 KB |
-| PO copy (not in the spec's step 9) | `poCopy` (query given in the sheet) | team uploads it (`Ireps_screen_upload.xlsx`, Screen 11) | 1–5 MB |
-| Covering letter, GST mandate, LR copy | — ("no specific placeholder for upload in IREPS") | GST mandate was uploaded in the capture anyway | — |
+| e. DP/MA | `modificationAdvise` | optional | 100-500 KB |
+| f. WTC | `workCertificate` | always | 90-150 KB |
+| g. IC | `inspectionCertificate` | third-party inspection | 60-65 KB |
+| PO copy (not in the spec's step 9) | `poCopy` (query given in the sheet) | team uploads it (`Ireps_screen_upload.xlsx`, Screen 11) | 1-5 MB |
+| Covering letter, GST mandate, LR copy | - ("no specific placeholder for upload in IREPS") | GST mandate was uploaded in the capture anyway | - |
 
 All listed sizes are well under the 8 MB limit. The team reports a practical
-limit of 7–8 attachments per bill.
+limit of 7-8 attachments per bill.
 
 The inspection agency from step 7 (#114) decides which conditional documents
 apply: `TPI` → IC; `CONSG` → E-Declaration. The team's own description is
-"consignee inspection – 6 documents (PO / MA / R-Note or CRN / WTC / GC/WC)"
-and "third party inspection – 7 documents (… / IC)".
+"consignee inspection - 6 documents (PO / MA / R-Note or CRN / WTC / GC/WC)"
+and "third party inspection - 7 documents (… / IC)".
 
 **Comments**
 - **Points that conflict between sources (confirm with the business):**
@@ -624,7 +624,7 @@ and "third party inspection – 7 documents (… / IC)".
   DP/MA as "Not found". That only means they were not in the capture; they use
   the same API.
 
-### Step 10 — Generate preview
+### Step 10: Generate preview
 `POST /epsn/ct/generateBillPreview.do` with `billRegNo, supplementaryBillType=null`
 (non-stock #385). Returns the preview HTML (~22 KB), which also holds the
 Struts token and DSC thumbprint used in step 13. It is read-only, so DocLink
@@ -633,7 +633,7 @@ bill values (R-Note details, inspection agency, invoice, GSTINs, HSN, rates,
 taxable / tax / amount claimed, uploaded documents; Screen 10), which makes it
 a good final check.
 
-### Steps 11–13 — Sign & submit (manual)
+### Steps 11-13: Sign & submit (manual)
 1. `POST /epsn/ct/supplierBillPDF.do` with `html=<preview HTML, URL-encoded twice>`
    → `OK:<base64 PDF>` (PDF made by wkhtmltopdf).
 2. Signer: `action=pdfsign tbs=<base64 PDF>`, sent in chunks (the signer
@@ -683,33 +683,33 @@ shown raw.
 
 | # | Spec field | Request field | Source | Available? |
 |---|---|---|---|---|
-| 1–5 | Bill reg no., vendor name/code, account, address | `companyName`, `vendorCode` | IREPS form | Yes |
-| 6–7 | GST / ED-ST | `gstFlag=Y` | constant | Yes |
-| 8–9 | Tax invoice / debit note | `invoiceType=I` | constant | Yes |
-| 10–11 | Stock / Non-Stock | `stockNonstock` | IREPS: R-NOTE vs CRN source, PO search column, PO PDF title | **Yes** (spec says ECM/TieQraft; Oracle will not add it; close the open point) |
-| — | Fuel bill | `fuelNonFuel=N` | constant | Yes (not in spec) |
-| 12–14 | Single invoice & single HSN | `multiInvoiceFlag=N`, `invoiceCount=1` | constant | Yes |
-| 15–16 | Paying railway / authority | `payingRly`, `payingAuthorityCode`, `ipasAUCode` | IREPS (#109), one option | Yes |
-| 17–18 | PVC / SVC | `pvc=N`, `svcFlag=Y` | page script | Yes |
+| 1-5 | Bill reg no., vendor name/code, account, address | `companyName`, `vendorCode` | IREPS form | Yes |
+| 6-7 | GST / ED-ST | `gstFlag=Y` | constant | Yes |
+| 8-9 | Tax invoice / debit note | `invoiceType=I` | constant | Yes |
+| 10-11 | Stock / Non-Stock | `stockNonstock` | IREPS: R-NOTE vs CRN source, PO search column, PO PDF title | **Yes** (spec says ECM/TieQraft; Oracle will not add it; close the open point) |
+| - | Fuel bill | `fuelNonFuel=N` | constant | Yes (not in spec) |
+| 12-14 | Single invoice & single HSN | `multiInvoiceFlag=N`, `invoiceCount=1` | constant | Yes |
+| 15-16 | Paying railway / authority | `payingRly`, `payingAuthorityCode`, `ipasAUCode` | IREPS (#109), one option | Yes |
+| 17-18 | PVC / SVC | `pvc=N`, `svcFlag=Y` | page script | Yes |
 | 19 | Tax invoice no. | `invoiceNo` | ECM `invoiceNumber` | Yes (≤ 16 chars; only `-` `/`) |
 | 20 | Tax invoice date | `invoiceDate` (dd/mm/yyyy) | ECM `salesInvoiceDate` (`yyyy-mm-dd hh:mm:ss.sss`, or epoch ms read in IST) | Yes |
 | 21 | Invoice amount | `invoiceAmount` | ECM `onivla` (incl. GST) | Yes |
 | 22 | Payment % | `paymentPercent` | default 100; ECM `paymentTerm` (not present); PO payment terms in the page script | Yes for normal bills; advance/retrofit open |
 | 23 | Payment type | `paymentType` (`A` / `F`) | default `F` | Yes for normal bills; advance/retrofit open |
-| 24–25 | Bank account / IFSC | `bankAccountNo`, `ifscCode` | pre-filled | Yes |
-| 26–28 | Reverse charge / composition / GSTIN registered | `N`, `N`, `Y` | constant | Yes |
+| 24-25 | Bank account / IFSC | `bankAccountNo`, `ifscCode` | pre-filled | Yes |
+| 26-28 | Reverse charge / composition / GSTIN registered | `N`, `N`, `Y` | constant | Yes |
 | 29 | Supplier GSTIN | `supplierGSTIN` | ECM `gstinSupplier` (not present) → meanwhile from ECM `division` | **Derivable, to confirm** (note 1) |
-| — | Supplier state | `supplierState` | first 2 digits of supplier GSTIN | Yes once GSTIN known |
-| — | State of supply | `stateOfSupply` (GST state code) | first 2 digits of ECM `gstinRecipient`, or the state in `consigneeAddressLine4` | **Derivable, to confirm** (note 2) |
-| — | Place of supply | `placeOfSupply` (text, ≤ 20) | ECM `supplyPlace` / consignee name | Yes (not in spec) |
-| — | Bill description | `billDescription` (≤ 200) | ECM `partDescription`, or a template such as `CLAIM FOR 100% PAYMENT` | Yes (not in spec) |
-| — | `organization`, `department`, `unit`, `poKey`, `poNumber`, `poDate`, `nitOid`, `paymentCode` | | IREPS form / page script | Yes |
+| - | Supplier state | `supplierState` | first 2 digits of supplier GSTIN | Yes once GSTIN known |
+| - | State of supply | `stateOfSupply` (GST state code) | first 2 digits of ECM `gstinRecipient`, or the state in `consigneeAddressLine4` | **Derivable, to confirm** (note 2) |
+| - | Place of supply | `placeOfSupply` (text, ≤ 20) | ECM `supplyPlace` / consignee name | Yes (not in spec) |
+| - | Bill description | `billDescription` (≤ 200) | ECM `partDescription`, or a template such as `CLAIM FOR 100% PAYMENT` | Yes (not in spec) |
+| - | `organization`, `department`, `unit`, `poKey`, `poNumber`, `poDate`, `nitOid`, `paymentCode` | | IREPS form / page script | Yes |
 
 Notes:
 1. **Supplier GSTIN follows the invoicing plant, not the IREPS account.** The
    Hosur account (`:833`) offers three GSTINs (`33…ZL` Tamil Nadu, `06…ZI`
    Haryana, `02…ZQ` Himachal). Evidence:
-   - Screens 6–7: invoice `3320260101270` filed with `33AAGCS8525B1ZL`.
+   - Screens 6-7: invoice `3320260101270` filed with `33AAGCS8525B1ZL`.
    - Non-stock capture: invoice `1061000262` filed with `06AAGCS8525B1ZI`.
      The `1061…` series belongs to `division = WABRTK` (Rohtak) in the ECM
      sample, and `1331…` to `WABHSR` (Hosur).
@@ -738,11 +738,11 @@ Notes:
 | c. HSN code | `hsnCode` | ECM `serviceAccountingCode` | Yes (digits, ≤ 8) |
 | d. GST % | `igstRate` or `cgstRate`+`sgstRate` | PO rate from #114; split by header states; cross-check ECM `taxCode`, `totalTaxValue` | **Yes** (spec says ECM; `gstPercent` not needed) |
 | e. Value | item-wise claim → `totalAmount` | ECM `onivla`, checked against the calculated total | Yes |
-| — | Taxable / tax amounts | `expenseAmount`, `basicAmount`, `igst/cgst/sgstAmount`, `maxClaim` | calculated (step 7) | Yes |
-| — | Railway GSTIN | `rlyGSTIN` | consignee GSTIN in #114 | Yes |
-| — | ITC admissible | `itcFlagFinal=N` | constant | Yes |
-| — | Item data (PL no., description, consignee, delivery date, allocation, qty, rate, unit, inspection agency) | | IREPS #114 | Yes |
-| — | Charges (discount, packing, freight, other) | | `0` / defaults in all bills seen | Yes |
+| - | Taxable / tax amounts | `expenseAmount`, `basicAmount`, `igst/cgst/sgstAmount`, `maxClaim` | calculated (step 7) | Yes |
+| - | Railway GSTIN | `rlyGSTIN` | consignee GSTIN in #114 | Yes |
+| - | ITC admissible | `itcFlagFinal=N` | constant | Yes |
+| - | Item data (PL no., description, consignee, delivery date, allocation, qty, rate, unit, inspection agency) | | IREPS #114 | Yes |
+| - | Charges (discount, packing, freight, other) | | `0` / defaults in all bills seen | Yes |
 
 ---
 
@@ -815,7 +815,7 @@ Notes:
   - HSN ≤ 8 digits
   - place of supply ≤ 20 chars
   - each PDF < 8 MB
-- **Hand over to the user** at step 9 (signing each document) and steps 11–13
+- **Hand over to the user** at step 9 (signing each document) and steps 11-13
   (preview, sign, submit).
 - Fix the R-NOTE parser first (section 3) and keep the Bill Claim link's
   `rly` / `poKey`.
