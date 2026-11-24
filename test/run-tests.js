@@ -565,6 +565,18 @@ await test("requestIreps: HTTP 500, network failure and timeout map to IREPS_REQ
   eq(e3.reason, "timeout");
 });
 
+await test("requestIreps (4.7): a timeout while IREPS sends the page is 'did not respond in time'; a broken page is 'could not be read'", async () => {
+  // fetch() rejects the body read with an AbortError when the request's deadline aborts it mid-page
+  const bodyFails = (error) => async () => ({ ok: true, status: 200, statusText: "OK", url: "", redirected: false, headers: new Headers(), text: async () => { throw error; } });
+  const late = await rejects(requestIreps({ path: "/epsn/admin/viewBills.do" }, { fetch: bodyFails(new DOMException("The operation was aborted.", "AbortError")) }), IREPS_ERROR.REQUEST_FAILED);
+  eq(late.reason, "timeout");
+  eq(late.detail, "IREPS did not respond in time");
+  eq(late.message, "IREPS did not respond in time");
+  const cut = await rejects(requestIreps({ path: "/epsn/admin/viewBills.do" }, { fetch: bodyFails(new TypeError("network error")) }), IREPS_ERROR.REQUEST_FAILED);
+  eq(cut.reason, "network");
+  eq(cut.detail, "the IREPS response could not be read");
+});
+
 /* ------------------------------------------------------- Bill Status flow */
 
 await test("fetchBillStatus: load page -> fresh token -> Show Results -> parsed bills (token never exposed)", async () => {
@@ -830,7 +842,7 @@ await test("config (L8): \"downloadLog\": false turns the log off like { enabled
     applyDownloadLogConfig({});
     eq(isDownloadLogEnabled(), true, "on unless turned off (as shipped)");
     applyEcmConfig({ ecm: { env: "prd" } });
-    eq(ECM_CONFIG.env, "TEST", "an unknown ecm.env still means TEST (now with a warning in the log)");
+    eq(ECM_CONFIG.env, "", "an unknown ecm.env is no ECM environment, never TEST: the direct ECM fails closed (8.7, ecm-tests.js)");
     applyEcmConfig({ ecm: { env: "prod" } });
     eq(ECM_CONFIG.env, "PROD");
   } finally {
@@ -918,6 +930,34 @@ await test("logger (M5): ECM secrets, JSON tokens, API keys and the Struts token
   eq(obj.keys[0], "po:1");
   eq(obj.code, "IREPS_SESSION_EXPIRED", "an error code stays readable");
   for (const k of ["clientSecret", "accessToken", "x-api-key", "sessionId", "key"]) eq(obj[k], "[REDACTED]", k);
+});
+
+await test("logger (8.8): session ids in a string, an OAuth code / state in a URL, escaped quotes and escaped JSON are redacted", () => {
+  const cases = [
+    ['{"JSESSIONID":"S3SS10N"}', "S3SS10N"],
+    ['JSESSIONID: "S3SS10N"', "S3SS10N"],
+    ["JSESSIONID='S3SS10N'", "S3SS10N"],
+    ["sessionId=S3SS10N&x=1", "S3SS10N"],
+    ["session_id: S3SS10N", "S3SS10N"],
+    ['{"sessionId":"S3SS10N"}', "S3SS10N"],
+    ["https://cglncbgakabfoenpkbaoigpclmgkklcl.chromiumapp.org/okta?code=0AUTHC0DE&state=ST4TE", "0AUTHC0DE"],
+    ["https://cglncbgakabfoenpkbaoigpclmgkklcl.chromiumapp.org/okta?code=0AUTHC0DE&state=ST4TE", "ST4TE"],
+    ["/api/auth/okta/extension/finish?code=0AUTHC0DE&state=ST4TE", "0AUTHC0DE"],
+    ["https://x.test/okta#state=ST4TE&code=0AUTHC0DE", "0AUTHC0DE"],
+    ["grant_type=authorization_code&code=0AUTHC0DE&redirect_uri=x", "0AUTHC0DE"],
+    ['{"password":"pa\\"SSW0RD"}', "SSW0RD"],
+    ['password: "pa SSW0RD"', "SSW0RD"],
+    ['{\\"access_token\\":\\"eyJ0K3N\\",\\"expires_in\\":300}', "eyJ0K3N"],
+    ['{\\"password\\":\\"pa\\\\\\"SSW0RD\\"}', "SSW0RD"],
+    ['the answer: {"error":"x","password":"SSW0RD', "SSW0RD"],
+    ['{"security_token": 135790}', "135790"]
+  ];
+  for (const [text, secret] of cases) assert(!redact(text).includes(secret), `${text} -> ${redact(text)}`);
+  eq(redact('{\\"access_token\\":\\"eyJ0K3N\\",\\"expires_in\\":300}'), '{\\"access_token\\":\\"[REDACTED]\\",\\"expires_in\\":300}', "only the escaped value goes");
+  eq(redact('{"password":"pa\\"SSW0RD","user":"u1"}'), '{"password":"[REDACTED]","user":"u1"}', "up to the value's own closing quote");
+  for (const text of ["error_code=X&zipcode=560001&statecode=KA", '{"code":"IREPS_SESSION_EXPIRED","state":"running"}', "failed with code: IREPS_SESSION_EXPIRED", '{"sessionExpired":true,"tokenFound":false}', "IREPS session expired"]) {
+    eq(redact(text), text, `left readable: ${text}`);
+  }
 });
 
 await test("filename format", () => {

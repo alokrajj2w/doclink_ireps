@@ -76,9 +76,11 @@ function onEvent(ev) {
     for (const [i, s] of ev.skipped.entries()) upsert(`s:${i}`, { tenderNo: s.tenderNo, railway: s.railway, letterNo: '-', subject: s.tenderTitle, deadline: s.replyDeadline, status: 'NEEDS_REVIEW', note: s.reason });
   } else if (ev.type === 'record') {
     const r = ev.record;
-    // a record row is replaced by its letter rows once they exist; until then it carries the record's own state
-    if (['NO_PENDING_LETTERS', 'FAILED', 'SESSION_EXPIRED', 'NEEDS_REVIEW', 'IN_PROGRESS'].includes(r.status) || !rows.has(`r:${r.nitOid}`)) {
-      upsert(`r:${r.nitOid}`, { tenderNo: r.tenderNo, railway: r.railway, letterNo: '-', subject: r.tenderTitle, deadline: r.replyDeadline, status: r.status, note: r.status === 'NO_PENDING_LETTERS' ? 'No pending letters at download time' : r.error });
+    // a record row is replaced by its letter rows once they exist; until then it carries the record's own state,
+    // also DOWNLOADED: a record "Retry failed" leaves alone because an earlier run finished it (7.13)
+    if (['NO_PENDING_LETTERS', 'FAILED', 'SESSION_EXPIRED', 'NEEDS_REVIEW', 'IN_PROGRESS', 'DOWNLOADED'].includes(r.status) || !rows.has(`r:${r.nitOid}`)) {
+      const note = r.status === 'NO_PENDING_LETTERS' ? 'No pending letters at download time' : r.savedEarlier ? 'Downloaded by an earlier run' : r.error;
+      upsert(`r:${r.nitOid}`, { tenderNo: r.tenderNo, railway: r.railway, letterNo: '-', subject: r.tenderTitle, deadline: r.replyDeadline, status: r.status, note });
     }
   } else if (ev.type === 'letter') {
     const l = ev.letter;
@@ -107,6 +109,19 @@ function renderSummary(s) {
   $('btn-pc-retry').hidden = !(s.failed || s.unavailable || s.sessionExpired);
 }
 
+const COUNT_IDS = ['pc-n-records', 'pc-n-letters', 'pc-n-downloaded', 'pc-n-attachments', 'pc-n-unavailable', 'pc-n-failed', 'pc-n-review', 'pc-n-noletters'];
+
+/**
+ * A new run starts from an empty summary (7.12): one that fails at its start never shows the last run's counts,
+ * folder or "Retry failed" next to its own error, and one that starts never shows them while its own come in.
+ */
+function clearSummary() {
+  for (const id of COUNT_IDS) $(id).textContent = '0';
+  $('pc-counts').hidden = true;
+  $('pc-folder').textContent = '';
+  $('btn-pc-retry').hidden = true;
+}
+
 async function run(mode) {
   if (running) return;
   $('pc-error').hidden = true;
@@ -115,6 +130,7 @@ async function run(mode) {
     $('pc-error').hidden = false;
     return;
   }
+  clearSummary();
   $('pc-empty').hidden = true;
   $('pc-tbody').replaceChildren();
   rows.clear();

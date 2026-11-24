@@ -112,6 +112,40 @@ export function invoiceRecords(answer) {
   return Object.keys(body).some((k) => INVOICE_COLUMNS[columnKey(k)] === "invoiceNumber") || body.properties ? [body] : [];
 }
 
+const plain = (v) => String(v ?? "").trim();
+const numeric = (v) => {
+  const t = plain(v).replace(/,/g, "");
+  return /^\d+(\.\d+)?$/.test(t) ? Number(t) : null;
+};
+
+/**
+ * Equal as numbers when both are numbers ("001" == "1", "87.0" == "87"), else as trimmed text,
+ * case ignored. How a receipt's PO, PO Sr and quantity are compared with an invoice's.
+ */
+export function sameValue(a, b) {
+  const x = numeric(a);
+  const y = numeric(b);
+  return x !== null && y !== null ? x === y : plain(a) !== "" && plain(a).toUpperCase() === plain(b).toUpperCase();
+}
+
+/**
+ * What an invoice names differently from the receipt: its customer PO, PO Sr and quantity, each
+ * checked only where the record has it (review 3.3). Empty when it can be this receipt's invoice.
+ * @param {object} invoice  normaliseInvoice()'s answer
+ * @param {{ customerPO: string, customerPOSrNo: string, invoiceQuantity: string }} key  the receipt's (invoice-file.js receiptInvoiceKey)
+ * @returns {string[]}
+ */
+export function receiptMismatches(invoice, key) {
+  const out = [];
+  const check = (label, have, want) => {
+    if (plain(have) !== "" && !sameValue(have, want)) out.push(`${label} ${plain(have)}, the receipt's is ${plain(want) || "?"}`);
+  };
+  check("PO", invoice.customerPONumber, key.customerPO);
+  check("PO Sr", invoice.customerPOSrNumber, key.customerPOSrNo);
+  check("quantity", invoice.quantity, key.invoiceQuantity);
+  return out;
+}
+
 /** "Sent to Doculink" set? (Y / Yes / true / 1 / a date) */
 export function isSentToDoculink(value) {
   if (value === true || value === 1) return true;
@@ -147,9 +181,15 @@ export async function retrieveInvoice(key, deps = {}) {
   } catch (error) {
     throw ecmUnavailable(error);
   }
-  const all = invoiceRecords(answer).map((r) => normaliseInvoice(r, "ECM"));
-  const fresh = all.filter((inv) => !isSentToDoculink(inv.sentToDoculink));
+  const answered = invoiceRecords(answer).map((r) => normaliseInvoice(r, "ECM"));
   const label = `PO ${params.customerPO}, PO Sr ${params.customerPOSrNo}, qty ${params.invoiceQuantity}`;
+  // only a record that names this receipt is used, as with a JSON file (review 3.3)
+  const all = answered.filter((inv) => receiptMismatches(inv, params).length === 0);
+  if (answered.length && !all.length) {
+    const named = answered.slice(0, 3).map((inv) => `invoice ${inv.invoiceNumber || "(no number)"}: ${receiptMismatches(inv, params).join("; ")}`);
+    throw new IrepsError(BILL_ERROR.ECM_MISMATCH, "ECM invoice for another receipt", { detail: `ECM answered for ${label} with ${named.join(" | ")}${answered.length > 3 ? ` and ${answered.length - 3} more` : ""}` });
+  }
+  const fresh = all.filter((inv) => !isSentToDoculink(inv.sentToDoculink));
   if (fresh.length === 1) {
     if (!fresh[0].invoiceNumber) throw new IrepsError(BILL_ERROR.ECM_NOT_FOUND, "ECM record without invoice number", { detail: `ECM answered for ${label}, but the record has no invoice number` });
     return fresh[0];

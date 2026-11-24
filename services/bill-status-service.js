@@ -35,7 +35,7 @@ import {
   IREPS_ERROR,
   IrepsError
 } from "./ireps-api.js";
-import { validateIrepsSession } from "./session-service.js";
+import { validateIrepsSession, isNoRecordsPage } from "./session-service.js";
 import { extractBillStatusForm, publicFormInfo } from "./ireps-form.js";
 import { logger } from "../utils/logger.js";
 import { withIrepsFormLock } from "./ireps-form-lock.js";
@@ -109,11 +109,13 @@ async function fetchBillStatusLocked(options, deps) {
     billStatusMarkers: verdict.authenticated
   });
   logger.info(`[DocLink][BillStatus] result page structure ${JSON.stringify(describePageStructure(results.html))}`);
-  if (!verdict.authenticated && verdict.code !== IREPS_ERROR.SESSION_EXPIRED && !deps.noRetry && form.token) {
+  const answeredWithMessage = () => verdict.authenticated && rejectionMessage(results.html) !== "";
+  if (((!verdict.authenticated && verdict.code !== IREPS_ERROR.SESSION_EXPIRED) || answeredWithMessage()) && !deps.noRetry && form.token) {
     // The Struts token is single-use per page render; if the user reloaded an
     // IREPS page in another tab in between, the token was consumed. Retry once
-    // with a fresh page and token.
-    logger.warn("Search response not recognised; retrying once with a fresh form token");
+    // with a fresh page and token. The same for a Bill Status page that came
+    // back with an IREPS message instead of bills.
+    logger.warn("Search response not recognised, or answered with an IREPS message and no bills; retrying once with a fresh form token");
     const fresh = await loadBillStatusPage(requestDeps);
     assertAuthenticated(fresh);
     form = extractBillStatusForm(fresh.html);
@@ -135,6 +137,7 @@ async function fetchBillStatusLocked(options, deps) {
   } catch (error) {
     throw new IrepsError(IREPS_ERROR.PARSE_FAILED, "Bill Status HTML could not be parsed", { cause: error });
   }
+  const rejection = rejectionMessage(results.html);
   results = null;
   logger.info(`[DocLink][BillStatus] parsed ${parsed && parsed.recordCount} rows`);
   if (!parsed || !Array.isArray(parsed.bills)) {
@@ -143,6 +146,11 @@ async function fetchBillStatusLocked(options, deps) {
   if (parsed.recordCount === 0) {
     if (parsed.blockCount > 0) {
       throw new IrepsError(IREPS_ERROR.PARSE_FAILED, `${parsed.blockCount} bill blocks found but none could be read`);
+    }
+    // "No Bill Records Found" only when IREPS says so: a page that carries another IREPS message
+    // ("server is busy", a validation message) is that message, not an empty list
+    if (rejection) {
+      throw new IrepsError(IREPS_ERROR.SEARCH_REJECTED, `IREPS answered the search with: ${rejection}`, { detail: rejection });
     }
     throw new IrepsError(IREPS_ERROR.NO_RECORDS, "IREPS returned no bill records for the selected search");
   }
@@ -189,6 +197,23 @@ export function describePageStructure(html) {
       viewBillsStatus: text.includes("view bills status")
     }
   };
+}
+
+/**
+ * IREPS's own message on a Bill Status answer that has no bill blocks (the page's errorStyle span, as plain
+ * text), unless it is IREPS's "no records" wording; "" otherwise. The service worker has no DOMParser.
+ * @param {string} html
+ */
+export function rejectionMessage(html) {
+  const source = String(html || "");
+  if (/<table[^>]*\bid\s*=\s*["']?table_id\b/i.test(source)) return "";
+  const texts = [];
+  for (const m of source.matchAll(/<span[^>]*\bclass\s*=\s*["'][^"']*\berrorStyle\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi)) {
+    const text = m[1].replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/\s+/g, " ").trim();
+    if (text) texts.push(text);
+  }
+  const message = texts.join(" ").slice(0, 200);
+  return message && !isNoRecordsPage(message) ? message : "";
 }
 
 /** Path of a response URL (no query string) for the log. */

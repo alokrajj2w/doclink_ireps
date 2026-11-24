@@ -30,7 +30,8 @@ import { SEARCH_PO_DOCUMENT_TYPES, SEARCH_PO_CRITERIA } from "../services/search
 import { SAVE_DESTINATION, describeIngestStats } from "../services/recon-service.js";
 import { describeSkip } from "../services/download-log.js";
 import { toIrepsDate } from "../utils/dates.js";
-import { fillSelect } from "./popup-common.js";
+import { fillSelect, noteBackgroundRun, backgroundRunText } from "./popup-common.js";
+import { isOwnRun } from "./popup-gate.js";
 
 const ALL_RAILWAYS = "-1";
 /** The document types that have a card here (PO and MA have their own views). */
@@ -67,6 +68,8 @@ class DocumentCard {
   constructor(root) {
     this.criteria = root.dataset.criteria;
     this.label = (SEARCH_PO_DOCUMENT_TYPES.find((t) => t.criteria === this.criteria) || {}).shortLabel || this.criteria;
+    /** This type's results in the main view's shared bottom panel (popup.js showResult / hideResult). */
+    this.resultOwner = `doc:${this.criteria}`;
     root.append(document.getElementById("tpl-doc-card").content.cloneNode(true));
     const q = (role) => root.querySelector(`[data-role="${role}"]`);
     this.el = {
@@ -180,6 +183,15 @@ class DocumentCard {
     this.el.btnLabel.textContent = text || this.label;
   }
 
+  /**
+   * A run of this type that this panel did not start (a scheduled one, another tab's) holds the job: the
+   * panel only says so and keeps the Download button waiting; the card and the main view stay as they are.
+   */
+  noteBackground(startedBy, running) {
+    noteBackgroundRun(`doc:${this.criteria}`, running ? backgroundRunText(this.label, startedBy) : null);
+    this.el.btnDownload.disabled = running;
+  }
+
   clearError() {
     this.el.error.hidden = true;
     this.el.error.classList.remove("is-notice");
@@ -215,28 +227,34 @@ class DocumentCard {
     const n = summary.recordCount ?? 0;
     const pages = summary.pagesFetched > 1 ? ` across ${summary.pagesFetched} result pages` : "";
     const toRecon = summary.destination === SAVE_DESTINATION.RECON;
+    // fewer records read than IREPS listed: said with the result, never a plain "successfully" (1.1)
+    const short = summary.incomplete ? `${summary.incomplete}; some may be missing from this file.` : "";
     if (summary.skipped) {
       // the same rows were already downloaded by this user (the download log) and not saved again
       ctx.showView("main");
       ctx.showResult({
         title: `${this.label} export not saved again`,
-        summary: [`${this.label} records found: ${n}${pages}. ${describeSkip(summary.skip)}: the same records, so no new file was made.`, ...(summary.warnings || [])].join("\n"),
+        summary: [`${this.label} records found: ${n}${pages}. ${describeSkip(summary.skip)}: the same records, so no new file was made.`, short, ...(summary.warnings || [])].filter(Boolean).join("\n"),
         filter: summary.filter ? `Search: ${summary.filter}` : "",
         filename: summary.skip && summary.skip.filename ? `Earlier file: ${summary.skip.filename}` : "",
-        downloadId: null
-      });
+        downloadId: null,
+        notice: Boolean(short)
+      }, this.resultOwner);
       return;
     }
     const stored = toRecon && summary.deduplicated ? ", identical file already stored" : "";
     const loaded = toRecon ? describeIngestStats(summary.ingestStats) : "";
+    const where = toRecon ? "saved to the Recon Engine (S3)" : "downloaded";
     ctx.showView("main");
     ctx.showResult({
-      title: toRecon ? `✓ ${this.label} export saved to the Recon Engine (S3)` : `✓ ${this.label} export downloaded successfully`,
-      summary: `${this.label} records exported: ${n}${pages} (${formatLabel(summary.format)}${stored})${loaded ? `\n${loaded}` : ""}`,
+      title: short ? `${this.label} export ${where}, but IREPS listed more records` : toRecon ? `✓ ${this.label} export saved to the Recon Engine (S3)` : `✓ ${this.label} export downloaded successfully`,
+      // the download log's own warnings ("Download log unavailable ...") are said too
+      summary: [`${this.label} records exported: ${n}${pages} (${formatLabel(summary.format)}${stored})`, short, loaded, ...(summary.warnings || [])].filter(Boolean).join("\n"),
       filter: summary.filter ? `Search: ${summary.filter}` : "",
       filename: (toRecon ? summary.storedPath : summary.filename) || summary.filename || "",
-      downloadId: summary.downloadId ?? null
-    });
+      downloadId: summary.downloadId ?? null,
+      notice: Boolean(short)
+    }, this.resultOwner);
   }
 
   renderError(error) {
@@ -271,7 +289,8 @@ class DocumentCard {
       this.renderError(describeError("IREPS_INVALID_REQUEST", { detail: "Please enter a PO Number." }));
       return;
     }
-    ctx.hideResult();
+    // only this type's own result makes way for its new run; another job's result stays (7.8)
+    ctx.hideResult(this.resultOwner);
     this.el.options.open = false;
     this.updateDestination();
     this.renderProgress("CHECKING_SESSION", documentStageLabel(DOCUMENT_STAGES.CHECKING_SESSION, this.label));
@@ -322,18 +341,26 @@ export function initDocuments(context) {
   }
 }
 
-/** Route document broadcasts from the service worker to their card. Returns true when handled. */
+/**
+ * Route document broadcasts from the service worker to their card. Returns true when handled. A run this
+ * panel did not start (a scheduled one, another tab's) only notes that it runs: it never switches the view,
+ * shows the login view, or shows its result or error as this panel's.
+ */
 export function handleDocumentMessage(message) {
   const card = cards.get(message.criteria);
+  const own = isOwnRun(message.startedBy);
   switch (message.type) {
     case MESSAGE_TYPES.DOCUMENT_PROGRESS:
-      if (card) card.renderProgress(message.stage, message.message);
+      if (card && own) card.renderProgress(message.stage, message.message);
+      else if (card) card.noteBackground(message.startedBy, true);
       return true;
     case MESSAGE_TYPES.DOCUMENT_DOWNLOAD_COMPLETE:
-      if (card) card.renderComplete(message);
+      if (card && own) card.renderComplete(message);
+      else if (card) card.noteBackground(message.startedBy, false);
       return true;
     case MESSAGE_TYPES.DOCUMENT_DOWNLOAD_ERROR:
-      if (card) card.renderError(message);
+      if (card && own) card.renderError(message);
+      else if (card) card.noteBackground(message.startedBy, false);
       return true;
     default:
       return false;
@@ -355,6 +382,11 @@ export async function restoreDocuments() {
   for (const [criteria, card] of cards) {
     const state = await ctx.send(MESSAGE_TYPES.GET_DOCUMENT_JOB_STATE, { criteria });
     if (!state || state.status === "idle") continue;
+    // a run this panel did not start is never restored as its own: it only says that it runs
+    if (!isOwnRun(state.startedBy)) {
+      if (state.status === "running") card.noteBackground(state.startedBy, true);
+      continue;
+    }
     const fresh = Date.now() - (state.updatedAt || 0) < 10 * 60 * 1000;
     if (state.status === "running") {
       card.renderProgress(state.stage, state.message);

@@ -10,18 +10,18 @@
 //   commercialTabulation response.
 
 import {
-  TenderError, SESSION_MSG, log, norm,
+  TenderError, SESSION_MSG, IREPS_DOWN_CODES, log, norm,
   irepsFetch, assertSession, parseHtml, formParams, findForm,
   elementActions, parseCalls, qparam, toRequest, requestKey, fetchDocument, fetchLinkedDocument, createSaver, safeSegment,
   INBOX_PATH, CORRES_LIST_PATH, CORRES_REPLY_PATH, CORRES_VIEW_FALLBACK_PATH, dmyOf, inlineScripts,
-  isVendorInboxPage, isCorrespondencePage, pageNotRecognised, listFailed,
+  isVendorInboxPage, isCorrespondencePage, pageNotRecognised, listFailed, listUnanswered, listCut,
 } from './tender-core.js';
 import { describeError } from '../utils/messages.js';
 import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { printPageToPdf } from './tender-print.js';
 import { sharedRun } from './tender-shared-run.js';
 import {
-  searchTender, findTenderRows, findTenderRowsLoose, fmtDate,
+  searchTender, findTenderRows, findTenderRowsLoose, fmtDate, railwayOf,
   describeRow, loadForm, classifySearchResponse, closingDaySearchBody, nextResultPage, resultPageLink, resultPageLinks, searchResultsTotal,
 } from './tender-search.js';
 import { withIrepsFormLock } from '../services/ireps-form-lock.js';
@@ -56,12 +56,13 @@ export function finalize(r) {
   return r;
 }
 
-function failedCategory(category, message) {
+/** A category that failed as a whole; `code`: the error's own code, kept on its FAILED file (a scheduled run names it). */
+function failedCategory(category, message, code = '') {
   const r = newCategory(category);
   r.discovered = 1;
   r.failed = 1;
   r.note = message;
-  r.files.push({ fileName: '', status: 'FAILED', error: message });
+  r.files.push({ fileName: '', status: 'FAILED', error: message, ...(code ? { code } : {}) });
   return finalize(r);
 }
 
@@ -92,18 +93,23 @@ export function dedupeItems(items) {
  *   action.print     : a web page is printed by Chrome as Ctrl+P would (tender-print.js)
  *   action.keepPage  : the page is the document and the files it links are its attachments (a corrigendum):
  *                      the page and each attachment are saved, as "<name>_Attachment_N<ext>"
+ *   action.earlier   : (keepPage) what an earlier run saved of this document while an attachment failed (savedBefore):
+ *                      the page and the attachments saved then are not saved again, only the ones missing
  *   action.pageOnly  : the page alone is the document (an LOA letter): nothing it links is fetched and exactly
  *                      one file is saved (no .html companion when Chrome cannot print it)
  *   action.trusted   : an allowed Financial / Commercial Tabulation response, its pdfType (see resolveIrepsDocument)
  *   action.logAs     : log tag for what IREPS answered (describeResponse)
- * -> { files, converted, printError, attachmentErrors }
+ * A page with attachments is logged as downloaded (a scheduled run: reported saved) only once every attachment is
+ * saved (2.1); until then the next run fetches it again for what is missing.
+ * -> { files, converted, htmlKept, printError, attachmentFailures: [{ code, message }] }
  */
 export async function resolveAndDownloadIrepsDocument(action, run) {
   if (action.before) await action.before();
   let doc = await fetchDocument(run.base, { ...action.req, relativeTo: action.req.relativeTo || run.ctx.searchUrl },
     { allowHtml: !!action.allowHtml, allowAnyFile: !!action.allowAnyFile, keepPage: !!action.keepPage, pageOnly: !!action.pageOnly, trusted: action.trusted || false, logAs: action.logAs || '', nameHint: action.nameHint || '' });
+  const earlier = doc.kind === 'html' && action.keepPage ? action.earlier || null : null;
   let printError = '';
-  if (doc.kind === 'html' && action.print) {
+  if (doc.kind === 'html' && action.print && !earlier) {
     try {
       doc = { ...doc, bytes: await printPageToPdf(doc.page), converted: false, printed: true };
     } catch (e) {
@@ -116,20 +122,36 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
   // rendered page) or a file served without a name (a POST to a .do action)
   const given = doc.kind === 'file' && doc.sourceName ? doc.sourceName : action.fileName(doc.ext);
   const fileName = reserveFileName(run, action, action.id, given);
-  const out = [await saveDocument(run, action, { fileName, bytes: doc.bytes, contentType: doc.contentType, id: action.id, meta: action.meta },
-    { converted: !!doc.converted, ...(doc.printed ? { printed: true } : {}), validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '' } })];
-  if (doc.kind === 'html' && !doc.printed && !action.pageOnly && !sharedRun()) {
-    // Keep the complete original page next to the text rendering: nothing from the letter is lost.
-    // (Not in a scheduled run: it saves to the ECM only, and the ECM has the rendering.)
-    // (A page Chrome printed is already complete, as Ctrl+P would save it.)
-    const htmlName = fileName.replace(/\.pdf$/i, '') + '.html';
-    const savedHtml = await run.saver.save(action.subdir, htmlName, new TextEncoder().encode(doc.html), 'text/html');
-    out.push({ fileName: savedHtml.relPath.split('/').pop(), relPath: savedHtml.relPath, status: 'DOWNLOADED', id: action.id || '', downloadId: savedHtml.downloadId, size: savedHtml.size, note: 'original HTML' });
+  const out = [];
+  // the page's own record waits for its attachments: a corrigendum is downloaded only with all of them (2.1)
+  let pageRecord;
+  if (earlier) {
+    log('Download', `${fileName}: saved by an earlier run as ${earlier.page.fileName}; only the attached documents missing then are fetched`);
+    pageRecord = documentRecord(run, action, action.id, { filename: earlier.page.fileName, ecm: earlier.page.ecm || null });
+  } else {
+    const page = await saveDocument(run, action, { fileName, bytes: doc.bytes, contentType: doc.contentType, id: action.id, meta: action.meta },
+      { converted: !!doc.converted, ...(doc.printed ? { printed: true } : {}), validation: { kind: doc.kind, extension: doc.ext, httpStatus: doc.httpStatus, contentType: doc.contentType || '' } },
+      { holdRecord: !!doc.links?.length });
+    out.push(page.entry);
+    pageRecord = page.record;
+    if (doc.kind === 'html' && !doc.printed && !action.pageOnly && !sharedRun()) {
+      // Keep the complete original page next to the text rendering: nothing from the letter is lost.
+      // (Not in a scheduled run: it saves to the ECM only, and the ECM has the rendering.)
+      // (A page Chrome printed is already complete, as Ctrl+P would save it.)
+      const htmlName = fileName.replace(/\.pdf$/i, '') + '.html';
+      const savedHtml = await run.saver.save(action.subdir, htmlName, new TextEncoder().encode(doc.html), 'text/html');
+      out.push({ fileName: savedHtml.relPath.split('/').pop(), relPath: savedHtml.relPath, status: 'DOWNLOADED', id: action.id || '', downloadId: savedHtml.downloadId, size: savedHtml.size, note: 'original HTML' });
+    }
   }
-  // the documents attached to the page, each saved next to it; one that fails does not undo the page
-  const attachmentErrors = [];
-  let n = 0;
-  for (const url of doc.links || []) {
+  // the documents attached to the page, each saved next to it; one that fails does not undo the page. An attachment
+  // keeps the number it was saved under by an earlier run; one saved now takes the next number after those.
+  const attachmentFailures = [];
+  const links = (doc.links || []).map((url) => ({ url, link: pathOf(url) }));
+  const once = (link) => links.filter((x) => x.link === link).length === 1;
+  let n = earlier ? Math.max(0, ...earlier.links.values()) : 0;
+  let saved = 0;
+  for (const { url, link } of links) {
+    if (earlier?.links.has(link) && once(link)) continue; // saved by the earlier run
     try {
       const att = await fetchLinkedDocument(run.base, url, { allowAnyFile: !!action.allowAnyFile });
       if (!att) continue;
@@ -138,16 +160,50 @@ export async function resolveAndDownloadIrepsDocument(action, run) {
       const attId = `${action.id || ''}#${n}`;
       const attMeta = { ...action.meta, title };
       const attName = reserveFileName(run, { ...action, meta: attMeta }, attId, att.sourceName || `${fileName.replace(/\.[^.]+$/, '')}_Attachment_${n}${att.ext}`);
-      out.push(await saveDocument(run, action, { fileName: attName, bytes: att.bytes, contentType: att.contentType, id: attId, meta: attMeta },
-        { role: 'attachment', attachmentOf: fileName, validation: { kind: att.kind, extension: att.ext, httpStatus: att.httpStatus, contentType: att.contentType || '' } }));
+      out.push((await saveDocument(run, action, { fileName: attName, bytes: att.bytes, contentType: att.contentType, id: attId, meta: attMeta },
+        { role: 'attachment', attachmentOf: fileName, link, validation: { kind: att.kind, extension: att.ext, httpStatus: att.httpStatus, contentType: att.contentType || '' } })).entry);
+      saved++;
     } catch (e) {
       if (e.code === 'SESSION_EXPIRED' || e.code === 'EXCLUDED') throw e;
-      attachmentErrors.push(`${fileName}: an attached document could not be downloaded (${e.message})`);
+      const name = fileNameOf(url);
+      attachmentFailures.push({ code: e.code || '', message: `${fileName}: an attached document${name ? ` (${name})` : ''} could not be downloaded (${e.message})` });
       log('Download', `attachment of ${fileName} failed: ${e.message}`);
     }
   }
-  if (doc.links?.length) log('Download', `${fileName}: ${n} attached document(s) saved`);
-  return { files: out, converted: doc.kind === 'html' && !doc.printed, htmlKept: doc.kind === 'html' && !doc.printed && !action.pageOnly, printError, attachmentErrors };
+  if (links.length) log('Download', `${fileName}: ${saved} attached document(s) saved${attachmentFailures.length ? `, ${attachmentFailures.length} not: it is logged as downloaded once they are in` : ''}`);
+  if (pageRecord && !attachmentFailures.length) await logSaved(pageRecord);
+  const rendered = !earlier && doc.kind === 'html' && !doc.printed;
+  return { files: out, converted: rendered, htmlKept: rendered && !action.pageOnly, printError, attachmentFailures };
+}
+
+/** The file name a link ends with ("Revised_Spec.pdf"), or '' (never the URL itself: it goes in messages). */
+function fileNameOf(url) {
+  try {
+    return decodeURIComponent(new URL(url, 'https://x.invalid/').pathname.split('/').pop() || '');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * What an earlier run of this job saved of a document it could not complete: a corrigendum whose page was saved while
+ * an attached document failed (2.1). Read from the tender's download record (tender-jobs.js recordManifest keeps the
+ * file entries saveDocument returns) -> { page: its entry, links: Map(link -> attachment number) }, or null: the job
+ * keeps no ledger, the ledger has the document as complete (downloaded again only when asked, and then in full), or
+ * no page of it was saved.
+ */
+function savedBefore(run, category, bucket, ledgerKey, id) {
+  if (!run.ledger || !bucket || run.ledger.has(bucket, ledgerKey)) return null;
+  const doc = String(id ?? '');
+  const files = (run.ledger.manifest(run.ctx.tenderNo)?.files || []).filter((f) => f.category === category && f.status === 'DOWNLOADED');
+  const page = files.find((f) => String(f.id) === doc && !f.role && f.note !== 'original HTML');
+  if (!page) return null;
+  const links = new Map();
+  for (const f of files) {
+    const n = f.role === 'attachment' && f.link && String(f.id).startsWith(`${doc}#`) ? Number(String(f.id).slice(doc.length + 1)) : 0;
+    if (Number.isInteger(n) && n > 0) links.set(f.link, n);
+  }
+  return { page, links };
 }
 
 /**
@@ -169,8 +225,25 @@ function reserveFileName(run, action, id, fileName) {
   return name;
 }
 
-/** Save one document file (ECM or local) and record it in the download log. -> the result file entry */
-async function saveDocument(run, action, { fileName, bytes, contentType, id, meta }, extra = {}) {
+/** The download-log record of a saved document file: keyed by category, tender number and document id (downloadKey). */
+const documentRecord = (run, action, id, { filename, ecm }) => downloadRecord(
+  { docType: TENDER_DOC_TYPE[action.category] || 'tender_document', key: downloadKey.tender(action.category, run.ctx.tenderNo, id) },
+  { filename, ecm, account: run.account }
+);
+
+/** Log a saved document: a scheduled run reports it with its reservation (tender-shared-run.js); a manual run queues it. */
+async function logSaved(record) {
+  const shared = sharedRun();
+  if (shared) await shared.documentSaved(record);
+  else logDownload(record);
+}
+
+/**
+ * Save one document file (ECM or local) and record it in the download log. -> { entry: the result file entry, record }
+ * `holdRecord`: the record is not logged here but returned, for the caller to log once the document is complete
+ * (a page whose attachments are still to come); otherwise `record` is null.
+ */
+async function saveDocument(run, action, { fileName, bytes, contentType, id, meta }, extra = {}, { holdRecord = false } = {}) {
   const ecmDoc = run.ecm ? ecmDocumentFor(action.category, { ...action, id, meta }, run.ctx) : null;
   let saved;
   let ecm = null;
@@ -187,19 +260,15 @@ async function saveDocument(run, action, { fileName, bytes, contentType, id, met
   const size = saved ? saved.size : bytes.length;
   const name = saved ? saved.relPath.split('/').pop() : fileName;
   // the download log (no-op when it is off); the HTML companion of a rendered page is not a document of its own
-  const record = downloadRecord(
-    { docType: TENDER_DOC_TYPE[action.category] || 'tender_document', key: downloadKey.tender(action.category, run.ctx.tenderNo, id) },
-    { filename: name, ecm, account: run.account }
-  );
-  const shared = sharedRun();
-  if (shared) await shared.documentSaved(record); // a scheduled run reports it with its reservation
-  else logDownload(record);
+  const record = documentRecord(run, action, id, { filename: name, ecm });
+  if (!holdRecord) await logSaved(record);
   const { validation, ...rest } = extra;
   // fileName / relPath: the file as Chrome saved it (L11); requestedPath: the name asked for, when Chrome had to change it
-  return { fileName: name, relPath: saved ? saved.relPath : null, ...(saved?.requestedPath ? { requestedPath: saved.requestedPath } : {}), status: 'DOWNLOADED', id: id || '', downloadId: saved ? saved.downloadId : null, size, ...rest,
+  const entry = { fileName: name, relPath: saved ? saved.relPath : null, ...(saved?.requestedPath ? { requestedPath: saved.requestedPath } : {}), status: 'DOWNLOADED', id: id || '', downloadId: saved ? saved.downloadId : null, size, ...rest,
     title: meta?.title || '', docDate: meta?.docDate || '', downloadedAt: new Date().toISOString(),
     validation: { ...validation, bytes: size },
     ...(ecm ? { ecm } : {}) };
+  return { entry, record: holdRecord ? record : null };
 }
 
 // docs: the NIT documents, one entry each, so a NIT whose attachment failed is run again for that attachment
@@ -229,7 +298,9 @@ async function checkAlreadyDownloaded(run, result, items, build) {
     ecm: toEcm ? ecmCheckDocumentFor(result.category, build(it), run.ctx) : null, // null for grouped kinds (NIT, LOA, Result)
   }));
   const memo = run.redownloadMemo || (run.redownloadMemo = {});
+  const asked = new Set(); // what the question named: one downloaded again is downloaded in full (savedBefore is not used)
   const ask = (question) => {
+    for (const q of [...question.alreadyDownloaded, ...question.inEcm]) asked.add(q.id);
     // categories run in parallel: their questions wait in turn, so a remembered answer applies at once
     const answered = (memo.turn || Promise.resolve()).then(async () => {
       const ids = [...new Set([...question.alreadyDownloaded, ...question.inEcm].map((q) => q.id))];
@@ -244,7 +315,7 @@ async function checkAlreadyDownloaded(run, result, items, build) {
   };
   const checked = await preflightDownloads(candidates, { destination: toEcm ? LOG_DESTINATION.ECM : LOG_DESTINATION.LOCAL, account: run.account, ask });
   for (const w of checked.warnings) result.warnings.push(w);
-  return checked;
+  return { ...checked, asked };
 }
 
 /**
@@ -275,6 +346,21 @@ function reportSharedFailure(run, result, outcome, build) {
   }
 }
 
+/**
+ * A document saved without all of its attached documents (a corrigendum, 2.1): each one missing is a failed document
+ * of the category (so it is PARTIAL), and a scheduled run reports the document itself as failed with the first
+ * reason: its reservation is released, the slot ends partial and the next check fetches what is missing. The
+ * document's own record is not logged until then (resolveAndDownloadIrepsDocument).
+ */
+function attachmentsFailed(run, result, o, build) {
+  for (const f of o.attachmentFailures) {
+    result.discovered++;
+    result.failed++;
+    result.files.push({ fileName: '', id: o.item.id || '', status: 'FAILED', role: 'attachment', error: f.message, code: f.code });
+  }
+  reportSharedFailure(run, result, { item: o.item, error: o.attachmentFailures[0] }, build);
+}
+
 async function downloadItems(run, result, items, build) {
   items = dedupeItems(items);
   const bucket = LEDGER_BUCKET[result.category];
@@ -293,7 +379,15 @@ async function downloadItems(run, result, items, build) {
     items = fresh;
   }
   result.discovered = items.length;
-  if (items.length) await assertSameAccount(run.account, { base: run.base }); // steps run in parallel: re-check before this category starts saving
+  if (items.length) {
+    try {
+      await assertSameAccount(run.account, { base: run.base }); // steps run in parallel: re-check before this category starts saving
+    } catch (e) {
+      // a scheduled run reserved these documents already: each is reported with why it was not fetched (5.10)
+      for (const item of items) reportSharedFailure(run, result, { item, error: e }, build);
+      throw e;
+    }
+  }
   // up to ITEM_CONCURRENCY documents of one category download at the same time; results keep the list order
   const outcomes = new Array(items.length);
   let next = 0;
@@ -304,9 +398,13 @@ async function downloadItems(run, result, items, build) {
       const item = items[i];
       try {
         if (item.skip) throw new TenderError(item.skip.code, item.skip.message);
-        const { files, converted, htmlKept, printError, attachmentErrors } = await resolveAndDownloadIrepsDocument({ category: result.category, ...build(item) }, run);
-        if (run.ledger && bucket) run.ledger.mark(bucket, ledgerKey(item));
-        outcomes[i] = { ok: true, files, converted, htmlKept, printError, attachmentErrors };
+        const action = { category: result.category, ...build(item) };
+        // a corrigendum an earlier run left without an attachment: only what is missing (not when asked to download it again)
+        if (action.keepPage && !logged?.asked?.has(itemId(item))) action.earlier = savedBefore(run, result.category, bucket, ledgerKey(item), item.id);
+        const got = await resolveAndDownloadIrepsDocument(action, run);
+        // the ledger marks a document once it is complete: a corrigendum whose attachment failed is fetched again (2.1)
+        if (run.ledger && bucket && !got.attachmentFailures.length) run.ledger.mark(bucket, ledgerKey(item));
+        outcomes[i] = { ok: true, item, ...got };
       } catch (e) {
         if (e.code === 'SESSION_EXPIRED' || e.code === 'EXCLUDED') { fatal = fatal || e; return; }
         outcomes[i] = { ok: false, item, error: e };
@@ -321,7 +419,7 @@ async function downloadItems(run, result, items, build) {
       result.downloaded++;
       result.files.push(...o.files);
       if (o.printError) result.warnings.push(`Chrome could not print these documents as Ctrl+P would: ${o.printError}`);
-      result.warnings.push(...(o.attachmentErrors || []));
+      if (o.attachmentFailures.length) attachmentsFailed(run, result, o, build);
       if (o.converted) {
         result.warnings.push(o.htmlKept
           ? 'Some documents were printable web pages. A text-only PDF rendering and the complete original .html were saved; the PDF does not keep the page layout.'
@@ -571,16 +669,30 @@ export const todayStr = (d = new Date()) => dmyOf(d);
  * messages sent on any of `dates` (dd/mm/yyyy) whose subject `parse()` accepts.
  * Stops once a whole page is older than the earliest wanted date. A page IREPS fails to give (HTTP error),
  * or one with no messages that is not the inbox, ends the scan as before, and the messages read so far are
- * still returned - with `incomplete` (on the array) saying why the rest was not read (H4).
+ * still returned - with `incomplete` (on the array) saying why the rest was not read (H4). So does a later page
+ * IREPS does not answer at all (2.5), and the page limit while IREPS shows more pages (10.1).
+ * My Messages carries a Struts token (corrigendum response.har), so the scan runs under the IREPS form lock, as
+ * scanMessages does (M2); its callers (the corrigendum step, the NIT and corrigendum jobs) hold no lock.
  */
-export async function scanInbox(run, dates, parse) {
+export function scanInbox(run, dates, parse) {
+  return withIrepsFormLock(() => scanInboxPages(run, dates, parse));
+}
+
+async function scanInboxPages(run, dates, parse) {
   const wanted = new Set(dates);
   const key = (d) => d.split('/').reverse().join('');
   const earliest = [...wanted].map(key).sort()[0];
   const out = [];
   let prevSig = '';
   for (let pageNo = 1; pageNo <= MAX_INBOX_PAGES; pageNo++) {
-    const res = await irepsFetch(run.base, INBOX_PATH, { method: 'POST', form: { listType: 'MyMsg', pageNo: String(pageNo) } });
+    let res;
+    try {
+      res = await irepsFetch(run.base, INBOX_PATH, { method: 'POST', form: { listType: 'MyMsg', pageNo: String(pageNo) } });
+    } catch (e) {
+      if (pageNo === 1 || !IREPS_DOWN_CODES.has(e.code)) throw e;
+      out.incomplete = listUnanswered(`My Messages page ${pageNo}`, e).message;
+      break;
+    }
     assertSession(res);
     if (res.status !== 200) { out.incomplete = listFailed(`My Messages page ${pageNo}`, res.status).message; break; }
     const doc = parseHtml(res.text());
@@ -597,6 +709,7 @@ export async function scanInbox(run, dates, parse) {
       if (hit) out.push({ date, subject, ...hit, messageOid: qparam(tr.innerHTML.match(/ViewMessageDetailAction\.do\?oid=\d+/)?.[0] || '', 'oid') });
     }
     if (rows.every((tr) => key(norm(tr.firstElementChild.textContent).slice(0, 10)) < earliest)) break;
+    if (pageNo === MAX_INBOX_PAGES && hasMorePages(doc, pageNo)) out.incomplete = listCut('My Messages', MAX_INBOX_PAGES).message;
   }
   if (out.incomplete) log('Inbox', `My Messages not read to the end: ${out.incomplete}`, 'warn');
   return out;
@@ -802,6 +915,9 @@ function closingWindows(from, to) {
  * the range (or without a readable date) is never returned. The list is newest closing date first, so
  * paging stops after OLD_PAGES_TO_STOP pages that closed before `from`, and a window whose first page
  * repeats the previous window's (IREPS ignoring the dates) ends the scan.
+ * After pages were read, a page IREPS fails to give (HTTP error) ends that window and one it does not answer at all
+ * ends the scan (2.5), and the page limit with more pages shown is said too (10.1): what was read is kept and
+ * `incomplete` says why the rest was not read. The first page failing fails the scan, as before.
  */
 export async function scanClosedTenders(run, { from, to, tenderNo = '' }) {
   const form = await loadInboxForm(run, CLOSED_STATUS, 'Tenders');
@@ -815,23 +931,37 @@ export async function scanClosedTenders(run, { from, to, tenderNo = '' }) {
   let undated = 0;
   let prevFirstSig = '';
   let datesIgnored = false;
+  let unanswered = false;
   let incomplete = '';
   for (const win of closingWindows(from, to)) {
-    if (datesIgnored) break;
+    if (datesIgnored || unanswered) break;
     let prevSig = '';
     let oldPages = 0;
     for (let pageNo = 1; pageNo <= MAX_LIST_PAGES; pageNo++) {
       const p = new URLSearchParams(form.defaults);
       Object.entries({ menuLink: 'Tenders', status: CLOSED_STATUS, listType: CLOSED_STATUS, tenderNo, startDate: fmtDate(win.from, sample), endDate: fmtDate(win.to, sample), pageNo: String(pageNo) })
         .forEach(([k, v]) => p.set(k, v));
-      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined });
+      const where = `Closed Tenders ${fmtDate(win.from)}..${fmtDate(win.to)} page ${pageNo}`;
+      let res;
+      try {
+        res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined });
+      } catch (e) {
+        if (!pages || !IREPS_DOWN_CODES.has(e.code)) throw e;
+        incomplete = incomplete || listUnanswered(where, e).message;
+        unanswered = true;
+        break;
+      }
       assertSession(res);
-      if (res.status !== 200) throw new TenderError('HTTP', `IREPS returned HTTP ${res.status} for the Closed Tenders list.`);
+      if (res.status !== 200) {
+        if (!pages) throw new TenderError('HTTP', `IREPS returned HTTP ${res.status} for the Closed Tenders list.`);
+        incomplete = incomplete || listFailed(where, res.status).message;
+        break;
+      }
       pages++;
       const doc = parseHtml(res.text());
       const found = parseClosedTenders(doc);
       // no rows is "none closed" only on IREPS's own Closed Tenders page (H4): otherwise the scan is incomplete
-      if (!found.length && !isVendorInboxPage(doc)) incomplete = incomplete || pageNotRecognised(`Closed Tenders ${fmtDate(win.from)}..${fmtDate(win.to)} page ${pageNo}`, doc).message;
+      if (!found.length && !isVendorInboxPage(doc)) incomplete = incomplete || pageNotRecognised(where, doc).message;
       const sig = found.map((r) => `${r.tenderNo}|${r.bidId}`).join(',');
       if (!found.length || sig === prevSig) break;
       if (pageNo === 1) {
@@ -857,7 +987,10 @@ export async function scanClosedTenders(run, { from, to, tenderNo = '' }) {
         log('Closed', `Pages ${pageNo - OLD_PAGES_TO_STOP + 1}-${pageNo} all closed before ${fmtDate(fromDay)}; stopping (the list is newest first)`);
         break;
       }
-      if (pageNo === MAX_LIST_PAGES) log('Closed', `Stopped at the ${MAX_LIST_PAGES}-page limit; older pages of Closed Tenders were not read`);
+      if (pageNo === MAX_LIST_PAGES) {
+        incomplete = incomplete || listCut(`Closed Tenders ${fmtDate(win.from)}..${fmtDate(win.to)}`, MAX_LIST_PAGES).message;
+        log('Closed', `Stopped at the ${MAX_LIST_PAGES}-page limit; older pages of Closed Tenders were not read`);
+      }
     }
   }
   log('Closed', `${rows.length} closed tender(s) closing ${fmtDate(fromDay)}..${fmtDate(toDay)} over ${pages} page(s), ${rows.filter((r) => r.links.financialTabulation || r.links.commercialTabulation).length} with a tabulation${outside ? `; ${outside} outside the dates skipped` : ''}${undated ? `; ${undated} without a readable closing date skipped` : ''}`);
@@ -865,7 +998,11 @@ export async function scanClosedTenders(run, { from, to, tenderNo = '' }) {
   return { rows, pages, incomplete };
 }
 
-/** This tender's Closed Tenders row (one scan per run, shared by both tabulation steps), or null. */
+/**
+ * This tender's Closed Tenders row (one scan per run, shared by both tabulation steps), or null. A row not found on
+ * a list that was not read to its end is an error with the reason, never "not available yet": it may be on the
+ * part not read.
+ */
 function closedTenderRow(run) {
   if (!run.closedRowP) {
     const day = 86400000;
@@ -873,9 +1010,11 @@ function closedTenderRow(run) {
     const now = new Date();
     // around the known closing date, else the page's own last 90 days
     const [from, to] = closing ? [new Date(closing.getTime() - day), new Date(closing.getTime() + day)] : [new Date(now.getTime() - (CLOSED_WINDOW_DAYS - 1) * day), now];
-    run.closedRowP = scanClosedTenders(run, { from, to, tenderNo: run.ctx.tenderNo }).then(({ rows }) => {
+    run.closedRowP = scanClosedTenders(run, { from, to, tenderNo: run.ctx.tenderNo }).then(({ rows, incomplete }) => {
       const want = norm(run.ctx.tenderNo).toLowerCase();
-      return rows.find((r) => norm(r.tenderNo).toLowerCase() === want) || null;
+      const row = rows.find((r) => norm(r.tenderNo).toLowerCase() === want) || null;
+      if (!row && incomplete) throw new TenderError('LIST', incomplete);
+      return row;
     });
   }
   return run.closedRowP;
@@ -939,11 +1078,13 @@ function closingDays(from, to) {
  *     IREPS session, not this day's list. The day stops there, and says so.
  * At the end the different tenders read are compared with IREPS's last count.
  * `problem`: why the day was not read to its end (a page DocLink does not recognise, an HTTP error, another search,
- * fewer tenders read than IREPS's count); the rows read before it are still returned.
+ * fewer tenders read than IREPS's count, a page IREPS did not answer at all); the rows read before it are still
+ * returned. `unanswered`: IREPS stopped answering (no answer in time, or not reached) after the first page (2.5);
+ * the day's first page not answered is thrown, as before.
  */
 async function readClosingDay(run, form, day, { tenderNo = '', label = '' } = {}) {
   const what = `Search Tender ${fmtDate(day)}`;
-  const out = { rows: [], pages: 0, read: 0, problem: '' };
+  const out = { rows: [], pages: 0, read: 0, problem: '', unanswered: false };
   const seen = new Set();
   let outside = 0;
   /** A page's rows: each tender once; this vendor's tenders that close that day are kept. */
@@ -963,7 +1104,13 @@ async function readClosingDay(run, form, day, { tenderNo = '', label = '' } = {}
   const readAgain = async (doc, pageNo, relativeTo) => {
     const url = resultPageLink(doc, pageNo);
     if (!url) return false;
-    const again = await irepsFetch(run.base, url, { relativeTo });
+    let again;
+    try {
+      again = await irepsFetch(run.base, url, { relativeTo });
+    } catch (e) {
+      if (!IREPS_DOWN_CODES.has(e.code)) throw e;
+      return false; // not answered: the day says the page could not be read again
+    }
     assertSession(again);
     out.pages++;
     if (again.status !== 200) return false;
@@ -981,13 +1128,24 @@ async function readClosingDay(run, form, day, { tenderNo = '', label = '' } = {}
     answer.catch(() => {}); // the answer of a page after the one the day stops at is not read: no error
     ahead.set(n, answer);
   };
+  /** The answer to result page `pageNo`, or null when IREPS did not answer it after a page was read: the day stops there. */
+  const answerOf = async (pageNo, request) => {
+    try {
+      return await request;
+    } catch (e) {
+      if (!out.pages || !IREPS_DOWN_CODES.has(e.code)) throw e;
+      out.problem = out.problem || listUnanswered(`${what} page ${pageNo}`, e).message;
+      out.unanswered = true;
+      return null;
+    }
+  };
   const started = Date.now();
   let total = null;
   let perPage = 0;
   let prevSig = '';
   try {
-    let res = await irepsFetch(run.base, form.action, { method: 'POST', form: closingDaySearchBody(form, day, { tenderNo }), relativeTo: form.pageUrl || undefined });
-    for (let pageNo = 1; ; pageNo++) {
+    let res = await answerOf(1, irepsFetch(run.base, form.action, { method: 'POST', form: closingDaySearchBody(form, day, { tenderNo }), relativeTo: form.pageUrl || undefined }));
+    for (let pageNo = 1; res; pageNo++) {
       assertSession(res);
       if (res.status !== 200) { out.problem = listFailed(`${what} page ${pageNo}`, res.status).message; break; }
       out.pages++;
@@ -1028,8 +1186,9 @@ async function readClosingDay(run, form, day, { tenderNo = '', label = '' } = {}
       // whose links IREPS has shown, up to SEARCH_PAGES_AT_ONCE under way
       askAhead(pageNo + 1, { url: next, relativeTo: res.url });
       for (let n = pageNo + 2; n <= pageNo + SEARCH_PAGES_AT_ONCE; n++) askAhead(n);
-      res = await ahead.get(pageNo + 1);
+      const asked = ahead.get(pageNo + 1);
       ahead.delete(pageNo + 1);
+      res = await answerOf(pageNo + 1, asked);
     }
   } finally {
     // a page asked for after the one the day stopped at is waited for, its answer unread: the IREPS form lock is
@@ -1051,7 +1210,9 @@ async function readClosingDay(run, form, day, { tenderNo = '', label = '' } = {}
  * IREPS keeps the search in the session and the page links depend on it, so each day's search and pages run
  * under the IREPS form lock, released between days for DocLink's other searches.
  * -> { rows (see parseSearchTenderRows, + pageUrl), pages, searched (rows read), incomplete }
- * `incomplete`: a day not read to its end (H4); what was read is still returned.
+ * `incomplete`: a day not read to its end (H4); what was read is still returned. When IREPS stops answering (no
+ * answer in time, not reached, or the form does not open) after pages were read, the scan stops there, keeps what
+ * it read and says which days were not searched (2.5); before anything was read, it fails as before.
  */
 export async function scanTenderSearch(run, { from, to, tenderNo = '' }) {
   const days = closingDays(from, to);
@@ -1060,18 +1221,31 @@ export async function scanTenderSearch(run, { from, to, tenderNo = '' }) {
   let form = null;
   let pages = 0;
   let searched = 0;
+  let stopped = '';
+  const notSearched = (first, why) => describeError('TENDER_LIST_FAILED', { detail: `Search Tender ${fmtDate(first)}..${fmtDate(days[days.length - 1])}: not searched, ${why}` }).message;
   for (const [i, day] of days.entries()) {
     const label = days.length > 1 ? ` (day ${i + 1} of ${days.length})` : '';
-    const got = await withIrepsFormLock(async () => {
-      if (!form || form.hasToken) form = await loadForm(run.base); // a form with a Struts token is single use
-      return readClosingDay(run, form, day, { tenderNo, label });
-    });
+    let got;
+    try {
+      got = await withIrepsFormLock(async () => {
+        if (!form || form.hasToken) form = await loadForm(run.base); // a form with a Struts token is single use
+        return readClosingDay(run, form, day, { tenderNo, label });
+      });
+    } catch (e) {
+      if (!pages || !(IREPS_DOWN_CODES.has(e.code) || e.code === 'SEARCH_FORM')) throw e;
+      stopped = notSearched(day, e.code === 'SEARCH_FORM' ? 'the Search Tender form did not open' : e.code === 'TIMEOUT' ? 'IREPS did not answer in time' : 'IREPS could not be reached');
+      break;
+    }
     pages += got.pages;
     searched += got.read;
     rows.push(...got.rows);
     if (got.problem) problems.push(got.problem);
+    if (got.unanswered && i < days.length - 1) {
+      stopped = notSearched(days[i + 1], 'as IREPS stopped answering');
+      break;
+    }
   }
-  const incomplete = problems.length ? `${problems[0]}${problems.length > 1 ? ` (${problems.length - 1} more day(s) not read to the end)` : ''}` : '';
+  const incomplete = [problems.length ? `${problems[0]}${problems.length > 1 ? ` (${problems.length - 1} more day(s) not read to the end)` : ''}` : '', stopped].filter(Boolean).join(' ');
   log('Search', `${rows.length} tender(s) of this vendor closing ${fmtDate(from)}..${fmtDate(to)} in ${searched} result row(s) over ${pages} page(s), ${rows.filter((r) => r.links.financialTabulation || r.links.commercialTabulation).length} with a tabulation`);
   if (incomplete) log('Search', `Search Tender not fully read: ${incomplete}`, 'warn');
   return { rows, pages, searched, incomplete };
@@ -1188,9 +1362,10 @@ async function scanInboxRows(run, status) {
   const visited = new Set();
   let prevFirstSig = '';
   let datesIgnored = false;
+  let unanswered = false;
 
   for (const win of inboxWindows(form.defaults)) {
-    if (datesIgnored) break;
+    if (datesIgnored || unanswered) break;
     entry.windows++;
     let prevSig = '';
     for (let pageNo = 1; pageNo <= MAX_INBOX_PAGES; pageNo++) {
@@ -1207,10 +1382,19 @@ async function scanInboxRows(run, status) {
       if (visited.has(pageKey)) break;
       visited.add(pageKey);
 
-      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined, wait: pageWait(run, status) });
+      const where = `the ${LETTER_KINDS[status].page} list ${win.startDate}..${win.endDate} page ${pageNo}`;
+      let res;
+      try {
+        res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, relativeTo: form.pageUrl || undefined, wait: pageWait(run, status) });
+      } catch (e) {
+        // after pages were read, a page IREPS does not answer at all ends the scan: the letters read are kept (2.5)
+        if (!entry.pages || !IREPS_DOWN_CODES.has(e.code)) throw e;
+        entry.incomplete ||= listUnanswered(where, e).message;
+        unanswered = true;
+        break;
+      }
       assertSession(res);
       // a page IREPS fails to give ends this range's pages as before, and is reported (H4): letters on it are missed
-      const where = `the ${LETTER_KINDS[status].page} list ${win.startDate}..${win.endDate} page ${pageNo}`;
       if (res.status !== 200) { entry.incomplete ||= listFailed(where, res.status).message; break; }
       entry.pages++;
       const doc = parseHtml(res.text());
@@ -1228,19 +1412,40 @@ async function scanInboxRows(run, status) {
       prevSig = sig;
       let hits = findTenderRows(doc, run.ctx.tenderNo);
       if (!hits.length) hits = findTenderRowsLoose(doc, run.ctx.tenderNo);
+      const unitCol = listColumn(doc, UNIT_HEADER_RE); // -1 on a page without that header: the row's railway is then ''
       for (const tr of hits) {
         const actions = elementActions(tr);
         const k = actions.map((a) => a.urls.join(',') + a.onclick).join('|');
         if (seenRows.has(k)) continue;
         seenRows.add(k);
-        for (const a of actions) for (const u of a.urls) noteIds(run, u, 'inbox');
-        entry.rows.push({ actions, html: tr.outerHTML, text: norm(tr.textContent) });
+        const railway = unitCol >= 0 ? railwayOf(rowCells(tr)[unitCol]?.textContent) : '';
+        entry.rows.push({ actions, html: tr.outerHTML, text: norm(tr.textContent), railway });
       }
       if (!hasMorePages(doc, pageNo)) break;
+      if (pageNo === MAX_INBOX_PAGES) entry.incomplete ||= listCut(`the ${LETTER_KINDS[status].page} list ${win.startDate}..${win.endDate}`, MAX_INBOX_PAGES).message;
     }
   }
+  // railways reuse tender numbers: only this tender's railway's letters (6.2), and the ids only from them
+  entry.rows = ownRailwayRows(run, entry.rows, `the ${LETTER_KINDS[status].page} list`);
+  for (const row of entry.rows) for (const a of row.actions) for (const u of a.urls) noteIds(run, u, 'inbox');
   log('Inbox', `${status}: ${entry.rows.length} matching row(s) over ${entry.windows} date window(s), ${entry.pages} page(s)${entry.incomplete ? `; not read to the end: ${entry.incomplete}` : ''}`);
   return entry;
+}
+
+/**
+ * Of a tender's rows in an IREPS list ({ railway: railwayOf its "Dept/Rly. Unit", '' when the list has no such
+ * column }), the ones of the tender's own railway (6.2): railways reuse tender numbers (10263703 is a N F RLY and an
+ * EAST CENTRAL RLY tender). Only when the rows name more than one railway and one of them is the run's
+ * (ctx.railwayUnit) are the others left out; with one railway, no unit column or no row of the run's railway, every
+ * row is kept as before (a row without a railway is always kept).
+ */
+function ownRailwayRows(run, rows, what) {
+  const want = railwayOf(run.ctx.railwayUnit);
+  const railways = new Set(rows.map((r) => r.railway).filter(Boolean));
+  if (!want || railways.size < 2 || !railways.has(want)) return rows;
+  const kept = rows.filter((r) => !r.railway || r.railway === want);
+  log('Tender', `${what}: tender ${run.ctx.tenderNo} is listed for ${railways.size} railways; only the ${want} row(s) are taken (${rows.length - kept.length} left out)`);
+  return kept;
 }
 
 /** Published-letter requests (method taken from how the page issues them). */
@@ -1267,6 +1472,8 @@ const LETTER_STAMP_RE = /(\d{2}\/\d{2}\/\d{4})\s+\d{1,2}:\d{2}\s*\((\d+)\)/;
 
 /** The header of the Post Tenders lists' first column: "DAHOD / WESTERN RLY" (department / railway). */
 const UNIT_HEADER_RE = /^Dept\/Rly\.?\s*Unit$/i;
+/** The same column in the Tender Related Correspondence list, headed "Dept/Rly" (captured list, pending-list.html). */
+const RLY_HEADER_RE = /^Dept\/Rly\.?(?:\s*Unit)?$/i;
 
 const rowCells = (tr) => [...tr.children].filter((c) => /^t[dh]$/i.test(c.tagName));
 
@@ -1294,7 +1501,9 @@ const stampDay = (s) => { const [d, m, y] = s.split('/').map(Number); return new
  *   -> { entries: [{ tenderNo, id, date, unit, rq, url }], scripts, unparsed, incomplete }
  *   unit: the row's "Dept/Rly. Unit" ("DAHOD / WESTERN RLY"), '' when the page has no such column
  *   unparsed: rows with a letter but no readable date / tender; incomplete: why the list was not read to its
- *   end (a page IREPS failed to give, or one with no rows that is not the list): the letters read are kept (H4)
+ *   end (a page IREPS failed to give, or one with no rows that is not the list): the letters read are kept (H4).
+ *   So is a later page IREPS does not answer at all, which ends the scan (2.5), and the page limit while IREPS
+ *   shows more pages (10.1); the first page not answered fails the scan, as before.
  */
 export async function scanPostTenderList(run, status, { windows = null, stopBefore = null } = {}) {
   const spec = LETTER_SPECS[status];
@@ -1313,7 +1522,10 @@ export async function scanPostTenderList(run, status, { windows = null, stopBefo
   let incomplete = ''; // why the list was not read to its end (an HTTP error, a page that is not the list)
   let scripts = form.scripts;
   let prevFirstSig = '';
+  let pagesRead = 0;
+  let unanswered = false;
   for (const win of wins) {
+    if (unanswered) break;
     let prevSig = '';
     let oldPages = 0;
     let stopped = false;
@@ -1321,16 +1533,26 @@ export async function scanPostTenderList(run, status, { windows = null, stopBefo
       const p = new URLSearchParams(form.defaults);
       Object.entries({ menuLink: 'PostTenders', status, tenderNo: '', startDate: win.startDate, endDate: win.endDate, pageNo: String(pageNo), listType: status }).forEach(([k, v]) => p.set(k, v));
       if (!p.get('raStatus')) p.set('raStatus', '-1');
-      const res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, wait: pageWait(run, status) });
+      const where = `the ${LETTER_KINDS[status].page} list page ${pageNo}`;
+      let res;
+      try {
+        res = await irepsFetch(run.base, form.action, { method: 'POST', form: p, wait: pageWait(run, status) });
+      } catch (e) {
+        if (!pagesRead || !IREPS_DOWN_CODES.has(e.code)) throw e;
+        incomplete ||= listUnanswered(where, e).message;
+        unanswered = true;
+        break;
+      }
       assertSession(res);
       // a page IREPS fails to give ends the list as before, and is reported (H4): letters on it are missed
-      if (res.status !== 200) { incomplete ||= listFailed(`the ${LETTER_KINDS[status].page} list page ${pageNo}`, res.status).message; break; }
+      if (res.status !== 200) { incomplete ||= listFailed(where, res.status).message; break; }
+      pagesRead++;
       const doc = parseHtml(res.text());
       scripts += '\n' + inlineScripts(doc);
       const leaf = [...doc.querySelectorAll('tr')].filter((tr) => !tr.querySelector('tr') && tr.querySelector('a,[onclick]'));
       log('Inbox', `${status} ${win.startDate}..${win.endDate} page ${pageNo}: ${leaf.length} row(s), title "${norm(doc.title)}"${leaf.length ? '' : `, text "${norm(doc.body?.textContent).slice(0, 100)}"`}`);
       // "no rows" is the list's own answer only on IREPS's list page itself
-      if (!leaf.length && !isVendorInboxPage(doc)) { incomplete ||= pageNotRecognised(`the ${LETTER_KINDS[status].page} list page ${pageNo}`, doc).message; break; }
+      if (!leaf.length && !isVendorInboxPage(doc)) { incomplete ||= pageNotRecognised(where, doc).message; break; }
       const sig = leaf.map((t) => norm(t.outerHTML)).join('\n');
       if (!leaf.length || sig === prevSig) break;
       if (pageNo === 1) {
@@ -1362,7 +1584,10 @@ export async function scanPostTenderList(run, status, { windows = null, stopBefo
         log('Inbox', `${status}: pages ${pageNo - OLD_PAGES_TO_STOP + 1}-${pageNo} are all older than ${from}; stopping (the list is newest first)`);
         break;
       }
-      if (pageNo === MAX_LIST_PAGES) log('Inbox', `${status}: stopped at the ${MAX_LIST_PAGES}-page limit; older pages of the list were not read`);
+      if (pageNo === MAX_LIST_PAGES) {
+        incomplete ||= listCut(`the ${LETTER_KINDS[status].page} list`, MAX_LIST_PAGES).message;
+        log('Inbox', `${status}: stopped at the ${MAX_LIST_PAGES}-page limit; older pages of the list were not read`);
+      }
     }
     if (stopped) break;
   }
@@ -1497,6 +1722,17 @@ function pageTenderNo(doc) {
   return '';
 }
 
+/** The value a page prints beside its label cell `re` ("Dept/Rly. Unit" on the correspondence page), or ''. */
+function pageField(doc, re) {
+  for (const c of doc.querySelectorAll('td')) {
+    if (c.children.length === 0 && re.test(norm(c.textContent))) {
+      const v = norm(c.nextElementSibling?.textContent);
+      if (v) return v;
+    }
+  }
+  return '';
+}
+
 /** The tender's "Closing Date" as the correspondence page prints it beside the Tender No, or ''. */
 export function pageClosingDate(doc) {
   for (const c of doc.querySelectorAll('td')) {
@@ -1525,7 +1761,10 @@ async function findNitOid(run) {
     const doc = parseHtml(res.text());
     let rows = findTenderRows(doc, run.ctx.tenderNo);
     if (!rows.length) rows = findTenderRowsLoose(doc, run.ctx.tenderNo);
-    for (const tr of rows) for (const a of elementActions(tr)) for (const u of a.urls) noteIds(run, u, 'correspondence_list');
+    // railways reuse tender numbers: when the list names several railways for it, the row of this tender's (6.2)
+    const unitCol = listColumn(doc, RLY_HEADER_RE);
+    const mine = ownRailwayRows(run, rows.map((tr) => ({ tr, railway: unitCol >= 0 ? railwayOf(rowCells(tr)[unitCol]?.textContent) : '' })), 'Tender Related Correspondence');
+    for (const { tr } of mine) for (const a of elementActions(tr)) for (const u of a.urls) noteIds(run, u, 'correspondence_list');
     if (!rows.length && !isCorrespondencePage(doc)) throw pageNotRecognised('Tender Related Correspondence', doc);
   } catch (e) {
     if (e.code === 'SESSION_EXPIRED') throw e;
@@ -1561,6 +1800,13 @@ async function correspondence(run) {
   if (onPage && norm(onPage).toLowerCase() !== norm(ctx.tenderNo).toLowerCase()) {
     log('Correspondence', 'nitOid belongs to a different tender; discarded');
     return failedCategory('CORRESPONDENCE', `The correspondence page is for tender ${onPage}, not ${ctx.tenderNo}; nothing was downloaded.`);
+  }
+  // railways reuse tender numbers (6.2): a page whose "Dept/Rly. Unit" names another railway is another tender's
+  const pageRailway = railwayOf(pageField(doc, /^Dept\/Rly\.?\s*Unit$/i));
+  const ownRailway = railwayOf(ctx.railwayUnit);
+  if (pageRailway && ownRailway && pageRailway !== ownRailway) {
+    log('Correspondence', 'nitOid belongs to the same tender number of another railway; discarded');
+    return failedCategory('CORRESPONDENCE', `The correspondence page is for tender ${onPage || ctx.tenderNo} of ${pageRailway}, not of ${ownRailway}; nothing was downloaded.`);
   }
   if (!onPage) log('Correspondence', 'Tender No not found on the correspondence page; cannot cross-check');
   // the ECM's tender date: runs that did not search the tender (letters by date) learn it here
@@ -1648,7 +1894,7 @@ export async function runSteps(run, keys, onProgress = () => {}) {
   await Promise.all(steps.map(async ([key, msg, fn]) => {
     try {
       if (aborted) {
-        categories[key] = failedCategory(TYPE[key], `Skipped: ${aborted.message}`);
+        categories[key] = failedCategory(TYPE[key], `Skipped: ${aborted.message}`, aborted.code);
         return;
       }
       onProgress(started++ === 0 ? msg : `${msg} (in parallel)`);
@@ -1659,7 +1905,9 @@ export async function runSteps(run, keys, onProgress = () => {}) {
       } catch (e) {
         if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = aborted || { code: e.code, message: e.message };
         else log(TYPE[key], `failed: ${e.message}`);
-        categories[key] = failedCategory(TYPE[key], e.message);
+        // the error's own code goes with it (a scheduled run names it); its text is the one any reserved document of
+        // the step was reported with (downloadItems), so the run lists that failure once
+        categories[key] = failedCategory(TYPE[key], e.message, e.code);
       }
     } finally {
       if (key === 'tenderPdf' && nitPdfDone) nitPdfDone(); // done, failed or skipped: never hold the attachments

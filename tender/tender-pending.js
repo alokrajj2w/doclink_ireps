@@ -154,7 +154,8 @@ export function parsePendingList(html) {
       const act = elementActions(row.cells[map.action]).flatMap((a) => a.reqs).find((r) => /vendorCorrespondencePendingReply\.do/i.test(r.url));
       const nitOid = act ? qparam(act.url, 'nitOid') : '';
       if (!nitOid || !/^[\w-]+$/.test(nitOid)) {
-        out.skipped.push({ ...base, reason: 'No pending-correspondence action with a nitOid was found on this row' });
+        // a pending row DocLink cannot open (1.6): reported for review, never "No correspondence found"
+        out.skipped.push({ ...base, reason: 'No pending-correspondence action with a nitOid was found on this row', unreadable: true });
         continue;
       }
       if (seenOids.has(nitOid)) continue;
@@ -495,11 +496,17 @@ export function pruneCorrespondenceState(state, now = Date.now(), limits = STATE
   return state;
 }
 
-function summarize(state, run) {
+/**
+ * The counts of this run (`run`: the keys and nitOids it touched). A record counts as failed / needing review on
+ * its own when none of its letters was handled in this run, also when an earlier run listed its letters (2.3).
+ * `unreadableRows`: Pending rows DocLink could not open (no nitOid), counted for review.
+ */
+function summarize(state, run, unreadableRows = 0) {
   const letters = Object.values(state.letters).filter((l) => run.has(l.key));
   const records = Object.values(state.records).filter((r) => run.has(r.nitOid));
   const count = (st) => letters.filter((l) => l.status === st).length;
   const unavailable = letters.filter((l) => l.status === STATUS.FAILED && l.unavailable).length;
+  const onItsOwn = (r, st) => r.status === st && !(r.letterKeys || []).some((k) => run.has(k));
   return {
     pendingRecords: records.length,
     lettersDiscovered: letters.length,
@@ -507,8 +514,8 @@ function summarize(state, run) {
     alreadyDownloaded: letters.filter((l) => l.status === STATUS.DOWNLOADED && l.alreadyDownloaded).length,
     attachmentsDownloaded: letters.reduce((n, l) => n + l.files.filter((f) => f.role === 'attachment' && f.status === 'DOWNLOADED' && !f.previous).length, 0),
     unavailable,
-    failed: count(STATUS.FAILED) - unavailable + records.filter((r) => r.status === STATUS.FAILED && !r.letterKeys.length).length,
-    needsReview: count(STATUS.NEEDS_REVIEW) + records.filter((r) => r.status === STATUS.NEEDS_REVIEW && !r.letterKeys.length).length,
+    failed: count(STATUS.FAILED) - unavailable + records.filter((r) => onItsOwn(r, STATUS.FAILED)).length,
+    needsReview: count(STATUS.NEEDS_REVIEW) + records.filter((r) => onItsOwn(r, STATUS.NEEDS_REVIEW)).length + unreadableRows,
     noPendingLetters: records.filter((r) => r.status === STATUS.NO_PENDING_LETTERS).length,
     sessionExpired: count(STATUS.SESSION_EXPIRED),
   };
@@ -537,6 +544,11 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   const folder = ecm ? `ECM (${account.operatingUnit || 'IREPS unit'}); a file the ECM does not take: Downloads/${jobSaver.root}/` : `Downloads/${jobSaver.root}/`;
   let aborted = null;
   let skipped = [];
+  // what this run could not do beyond single letters, for the scheduled run's report (tender-runner.js):
+  // records it could not read, and records / letters / list rows it could not match safely
+  const failedRecords = [];
+  const needsReview = [];
+  let unreadableRows = 0;
 
   const persist = async () => {
     ledger.setManifest(MANIFEST_KEY, state);
@@ -544,7 +556,8 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   };
   const emitLetter = (l) => onEvent({ type: 'letter', letter: publicLetter(l), key: l.key });
   const emitRecord = (r) => onEvent({ type: 'record', record: { ...r, letterKeys: undefined }, nitOid: r.nitOid });
-  const emitSummary = () => onEvent({ type: 'summary', summary: summarize(state, run) });
+  const emitSummary = () => onEvent({ type: 'summary', summary: summarize(state, run, unreadableRows) });
+  const outcome = (empty) => ({ account: publicAccount(account), empty, summary: summarize(state, run, unreadableRows), skipped, failedRecords, needsReview, aborted, folder, toEcm: !!ecm });
   const abortWith = (e) => {
     aborted = { code: e.code, message: e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.message };
   };
@@ -565,6 +578,11 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   if (!list.pendingSectionFound) {
     throw pageNotRecognised(`Tender Related Correspondence has no "Correspondence - Pending" table DocLink can read (sections: ${list.sections.join(', ') || 'none'})`, null);
   }
+  for (const s of list.skipped.filter((x) => x.unreadable)) {
+    unreadableRows++;
+    needsReview.push({ tenderNo: s.tenderNo, reason: s.reason });
+    log('Pending', `${s.tenderNo}: ${s.reason}; not downloaded`, 'warn');
+  }
 
   const tenderCount = new Map();
   for (const r of list.rows) tenderCount.set(lc(r.tenderNo), (tenderCount.get(lc(r.tenderNo)) || 0) + 1);
@@ -582,10 +600,11 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   onEvent({ type: 'records', records: records.map((r) => ({ ...r, letterKeys: undefined })), skipped, pendingSectionFound: list.pendingSectionFound });
 
   if (!records.length) {
-    onProgress('No correspondence found');
+    // "No correspondence found" only when the Pending table has no row DocLink could not read either (1.6)
+    onProgress(unreadableRows ? `${unreadableRows} pending row(s) could not be read; nothing was downloaded` : 'No correspondence found');
     await persist();
     emitSummary();
-    return { account: publicAccount(account), empty: true, summary: summarize(state, run), skipped, aborted, folder, toEcm: !!ecm };
+    return outcome(!unreadableRows);
   }
 
   // ---- Stage C..E per record (sequential: conservative towards IREPS)
@@ -596,8 +615,20 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
       continue;
     }
     if (mode === 'retry' && rec.prevStatus === STATUS.DOWNLOADED) {
-      rec.status = STATUS.DOWNLOADED; // finished last time: nothing to retry, nothing re-downloaded
-      rec.letterKeys.forEach((k) => run.add(k));
+      // finished last time: nothing to retry, nothing re-downloaded. Its letters are shown and counted as saved by an
+      // earlier run ("already saved"), never as this run's downloads, and the record shows as downloaded (7.13)
+      rec.status = STATUS.DOWNLOADED;
+      rec.savedEarlier = true;
+      for (const k of rec.letterKeys) {
+        const l = state.letters[k];
+        if (!l) continue;
+        run.add(k);
+        if (l.status === STATUS.DOWNLOADED) {
+          l.alreadyDownloaded = true;
+          l.files = (l.files || []).map((f) => ({ ...f, previous: true }));
+        }
+        emitLetter(l);
+      }
       emitRecord(rec);
       continue;
     }
@@ -617,6 +648,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
       if (page.tender.tenderNo && lc(page.tender.tenderNo) !== lc(rec.tenderNo)) {
         rec.status = STATUS.NEEDS_REVIEW;
         rec.error = `The details page is for tender ${page.tender.tenderNo}, not ${rec.tenderNo}; nothing was downloaded.`;
+        needsReview.push({ tenderNo: rec.tenderNo, reason: rec.error });
         emitRecord(rec);
         await persist();
         emitSummary();
@@ -631,6 +663,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
         rec.status = STATUS.FAILED;
         rec.code = 'PAGE';
         rec.error = pageNotRecognised(`the correspondence page of tender ${rec.tenderNo} has no "Pending Replies" table DocLink can read`, null).message;
+        failedRecords.push({ tenderNo: rec.tenderNo, code: rec.code, error: rec.error });
         log('Pending', `${rec.tenderNo}: no Pending Replies table recognised; nothing downloaded`, 'warn');
         emitRecord(rec);
         await persist();
@@ -661,6 +694,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
         if (l.nitOid !== rec.nitOid) {
           entry.status = STATUS.NEEDS_REVIEW;
           entry.error = 'The letter belongs to a different nitOid than the pending record; not downloaded.';
+          needsReview.push({ tenderNo: rec.tenderNo, letterNo: l.letterNo || l.letterId, reason: entry.error });
         }
         state.letters[key] = entry;
         run.add(key);
@@ -671,6 +705,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
       page.unparsedRows.forEach((u, i) => {
         const key = `${account.irepsAccountId}|${rec.nitOid}|unparsed${i}`;
         state.letters[key] = { key, accountId: account.irepsAccountId, tenderNo: rec.tenderNo, nitOid: rec.nitOid, corresId: u.corresId || '', letterId: u.letterId || '', letterNo: u.letterNo || u.text || '', letterDate: u.letterDate || '', subject: u.subject || '', replyDeadline: u.replyDeadline || '', status: STATUS.NEEDS_REVIEW, error: u.reason, code: 'UNPARSED', unavailable: false, files: [], attachmentsComplete: false, sourceAction: '', downloadedAt: '', seenAt: new Date().toISOString() };
+        needsReview.push({ tenderNo: rec.tenderNo, letterNo: u.letterNo || u.text || '?', reason: u.reason });
         run.add(key);
         rec.letterKeys.push(key);
         emitLetter(state.letters[key]);
@@ -716,6 +751,8 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
       } else {
         rec.status = STATUS.FAILED;
         rec.error = e.message;
+        rec.code = e.code || '';
+        failedRecords.push({ tenderNo: rec.tenderNo, code: rec.code, error: rec.error });
         log('Pending', `record ${rec.tenderNo} failed: ${e.message}`);
       }
       emitRecord(rec);
@@ -738,7 +775,7 @@ export async function downloadPendingCorrespondence({ mode = 'all', force = fals
   emitSummary();
   flushDownloadLog();
   onProgress(aborted ? 'Stopped: ' + aborted.message : 'Correspondence download complete.');
-  return { account: publicAccount(account), empty: false, summary: summarize(state, run), skipped, aborted, folder, toEcm: !!ecm };
+  return outcome(false);
 }
 
 /**
@@ -759,12 +796,29 @@ async function savedByAnotherRun(entry) {
   return true;
 }
 
+/**
+ * A scheduled run (tender-shared-run.js) reports a letter as saved only once the letter AND every attachment it
+ * links are in the ECM (2.2): its reservation is the whole letter's. While an attachment is missing the letter is
+ * reported failed, so the next check opens it again and fetches only what is missing. In a manual run each file
+ * is logged as it is saved, as before.
+ */
+async function reportLetter(entry, saved) {
+  const shared = sharedRun();
+  if (shared) await logPending(entry, 'letter', saved);
+}
+
 async function processLetter({ base, saver, ecm, state, rec, entry, letter, page, detailUrl, force, sleep, pace, onProgress }) {
-  const prevLetterFile = !force && entry.files.find((f) => f.role === 'letter' && f.status === 'DOWNLOADED');
+  const shared = sharedRun();
+  // a scheduled run only trusts a letter file that went to the ECM (its own ledger never holds a local one)
+  const prevLetterFile = !force && entry.files.find((f) => f.role === 'letter' && f.status === 'DOWNLOADED' && (!shared || f.ecm));
   if (!force && entry.attachmentsComplete && prevLetterFile) {
     entry.status = STATUS.DOWNLOADED;
     entry.alreadyDownloaded = true;
     entry.files = entry.files.map((f) => ({ ...f, previous: true }));
+    // a scheduled run got the letter's reservation, so no one has reported it saved: an earlier run of this browser
+    // saved it to the ECM and stopped before it said so (a closed runner tab). It is reported now, so the slot can
+    // end done instead of partial at every check (1.10)
+    await reportLetter(entry, { filename: prevLetterFile.fileName, ecm: prevLetterFile.ecm });
     return;
   }
   entry.status = STATUS.IN_PROGRESS;
@@ -778,6 +832,8 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
 
   let opened = await withRetry(() => openLetter(base, req, { tenderNo: rec.tenderNo, letterNo: letter.letterNo, letterDate: letter.letterDate, subject: letter.subject }), { sleep, label: `letter ${letter.letterId}` });
   const files = force ? [] : entry.files.filter((f) => f.status === 'DOWNLOADED').map((f) => ({ ...f, previous: true }));
+  // the letter file as the download log records it: saved now, or (attachments missing last time) by an earlier run
+  let letterSaved = prevLetterFile ? { filename: prevLetterFile.fileName, ecm: prevLetterFile.ecm } : null;
 
   // ---- the letter itself
   if (!prevLetterFile) {
@@ -802,7 +858,8 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
     const letterNo = letter.letterNo || letter.letterId;
     const stored = await storeFile({ saver, ecm, rec, letter }, name, opened.bytes, [letterNo, letter.subject].filter(Boolean).join(' - '), opened.contentType);
     const check = stored.saved ? await verifySaved(stored.saved, opened.bytes, 'letter') : {};
-    await logPending(entry, 'letter', { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm });
+    letterSaved = { filename: stored.saved ? stored.saved.relPath : name, ecm: stored.ecm };
+    if (!shared) await logPending(entry, 'letter', letterSaved);
     files.push({
       role: 'letter', ...storedEntry(name, opened.bytes, stored), status: 'DOWNLOADED', downloadedAt: new Date().toISOString(),
       validation: { ok: true, kind: opened.form === 'html' ? 'pdf (rendered from HTML)' : opened.form === 'printed' ? 'pdf (printed by Chrome)' : opened.form, source: opened.via, ...(printError ? { printError } : {}), extension: opened.ext, httpStatus: opened.httpStatus, contentType: opened.contentType, pdfSignature: opened.ext === '.pdf' ? isPdfBytes(opened.bytes) : null, ...check },
@@ -819,6 +876,7 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
 
   // ---- attachments the letter really exposes
   let attFailed = 0;
+  let attError = null;
   log('Pending', `letter ${letter.letterId}: ${opened.attachments.length} attachment link(s)`);
   for (const att of opened.attachments) {
     const done = files.find((f) => f.role === 'attachment' && f.attId === att.id && f.status === 'DOWNLOADED');
@@ -840,6 +898,7 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
     } catch (e) {
       if (e.code === 'SESSION_EXPIRED') throw e;
       attFailed++;
+      attError = attError || e;
       files.push({ role: 'attachment', attId: att.id, fileName: '', originalName: att.nameHint || att.label, status: 'FAILED', error: e.message, code: e.code || '' });
       log('Pending', `attachment ${att.id} failed: ${e.message}`);
     }
@@ -850,7 +909,11 @@ async function processLetter({ base, saver, ecm, state, rec, entry, letter, page
     entry.status = STATUS.FAILED;
     entry.error = `${attFailed} attachment(s) could not be downloaded (the letter itself was saved).`;
     entry.code = 'ATTACHMENT';
+    // a scheduled run: the letter is not done while an attachment is missing; it is named, and its reservation is
+    // released as failed, so the next check fetches the missing attachment (2.2)
+    shared?.documentFailed?.({ key: downloadKey.pending(entry.key, 'letter'), doc: `Tender ${rec.tenderNo} - letter ${letter.letterNo || letter.letterId} (attachment)`, code: attError.code || '', detail: `${entry.error} ${attError.message}` });
   } else {
     entry.status = STATUS.DOWNLOADED;
+    if (letterSaved) await reportLetter(entry, letterSaved);
   }
 }

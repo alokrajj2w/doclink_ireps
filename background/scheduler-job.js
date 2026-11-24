@@ -1,9 +1,9 @@
 /**
  * Scheduled downloads in the service worker: the chrome.* side of services/scheduler/.
  *
- *   - wakes the scheduler on its alarm, on an IREPS page load (the user is active there), on a
- *     panel nudge (Recon sign-in, a passing IREPS check), on browser start and when a manual job
- *     ends while a slot waited for it;
+ *   - wakes the scheduler on its alarm, on an IREPS page load (the user is active there; never a
+ *     load in a tab DocLink opened itself, such as a print tab), on a panel nudge (Recon sign-in, a
+ *     passing IREPS check), on browser start and when a manual job ends while a slot waited for it;
  *   - runs a claimed slot through the worker's own jobs (launchers passed in), with the shared
  *     hooks: reserved for the IREPS account, saved to S3 / ECM only, reported to the Recon Engine;
  *   - runs a claimed tender slot (Phase 2) in a background DocLink tab (services/scheduler/tender-runner.js,
@@ -32,7 +32,7 @@ import { SAVE_DESTINATION } from "../services/recon-service.js";
 import { EXPORT_FORMAT } from "../services/search-po/search-po-export.js";
 import { SEARCH_PO_CRITERIA } from "../services/search-po/search-po-api.js";
 import { MA_DATE_MODE, MA_ERROR } from "../services/ma/ma-service.js";
-import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
+import { MESSAGE_TYPES, SCHEDULED_RUN, describeError } from "../utils/messages.js";
 import { logger } from "../utils/logger.js";
 
 export const SCHEDULER_ALARM = "doclink.scheduler";
@@ -80,10 +80,49 @@ export function isIrepsActivityUrl(url, irepsBaseUrl) {
 }
 
 /**
+ * Whether a tab's finished page load is the user's activity on IREPS (isIrepsActivityUrl), and not
+ * DocLink's own work: a tab DocLink opened itself (a print tab, the tender runner tab) or a popup one
+ * of them opened (which is then noted as DocLink's too, for the tabs it opens in turn). Such a load
+ * never counts, so the scheduler neither claims nor sends anything to IREPS because of it.
+ * @param {string} url
+ * @param {{ id?: number, openerTabId?: number }|null} tab
+ * @param {{ irepsBaseUrl: string, signals: { isOwnTab: Function, recordOwnTab: Function } }} context
+ */
+export async function isUserIrepsActivity(url, tab, { irepsBaseUrl, signals }) {
+  if (!isIrepsActivityUrl(url, irepsBaseUrl)) return false;
+  if (tab && (await signals.isOwnTab(tab))) {
+    await signals.recordOwnTab(tab.id);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * A batch's final state as a document run's end (runners.js): its items, the lists it read short of
+ * IREPS's total (`warnings`), and what it could not read besides the documents (`problems`: the IC
+ * notifications whose search failed or found nothing, ic-notification-service.js).
+ * @param {object|null} state   the final batch state (services/po/po-date-service.js, inspection-certificate/*)
+ */
+export function batchRunEnd(state) {
+  if (state && state.phase === "error") {
+    const error = state.error || {};
+    return { ok: false, code: error.code || "UNKNOWN", detail: error.detail || error.message || null, items: state.items || [] };
+  }
+  return {
+    ok: true,
+    items: (state && state.items) || [],
+    sessionExpired: Boolean(state && state.sessionExpired),
+    warnings: (state && Array.isArray(state.warnings) && state.warnings) || [],
+    problems: (state && Array.isArray(state.problems) && state.problems) || []
+  };
+}
+
+/**
  * @param {object} deps
  * @param {(type: string, payload?: object) => void} deps.broadcast
  * @param {{ billStatus: Function, document: Function, maSearch: Function, maDownload: Function, batch: Function }} deps.launch
- *        the worker's launchers (each answers { started, error?, done })
+ *        the worker's launchers (each answers { started, error?, done }); every scheduled run is started as
+ *        SCHEDULED_RUN, so no panel shows it as its own run
  * @param {() => boolean} deps.isBusy                  a manual job or the bill upload runs here
  * @param {() => Promise<{ ok: true, account: { irepsAccountId: string, operatingUnit?: string|null } }|{ ok: false, code: string, detail?: string }>} deps.readIrepsAccount
  *        the verified IREPS account (the IREPS home page; services/ireps-account-service.js), or why not
@@ -102,37 +141,31 @@ export function createSchedulerJob(deps) {
   const reasonOf = (error) => (error && (error.detail || error.message)) || null;
 
   /** A batch launch whose `done` (the final batch state) becomes a document run's result. */
-  function asDocumentRun(launched) {
-    if (!launched.started) return launched;
-    const done = launched.done.then((state) =>
-      state && state.phase === "error"
-        ? { ok: false, code: (state.error && state.error.code) || "UNKNOWN", detail: reasonOf(state.error), items: state.items || [] }
-        : { ok: true, items: (state && state.items) || [], sessionExpired: Boolean(state && state.sessionExpired) }
-    );
-    return { ...launched, done };
-  }
+  const asDocumentRun = (launched) => (launched.started ? { ...launched, done: launched.done.then(batchRunEnd) } : launched);
 
   async function runMa(ctx, hooks) {
-    const search = await deps.launch.maSearch({ dateMode: MA_DATE_MODE.RANGE, dateFrom: ctx.params.dateFrom, dateTo: ctx.params.dateTo });
+    const search = await deps.launch.maSearch({ dateMode: MA_DATE_MODE.RANGE, dateFrom: ctx.params.dateFrom, dateTo: ctx.params.dateTo }, SCHEDULED_RUN);
     if (!search.started) return search;
     const found = await search.done;
     // no MA in the range is what IREPS said, not a failure: nothing to save today
     if (!found.ok && found.code === MA_ERROR.NOT_FOUND) return { started: true, done: Promise.resolve({ ok: true, items: [] }) };
     if (!found.ok) return { started: true, done: Promise.resolve({ ok: false, code: found.code, detail: reasonOf(found.error), items: [] }) };
-    const download = await deps.launch.maDownload("all", toS3OrEcm, null, hooks);
+    // a list short of IREPS's own total: what was read is downloaded, and the run is not done
+    const warnings = found.incomplete ? [`MA search: ${found.incomplete}; some MAs may be missing.`] : [];
+    const download = await deps.launch.maDownload("all", toS3OrEcm, SCHEDULED_RUN, hooks);
     if (!download.started) return download;
-    const done = download.done.then((r) => (r.ok ? { ok: true, items: r.summary.items || [], sessionExpired: Boolean(r.summary.sessionExpired) } : { ok: false, code: r.code, detail: reasonOf(r.error), items: [] }));
+    const done = download.done.then((r) => (r.ok ? { ok: true, items: r.summary.items || [], sessionExpired: Boolean(r.summary.sessionExpired), warnings } : { ok: false, code: r.code, detail: reasonOf(r.error), items: [] }));
     return { started: true, done };
   }
 
   /** A Bill Status / CRN / R-NOTE launch whose failure carries the job's reason. */
   const withReason = (launched) => (launched.started ? { ...launched, done: launched.done.then((r) => (r.ok ? r : { ...r, detail: reasonOf(r.error) })) } : launched);
-  const searchPoExport = (criteria, docType) => async (ctx, hooks) => withReason(await deps.launch.document(criteria, exportLaunchOptions(docType, ctx.params), null, hooks));
+  const searchPoExport = (criteria, docType) => async (ctx, hooks) => withReason(await deps.launch.document(criteria, exportLaunchOptions(docType, ctx.params), SCHEDULED_RUN, hooks));
   const batch = (kind, withDates) => async (ctx, hooks) =>
-    asDocumentRun(await deps.launch.batch({ kind, destination: toS3OrEcm, ...(withDates ? { dateFrom: ctx.params.dateFrom, dateTo: ctx.params.dateTo } : {}) }, hooks));
+    asDocumentRun(await deps.launch.batch({ kind, destination: toS3OrEcm, panelTabId: SCHEDULED_RUN, ...(withDates ? { dateFrom: ctx.params.dateFrom, dateTo: ctx.params.dateTo } : {}) }, hooks));
 
   const runners = {
-    billStatus: exportRunner(async (ctx, hooks) => withReason(await deps.launch.billStatus(exportLaunchOptions("billStatus", ctx.params), null, hooks))),
+    billStatus: exportRunner(async (ctx, hooks) => withReason(await deps.launch.billStatus(exportLaunchOptions("billStatus", ctx.params), SCHEDULED_RUN, hooks))),
     crn: exportRunner(searchPoExport(SEARCH_PO_CRITERIA.CRN, "crn")),
     rnote: exportRunner(searchPoExport(SEARCH_PO_CRITERIA.RNOTE, "rnote")),
     ma: documentRunner(runMa),
@@ -142,7 +175,12 @@ export function createSchedulerJob(deps) {
   };
   // Phase 2: tender documents run in a background DocLink tab
   const tenderRunner = createTenderRunner({
-    openTab: async (path) => (await chrome.tabs.create({ url: chrome.runtime.getURL(path), active: false })).id,
+    openTab: async (path) => {
+      const tab = await chrome.tabs.create({ url: chrome.runtime.getURL(path), active: false });
+      // DocLink's own tab: a page it (or a tab it opens) loads is never the user's IREPS activity
+      await signals.recordOwnTab(tab.id);
+      return tab.id;
+    },
     closeTab: (tabId) => chrome.tabs.remove(tabId),
     holdWorker
   });
@@ -270,16 +308,26 @@ export function createSchedulerJob(deps) {
     // the runner tab of a tender slot (only the tab this run opened is answered)
     [MESSAGE_TYPES.SCHEDULE_RUNNER_READY]: (message, sender) => tenderRunner.ready(message.claimId, senderTab(sender)),
     [MESSAGE_TYPES.SCHEDULE_RUNNER_PING]: (message, sender) => tenderRunner.ping(message.claimId, senderTab(sender)),
-    [MESSAGE_TYPES.SCHEDULE_RUNNER_DONE]: (message, sender) => tenderRunner.done(message.claimId, message.outcome, senderTab(sender))
+    [MESSAGE_TYPES.SCHEDULE_RUNNER_DONE]: (message, sender) => tenderRunner.done(message.claimId, message.outcome, senderTab(sender)),
+    // a print tab DocLink opened (tender/tender-print.js): answered once it is noted, before its page loads
+    [MESSAGE_TYPES.NOTE_OWN_TAB]: async (message) => {
+      await signals.recordOwnTab(message.tabId);
+      return { ok: true };
+    }
   };
 
   return {
     handlers,
     isSchedulerAlarm: (alarm) => Boolean(alarm && alarm.name === SCHEDULER_ALARM),
     onAlarm: () => scheduler.wake("alarm", { force: true }),
-    /** A tab finished loading `url`: IREPS activity is recorded, and a due slot may run. */
-    async onPageLoaded(url) {
-      if (!isIrepsActivityUrl(url, deps.irepsBaseUrl())) return;
+    /**
+     * A tab finished loading `url`: IREPS activity is recorded, and a due slot may run; never for a tab
+     * DocLink opened itself (isUserIrepsActivity).
+     * @param {string} url
+     * @param {{ id?: number, openerTabId?: number }} [tab]
+     */
+    async onPageLoaded(url, tab = null) {
+      if (!(await isUserIrepsActivity(url, tab, { irepsBaseUrl: deps.irepsBaseUrl(), signals }))) return;
       await signals.recordIrepsActivity();
       await scheduler.wake("ireps page", { quietable: true });
     },
@@ -289,8 +337,11 @@ export function createSchedulerJob(deps) {
       await scheduler.wake("ireps session check", { quietable: true });
     },
     onBrowserStart: () => scheduler.wake("browser start", { force: true }),
-    /** A tab closed: a tender runner tab closed before its run ended gives the slot back. */
-    onTabRemoved: (tabId) => tenderRunner.tabRemoved(tabId),
+    /** A tab closed: a tender runner tab closed before its run ended gives the slot back; an own tab is forgotten. */
+    onTabRemoved: (tabId) => {
+      tenderRunner.tabRemoved(tabId);
+      signals.forgetOwnTab(tabId);
+    },
     /** A manual job ended: a slot that waited for it may run now. */
     jobEnded() {
       if (scheduler.getState().waitingFor === "busy") scheduler.wake("job ended", { force: true });

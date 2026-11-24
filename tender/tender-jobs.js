@@ -22,6 +22,13 @@ const DAY = 86400000;
 const ddmmyyyy = (d) => fmtDate(d);
 /** Runs kept in a tender's download record (M21: the record must not grow without end). */
 const RUNS_KEPT = 10;
+/**
+ * Errors of one tender (outside its documents) that stop a letters / tabulations run: the session or the
+ * account is gone, IREPS's home page did not answer (the account check: IREPS is down, every other tender
+ * would wait for it too), or a scheduled run can no longer reserve its documents. The tenders not reached are
+ * reported as skipped, and the run says why it stopped.
+ */
+const stopsRun = (e) => ['SESSION_EXPIRED', 'ACCOUNT_CHANGED', 'IREPS_UNAVAILABLE'].includes(e.code) || IREPS_DOWN_CODES.has(e.code) || /^SCHEDULE_/.test(e.code || '');
 
 export async function beginJob({ onProgress, onAccount }) {
   const { base, account, folderLabel } = await startTenderJob({ onProgress, onAccount });
@@ -38,6 +45,9 @@ export function dayRange(from, to) {
 }
 const parseDmy = (s) => { const [d, m, y] = s.split('/').map(Number); return new Date(y, m - 1, d); };
 
+/** Tries of the closing-date search when IREPS does not answer it (a timeout, an HTTP error, a page DocLink does not recognise). */
+const CLOSING_DATE_TRIES = 2;
+
 /**
  * The tender's closing date (IREPS "Due Date/Time"), searched once per job; '' when IREPS does not
  * find the tender. Only for ECM uploads (their tender date): the Post Tenders letter lists do not
@@ -45,21 +55,33 @@ const parseDmy = (s) => { const [d, m, y] = s.split('/').map(Number); return new
  * never pays for this search.
  *   railway: the letter row's "Dept/Rly. Unit"; when two railways use the tender number, the search takes
  *            that railway's tender (tender-search.js preferredRows)
+ *   onUnanswered(why): the search got no answer, also when tried again: the date is '' for this letter, and
+ *            nothing is kept for the rest of the job (a later letter of the tender searches again)
+ * Only IREPS's own answer is kept for the job: the date, or "not found" (every search answered without the tender).
  */
-export async function closingDateFor(job, tenderNo, onProgress = () => {}, { railway = '' } = {}) {
+export async function closingDateFor(job, tenderNo, onProgress = () => {}, { railway = '', onUnanswered = () => {} } = {}) {
   job.closingDates = job.closingDates || new Map();
   const key = `${tenderNo}|${railwayOf(railway)}`;
-  if (!job.closingDates.has(key)) {
-    let date = '';
+  if (job.closingDates.has(key)) return job.closingDates.get(key);
+  let why = '';
+  for (let attempt = 1; attempt <= CLOSING_DATE_TRIES; attempt++) {
     try {
-      date = (await searchTender(job.base, tenderNo, { preferWindows: [[-90, 0], [0, 90]], onProgress, prefer: { railway } })).closingDate || '';
+      const date = (await searchTender(job.base, tenderNo, { preferWindows: [[-90, 0], [0, 90]], onProgress, prefer: { railway } })).closingDate || '';
+      job.closingDates.set(key, date);
+      return date;
     } catch (e) {
       if (e.code === 'SESSION_EXPIRED') throw e;
-      log('Letters', `Closing date of ${tenderNo} not found (${e.message}); the ECM tender date is left blank`);
+      if (e.code === 'NOT_FOUND') {
+        log('Letters', `Closing date of ${tenderNo} not found (${e.message}); the ECM tender date is left blank`);
+        job.closingDates.set(key, '');
+        return '';
+      }
+      why = e.message;
+      log('Letters', `Closing date of ${tenderNo}: the tender search got no answer (${e.message})${attempt < CLOSING_DATE_TRIES ? '; trying again' : ''}`, 'warn');
     }
-    job.closingDates.set(key, date);
   }
-  return job.closingDates.get(key);
+  onUnanswered(why);
+  return '';
 }
 
 /**
@@ -253,7 +275,7 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
     for (const tenderNo of tenders) {
       const rec = byTender.get(tenderNo) || { tenderNo, categories: {}, folder: '' };
       byTender.set(tenderNo, rec);
-      if (aborted) { rec.error = `Skipped: ${aborted.message}`; continue; }
+      if (aborted) { Object.assign(rec, { status: 'SKIPPED', code: aborted.code, error: `Skipped: ${aborted.message}` }); continue; }
       onProgress(`${LETTER_KINDS[status].tag} letters for ${tenderNo}...`);
       try {
         const run = startLetterRun(job, tenderNo);
@@ -261,8 +283,10 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
         await assertSameAccount(job.account, { base: job.base });
         run.ecm = await ecmSink();
         const items = todays.filter((e) => e.tenderNo === tenderNo).map(({ id, rq, url, date, unit }) => ({ id, rq, url, date, unit }));
-        // the list row's railway picks this tender when another railway uses the same tender number
-        if (run.ecm && ECM_TAKES_TENDER_DATE) run.ctx.closingDate = await closingDateFor(job, tenderNo, onProgress, { railway: items.find((x) => x.unit)?.unit || '' });
+        // the list row's railway picks this tender when another railway uses the same tender number; a search
+        // IREPS did not answer leaves the ECM tender date blank for this letter, and the result says so
+        const onUnanswered = (why) => { rec.tenderDateProblem = `The ECM tender date was left blank: IREPS's tender search did not answer (${why}).`; };
+        if (run.ecm && ECM_TAKES_TENDER_DATE) run.ctx.closingDate = await closingDateFor(job, tenderNo, onProgress, { railway: items.find((x) => x.unit)?.unit || '', onUnanswered });
         const r = await downloadLetterItems(run, status, items, scripts);
         rec.categories[LETTER_SPECS[status].key] = r;
         await recordManifest(job, run, { [LETTER_SPECS[status].key]: r }, { range: { from: dates[0], to: dates[dates.length - 1] } });
@@ -270,8 +294,10 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
         rec.nitOid = run.ids.nitOid || rec.nitOid || '';
         newLetters += r.downloaded;
       } catch (e) {
-        if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
-        rec.error = e.message;
+        // IREPS_UNAVAILABLE (the account check), like an expired session, stops the run: never a "done" run
+        // with every other tender failing on its own
+        if (stopsRun(e)) aborted = { code: e.code, message: e.message };
+        Object.assign(rec, { status: 'FAILED', code: e.code || '', error: e.message });
       }
       await job.ledger.save(); // after every tender (M21): a run cut short keeps what it did
     }
@@ -310,7 +336,7 @@ export async function downloadTabulationsByDate({ from, to, pdfTypes = Object.ke
     tenders.push(rec);
     const wanted = pdfTypes.filter((t) => row.links[t]);
     if (!wanted.length) { rec.notAvailable = true; continue; }
-    if (aborted) { rec.error = `Skipped: ${aborted.message}`; continue; }
+    if (aborted) { Object.assign(rec, { status: 'SKIPPED', code: aborted.code, error: `Skipped: ${aborted.message}` }); continue; }
     onProgress(`Tabulation for ${row.tenderNo}...`);
     try {
       const run = startLetterRun(job, row.tenderNo);
@@ -326,8 +352,9 @@ export async function downloadTabulationsByDate({ from, to, pdfTypes = Object.ke
       await recordManifest(job, run, rec.categories, { range });
       rec.folder = `Downloads/${run.saver.root}/`;
     } catch (e) {
-      if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT_CHANGED') aborted = { code: e.code, message: e.message };
-      rec.error = e.message;
+      // the tender is failed and named (the scheduled run is partial); IREPS not answering stops the run
+      if (stopsRun(e)) aborted = { code: e.code, message: e.message };
+      Object.assign(rec, { status: 'FAILED', code: e.code || '', error: e.message });
     }
     await job.ledger.save(); // after every tender (M21): a run cut short keeps what it did
   }

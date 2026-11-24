@@ -18,7 +18,7 @@
  */
 
 import { IrepsError } from "../ireps-api.js";
-import { BILL_ERROR, postBill, orderedBody, parseDocumentList } from "./bill-upload-api.js";
+import { BILL_ERROR, postBill, orderedBody, parseDocumentList, writeAnswer } from "./bill-upload-api.js";
 
 export const UPLOAD_DOCUMENT_ENDPOINT = "/epsn/ct/uploadBillDocuments.do";
 
@@ -96,14 +96,19 @@ export function parseSignerReply(text) {
   };
 }
 
-/** save.php: "<html><body onload='...afterUpload()'>OK~<path>~<bytes></body></html>". */
+/**
+ * save.php: "<html><body onload='...afterUpload()'>OK~<path>~<bytes></body></html>". IREPS keeps "~" in a
+ * file name (irepsFileName), so the path is everything between the first "~" and the last one, never cut at
+ * a "~" inside it (review 3.11). Like the bill page ("Document not saved!"), only an OK with a byte count
+ * above 0 is a stored file.
+ */
 export function parseSaveResult(text) {
   const body = String(text || "").replace(/<[^>]*>/g, "").trim();
-  const parts = body.split("~");
-  if (parts[0] !== "OK" || !parts[1]) {
+  const m = /^OK~(.+)~(\d+)$/.exec(body);
+  if (!m || !m[1].trim() || !(Number(m[2]) > 0)) {
     throw new IrepsError(BILL_ERROR.IREPS_REJECTED, "save.php refused the file", { detail: `IREPS did not store the file: ${body.slice(0, 200) || "empty answer"}` });
   }
-  return { path: parts[1].trim(), bytes: Number(parts[2]) || null };
+  return { path: m[1].trim(), bytes: Number(m[2]) };
 }
 
 /** IREPS keeps [0-9A-Za-z._~-] of the file name (billFunctions.js uploadResult). */
@@ -162,7 +167,15 @@ export async function uploadBillDocument({ bill, file, fileDesc }, deps) {
   // 2. store the signed PDF
   const fileName = irepsFileName(file.name);
   const relativeDir = billDocumentsDir(bill, deps.today);
+  // what the bill page registers: the folder it stored into and the file name (billFunctions.js uploadResult)
+  const filePath = `${relativeDir}/${fileName}`;
   const saved = parseSaveResult(await deps.saveFile({ relativeDir, pdfName: fileName, pdfContent: signed.signedBase64 }));
+  // a link to another file than the one stored would be useless on a payment document: register only the stored one
+  if (saved.path !== filePath) {
+    throw new IrepsError(BILL_ERROR.RESPONSE_INVALID, "save.php stored the file under another path", {
+      detail: `IREPS stored the file as ${saved.path}, not as ${filePath}, the path the bill page registers; DocLink did not add it to bill ${bill.billRegNo}. Rename the PDF to letters, digits, "-", "_" and "." only and upload it again`
+    });
+  }
 
   // 3. register it on the bill
   const values = {
@@ -170,14 +183,16 @@ export async function uploadBillDocument({ bill, file, fileDesc }, deps) {
     dispatchNo: bill.dispatchNo,
     vendorCode: bill.vendorCode,
     fileName,
-    filePath: saved.path,
+    filePath,
     fileDesc: desc,
     spmBillRegNo: bill.spmBillRegNo || "null",
     supplementaryBillType: ""
   };
-  const { text } = await postBill(UPLOAD_DOCUMENT_ENDPOINT, orderedBody(UPLOAD_DOCUMENT_FIELDS, values), { fetch: deps.fetch });
+  // the registration is the write: an answer that is a page, or none at all, leaves it open (the
+  // caller, bill-upload-service.js addDocumentToBill, records that); a plain refusal does not
+  const text = writeAnswer("uploadBillDocuments", (await postBill(UPLOAD_DOCUMENT_ENDPOINT, orderedBody(UPLOAD_DOCUMENT_FIELDS, values), { fetch: deps.fetch })).text);
   if (!text.startsWith("OK#")) {
     throw new IrepsError(BILL_ERROR.IREPS_REJECTED, "uploadBillDocuments refused", { detail: `IREPS stored the file but did not add it to bill ${bill.billRegNo}: ${text.replace(/<[^>]+>/g, " ").trim().slice(0, 200) || "empty answer"}` });
   }
-  return { fileName, filePath: saved.path, bytes: saved.bytes, documents: parseDocumentList(text) };
+  return { fileName, filePath, bytes: saved.bytes, documents: parseDocumentList(text) };
 }

@@ -56,8 +56,13 @@ export const RECON_ERROR = Object.freeze({
   AUTH_REQUIRED: "RECON_AUTH_REQUIRED",
   UNAVAILABLE: "RECON_UNAVAILABLE",
   REJECTED: "RECON_REJECTED",
-  NOT_INGESTED: "RECON_NOT_INGESTED"
+  NOT_INGESTED: "RECON_NOT_INGESTED",
+  /** A 2xx whose answer could not be read: no refusal, the file may be stored (8.5). */
+  ANSWER_UNREADABLE: "RECON_ANSWER_UNREADABLE"
 });
+
+/** A passing fault of the Recon Engine or of the proxy in front of it: 408, 429, 5xx (as ecm-service.js isTransientStatus). */
+const isTransientStatus = (status) => status === 408 || status === 429 || status >= 500;
 
 export class ReconError extends Error {
   /**
@@ -221,13 +226,21 @@ export async function uploadToRecon(file, deps = {}) {
   const endpoint = `${baseUrl}/api/documents`;
   logger.info(`Uploading ${file.filename} to the Recon Engine`, { docType: file.docType, bytes: file.bytes.length, customer: RECON_CONFIG.customerId });
 
+  const fetchImpl = deps.fetch || ((...args) => globalThis.fetch(...args));
+  // the answer's status as soon as it arrives: an answer lost after a 2xx is no "could not reach"
+  let head = null;
+  const fetchHead = async (...args) => (head = await fetchImpl(...args));
   let response;
   let body;
   try {
     // one deadline for the upload's answer, headers and body
-    ({ response, body } = await fetchWithDeadline(endpoint, { method: "POST", body: form, credentials: "include" }, { timeoutMs: RECON_CONFIG.timeoutMs, fetch: deps.fetch }));
+    ({ response, body } = await fetchWithDeadline(endpoint, { method: "POST", body: form, credentials: "include" }, { timeoutMs: RECON_CONFIG.timeoutMs, fetch: fetchHead }));
   } catch (error) {
     const timedOut = error instanceof DeadlineError;
+    if (head && head.ok) {
+      logger.warn(`Recon Engine took the upload (HTTP ${head.status}) but its answer could not be read`, error);
+      throw new ReconError(RECON_ERROR.ANSWER_UNREADABLE, { status: head.status, detail: `HTTP ${head.status}${timedOut ? `, ${error.message}` : ""}` });
+    }
     logger.warn("Recon Engine unreachable", error);
     throw new ReconError(RECON_ERROR.UNAVAILABLE, { detail: timedOut ? error.message : `could not reach ${new URL(baseUrl).origin}` });
   }
@@ -237,8 +250,10 @@ export async function uploadToRecon(file, deps = {}) {
     // The file is stored before it is parsed, so it is in S3 but not loaded.
     throw new ReconError(RECON_ERROR.NOT_INGESTED, { status: 422, detail: apiErrorDetail(body) || "the Recon Engine could not read the file" });
   }
-  // a 5xx is the Recon Engine (or the proxy in front of it) failing, not a refusal of the file: "try again" (L9)
-  if (response.status >= 500) throw new ReconError(RECON_ERROR.UNAVAILABLE, { status: response.status, detail: apiErrorDetail(body) || `HTTP ${response.status}` });
+  // 408, 429 and 5xx are the Recon Engine (or the proxy in front of it) failing for now, not a refusal of the file: "try again" (L9, 8.5)
+  if (isTransientStatus(response.status)) throw new ReconError(RECON_ERROR.UNAVAILABLE, { status: response.status, detail: apiErrorDetail(body) || `HTTP ${response.status}` });
+  // a 2xx is no refusal: what the Recon Engine stored is not known, never "nothing was saved" (8.5)
+  if (response.ok && !body) throw new ReconError(RECON_ERROR.ANSWER_UNREADABLE, { status: response.status, detail: `HTTP ${response.status}` });
   if (!response.ok || !body) {
     throw new ReconError(RECON_ERROR.REJECTED, { status: response.status, detail: apiErrorDetail(body) || `HTTP ${response.status}` });
   }

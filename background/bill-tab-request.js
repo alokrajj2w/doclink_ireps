@@ -2,8 +2,10 @@
  * Content script (isolated world) injected into the user's IREPS tab by the bill upload
  * (services/bill-upload/tab-transport.js) with chrome.scripting.executeScript({ files }).
  * It sends one bill request from the page's own origin when the service worker asks with
- * chrome.tabs.sendMessage({ type: "DOCLINK_TAB_FETCH", url, method, headers, body }) and
+ * chrome.tabs.sendMessage({ type: "DOCLINK_TAB_FETCH", id, url, method, headers, body }) and
  * answers { ok, status, statusText, url, redirected, contentType, text } or { ok: false, error }.
+ * DOCLINK_TAB_ABORT { id } cancels a request the service worker stopped waiting for (IREPS's
+ * deadline passed); it answers nothing.
  *
  * A plain script, copied verbatim into the build (scripts/build.mjs STATIC_FILES): it is
  * injected as a file, never serialised from the obfuscated service worker. Only same-origin
@@ -11,12 +13,17 @@
  */
 (() => {
   // versioned: a copy injected by an older DocLink must not keep this one from registering
-  const VERSION = "2";
+  const VERSION = "3";
   if (globalThis.__doclinkBillTabRequest === VERSION) return;
   globalThis.__doclinkBillTabRequest = VERSION;
 
+  /** Requests under way, by the id the service worker gave them (DOCLINK_TAB_ABORT cancels one). */
+  const running = new Map();
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || message.type !== "DOCLINK_TAB_FETCH") return false;
+    const controller = new AbortController();
+    if (message.id) running.set(message.id, controller);
     (async () => {
       try {
         const url = new URL(message.url, location.href);
@@ -27,7 +34,8 @@
           body: message.body === null || message.body === undefined ? undefined : message.body,
           credentials: "include",
           cache: "no-store",
-          redirect: "follow"
+          redirect: "follow",
+          signal: controller.signal
         });
         sendResponse({
           ok: true,
@@ -40,9 +48,19 @@
         });
       } catch (error) {
         sendResponse({ ok: false, error: String((error && error.message) || error) });
+      } finally {
+        if (message.id) running.delete(message.id);
       }
     })();
     return true; // answered asynchronously
+  });
+
+  // the service worker no longer waits for this request (IREPS's deadline passed): stop it here too
+  chrome.runtime.onMessage.addListener((message) => {
+    if (!message || message.type !== "DOCLINK_TAB_ABORT") return false;
+    const controller = running.get(message.id);
+    if (controller) controller.abort();
+    return false;
   });
 
   /*

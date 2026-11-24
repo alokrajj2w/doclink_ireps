@@ -18,13 +18,17 @@
  * "no records" notice). A page whose result table is not recognised, or that reports
  * records none of which could be read, is an error (IREPS_IC_PARSE_FAILED): after an
  * IREPS layout change DocLink must not report "0 ICs" and quietly skip the documents.
+ *
+ * Every search that reads all its result pages compares the inspection calls read (before any
+ * filter of DocLink's own: PO number, IC dates, status) with IREPS's "Total Records". A shortfall
+ * (a row DocLink could not read) comes back as `incomplete`, which every IC flow reports.
  */
 
 import { IrepsError } from "../ireps-api.js";
 import { withIrepsFormLock } from "../ireps-form-lock.js";
 import { isIrepsLoginPage, isNoRecordsPage } from "../session-service.js";
 import { logger } from "../../utils/logger.js";
-import { loadIcListPage, submitIcSearch, buildIcPageRequest, extractIcPageCount, extractIcTotalRecords, IC_ERROR } from "./ic-api.js";
+import { loadIcListPage, submitIcSearch, buildIcPageRequest, extractIcPageCount, extractIcTotalRecords, extractIcReportedTotal, IC_ERROR } from "./ic-api.js";
 import { extractIcForm, hasIcForm } from "./ic-form.js";
 
 /** Validate a vendorInspectionCallList.do response and decide whether the user is authenticated. */
@@ -96,7 +100,9 @@ async function parsePage(parseHtml, results, parseOptions) {
  * @param {(stage: string) => void} [options.onStage]       "CONNECTED" after the session check, "SEARCHING", "PARSING"
  * @param {{ fetch?: typeof fetch, retry?: Function, noTokenRetry?: boolean }} [deps]
  *        retry wraps each request (transient network failures, services/batch-utils.js withRetry)
- * @returns {Promise<{ pages: number }>}
+ * @returns {Promise<{ pages: number, reported: number|null, read: number, incomplete: string|null }>}
+ *          reported: IREPS's "Total Records"; read: the calls read on every page; incomplete: the
+ *          shortfall in words when every page was read and fewer calls than IREPS reported came back
  */
 export function runIcSearch(search, deps = {}) {
   // every result page carries the token of the page before it: no other IREPS search in between (M2)
@@ -120,14 +126,25 @@ async function runIcSearchLocked({ buildRequest, parseHtml, parseOptions = {}, o
   }
 
   let pageNo = 1;
+  // IREPS's own count (page 1) and the calls read on every page, before any filter of DocLink's own (4.3)
+  let reported = null;
+  let read = 0;
+  let readEveryPage = false;
   for (;;) {
     assertIcPage(verdict, "IREPS response not recognised");
-    if (pageNo === 1) onStage("PARSING");
+    if (pageNo === 1) {
+      onStage("PARSING");
+      reported = extractIcReportedTotal(results.html);
+    }
     const parsed = await parsePage(parseHtml, results, parseOptions);
+    read += parsed.records.length + (Number(parsed.filteredCount) || 0);
     // Re-read the page count each time: the portal only prints ~10 page links at once.
     const pageCount = extractIcPageCount(results.html);
     if ((await onPage(parsed, { pageNo, pageCount })) === false) break;
-    if (pageNo >= pageCount) break;
+    if (pageNo >= pageCount) {
+      readEveryPage = true;
+      break;
+    }
     if (pageNo >= maxPages) {
       if (typeof onPageLimit === "function") onPageLimit();
       break;
@@ -136,5 +153,8 @@ async function runIcSearchLocked({ buildRequest, parseHtml, parseOptions = {}, o
     request = buildIcPageRequest(request, extractIcForm(results.html).token, pageNo);
     ({ results, verdict } = await submitChecked(request, requestDeps, retry));
   }
-  return { pages: pageNo };
+  // a search stopped early on purpose (a page limit, a caller that read enough) is not compared
+  const incomplete = readEveryPage && Number.isFinite(reported) && read < reported ? `IREPS reported ${reported} inspection call${reported === 1 ? "" : "s"} but ${read} ${read === 1 ? "was" : "were"} read` : null;
+  if (incomplete) logger.warn(`IC search: ${incomplete}`, { pages: pageNo });
+  return { pages: pageNo, reported, read, incomplete };
 }

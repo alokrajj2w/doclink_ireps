@@ -55,6 +55,8 @@ export const IC_ERROR = Object.freeze({
   RESULTS_INVALID: "IREPS_IC_RESULTS_INVALID",
   PARSE_FAILED: "IREPS_IC_PARSE_FAILED",
   LINK_NOT_FOUND: "IREPS_IC_LINK_NOT_FOUND",
+  // an IC-issued notification whose PO + serial has no IC-issued call in the list
+  NOT_LISTED: "IREPS_IC_NOT_LISTED",
   DOWNLOAD_FAILED: "IREPS_IC_DOWNLOAD_FAILED",
   INVALID_PDF: "IREPS_IC_INVALID_PDF"
 });
@@ -214,6 +216,18 @@ export function extractIcTotalRecords(html) {
   if (value) return Number(value[1]);
   const text = /Total\s+Records\s*:\s*(\d+)/i.exec(source.replace(/<[^>]+>/g, " "));
   return text ? Number(text[1]) : null;
+}
+
+/**
+ * IREPS's own count of a search's inspection calls as it shows it to the user ("Total Records: N"), else
+ * the page's hidden totalRecords field; null when the page carries neither. The calls DocLink read are
+ * compared with it (ic-search.js), so a row it could not read never vanishes without a word.
+ * @param {string} html
+ * @returns {number|null}
+ */
+export function extractIcReportedTotal(html) {
+  const text = /Total\s+Records\s*:\s*(\d+)/i.exec(String(html || "").replace(/<[^>]+>/g, " "));
+  return text ? Number(text[1]) : extractIcTotalRecords(html);
 }
 
 /**

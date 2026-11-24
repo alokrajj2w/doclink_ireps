@@ -22,6 +22,8 @@ let el = null;
 let ctx = null;
 let shown = 0;
 let loading = false;
+/** Counts the first-page loads (each filter change, Refresh, opening the view): a page read for older filters is never shown (7.9). */
+let generation = 0;
 
 const siteName = (site) => (site ? `${site.charAt(0).toUpperCase()}${site.slice(1)}` : "");
 
@@ -110,12 +112,19 @@ function errorFor(error) {
   if (code === "RECON_AUTH_REQUIRED") return describeError("RECON_AUTH_REQUIRED");
   if (code === "RECON_NOT_CONFIGURED") return describeError("RECON_NOT_CONFIGURED", { detail: error.detail });
   if (code === "FORBIDDEN") return { title: "Admins only", message: "Only an admin may see other users' downloads." };
-  return { title: "Download log unavailable", message: `DocLink could not read the download log from the Recon Engine${error && error.detail ? ` (${error.detail})` : ""}. Try again.` };
+  return describeError("DOWNLOAD_LOG_LIST_UNAVAILABLE", { detail: (error && error.detail) || (error && error.status ? `HTTP ${error.status}` : "no answer") });
 }
 
-/** Load the first page (reset) or the next one. */
+/**
+ * Load the first page (reset) or the next one. A first-page load always runs, also while a page is being
+ * read: the filters may have changed meanwhile, and the page read for the older filters is then dropped
+ * (7.9). "Load more" waits for the page being read (its button is disabled meanwhile).
+ */
 async function load({ reset = true } = {}) {
-  if (loading) return;
+  if (!reset && loading) return;
+  if (reset) generation++;
+  const mine = generation;
+  const current = () => mine === generation;
   loading = true;
   el.error.hidden = true;
   el.btnRefresh.disabled = true;
@@ -129,6 +138,7 @@ async function load({ reset = true } = {}) {
   }
   try {
     const page = await listDownloads({ ...f, limit: PAGE, offset: shown });
+    if (!current()) return;
     el.list.append(...page.downloads.map((d) => row(d, f.all)));
     shown += page.downloads.length;
     el.tableWrap.hidden = shown === 0;
@@ -137,18 +147,24 @@ async function load({ reset = true } = {}) {
       ? `${shown} download${shown === 1 ? "" : "s"}${page.downloads.length < PAGE ? "" : " so far"}${f.all ? " by all users" : ""}, newest first.`
       : `No downloads${f.all ? "" : " by you"} in this range.`;
   } catch (error) {
+    if (!current()) return;
     logger.warn("Could not read the download log", { code: error && error.code, status: error && error.status });
     el.summary.textContent = "";
     el.btnMore.hidden = true;
     showError(errorFor(error));
   } finally {
-    loading = false;
-    el.btnRefresh.disabled = false;
-    el.btnMore.disabled = false;
+    if (current()) {
+      loading = false;
+      el.btnRefresh.disabled = false;
+      el.btnMore.disabled = false;
+    }
   }
 }
 
-/** Open the view: the Recon sign-in first (the log is per user), then the first page. */
+/**
+ * Open the view: the Recon sign-in first (the log is per user), then the first page. A Recon Engine that
+ * cannot be reached is said as such, never as a missing sign-in (4.11).
+ */
 async function open() {
   ctx.showView("downloads");
   const signedIn = await ctx.ensureSignedIn();
@@ -158,7 +174,7 @@ async function open() {
   if (!signedIn) {
     el.list.replaceChildren();
     el.summary.textContent = "";
-    showError(describeError("RECON_AUTH_REQUIRED"));
+    showError(ctx.reconUnreachable && ctx.reconUnreachable() ? describeError("DOWNLOAD_LOG_LIST_UNAVAILABLE", { detail: "it did not answer" }) : describeError("RECON_AUTH_REQUIRED"));
     return;
   }
   await load();
@@ -166,7 +182,8 @@ async function open() {
 
 /**
  * @param {{ showView: (name: string) => void, ensureSignedIn: () => Promise<boolean>,
- *           currentUser: () => object|null, openSignIn: () => Promise<void> }} context
+ *           currentUser: () => object|null, openSignIn: () => Promise<void>, reconUnreachable?: () => boolean }} context
+ *        reconUnreachable: whether the last Recon check could not reach it at all (popup-recon-auth.js)
  */
 export function initDownloads(context) {
   ctx = context;

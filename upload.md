@@ -209,7 +209,7 @@ its sample rows):
 | ECM column | Example | Used for |
 |---|---|---|
 | `invoiceNumber` | `1331000660`, `1061000617` | Tax invoice no. (header), challan match (step 4), ECM document fetch |
-| `salesInvoiceDate` | `2026-08-18 00:00:00.000` | Tax invoice date. Convert to `dd/mm/yyyy`. The live `RetrieveInvoiceData` answer (18 Nov 2026) sends epoch ms as a string, e.g. `"1793314800000"` (2026-10-29T23:00Z): DocLink reads its day in IST (30/10/2026). |
+| `salesInvoiceDate` | `2026-08-18 00:00:00.000` | Tax invoice date. Convert to `dd/mm/yyyy`. The live `RetrieveInvoiceData` answer (18 Nov 2026) sends epoch ms as a string, e.g. `"1793314800000"` (2026-10-29T23:00Z): DocLink reads its day in IST (30/10/2026). An ISO time with a zone is read as its IST day; a number that is not epoch ms of 2000 to 2099 is refused (review 3.10). |
 | `onivla` | `63749.91` | Invoice amount incl. GST (header) and item-wise claim (step 7) |
 | `quantity`, `offeredQuantity`, `orderQuantity` | `15` | Match key (`invoiceQuantity`) and check against receipt qty |
 | `rate` | `3601.69` | Check against IREPS PO rate |
@@ -440,16 +440,22 @@ script `billFunctions.js`, stock #77):
 
 **How the page computes the amounts** (`calculateExpAmt`, `saveDtls` in
 `billFunctions.js`):
+- basic bill rate (`netBasicRate`) = PO rate + PVC - discount to 5 decimals,
+  as a number (`calcBBR`).
 - taxable (`expenseAmount`, "Taxable Amount") = basic bill rate × RO/CRN qty
   billed × Payment % / 100, plus packing/freight/forwarding/other charges.
-- tax (`basicAmount`, "Tax Amount") = taxable × GST rate. The field names do
+- the taxable amount stays unrounded (`expenseAmount` is its `toFixed(2)`);
+  each GST amount = taxable × drop-down rate / 100, `toFixed(2)` of the binary
+  value (107178.795 gives 107178.79); `basicAmount` ("Tax Amount") = their
+  sum; total = unrounded taxable + that sum, `toFixed(2)`. The field names do
   not match their meaning.
 - IGST is enabled when the header `stateOfSupply` ≠ `supplierState`;
   otherwise CGST, and SGST (or UTGST for a union territory) is set to the
   same rate. Allowed values: IGST `0,1,2,3,5,8.9,12,13.8,18,28,40`; CGST
   `0,0.5,1,1.5,2.5,4.45,6,6.9,9,14,20`.
 - `maxClaim` starts as the max claim from #116 (item value − already passed).
-  **If the header invoice amount (rounded) is larger, the page raises
+  **If the header invoice amount in whole rupees is larger than the max claim
+  read at two decimals (`to2Points`) in whole rupees, the page raises
   `maxClaim` to the invoice amount**, and it does the same when PVC, freight
   or forwarding is non-zero.
 - "Item-wise claim by vendor" overrides the calculated total:
@@ -486,11 +492,12 @@ The non-stock capture (#373) differs mainly in `dispatchMode=NA`,
   298300.00 + 53694.00 = 351994.00 (100 × 2983 at 18 %).
 - **DocLink should calculate the amounts and send ECM `onivla` as the
   item-wise claim:** taxable = qty × PO rate × Payment %/100; tax = taxable ×
-  rate; total = taxable + tax. Stop if the total differs from `onivla` by more
-  than rounding. IREPS accepted a header `invoiceAmount` of 485777 against
-  a calculated 485776.50. IREPS will **not** stop an over-claim when the
-  invoice amount is higher than the item value, because it raises `maxClaim`
-  to the invoice amount, so DocLink must check this itself.
+  rate; total = taxable + tax, exactly as above (review 3.9). Stop if the total
+  differs from `onivla` by more than rounding. IREPS accepted a header
+  `invoiceAmount` of 485777 against a calculated 485776.50. IREPS will **not**
+  stop an over-claim when the invoice amount is higher than the item value,
+  because it raises `maxClaim` to the invoice amount, so DocLink must check
+  this itself.
 - `stRate` / GST rate comes from the PO (#114, block 3). The spec's "GST % -
   ECM" is therefore available from IREPS; ECM `totalTaxValue` / `taxCode` are
   cross-checks.
@@ -544,7 +551,11 @@ cancelled: `signing canceled completed`).
 | `upFile` | the file |
 
 Response: `<html><body onload='window.parent.CRISPKI.afterUpload()'>OK~ireps/upload/billDocuments/092026/3744921/3894570/1061000262_TAXINVOICE_SIGNED.pdf~37233</body></html>`
-(path and size in bytes).
+(path and size in bytes). The path can contain `~`, so it is read up to the last
+`~`. The page registers `relative_dir` + `/` + the cleaned file name, not the
+answer's path, and only when the size is above 0. The capture stored
+`1061000262 - GSTMANDATE.pdf` as `1061000262-GSTMANDATE.pdf`. DocLink registers
+the page's path and stops if `save.php` answered another one (review 3.11).
 
 **3. Register it on the bill:** `POST /epsn/ct/uploadBillDocuments.do`
 ```
@@ -663,7 +674,7 @@ a good final check.
 | `saveBillHeader.do` | `success^^<billRegNo>` |
 | `fetchPOItemDetails.do` | `success@#$%<block>@#$%…`, fields `^^` |
 | `populateROList.do` | `success^^<count>^^<roNo>[^^…]` |
-| `populateRODetails.do` | `success^^` + 15 fields (section 6, step 7) |
+| `populateRODetails.do` | `success^^` + 15 fields (section 6, step 7); `duplicate` / `multi` are refusals the page knows (`setRODetails`; not captured), which DocLink shows in plain words |
 | `saveBillDetails.do` | `success^^<dispatchNo>^^<amount>^^<rlyGSTIN>^^OK#<n><><doc list>` |
 | `save.php` | HTML with `OK~<path>~<bytes>` |
 | `uploadBillDocuments.do` | `OK#<n><><doc list>` |
@@ -692,7 +703,7 @@ shown raw.
 | 15-16 | Paying railway / authority | `payingRly`, `payingAuthorityCode`, `ipasAUCode` | IREPS (#109), one option | Yes |
 | 17-18 | PVC / SVC | `pvc=N`, `svcFlag=Y` | page script | Yes |
 | 19 | Tax invoice no. | `invoiceNo` | ECM `invoiceNumber` | Yes (≤ 16 chars; only `-` `/`) |
-| 20 | Tax invoice date | `invoiceDate` (dd/mm/yyyy) | ECM `salesInvoiceDate` (`yyyy-mm-dd hh:mm:ss.sss`, or epoch ms read in IST) | Yes |
+| 20 | Tax invoice date | `invoiceDate` (dd/mm/yyyy) | ECM `salesInvoiceDate` (`yyyy-mm-dd hh:mm:ss.sss`, epoch ms of 2000 to 2099, or an ISO time with a zone, read in IST) | Yes |
 | 21 | Invoice amount | `invoiceAmount` | ECM `onivla` (incl. GST) | Yes |
 | 22 | Payment % | `paymentPercent` | default 100; ECM `paymentTerm` (not present); PO payment terms in the page script | Yes for normal bills; advance/retrofit open |
 | 23 | Payment type | `paymentType` (`A` / `F`) | default `F` | Yes for normal bills; advance/retrofit open |
@@ -801,7 +812,9 @@ Notes:
   the header cannot be edited afterwards. Show the user the full header and
   item values first, with the source of each value.
 - **Store progress per bill** (`billRegNo`, `dispatchNo`, uploaded documents)
-  so a failure halfway can resume instead of creating a second draft.
+  so a failure halfway can resume instead of creating a second draft. A write
+  whose answer is lost is recorded as unknown and never resent by itself
+  (`bill-upload-service.js` `guardedWrite`).
 - **Calculate amounts in DocLink** (step 7), send ECM `onivla` as the
   item-wise claim, and stop if it differs from the calculated total by more
   than rounding. IREPS does not catch an over-claim when the header invoice
@@ -832,12 +845,12 @@ Started by hand from the side panel, **Upload Bill to IREPS**. Code in
 | Study step | Implemented as |
 |---|---|
 | 1. R-Note / CRN | R-NOTE and CRN search by PO number (or last 180 days); only rows with a Bill Claim link are billable; rows IREPS already shows a bill for are not |
-| 4. ECM match | `RetrieveInvoiceData` with customer PO, PO Sr, quantity; exactly one invoice not "Sent to Doculink", else stop. **Fallback:** the invoice typed by hand, since ECM has no PO Sr yet |
-| 4-6. Bill page, header | Read-only calls first; header built per section 8 with every value's source; supplier GSTIN / state / place of supply / description editable and re-checked; `stockNonstock` tried on the other value when IREPS lists no PO Sr under the first |
-| Pre-check | Before anything is written: receipt quantity and item value (`populateRODetails`) against the invoice |
-| 5. Header save | Only after the user confirms, with no error and warnings read; the bill reg no. is recorded per receipt at once |
-| 7. Item | Amounts computed as the bill page does; claim = computed total when it matches the invoice within 1 rupee; stops on charges / PVC / part bills; saved with the captured field order (the test reproduces the non-stock capture's `saveBillDetails.do` body byte for byte) |
-| 9. Documents | Fetched from ECM with the sheet's per-type queries (narrowed to the invoice number, or the PO number for IC / MA / PO copy), newest per type, PDF and < 8 MB checked, saved locally with the description to type. Attaching, signing, preview and submit stay manual |
+| 4. ECM match | `RetrieveInvoiceData` with customer PO, PO Sr, quantity; exactly one invoice not "Sent to Doculink", else stop; a record whose customer PO, PO Sr or quantity (where present) differ from the receipt's is not used (`BILL_ECM_MISMATCH`). **Fallback:** the invoice typed by hand, since ECM has no PO Sr yet |
+| 4-6. Bill page, header | Read-only calls first (the bill page load under the IREPS form lock: it carries a Struts token); the chosen receipt must be in IREPS's RO list (never swapped); header built per section 8 with every value's source; supplier GSTIN / state / place of supply / description editable and re-checked; `stockNonstock` tried on the other value when the first list IREPS gave lacks the PO Sr; a list IREPS refused or did not answer is reported as itself and never switches it (review 3.12) |
+| Pre-check | Before anything is written: receipt quantity and item value (`populateRODetails`) against the invoice; `duplicate` / `multi` stop with what IREPS means, also at the item (review 3.13) |
+| 5. Header save | Only after the user confirms, with no error and warnings read; refused when another receipt's DocLink bill has the invoice; the write is recorded per receipt before it is sent and the bill reg no. as soon as IREPS answers; a lost answer (tab reloaded / closed / left, network, 120 s deadline, HTTP 5xx, unreadable answer) stops the receipt until the user confirms they checked Bills for Pay (same for the item and each document registration) |
+| 7. Item | Amounts computed exactly as the bill page does (review 3.9); claim = computed total when it matches the invoice within 1 rupee; stops on charges / PVC / part bills; saved with the captured field order (the test reproduces the non-stock capture's `saveBillDetails.do` body byte for byte); railway GSTIN: the consignee's when of the state of supply, else IREPS's railway GSTIN of the state of supply when exactly one fits (the only one, or the consignee's PAN; the stock capture saved 29AAAGM0289C1ZF for consignee 37AAAGM0289C1ZI), as a warning; else the item stops |
+| 9. Documents | Fetched from ECM with the sheet's per-type queries (narrowed to the invoice number, or the PO number for IC / MA / PO copy), newest per type, PDF and < 8 MB checked, saved locally with the description to type. Each document is attached by DocLink after the user signs it in the IREPS signer (step 9); preview and the final Sign & Submit stay manual |
 
 Choices made where the study left options:
 

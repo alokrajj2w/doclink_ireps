@@ -16,7 +16,7 @@
  * the service worker, where config.json is loaded (GET_TAB_SCOPE).
  */
 
-import { MESSAGE_TYPES } from "../utils/messages.js";
+import { MESSAGE_TYPES, SCHEDULED_RUN } from "../utils/messages.js";
 import { TAB_SCOPE } from "../utils/url-scope.js";
 import { logger } from "../utils/logger.js";
 
@@ -69,6 +69,29 @@ export async function currentPanelTabId() {
   } catch {
     return null;
   }
+}
+
+/** The tab ids this panel document sent with the runs it started (popup.js send). */
+const runTabs = new Set();
+
+/** A run this panel starts carries `tabId` (popup.js send): its states and broadcasts are then this panel's own. */
+export function rememberRunTab(tabId) {
+  if (Number.isInteger(tabId)) runTabs.add(tabId);
+}
+
+/**
+ * Whether a run is this panel's own, by who started it (`startedBy` in its job state and broadcasts):
+ * a run from this panel's tab is; a scheduled run (SCHEDULED_RUN) and a run started in another tab's
+ * panel are not, so they never switch this panel's view, show the login view or show their results here.
+ * A run that names no starter (a state saved before starters were kept) counts as this panel's, as before.
+ * @param {number|string|null|undefined} startedBy
+ */
+export function isOwnRun(startedBy) {
+  if (startedBy === undefined || startedBy === null) return true;
+  if (startedBy === SCHEDULED_RUN) return false;
+  if (runTabs.has(startedBy)) return true;
+  const own = panelOwnTabId();
+  return own === null || own === startedBy;
 }
 export async function initGate(ctx) {
   const el = {

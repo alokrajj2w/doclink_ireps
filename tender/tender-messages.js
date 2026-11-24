@@ -4,7 +4,10 @@
 // Read-only: nothing is deleted, replied to or archived. (Opening a message does mark it "read" in IREPS,
 // exactly as opening it by hand would.)
 
-import { TenderError, log, norm, irepsFetch, assertSession, parseHtml, parseCalls, INBOX_PATH, dmyOf, isVendorInboxPage, pageNotRecognised, listFailed } from './tender-core.js';
+import {
+  TenderError, IREPS_DOWN_CODES, log, norm, irepsFetch, assertSession, parseHtml, parseCalls, INBOX_PATH, dmyOf, isVendorInboxPage, pageNotRecognised, listFailed, listUnanswered, listCut,
+} from './tender-core.js';
+import { withIrepsFormLock } from '../services/ireps-form-lock.js';
 
 export { INBOX_PATH, dmyOf };
 
@@ -57,9 +60,16 @@ export function parseInboxPage(doc) {
  * A page with no message rows counts as "no messages" only when it is IREPS's inbox page itself and does
  * not report messages it shows none of (H4). The first page anything else is an error (as an HTTP error
  * is); a later page that is not the inbox ends the scan as before, with `incomplete` saying so - the
- * messages read so far are kept.
+ * messages read so far are kept. So does a later page IREPS fails to give or does not answer at all (2.5),
+ * and MAX_PAGES pages read while IREPS shows more (10.1: `truncated` and `incomplete`).
+ * My Messages carries a Struts token (corrigendum response.har), so the walk runs under the IREPS form lock, as a
+ * search does (M2). The caller (NIT Documents) holds no lock: it is not re-entrant.
  */
-export async function scanMessages(base, { from, to, onProgress = () => {} }) {
+export function scanMessages(base, options) {
+  return withIrepsFormLock(() => scanMessagePages(base, options));
+}
+
+async function scanMessagePages(base, { from, to, onProgress = () => {} }) {
   const lo = key(dmyOf(from));
   const hi = key(dmyOf(to));
   const visited = new Set();
@@ -69,14 +79,32 @@ export async function scanMessages(base, { from, to, onProgress = () => {} }) {
   let total = 0;
   let unreachable = false;
   let incomplete = '';
-  while (queue.length && visited.size < MAX_PAGES) {
+  let atLimit = false;
+  while (queue.length) {
+    if (visited.size >= MAX_PAGES) {
+      atLimit = true;
+      break;
+    }
     const pageNo = queue.shift();
     if (visited.has(pageNo)) continue;
     visited.add(pageNo);
     onProgress(`Reading My Messages page ${pageNo}...`);
-    const res = await irepsFetch(base, INBOX_PATH, { method: 'POST', form: { listType: 'MyMsg', pageNo: String(pageNo) } });
+    let res;
+    try {
+      res = await irepsFetch(base, INBOX_PATH, { method: 'POST', form: { listType: 'MyMsg', pageNo: String(pageNo) } });
+    } catch (e) {
+      if (visited.size === 1 || !IREPS_DOWN_CODES.has(e.code)) throw e;
+      incomplete = listUnanswered(`My Messages page ${pageNo}`, e).message;
+      log('Messages', `not read to the end: ${incomplete}`, 'warn');
+      break;
+    }
     assertSession(res);
-    if (res.status !== 200) throw listFailed(`My Messages page ${pageNo}`, res.status);
+    if (res.status !== 200) {
+      if (visited.size === 1) throw listFailed(`My Messages page ${pageNo}`, res.status);
+      incomplete = listFailed(`My Messages page ${pageNo}`, res.status).message;
+      log('Messages', `not read to the end: ${incomplete}`, 'warn');
+      break;
+    }
     const doc = parseHtml(res.text());
     const page = parseInboxPage(doc);
     if (!page.rows.length && pageNo === 1) {
@@ -102,6 +130,11 @@ export async function scanMessages(base, { from, to, onProgress = () => {} }) {
     if (!page.rows.length) break;
   }
   if (queue.length) unreachable = true;
+  // stopped by the page limit while IREPS shows more pages: never a silent partial list (10.1)
+  if (atLimit && !incomplete) {
+    incomplete = listCut('My Messages', MAX_PAGES).message;
+    log('Messages', `not read to the end: ${incomplete}`, 'warn');
+  }
   return { rows, total, pagesRead: visited.size, truncated: unreachable, incomplete };
 }
 

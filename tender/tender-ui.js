@@ -83,42 +83,63 @@ const TABULATION_NAME = { financialTabulation: 'Financial Tabulation', commercia
 
 const LETTER_PAGE = { MyNegotiation: 'Negotiation', MyCounterOffer: 'Counter Offer', MyAdvanceAcceptanceLetter: 'Advance Acceptance Letter' };
 
-const tenderRows = new Map(); // tenderNo -> <li>, updated live as each tender finishes
+/** A category or tender row that did not get everything it found: shown red. */
+const catFailed = (c) => c.status === 'FAILED' || c.status === 'PARTIAL';
+const rowFailed = (t) => Boolean(t.error) || Object.values(t.categories || {}).some(catFailed);
+/**
+ * What a by-date run (letters, tabulations) did with what it found: downloaded, failed (letters and tabulations
+ * that failed, tenders that could not be handled), already downloaded before.
+ */
+function found(tenders) {
+  const cats = tenders.flatMap((t) => Object.values(t.categories || {}));
+  const sum = (f) => cats.reduce((n, c) => n + (c[f] || 0), 0);
+  return { failed: sum('failed') + tenders.filter((t) => t.error).length, already: sum('alreadyDownloaded') };
+}
+/** "2 downloaded, 1 failed, 3 already downloaded"; '' when none of them. */
+const foundText = (downloaded, { failed, already }) => [downloaded ? `${downloaded} downloaded` : '', failed ? `${failed} failed` : '', already ? `${already} already downloaded` : ''].filter(Boolean).join(', ');
+
+const tenderRows = new Map(); // tender key (number and railway) -> <li>, updated live as each tender finishes
 function renderDiscovered(ev) {
   $('auto-discovered').hidden = false;
   const list = $('auto-discovered-rows');
   list.replaceChildren();
   tenderRows.clear();
   for (const t of ev.tenders) {
-    const row = li(`${t.tenderNo}`, 'queued', 'tender-muted', '', `${t.title || ''}${t.due ? ` · due ${t.due.toLocaleString?.() || t.due}` : ''} · ${t.kinds.join('/')} message ${t.sentAt}`);
-    tenderRows.set(t.tenderNo, row);
+    // two railways may use one tender number: each is its own row, with its railway
+    const row = li(`${t.tenderNo}`, 'queued', 'tender-muted', '', `${t.title || ''}${t.railwayUnit ? ` · ${t.railwayUnit}` : ''}${t.due ? ` · due ${t.due.toLocaleString?.() || t.due}` : ''} · ${t.kinds.join('/')} message ${t.sentAt}`);
+    tenderRows.set(t.key || t.tenderNo, row);
     list.append(row);
   }
+  // a message IREPS did not open is a failure, not one to review: "Retry failed" opens it again
+  const failedMessages = ev.failedMessages || [];
+  for (const m of failedMessages) list.append(li(m.subject || `Message of ${m.sentDate}`, 'failed', 'tender-bad', m.reason, `Message of ${m.sentDate}${m.sentTime ? ` ${m.sentTime}` : ''} · ${m.reason}`));
   $('auto-review').hidden = !ev.review.length;
   $('auto-review-rows').replaceChildren(...ev.review.map((r) => li(r.subject || `message ${r.oid}`, 'NEEDS_REVIEW', 'tender-bad', r.reason, r.reason)));
-  if (!ev.tenders.length && !ev.review.length) list.append(li('No new NIT / corrigendum messages in this date range', '', 'tender-muted'));
+  if (!ev.tenders.length && !ev.review.length && !failedMessages.length) list.append(li('No new NIT / corrigendum messages in this date range', '', 'tender-muted'));
 }
 
 function renderTender(ev) {
-  const row = tenderRows.get(ev.tenderNo);
+  const key = ev.key || ev.tenderNo;
+  const row = tenderRows.get(key);
   if (!row) return;
   const parts = Object.entries(ev.categories || {}).map(([k, c]) => `${LABEL[k] || k}: ${catText(c)}`);
   const text = ev.status === 'ALREADY_DOWNLOADED' ? 'already downloaded' : ev.status === 'NOT_FOUND' ? 'not found in IREPS' : ev.status === 'FAILED' && !parts.length ? 'failed' : parts.join(' · ') || ev.status;
   const bad = ev.status === 'FAILED' || ev.status === 'NOT_FOUND';
-  const fresh = li(ev.tenderNo, text, bad ? 'tender-bad' : 'tender-ok', '', [ev.error, ...Object.values(ev.categories || {}).map(reasons)].filter(Boolean).join('\n'));
+  const fresh = li(ev.tenderNo, text, bad ? 'tender-bad' : 'tender-ok', '', [ev.railwayUnit, ev.error, ...Object.values(ev.categories || {}).map(reasons)].filter(Boolean).join('\n'));
   row.replaceWith(fresh);
-  tenderRows.set(ev.tenderNo, fresh);
+  tenderRows.set(key, fresh);
 }
 
 function renderResult(r) {
   const body = $('tender-result-rows');
   body.replaceChildren();
+  const notOpened = r.summary.failedMessages || 0;
   $('tender-result-tender').textContent = `Dates ${r.range.from} - ${r.range.to}: ${r.messages.relevant} NIT/corrigendum message(s) of ${r.messages.scanned}, ${r.messages.pagesRead} page(s) read`;
-  $('tender-result-totals').textContent = `Downloaded: ${r.summary.downloaded}   Failed tenders: ${r.summary.failed}   Needs review: ${r.summary.needsReview}${r.messages.truncated ? '   (page limit reached - narrow the date range)' : ''}`;
+  $('tender-result-totals').textContent = `Downloaded: ${r.summary.downloaded}   Failed tenders: ${r.summary.failed}${notOpened ? `   Messages not opened: ${notOpened}` : ''}   Needs review: ${r.summary.needsReview}${r.messages.truncated ? '   (page limit reached - narrow the date range)' : ''}`;
   $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/';
   $('btn-tender-show').hidden = true;
   $('tender-result').hidden = false;
-  $('btn-auto-retry').hidden = !(r.summary.failed || r.tenders.some((t) => t.status === 'FAILED') || r.messages.incomplete);
+  $('btn-auto-retry').hidden = !(r.summary.failed || notOpened || r.tenders.some((t) => t.status === 'FAILED') || r.messages.incomplete);
   // My Messages not read to its end (H4): the messages after it were not looked at
   const problems = [r.aborted ? `Stopped early: ${r.aborted.message}` : '', r.messages.incomplete ? `My Messages was not read to the end: ${r.messages.incomplete}` : ''].filter(Boolean);
   if (problems.length) {
@@ -137,13 +158,18 @@ function renderLetterResult(status, r) {
   const n = l.summary?.newLetters || 0;
   const err = l.listErrors?.[status];
   const warn = l.listWarnings?.[status]; // rows of the list DocLink could not read (shown, never silently skipped)
-  body.append(li(`${name} letters (by Letter Date)`, err ? 'failed' : n ? `${n} downloaded` : 'none for these dates', err || warn ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', err || warn || ''));
+  // "none for these dates" only when the list was read and has no letter of these dates: letters found but not
+  // downloaded are "failed" (red), letters downloaded before are "already downloaded" (1.15)
+  const f = found(l.tenders);
+  const text = err ? 'failed' : foundText(n, f) || (l.listed ? 'nothing new' : 'none for these dates');
+  body.append(li(`${name} letters (by Letter Date)`, text, err || warn || f.failed ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', err || warn || ''));
   for (const t of l.tenders) {
     const parts = Object.entries(t.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
-    body.append(li(`  ${t.tenderNo}`, t.error ? 'failed' : parts.join(' · '), t.error ? 'tender-bad' : 'tender-ok', '', t.error || Object.values(t.categories).map(reasons).filter(Boolean).join('\n')));
+    const why = [t.error, ...Object.values(t.categories).map(reasons), t.tenderDateProblem].filter(Boolean).join('\n');
+    body.append(li(`  ${t.tenderNo}`, t.error ? 'failed' : parts.join(' · '), rowFailed(t) ? 'tender-bad' : 'tender-ok', '', why));
   }
   $('tender-result-tender').textContent = `${name} letters with Letter Date ${r.range.from} - ${r.range.to}${l.listed ? `: ${l.listed} found` : ''}`;
-  $('tender-result-totals').textContent = `Downloaded: ${n}`;
+  $('tender-result-totals').textContent = `Downloaded: ${n}${f.failed ? `   Failed: ${f.failed}` : ''}${f.already ? `   Already downloaded: ${f.already}` : ''}`;
   $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/';
   $('btn-tender-show').hidden = true;
   $('tender-result').hidden = false;
@@ -162,17 +188,20 @@ function renderTabulationResult(pdfType, r) {
   body.replaceChildren();
   const t = r.tabulations;
   const n = t.summary.downloaded;
-  body.append(li(`${name} (by Closing Date)`, n ? `${n} downloaded` : t.summary.withTabulation ? 'nothing new' : 'none for these dates', n ? 'tender-ok' : 'tender-muted'));
+  // a tabulation found but not downloaded is "failed" (red), never "nothing new"; one downloaded before says so (1.15)
+  const f = found(t.tenders.filter((x) => !x.notAvailable));
+  const text = foundText(n, f) || (t.summary.withTabulation ? 'nothing new' : 'none for these dates');
+  body.append(li(`${name} (by Closing Date)`, text, f.failed || t.incomplete ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', t.incomplete || ''));
   for (const x of t.tenders) {
     if (x.notAvailable) {
       body.append(li(`  ${x.tenderNo}`, 'not available yet', 'tender-muted', '', `${x.title || ''}${x.closingDate ? ` · closed ${x.closingDate}` : ''} · IREPS shows no ${name} yet`));
       continue;
     }
     const parts = Object.entries(x.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
-    body.append(li(`  ${x.tenderNo}`, x.error ? 'failed' : parts.join(' · '), x.error ? 'tender-bad' : 'tender-ok', '', x.error || Object.values(x.categories).map(reasons).filter(Boolean).join('\n')));
+    body.append(li(`  ${x.tenderNo}`, x.error ? 'failed' : parts.join(' · '), rowFailed(x) ? 'tender-bad' : 'tender-ok', '', [x.error, ...Object.values(x.categories).map(reasons)].filter(Boolean).join('\n')));
   }
   $('tender-result-tender').textContent = `${name} of tenders closing ${r.range.from} - ${r.range.to}: ${t.listed} closed tender(s), ${t.summary.withTabulation} with a ${name}`;
-  $('tender-result-totals').textContent = `Downloaded: ${n}   Not available yet: ${t.summary.notAvailable}`;
+  $('tender-result-totals').textContent = `Downloaded: ${n}${f.failed ? `   Failed: ${f.failed}` : ''}${f.already ? `   Already downloaded: ${f.already}` : ''}   Not available yet: ${t.summary.notAvailable}`;
   $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/Tabulation/';
   $('btn-tender-show').hidden = true;
   $('tender-result').hidden = false;

@@ -688,6 +688,9 @@ export async function runCrnTests({ test, assert, eq, rejects, fixture, FAKE_TOK
     const capped = await searchCrn({ recordsPerPage: per }, { fetch: limited.fetchImpl, parseHtml, maxPages: 2 });
     eq(capped.recordCount, 20);
     assert(capped.warnings.some((w) => w.includes("safety limit")), capped.warnings.join(" | "));
+    // a list cut at the page limit is not complete: incomplete says so, so a scheduled run is not "done" (inspection, P1 note)
+    assert(/only the first 2 were read/.test(capped.incomplete || ""), String(capped.incomplete));
+    eq(partial.incomplete ?? null, null, "fetchAllPages:false (an explicit opt-out) is not reported as cut");
   });
 
   /* ---------------------------------------------------- zip / xlsx writers */

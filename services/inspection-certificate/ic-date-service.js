@@ -69,12 +69,12 @@ export async function searchIcsByDate(options, deps = {}) {
   const sel = validateIcDateSelection(options.dateFrom, options.dateTo);
   const parseHtml = deps.parseHtml || ((html, opts) => parseIcSearchResults(html, null, opts));
   const retry = (task) => withRetry(task, { attempts: 3, sleep: deps.sleep, delayMs: deps.retryDelayMs });
-  const stats = { pages: 0, scanned: 0, outOfRange: 0, notIssued: 0, duplicates: 0, stoppedEarly: false, pageLimit: false };
+  const stats = { pages: 0, scanned: 0, outOfRange: 0, notIssued: 0, duplicates: 0, stoppedEarly: false, pageLimit: false, incomplete: null };
   const seen = new Set();
   const records = [];
   let oldPages = 0;
 
-  await runIcSearch(
+  const search = await runIcSearch(
     {
       buildRequest: (form) => buildIcDateSearchRequest(form, { dateFromIC: sel.dateFrom, dateToIC: sel.dateTo }),
       parseHtml,
@@ -117,6 +117,8 @@ export async function searchIcsByDate(options, deps = {}) {
     },
     { fetch: deps.fetch, retry }
   );
+  // fewer inspection calls read than IREPS's "Total Records": some ICs of the range may be missing (4.3)
+  stats.incomplete = search.incomplete;
   return { dateFrom: sel.dateFrom, dateTo: sel.dateTo, records, stats };
 }
 
@@ -193,6 +195,7 @@ export async function runIcDateDownload(options, deps = {}) {
   state.counts.outOfRange = found.stats.outOfRange;
   state.counts.pages = found.stats.pages;
   if (found.stats.pageLimit) state.warnings.push(`IREPS listed more than ${MAX_IC_DATE_PAGES} result pages; only those were read. Choose a shorter date range for the rest.`);
+  if (found.stats.incomplete) state.warnings.push(`IC dates ${sel.dateFrom} to ${sel.dateTo}: ${found.stats.incomplete}; some ICs may be missing.`);
   state.items = icDateItems(found.records);
   state.phase = "downloading";
   notify();

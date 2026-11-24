@@ -179,6 +179,84 @@ export async function runDownloadLogTests({ test, assert, eq }) {
     configureDownloadLog({ storage: memoryStorage(), context: "sw" });
   });
 
+  /** An answer whose status arrives and whose body then breaks off (the connection drops). */
+  const brokenAnswer = (status) => new Response(new ReadableStream({ start: (c) => c.error(new TypeError("network error")) }), { status, headers: { "Content-Type": "application/json" } });
+
+  await test("download log (8.4): a batch the Recon Engine took (2xx) is not posted again when its answer cannot be read; a 2xx page that is no answer keeps the records", async () => {
+    setDownloadLogUser(null);
+    const storage = memoryStorage();
+    configureDownloadLog({ storage, context: "test" });
+    const queueKey = "doclink.downloadLog.queue.test";
+    for (const k of ["A", "B"]) await logDownload(downloadRecord({ docType: "po", key: `po:${k}` }, { filename: `${k}.pdf` }));
+    const posts = [];
+    const fetch = async (url, init = {}) => {
+      if (String(url).endsWith("/api/auth/me")) return json(404, {});
+      posts.push(JSON.parse(init.body).records.map((r) => r.doc_key).join());
+      return brokenAnswer(201);
+    };
+    const first = await flushDownloadLog({ fetch });
+    eq(first.posted, 2, "taken: the Recon Engine answered 201");
+    eq(storage.data[queueKey].length, 0);
+    eq((await flushDownloadLog({ fetch })).posted, 0);
+    eq(posts.join("|"), "po:A,po:B", "posted once, never again");
+
+    // a 2xx page that is not the Recon Engine's answer (a proxy's page): kept for the next flush
+    await logDownload(downloadRecord({ docType: "po", key: "po:C" }, { filename: "C.pdf" }));
+    const page = async (url) => (String(url).endsWith("/api/auth/me") ? json(404, {}) : new Response("<html><body>Please sign in</body></html>", { status: 200, headers: { "Content-Type": "text/html" } }));
+    const kept = await flushDownloadLog({ fetch: page });
+    eq(kept.posted, 0);
+    eq(kept.code, "DOWNLOAD_LOG_UNAVAILABLE");
+    eq(storage.data[queueKey].length, 1);
+    // the check before a run needs the answer itself: one that breaks off is no answer
+    const check = await checkDownloaded({ destination: "local", keys: ["po:C"] }, { fetch: async () => brokenAnswer(200) });
+    eq(check.ok, false);
+    eq(check.code, "DOWNLOAD_LOG_UNAVAILABLE");
+    configureDownloadLog({ storage: memoryStorage(), context: "sw" });
+  });
+
+  await test("download log (8.3): a chrome.storage read that fails never empties the queue: that change is dropped and the queue stays as it is", async () => {
+    setDownloadLogUser(null);
+    const storage = memoryStorage();
+    const queueKey = "doclink.downloadLog.queue.test";
+    let queueReads = 0;
+    let failing = new Set(); // which reads of the queue fail
+    const flaky = {
+      get: async (key) => {
+        if (key === queueKey && failing.has(++queueReads)) throw new Error("IO error: the storage could not be read");
+        return storage.get(key);
+      },
+      set: (items) => storage.set(items)
+    };
+    configureDownloadLog({ storage: flaky, context: "test" });
+    await logDownload(downloadRecord({ docType: "po", key: "po:A" }, { filename: "A.pdf" }));
+    setDownloadLogUser({ id: 9, email: "other@x.test" });
+    await logDownload(downloadRecord({ docType: "po", key: "po:OTHER" }, { filename: "o.pdf" }));
+    setDownloadLogUser(null);
+    const queued = () => storage.data[queueKey].map((r) => r.doc_key).join();
+    eq(queued(), "po:A,po:OTHER");
+
+    failing = new Set([queueReads + 1]);
+    await logDownload(downloadRecord({ docType: "po", key: "po:B" }, { filename: "B.pdf" }));
+    eq(queued(), "po:A,po:OTHER", "not written over: another user's record and the rest are kept");
+
+    const posted = [];
+    const fetch = async (url, init = {}) => {
+      if (String(url).endsWith("/api/auth/me")) return json(404, {});
+      posted.push(...JSON.parse(init.body).records.map((r) => r.doc_key));
+      return json(201, { logged: 1 });
+    };
+    // the flush's own read works; the one that takes the posted record out fails
+    failing = new Set([queueReads + 2]);
+    await flushDownloadLog({ fetch });
+    eq(posted.join(), "po:A");
+    eq(queued(), "po:A,po:OTHER", "the queue as it was, nothing emptied");
+    const next = await flushDownloadLog({ fetch });
+    eq(posted.join(), "po:A", "the record the Recon Engine took is never posted again");
+    eq(queued(), "po:OTHER", "taken out at the next flush; the other user's record waits");
+    eq(next.pending, 1);
+    configureDownloadLog({ storage: memoryStorage(), context: "sw" });
+  });
+
   await test("download log (M18): a record belongs to the Recon user who saved it; a flush sends only the signed-in user's", async () => {
     const storage = memoryStorage();
     configureDownloadLog({ storage, context: "test" });

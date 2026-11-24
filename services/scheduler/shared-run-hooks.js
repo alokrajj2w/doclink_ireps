@@ -9,7 +9,8 @@
  *   - S3 / ECM only, never local: exports go to the Recon Engine (S3), PDFs to the ECM. A refused
  *     upload is a failed document (the next check fetches it again), never a file in Downloads;
  *   - complete: each saved document is reported, with its download-log record, so the next
- *     reservation by anyone sees it at once. Failed documents are released for the next check;
+ *     reservation by anyone sees it at once (a tender run reports each one as soon as it is saved,
+ *     a PDF run in batches). Failed documents are released for the next check;
  *   - the claim check: before each upload the run must still hold its claim (fresh heartbeat).
  *
  * Phase 2 (tender documents) uses the same pieces through `tenderHooks`, installed in the tender code
@@ -31,7 +32,7 @@ import { logger } from "../../utils/logger.js";
 
 /** Keys per reserve request (the backend takes up to 100). */
 export const RESERVE_CHUNK = 100;
-/** Saved documents are reported in batches of this size while a run goes on. */
+/** A PDF run's saved documents are reported in batches of this size while it goes on (a tender run's at once: documentSaved). */
 const COMPLETE_BATCH = 10;
 
 /** An IREPS-free failure of a scheduled save, with a code from utils/messages.js. */
@@ -68,7 +69,8 @@ function ecmNote(filename, ecm) {
  * @param {object} deps.api                 services/scheduler/schedule-api.js
  * @param {string} deps.claimId
  * @param {{ irepsAccountId: string, operatingUnit?: string|null }} deps.account   the verified IREPS account
- * @param {() => boolean} deps.isClaimLive  false once the claim may have been lost (stale heartbeat, CLAIM_LOST)
+ * @param {() => boolean|Promise<boolean>} deps.isClaimLive  false once the claim may have been lost (stale heartbeat,
+ *   CLAIM_LOST); a tender run's answers later (tender-runner.js createClaimWatch asks the worker), and is awaited
  * @param {Function} [deps.uploadEcm]       uploadToEcm (tests pass a fake)
  * @param {Function} [deps.uploadExport]    (file, target) => saveExportFileTo(...) (tests pass a fake)
  * @param {Function} [deps.logFallback]     the download-log queue, used when `complete` cannot be sent
@@ -107,9 +109,11 @@ export function createSharedRunHooks(deps) {
     else more[list]++;
   }
 
-  function assertClaim() {
+  async function assertClaim() {
     if (aborted) throw new SharedRunError(aborted);
-    if (!isClaimLive()) {
+    const live = await isClaimLive();
+    if (aborted) throw new SharedRunError(aborted);
+    if (!live) {
       aborted = "SCHEDULE_CLAIM_LOST";
       throw new SharedRunError(aborted, "this run no longer holds its claim");
     }
@@ -166,14 +170,16 @@ export function createSharedRunHooks(deps) {
         note("skipped", docEntry(labels.get(item.id), "not downloaded: no document number to reserve it by"));
       } else byKey.set(item.id, key);
     }
+    let alreadySaved = 0;
     try {
-      assertClaim();
+      await assertClaim();
       const answer = await reserve([...new Set(byKey.values())], LOG_DESTINATION.ECM);
       for (const [id, key] of byKey) {
         if (answer.granted.has(key)) granted.set(id, key);
         else {
           const taken = takenSkip(answer.taken.get(key));
           skip.set(id, taken);
+          alreadySaved++;
           note("skipped", docEntry(labels.get(id), describeSkip(taken)));
         }
       }
@@ -183,14 +189,16 @@ export function createSharedRunHooks(deps) {
       logger.warn(`Scheduled run: documents not reserved (${aborted}); none is downloaded`);
       for (const id of byKey.keys()) if (!skip.has(id)) skip.set(id, { reason: SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT, by: "", note: aborted });
     }
-    stats.skipped += [...skip.keys()].filter((id) => byKey.has(id) && !granted.has(id)).length;
+    // only what someone already saved counts as "already saved": documents left out because the reservation
+    // failed were not checked at all (the run ends failed with the reservation's code)
+    stats.skipped += alreadySaved;
     return { skip, replace: new Map(), warnings: [] };
   }
 
   /** saveFile of a PDF run: the ECM only. */
   async function saveFile(bytes, path, item) {
     try {
-      assertClaim();
+      await assertClaim();
       if (!granted.has(item.id)) throw new SharedRunError("SCHEDULE_NOT_RESERVED", "the document was not reserved for this run");
       if (!item.ecm) throw new SharedRunError("SCHEDULE_DESTINATION_REFUSED", "the document has no ECM filing");
       const filename = path.split("/").pop();
@@ -249,7 +257,7 @@ export function createSharedRunHooks(deps) {
     const doc = `${target.label || labelFromKey(log.key)} export (${target.records.length} record${target.records.length === 1 ? "" : "s"})`;
     const failedWith = (code, detail) => note("failures", failureEntry({ doc, code, detail }));
     try {
-      assertClaim();
+      await assertClaim();
     } catch (error) {
       failedWith(error.code, error.detail);
       throw new WorkflowError(error.code);
@@ -271,7 +279,7 @@ export function createSharedRunHooks(deps) {
     }
     let saved;
     try {
-      assertClaim();
+      await assertClaim();
       saved = await uploadExport(file, { ...target, destination: SAVE_DESTINATION.RECON });
     } catch (error) {
       stats.failed++;
@@ -292,7 +300,7 @@ export function createSharedRunHooks(deps) {
    * it throws, so nothing is fetched without one.
    */
   async function reserveDocuments(keys) {
-    assertClaim();
+    await assertClaim();
     let answer;
     try {
       answer = await reserve([...new Set(keys)], LOG_DESTINATION.ECM);
@@ -312,30 +320,37 @@ export function createSharedRunHooks(deps) {
   const ecmSink = {
     // the second argument (save locally instead) is ignored on purpose: a refused upload is a failed document
     async save(doc) {
-      assertClaim();
+      await assertClaim();
       const stored = await uploadEcm({ ...doc, account });
       return { ecm: { status: stored.deduplicated ? ECM_OUTCOME.ALREADY_STORED : ECM_OUTCOME.STORED, site: stored.site, uid: stored.uid, path: stored.path }, local: null };
     }
   };
 
-  /** A tender file the ECM took: its download-log record goes to `complete`. */
+  /**
+   * A tender file the ECM took: its download-log record goes to `complete` at once (5.8). A tender run lives in a
+   * runner tab, which is closed whatever stops the run (the runner time limit, the user, Chrome): a saved document
+   * whose report still waited for a batch would be lost with the tab and downloaded again by the next check. So the
+   * run is reported as far as it got, one document after the other.
+   */
   async function documentSaved(record) {
     pendingDone.push(record);
     savedKeys.add(record.doc_key);
     stats.saved++;
     const ecm = record.ecm || null;
     note("saved", docEntry(labelFromKey(record.doc_key), ecmNote(record.filename, ecm && { status: ecm.status, path: ecm.path })));
-    if (pendingDone.length >= COMPLETE_BATCH) await flushDone();
+    await flushDone();
   }
 
   /**
-   * A tender document the run could not save, with why (the tender code's error). Only a reserved key
-   * counts: it is released with this code when the run ends.
-   * @param {{ key: string, doc?: string, code?: string, detail?: string }} failure
+   * A tender document the run could not save, with why (the tender code's error). Every report is named
+   * and counted as a failed document when the run ends. A reserved key that was not saved is released with
+   * this code; a document without a reservation of its own (an attachment of a saved letter or corrigendum),
+   * or one saved only in part, has nothing to release.
+   * @param {{ key?: string, doc?: string, code?: string, detail?: string }} failure
    */
   function documentFailed({ key, doc, code, detail } = {}) {
-    if (!key) return;
-    tenderFailures.set(key, failureEntry({ doc: doc || labelFromKey(key), key, code: tenderCode(code), detail }));
+    const entry = failureEntry({ doc: doc || labelFromKey(key), key, code: tenderCode(code, "SCHEDULE_DOWNLOAD_FAILED"), detail });
+    tenderFailures.set(key || `#${tenderFailures.size + 1}`, entry);
   }
 
   /**
@@ -353,7 +368,14 @@ export function createSharedRunHooks(deps) {
       failed.push({ doc_key: key, destination: LOG_DESTINATION.ECM, code: entry.code });
       note("failures", entry);
     }
-    stats.failed += failed.length;
+    // the reported failures that are not a reservation to release: still documents that were not saved
+    let unreserved = 0;
+    for (const [key, entry] of tenderFailures) {
+      if (grantedKeys.has(key) && !savedKeys.has(key)) continue;
+      note("failures", entry);
+      unreserved++;
+    }
+    stats.failed += failed.length + unreserved;
     const done = pendingDone;
     pendingDone = [];
     await complete(done, failed);

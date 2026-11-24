@@ -59,7 +59,9 @@ export function normalisePoNumber(poNumber) {
  * @property {string} poNumber
  * @property {object[]} certificates   every issued IC of the PO (may be empty)
  * @property {number} count
- * @property {string[]} warnings
+ * @property {string[]} warnings       the parser's row warnings and the list warnings
+ * @property {string[]} listWarnings   the list was not read in full: a page limit, or fewer calls read than IREPS's total
+ * @property {string|null} incomplete  the shortfall against IREPS's "Total Records", in words
  * @property {string} fetchedAt
  */
 
@@ -86,7 +88,7 @@ export async function searchInspectionCertificates(poNumber, deps = {}) {
   const warnings = [];
   const seen = new Set();
   let pageLimit = false;
-  await runIcSearch(
+  const search = await runIcSearch(
     {
       buildRequest: (form) => buildIcSearchRequest(form, poNo),
       parseHtml,
@@ -107,14 +109,18 @@ export async function searchInspectionCertificates(poNumber, deps = {}) {
     },
     { fetch: deps.fetch }
   );
-  if (pageLimit) warnings.push(`IREPS listed more than ${MAX_PO_IC_PAGES} result pages for PO ${poNo}; only the ICs on those pages were read.`);
+  const listWarnings = [];
+  if (pageLimit) listWarnings.push(`IREPS listed more than ${MAX_PO_IC_PAGES} result pages for PO ${poNo}; only the ICs on those pages were read.`);
+  if (search.incomplete) listWarnings.push(`PO ${poNo}: ${search.incomplete}; some Inspection Certificates may be missing.`);
 
   return {
     success: true,
     poNumber: poNo,
     certificates,
     count: certificates.length,
-    warnings,
+    warnings: [...warnings, ...listWarnings],
+    listWarnings,
+    incomplete: search.incomplete,
     fetchedAt: new Date().toISOString()
   };
 }
@@ -148,6 +154,7 @@ export function icDownloadItems(records, poNo) {
  * @property {true} success
  * @property {string} poNumber
  * @property {number} count            certificates found
+ * @property {string[]} warnings       the search's list warnings (rows without a link are failed items instead)
  * @property {import("../search-po/document-downloader.js").DocumentBatchSnapshot & { startedAt: string, finishedAt: string }} downloads
  */
 
@@ -172,5 +179,6 @@ export async function downloadInspectionCertificates(poNumber, deps = {}) {
     codes: DOWNLOAD_CODES,
     onProgress: deps.onDownloadProgress
   });
-  return { success: true, poNumber: found.poNumber, count: found.count, downloads };
+  // the search's own warnings reach the panel with the result (1.19); a row without a link is a failed item there
+  return { success: true, poNumber: found.poNumber, count: found.count, warnings: found.listWarnings, downloads };
 }

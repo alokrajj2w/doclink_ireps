@@ -9,13 +9,18 @@
  * The popup is a thin view over MA_SEARCH / MA_DOWNLOAD / GET_MA_STATE;
  * searching and downloading continue in the service worker when the popup
  * closes, and reopening restores the list and the per-MA status chips.
+ *
+ * Only this panel's own MA runs are shown here (popup-gate.js isOwnRun). A scheduled MA run, or an MA
+ * search from another tab's panel, never replaces this panel's list or selection and never switches its
+ * view: the panel only says that it runs, and its Search / Download buttons wait for it.
  */
 
-import { MESSAGE_TYPES, MA_STAGES, describeError } from "../utils/messages.js";
+import { MESSAGE_TYPES, MA_STAGES, describeError, asDescribedError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
 import { describeSkip, skipChipText } from "../services/download-log.js";
 import { toIrepsDate, localIsoDate } from "../utils/dates.js";
-import { fillSelect } from "./popup-common.js";
+import { fillSelect, noteBackgroundRun, backgroundRunText, irepsAnswered } from "./popup-common.js";
+import { isOwnRun } from "./popup-gate.js";
 
 const $ = (id) => document.getElementById(id);
 const ALL_RAILWAYS = "-1";
@@ -23,6 +28,8 @@ const STATUS_LABEL = { queued: "Queued", downloading: "Downloading", completed: 
 
 let ctx = null;
 let currentState = null;
+/** Who holds the MA job when this panel did not start it (a scheduled run, another tab's), else null. */
+let backgroundStarter = null;
 const selected = new Set();
 let renderedIds = [];
 let itemNodes = new Map();
@@ -56,6 +63,7 @@ function bindElements() {
     results: $("ma-results"),
     resultsTitle: $("ma-results-title"),
     resultsFilter: $("ma-results-filter"),
+    resultsWarning: $("ma-results-warning"),
     btnNewSearch: $("btn-ma-new-search"),
     selectAll: $("ma-select-all"),
     selectAllLabel: $("ma-select-all-label"),
@@ -110,9 +118,20 @@ function populateRailways(railways) {
 }
 
 function setSearchBusy(busy, label) {
-  el.btnSearch.disabled = busy;
+  el.btnSearch.disabled = busy || backgroundStarter !== null;
   el.btnSearch.classList.toggle("is-busy", busy);
   el.btnSearchLabel.textContent = label || "Search MAs";
+}
+
+/**
+ * An MA job this panel did not start (a scheduled run, another tab's search) runs or ended: the panel says
+ * so, and its Search / Download buttons wait for it. Its own MA list and selection are left as they are.
+ */
+function noteBackground(startedBy, running) {
+  backgroundStarter = running ? startedBy : null;
+  noteBackgroundRun("ma", running ? backgroundRunText("MA copies", startedBy) : null);
+  if (!el.btnSearch.classList.contains("is-busy")) el.btnSearch.disabled = running;
+  updateSelectionUi();
 }
 
 function hideError() {
@@ -271,11 +290,13 @@ function applyFilter() {
 
 function updateSelectionUi() {
   const n = selected.size;
-  const busy = currentState && (currentState.status === "downloading" || currentState.status === "searching");
+  const busy = backgroundStarter !== null || Boolean(currentState && (currentState.status === "downloading" || currentState.status === "searching"));
   el.btnDownloadSelected.textContent = n ? `Download Selected (${n})` : "Download Selected";
   el.btnDownloadAll.textContent = "Download All";
   el.btnDownloadSelected.disabled = busy || n === 0;
   el.btnDownloadAll.disabled = busy || renderedIds.length === 0;
+  // the worker keeps the list while an MA search or download runs (7.11)
+  el.btnNewSearch.disabled = busy;
   const visible = visibleIds();
   el.selectAll.checked = visible.length > 0 && visible.every((id) => selected.has(id));
   el.selectAll.indeterminate = !el.selectAll.checked && visible.some((id) => selected.has(id));
@@ -296,10 +317,17 @@ function renderDownloads(state) {
     el.downloadTitle.textContent = `Downloading MA copies… ${d.completed + d.failed} of ${d.total}`;
     el.downloadText.textContent = `${d.downloading} downloading · ${d.queued} queued · ${d.completed} completed · ${d.failed} failed`;
   } else {
-    el.downloadTitle.textContent = d.failed === 0 ? `✓ ${d.completed} MA cop${d.completed === 1 ? "y" : "ies"} downloaded` : `${d.completed} downloaded, ${d.failed} failed`;
+    // every selected MA was already there: nothing was downloaded, which is said as it is (1.17)
+    const nothingNew = d.failed === 0 && d.completed === 0 && d.skipped > 0;
+    el.downloadTitle.textContent = nothingNew ? "Nothing new to download" : d.failed === 0 ? `✓ ${d.completed} MA cop${d.completed === 1 ? "y" : "ies"} downloaded` : `${d.completed} downloaded, ${d.failed} failed`;
     const ecm = summariseEcm(d.items);
-    const skipped = d.skipped ? `${d.skipped} skipped: already downloaded or already in the ECM (hover the chip for when / where).` : "";
-    el.downloadText.textContent = [d.failed === 0 ? (d.skipped ? "Every other selected MA PDF was saved." : "All selected MA PDFs were saved.") : "Hover a Failed chip to see why. Failed MAs can be retried.", skipped, ecm, ...(d.warnings || [])].filter(Boolean).join("\n");
+    const skipped = !d.skipped
+      ? ""
+      : nothingNew
+        ? `All ${d.skipped} selected MA${d.skipped === 1 ? " was" : "s were"} already downloaded or already in the ECM (hover the chip for when / where).`
+        : `${d.skipped} skipped: already downloaded or already in the ECM (hover the chip for when / where).`;
+    const outcome = d.failed > 0 ? "Hover a Failed chip to see why. Failed MAs can be retried." : nothingNew ? "" : d.skipped ? "Every other selected MA PDF was saved." : "All selected MA PDFs were saved.";
+    el.downloadText.textContent = [outcome, skipped, ecm, ...(d.warnings || [])].filter(Boolean).join("\n");
   }
   // only files saved on this computer (an MA stored in the ECM has no local copy)
   const local = (d.items || []).filter((i) => i.status === "completed" && i.path && (!i.ecm || i.ecm.status === ECM_OUTCOME.FAILED));
@@ -311,33 +339,44 @@ function renderDownloads(state) {
   el.btnRetryFailed.hidden = running || retryableFailures(d).length === 0;
 }
 
-/** Render the whole MA state (from GET_MA_STATE or a broadcast). */
-function render(state) {
+/**
+ * Render the whole MA state (from GET_MA_STATE or a broadcast). `live`: the state of a run that just moved
+ * on. false for a state read when the view opens, which may be old: it never sets the IREPS indicator, and an
+ * old "login required" error is not shown again (the form check that follows decides, 4.9, 4.10).
+ * A list another tab's panel searched is not this panel's: it is neither shown nor downloaded from here.
+ */
+function render(state, { live = true } = {}) {
   const previousIds = renderedIds.join("|");
-  currentState = state || null;
   hideError();
   el.progress.hidden = true;
   setSearchBusy(false);
+  // an MA job this panel did not start holds the job now (a scheduled run, another tab's)
+  const busyWith = state && state.busyWith != null && !isOwnRun(state.busyWith) ? state.busyWith : null;
+  noteBackground(busyWith, busyWith !== null);
+  const mine = state && isOwnRun(state.startedBy) ? state : null;
+  currentState = mine;
 
-  if (!state || state.status === "idle") {
+  const staleLogin = !live && mine && mine.status === "error" && mine.error && mine.error.loginRequired;
+  if (!mine || mine.status === "idle" || staleLogin) {
     el.results.hidden = true;
     el.downloadSummary.hidden = true;
     return;
   }
-  if (state.form && state.form.railways) populateRailways(state.form.railways);
+  if (mine.form && mine.form.railways) populateRailways(mine.form.railways);
 
-  if (state.status === "searching") {
+  if (mine.status === "searching") {
     el.results.hidden = true;
     el.progress.hidden = false;
-    el.progressMessage.textContent = state.message || MA_STAGES.SEARCHING.label;
-    setSearchBusy(true, state.message || "Searching…");
-    ctx.setConnection("connected", "Connected");
+    el.progressMessage.textContent = mine.message || MA_STAGES.SEARCHING.label;
+    setSearchBusy(true, mine.message || "Searching…");
+    // "Connected" only once IREPS answered the search's session check (7.15)
+    if (live && irepsAnswered(mine.stage)) ctx.setConnection("connected", "Connected");
     return;
   }
-  if (state.status === "error") {
+  if (mine.status === "error") {
     el.results.hidden = true;
-    const described = state.error || describeError("UNKNOWN");
-    ctx.setConnectionForError(described);
+    const described = mine.error || describeError("UNKNOWN");
+    if (live) ctx.setConnectionForError(described);
     if (described.loginRequired) {
       ctx.showLogin(described);
       return;
@@ -346,14 +385,26 @@ function render(state) {
     return;
   }
 
-  // ready / downloading / complete
-  ctx.setConnection("connected", "Connected");
+  // ready / downloading / complete; the indicator says what the run found: an expired session as such (1.18).
+  // A download still running has not told yet (7.15)
+  if (live && mine.status !== "downloading") {
+    if (mine.error) ctx.setConnectionForError(mine.error);
+    else ctx.setConnection("connected", "Connected");
+  }
   el.results.hidden = false;
-  const n = state.recordCount || (state.records || []).length;
-  const total = state.allRecordCount && state.allRecordCount !== n ? ` of ${state.allRecordCount}` : "";
+  const n = mine.recordCount || (mine.records || []).length;
+  const total = mine.allRecordCount && mine.allRecordCount !== n ? ` of ${mine.allRecordCount}` : "";
   el.resultsTitle.textContent = `MA Results (${n}${total})`;
-  const pages = state.pagination && state.pagination.pagesFetched > 1 ? ` · ${state.pagination.pagesFetched} result pages` : "";
-  el.resultsFilter.textContent = `${state.filter || ""}${pages}`;
+  const pages = mine.pagination && mine.pagination.pagesFetched > 1 ? ` · ${mine.pagination.pagesFetched} result pages` : "";
+  el.resultsFilter.textContent = `${mine.filter || ""}${pages}`;
+  // fewer MAs read than IREPS listed: said over the list, never a silent short list (1.1)
+  el.resultsWarning.textContent = mine.incomplete ? `${mine.incomplete}; some MAs may be missing from this list.` : "";
+  el.resultsWarning.hidden = !mine.incomplete;
+  renderLoaded(mine, previousIds);
+}
+
+/** The list, its chips and the download summary of a loaded MA state. */
+function renderLoaded(state, previousIds) {
   const ids = (state.records || []).map((r) => String(r.id)).join("|");
   if (ids !== previousIds || itemNodes.size === 0) renderList(state);
   else updateStatuses(state);
@@ -367,9 +418,10 @@ function render(state) {
 /* Actions                                                                    */
 /* -------------------------------------------------------------------------- */
 
-async function refreshState() {
+/** `live`: the state follows a run's own end (false when the view opens: the state may be old). */
+async function refreshState({ live = true } = {}) {
   const state = await ctx.send(MESSAGE_TYPES.GET_MA_STATE);
-  render(state);
+  render(state, { live });
   return state;
 }
 
@@ -395,8 +447,9 @@ async function openView() {
   ctx.showView("ma");
   if (!el.date.value) el.date.value = localIsoDate();
   syncDateRows();
-  const state = await refreshState();
-  if (!state || state.status === "idle" || state.status === "error") await loadForm(false);
+  // the state may be old: an old "login required" never locks the view; the live form check decides (4.9)
+  const state = await refreshState({ live: false });
+  if (!state || state.status === "idle" || state.status === "error" || !isOwnRun(state.startedBy)) await loadForm(false);
 }
 
 async function startSearch(event) {
@@ -432,6 +485,7 @@ async function startDownload(ids) {
   else {
     el.btnDownloadSelected.disabled = true;
     el.btnDownloadAll.disabled = true;
+    el.btnNewSearch.disabled = true;
   }
 }
 
@@ -441,8 +495,13 @@ function retryFailed() {
   if (ids.length) startDownload(ids);
 }
 
+/** "New search": the worker forgets the list, unless an MA search or download runs; then the panel keeps it too and says why (7.11). */
 async function newSearch() {
-  await ctx.send(MESSAGE_TYPES.MA_RESET);
+  const response = await ctx.send(MESSAGE_TYPES.MA_RESET);
+  if (!response || response.ok === false) {
+    showError(response ? asDescribedError(response.error, "MA_BUSY") : describeError("NO_BACKGROUND_RESPONSE", { detail: "no reply to the New search request" }));
+    return;
+  }
   selected.clear();
   render({ status: "idle" });
 }
@@ -489,30 +548,41 @@ export function initMa(context) {
   syncDateRows();
 }
 
-/** Route MA broadcasts from the service worker. Returns true when handled. */
+/**
+ * Route MA broadcasts from the service worker. Returns true when handled. A run this panel did not start
+ * (a scheduled run, another tab's search) is only noted: this panel's list, selection and view stay.
+ */
 export function handleMaMessage(message) {
+  const own = isOwnRun(message.startedBy);
   switch (message.type) {
     case MESSAGE_TYPES.MA_PROGRESS:
-      if (!el.view.hidden) {
+      if (!own) noteBackground(message.startedBy, true);
+      else if (!el.view.hidden) {
         if (message.status === "downloading") {
           if (currentState) currentState.status = "downloading";
           setSearchBusy(true, "Downloading…");
+          updateSelectionUi();
         } else {
           el.results.hidden = true;
           el.progress.hidden = false;
           el.progressMessage.textContent = message.message || "";
           setSearchBusy(true, message.message || "Searching…");
+          // "Connected" only once IREPS answered the search's session check; a download says so when it ends (7.15)
+          if (irepsAnswered(message.stage)) ctx.setConnection("connected", "Connected");
         }
-        ctx.setConnection("connected", "Connected");
       }
       return true;
     case MESSAGE_TYPES.MA_SEARCH_COMPLETE:
+      if (!own) {
+        noteBackground(message.startedBy, false);
+        return true;
+      }
       selected.clear();
       if (!el.view.hidden) render(message);
       else currentState = message;
       return true;
     case MESSAGE_TYPES.MA_DOWNLOAD_PROGRESS:
-      if (currentState) {
+      if (own && currentState) {
         currentState = { ...currentState, status: "downloading", downloads: message.downloads };
         if (!el.view.hidden) {
           updateStatuses(currentState);
@@ -523,17 +593,20 @@ export function handleMaMessage(message) {
       return true;
     case MESSAGE_TYPES.MA_DOWNLOAD_COMPLETE:
     case MESSAGE_TYPES.MA_ERROR:
-      if (!el.view.hidden) refreshState();
+      if (!own) noteBackground(message.startedBy, false);
+      else if (!el.view.hidden) refreshState();
       return true;
     default:
       return false;
   }
 }
 
-/** Called once at popup start-up. Opens the MA view when an MA job is running. */
+/** Called once at popup start-up. Opens the MA view when an MA job of this panel's is running. */
 export async function restoreMa() {
   const state = await ctx.send(MESSAGE_TYPES.GET_MA_STATE);
   if (!state || state.status === "idle") return false;
+  // a run this panel did not start never opens the MA view here
+  if (!isOwnRun(state.startedBy)) return false;
   if (state.status === "searching" || state.status === "downloading") {
     ctx.showView("ma");
     if (!el.date.value) el.date.value = localIsoDate();

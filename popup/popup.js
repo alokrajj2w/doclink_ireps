@@ -14,13 +14,13 @@ import { loadDownloadLogConfig, configureDownloadLog, describeSkip, DOWNLOAD_LOG
 import { initRedownload } from "./popup-redownload.js";
 import { formatFriendlyDateTime } from "../utils/filename.js";
 import { toIrepsDate } from "../utils/dates.js";
-import { fillSelect } from "./popup-common.js";
+import { fillSelect, noteBackgroundRun, backgroundRunText } from "./popup-common.js";
 import { initDocuments, handleDocumentMessage, restoreDocuments, refreshDocumentsDestination } from "./popup-documents.js";
 import { initMa, handleMaMessage, restoreMa, refreshMaDestination } from "./popup-ma.js";
 import { initPoIc, handlePoIcMessage, restorePoIc, refreshPoIcDestination } from "./popup-po-ic.js";
 import { initBatch, handleBatchMessage, restoreBatch, refreshBatchDestination } from "./popup-po-ic-batch.js";
-import { initGate, currentPanelTabId, panelOwnTabId, tabExists } from "./popup-gate.js";
-import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser, RECON_OFFLINE } from "./popup-recon-auth.js";
+import { initGate, currentPanelTabId, panelOwnTabId, tabExists, isOwnRun, rememberRunTab } from "./popup-gate.js";
+import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser, reconUnreachable, RECON_OFFLINE } from "./popup-recon-auth.js";
 import { initDownloads } from "./popup-downloads.js";
 import { initSchedule, handleScheduleMessage } from "./popup-schedule.js";
 import { initBillUpload, handleBillUploadMessage, restoreBillUpload } from "./popup-bill-upload.js";
@@ -90,6 +90,8 @@ const ALL_ZONES = "-1";
 
 /** chrome.downloads id of the download shown in the bottom result panel. */
 let resultDownloadId = null;
+/** Whose result the bottom result panel shows ("billStatus", "doc:CRN", "doc:RNOTE"), or null. */
+let resultOwner = null;
 
 /* -------------------------------------------------------------------------- */
 /* Messaging                                                                  */
@@ -105,12 +107,19 @@ const RUN_TYPES = new Set([
   MESSAGE_TYPES.MA_DOWNLOAD,
   MESSAGE_TYPES.PO_DOWNLOAD,
   MESSAGE_TYPES.IC_DOWNLOAD,
+  MESSAGE_TYPES.IC_RETRY,
   MESSAGE_TYPES.BATCH_START,
   MESSAGE_TYPES.BATCH_RETRY
 ]);
 
 /** The runs that save to the Recon Engine (S3): Bill Status, CRN and R-NOTE. The rest save ECM documents. */
 const S3_RUN_TYPES = new Set([MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS, MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS]);
+
+/**
+ * Requests that start a job: each carries this panel's tab id, so the job's state and broadcasts say
+ * this panel started it (popup-gate.js isOwnRun). The MA search too, though it downloads nothing.
+ */
+const STARTER_TYPES = new Set([...RUN_TYPES, MESSAGE_TYPES.MA_SEARCH]);
 
 /** Whether a run under Save to: ECM / S3 needs the Recon sign-in: always for S3, and for ECM documents unless they go straight to the ECM. */
 async function needsReconSignIn(type) {
@@ -149,9 +158,15 @@ async function send(type, payload = {}) {
     } else if (payloadDestination(payload) === SAVE_DESTINATION.RECON && (await needsReconSignIn(type)) && !(await ensureReconSignedIn())) {
       payload = toLocal(payload);
     }
-    // the run asks this panel (not another tab's) which already-downloaded files to download again
+  }
+  if (STARTER_TYPES.has(type)) {
+    // the run asks this panel (not another tab's) which already-downloaded files to download again, and its
+    // state and broadcasts say this panel started it
     const panelTabId = await currentPanelTabId();
-    if (panelTabId !== null) payload = { ...payload, panelTabId };
+    if (panelTabId !== null) {
+      rememberRunTab(panelTabId);
+      payload = { ...payload, panelTabId };
+    }
   }
   // Every "Open Recon Engine" button now opens DocLink's own Recon sign-in page.
   if (type === MESSAGE_TYPES.OPEN_RECON) {
@@ -186,15 +201,20 @@ chrome.runtime.onMessage.addListener((message) => {
   if (handleBatchMessage(message)) return false;
   if (handleBillUploadMessage(message)) return false;
   if (handleScheduleMessage(message)) return false;
+  // a Bill Status run this panel did not start (a scheduled one, another tab's) never takes this panel over
+  const own = isOwnRun(message.startedBy);
   switch (message.type) {
     case MESSAGE_TYPES.IREPS_PROGRESS:
-      renderProgress(message.stage, message.message);
+      if (own) renderProgress(message.stage, message.message);
+      else noteBackgroundBillStatus(message.startedBy, true);
       break;
     case MESSAGE_TYPES.IREPS_DOWNLOAD_COMPLETE:
-      renderComplete(message);
+      if (own) renderComplete(message);
+      else noteBackgroundBillStatus(message.startedBy, false);
       break;
     case MESSAGE_TYPES.IREPS_DOWNLOAD_ERROR:
-      renderError(message);
+      if (own) renderError(message);
+      else noteBackgroundBillStatus(message.startedBy, false);
       break;
     default:
       break;
@@ -265,15 +285,32 @@ function setButtonBusy(busy, label) {
   el.btnLabel.textContent = label || "Bill Status";
 }
 
+/**
+ * A Bill Status run this panel did not start (a scheduled one, another tab's) holds the job: the panel
+ * only says so and keeps its Bill Status button waiting; its view, results and login view are untouched.
+ */
+function noteBackgroundBillStatus(startedBy, running) {
+  noteBackgroundRun("billStatus", running ? backgroundRunText("Bill Status", startedBy) : null);
+  el.btnDownload.disabled = running;
+}
+
 /* ------------------------------------------------ shared bottom result panel */
 
 /**
  * Show the details of a completed download (any type) in the panel at the
  * bottom of the main view, and return to the main view.
- * @param {{ title: string, summary?: string, filter?: string, filename?: string, downloadId?: number|null, preview?: boolean }} details
+ * `notice`: the download is short of what IREPS listed (shown as a warning, not a success).
+ * `owner`: whose result it is ("billStatus", "doc:CRN" ...), so that only that job's next run takes it away (7.8).
+ * @param {{ title: string, summary?: string, filter?: string, filename?: string, downloadId?: number|null, preview?: boolean, notice?: boolean }} details
+ * @param {string|null} [owner]
  */
-function showResult(details) {
+function showResult(details, owner = null) {
   showView("main");
+  resultOwner = owner;
+  const notice = details.notice === true;
+  el.mainResult.classList.toggle("result-success", !notice);
+  el.mainResult.classList.toggle("result-error", notice);
+  el.mainResult.classList.toggle("is-notice", notice);
   resultDownloadId = details.downloadId ?? null;
   el.mainResultTitle.textContent = details.title || "";
   el.mainResultSummary.textContent = details.summary || "";
@@ -285,13 +322,21 @@ function showResult(details) {
   el.mainResult.scrollIntoView({ block: "nearest" });
 }
 
-function hideResult() {
+/**
+ * Take the bottom result panel away. With `owner`, only when it shows that job's result: a run of one job
+ * never takes away the result of another that just finished (7.8). Without it (Dismiss), whatever it shows.
+ * @param {string} [owner]
+ */
+function hideResult(owner) {
+  if (owner && resultOwner !== owner) return;
   el.mainResult.hidden = true;
   resultDownloadId = null;
+  resultOwner = null;
 }
 
+/** Bill Status's own result and error box, before its next run is drawn. */
 function resetResults() {
-  hideResult();
+  hideResult("billStatus");
   el.resultError.hidden = true;
   el.resultError.classList.remove("is-notice");
   el.btnErrorPreview.hidden = true;
@@ -332,7 +377,7 @@ function renderComplete(summary) {
       filename: summary.skip && summary.skip.filename ? `Earlier file: ${summary.skip.filename}` : "",
       downloadId: null,
       preview: true
-    });
+    }, "billStatus");
     refreshMeta();
     return;
   }
@@ -342,12 +387,13 @@ function renderComplete(summary) {
   const loaded = toRecon ? describeIngestStats(summary.ingestStats) : "";
   showResult({
     title: toRecon ? "✓ Bill Status saved to the Recon Engine (S3)" : "✓ Bill Status downloaded successfully",
-    summary: `Records found: ${n}${extras.length ? ` (${extras.join(", ")})` : ""}${loaded ? `\n${loaded}` : ""}`,
+    // the download log's own warnings ("Download log unavailable ...") are said with the result (1.1)
+    summary: [`Records found: ${n}${extras.length ? ` (${extras.join(", ")})` : ""}`, loaded, ...(summary.warnings || [])].filter(Boolean).join("\n"),
     filter: summary.filter ? `Search: ${summary.filter}` : "",
     filename: (toRecon ? summary.storedPath : summary.filename) || summary.filename || "",
     downloadId: summary.downloadId ?? null,
     preview: true
-  });
+  }, "billStatus");
   refreshMeta();
 }
 
@@ -373,6 +419,7 @@ function renderError(error) {
   el.resultError.hidden = false;
 }
 
+/** The footer: the last Bill Status download in this browser and how the last Bill Status run ended (its labels say so, 7.14). */
 async function refreshMeta() {
   try {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.LAST_DOWNLOAD);
@@ -512,6 +559,11 @@ async function startDownload() {
 async function restoreJobState() {
   const state = await send(MESSAGE_TYPES.GET_JOB_STATE);
   if (!state || state.status === "idle") return false;
+  // a run this panel did not start (a scheduled one, another tab's) is never shown as this panel's own
+  if (!isOwnRun(state.startedBy)) {
+    if (state.status === "running") noteBackgroundBillStatus(state.startedBy, true);
+    return false;
+  }
   const fresh = Date.now() - (state.updatedAt || 0) < 10 * 60 * 1000;
   if (state.status === "running") {
     renderProgress(state.stage, state.message);
@@ -547,7 +599,7 @@ el.btnErrorPreview.addEventListener("click", () => send(MESSAGE_TYPES.OPEN_PREVI
 el.btnMainShowFile.addEventListener("click", () => {
   if (resultDownloadId !== null) chrome.downloads.show(resultDownloadId);
 });
-el.btnMainDismiss.addEventListener("click", hideResult);
+el.btnMainDismiss.addEventListener("click", () => hideResult());
 el.btnErrorOpenRecon.addEventListener("click", () => send(MESSAGE_TYPES.OPEN_RECON));
 for (const radio of el.optDestination) radio.addEventListener("change", onDestinationChange);
 
@@ -555,6 +607,36 @@ for (const radio of el.optRange) radio.addEventListener("change", updateOptionsS
 el.optZone.addEventListener("change", updateOptionsSummary);
 el.optDateFrom.addEventListener("change", updateOptionsSummary);
 el.optDateTo.addEventListener("change", updateOptionsSummary);
+
+/**
+ * What a reopened panel restores, each into its own card or view, and the view each one opens when it
+ * has something to show. Earlier entries win the view.
+ */
+const RESTORES = [
+  ["main", restoreJobState],
+  ["main", restoreDocuments],
+  ["ma", restoreMa],
+  ["po-ic", restorePoIc],
+  ["po-ic-batch", restoreBatch],
+  ["upload", restoreBillUpload]
+];
+
+/**
+ * Every view's state comes back on its own (7.7): each restore runs whatever the others found, so a Bill
+ * Status result never leaves a running CRN job, an MA download or a batch looking idle. The view shown is
+ * the one of the first restore that had something to show, else the main view.
+ */
+async function restoreViews() {
+  let view = null;
+  for (const [name, restore] of RESTORES) {
+    try {
+      if ((await restore()) && !view) view = name;
+    } catch (error) {
+      logger.warn(`Panel: the ${name} view's state was not restored`, error);
+    }
+  }
+  showView(view || "main");
+}
 
 /**
  * First time the active tab is the configured IREPS portal: restore any job
@@ -566,13 +648,7 @@ let bootstrapped = false;
 async function onIrepsTabActive() {
   if (!bootstrapped) {
     bootstrapped = true;
-    const restored = await restoreJobState();
-    const documentRestored = restored ? false : await restoreDocuments();
-    const maRestored = restored || documentRestored ? false : await restoreMa();
-    const poIcRestored = restored || documentRestored || maRestored ? false : await restorePoIc();
-    const batchRestored = restored || documentRestored || maRestored || poIcRestored ? false : await restoreBatch();
-    const billRestored = restored || documentRestored || maRestored || poIcRestored || batchRestored ? false : await restoreBillUpload();
-    if (!restored && !documentRestored && !maRestored && !poIcRestored && !batchRestored && !billRestored) showView("main");
+    await restoreViews();
     const state = await send(MESSAGE_TYPES.GET_JOB_STATE);
     if (!state || state.status !== "running") await checkSession(false);
     return;
@@ -604,7 +680,7 @@ async function onIrepsTabActive() {
   initBatch({ send, showView, setConnection, setConnectionForError, getDestination: selectedDestination });
   refreshBatchDestination();
   initBillUpload({ send, showView, setConnection, setConnectionForError, currentPanelTabId });
-  initDownloads({ showView, ensureSignedIn: () => ensureReconSignedIn({ always: true }), currentUser: currentReconUser, openSignIn: openReconSignIn });
+  initDownloads({ showView, ensureSignedIn: () => ensureReconSignedIn({ always: true }), currentUser: currentReconUser, openSignIn: openReconSignIn, reconUnreachable });
   initSchedule({ send, showView }).catch((error) => logger.warn("Scheduled downloads view not set up", error));
   // Nothing talks to IREPS until the active tab is the configured portal.
   await initGate({ send, setConnection, onActive: onIrepsTabActive });

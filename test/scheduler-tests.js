@@ -8,15 +8,15 @@
  */
 
 import { parseSchedulerConfig, SCHEDULE_TYPES, SCHEDULE_DEFAULT_TIMING, TENDER_SCHEDULE_TYPES } from "../services/scheduler/schedule-types.js";
-import { createTenderRunner, tenderRunOutcome, cleanOutcome, tenderCode, stoppedCode, RUNNER_PAGE } from "../services/scheduler/tender-runner.js";
-import { createScheduler, LEASE_MS, HEARTBEAT_MS, RUNNING_POLL_MS, DEBOUNCE_MS } from "../services/scheduler/scheduler.js";
+import { createTenderRunner, tenderRunOutcome, tenderJobProblems, cleanOutcome, tenderCode, stoppedCode, RUNNER_PAGE } from "../services/scheduler/tender-runner.js";
+import { createScheduler, LEASE_MS, HEARTBEAT_MS, RUNNING_POLL_MS, DEBOUNCE_MS, ACCOUNT_CHECK_MS } from "../services/scheduler/scheduler.js";
 import { createRunnerFactory, failedOutcome } from "../services/scheduler/runners.js";
 import { createSharedRunHooks, istParts, RESERVE_CHUNK } from "../services/scheduler/shared-run-hooks.js";
 import { createScheduleApi, ScheduleApiError } from "../services/scheduler/schedule-api.js";
 import { createLocalSignals, IREPS_ACTIVITY_MS } from "../services/scheduler/local-signals.js";
 import { scheduledSearch, labelFromKey, failureEntry, fitResult, RESULT_FAILURES_MAX, RESULT_MAX_CHARS, FIXED_LOOKBACK } from "../services/scheduler/run-details.js";
 import { createRunLog, runLogText, MAX_RUNS } from "../services/scheduler/run-log.js";
-import { isIrepsActivityUrl, exportLaunchOptions } from "../background/scheduler-job.js";
+import { isIrepsActivityUrl, isUserIrepsActivity, exportLaunchOptions, batchRunEnd } from "../background/scheduler-job.js";
 import { icDateItems } from "../services/inspection-certificate/ic-date-service.js";
 import { icFiling } from "../services/inspection-certificate/ic-service.js";
 import { slotText, istTime, todayRows, earlierText, editorTypes, lastErrorText, initSchedule, slotDetails, savedNotice, handleScheduleMessage } from "../popup/popup-schedule.js";
@@ -257,6 +257,53 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(h.calls.runs[0].ctx.params.dateFrom, "16/11/2026", "the claim's date range goes to the run");
   });
 
+  await test("Scheduler (5.6): one IREPS check covers the next slot only for ACCOUNT_CHECK_MS; after a longer run another account logged in gets no download", async () => {
+    const dues = () => [
+      { due: [slot(2, "crn"), slot(1, "billStatus")], running: null, next_check_at: null, slots: [] },
+      { due: [slot(2, "crn")], running: null, next_check_at: null, slots: [] },
+      { due: [], running: null, next_check_at: null, slots: [] }
+    ];
+    const quick = harness({ dues: dues(), during: async (ctx, { advance }) => void advance(ACCOUNT_CHECK_MS) });
+    await quick.scheduler.wake("ireps page");
+    eq(quick.calls.runs.map((r) => r.type).join(), "billStatus,crn");
+    eq(quick.calls.checkIreps, 1, "a run that ended within ACCOUNT_CHECK_MS: the next slot runs on the same check");
+
+    // the Bill Status run takes 40 minutes, and meanwhile IREPS account 60828 is logged in here
+    const opts = { dues: dues() };
+    opts.during = async (ctx, { advance }) => {
+      if (ctx.slot.doc_type !== "billStatus") return;
+      advance(40 * 60000);
+      opts.check = { ok: true, account: { irepsAccountId: "60828" } };
+    };
+    const long = harness(opts);
+    await long.scheduler.wake("ireps page");
+    eq(long.calls.runs.map((r) => r.type).join(), "billStatus", "the CRN slot never runs for 833 while 60828 is logged in");
+    eq(long.calls.checkIreps, 2, "the CRN slot had a check of its own");
+    eq(long.calls.claim.map((c) => c.slotId).join(), "1,2", "made only after its claim was won");
+    eq(long.calls.finish[1].code, "SCHEDULE_ACCOUNT_MISMATCH");
+    eq(long.calls.finish[1].countsAsAttempt, false, "given back, no attempt counted");
+    eq(long.calls.recordedAccount, "60828");
+  });
+
+  await test("Scheduler (5.6): after a longer run with no IREPS page loaded since, the next slot waits for one; nothing is claimed or sent to IREPS", async () => {
+    const opts = {
+      dues: [
+        { due: [slot(2, "crn"), slot(1, "billStatus")], running: null, next_check_at: null, slots: [] },
+        { due: [slot(2, "crn")], running: null, next_check_at: null, slots: [] }
+      ]
+    };
+    opts.during = async (ctx, { advance }) => {
+      advance(40 * 60000);
+      opts.irepsReady = false; // the last IREPS page load is older than IREPS_ACTIVITY_MS now
+    };
+    const h = harness(opts);
+    await h.scheduler.wake("ireps page");
+    eq(h.calls.runs.map((r) => r.type).join(), "billStatus");
+    eq(h.calls.claim.length, 1, "the CRN slot is not claimed");
+    eq(h.calls.checkIreps, 1, "and IREPS is not asked");
+    eq(h.scheduler.getState().waitingFor, "ireps");
+  });
+
   await test("Scheduler: another DocLink runs the account (409) -> no IREPS request; looks again soon", async () => {
     const h = harness({
       dues: [{ due: [slot(1, "billStatus")], running: null, next_check_at: new Date(T0 + 15 * 60000).toISOString(), slots: [] }],
@@ -305,6 +352,40 @@ export async function runSchedulerTests({ test, assert, eq }) {
     const text = runLog.log.events.at(-1).text;
     assert(/^Bill Status: claimed, but IREPS could not be checked here: IREPS not responding \(the home page answered HTTP 503\); given back/.test(text), text);
     assert(!/not logged in/.test(text), text);
+  });
+
+  await test("Scheduler (1.12): a claim given back because IREPS did not answer or another account is logged in never asks to log in to IREPS (no '!' badge)", async () => {
+    const due = () => [{ due: [slot(1, "billStatus")], running: null, next_check_at: null, slots: [] }];
+    const unavailable = harness({ check: { ok: false, code: "IREPS_UNAVAILABLE", detail: "the home page answered HTTP 503" }, dues: due() });
+    await unavailable.scheduler.wake("ireps page");
+    const u = unavailable.scheduler.getState();
+    eq(u.waitingFor, null, "not 'open IREPS (logged in)': the user is logged in");
+    eq(JSON.stringify(u.lastError), JSON.stringify({ code: "IREPS_UNAVAILABLE", detail: "the home page answered HTTP 503" }));
+    eq(lastErrorText(u.lastError), "Last check failed: IREPS not responding (the home page answered HTTP 503).");
+    const other = harness({ check: { ok: true, account: { irepsAccountId: "60828" } }, dues: due() });
+    await other.scheduler.wake("ireps page");
+    const o = other.scheduler.getState();
+    eq(o.waitingFor, null);
+    eq(o.lastError.code, "SCHEDULE_ACCOUNT_MISMATCH");
+    eq(o.lastError.detail, "IREPS account 60828 is logged in here, not 833");
+    const loggedOut = harness({ check: { ok: false, code: "IREPS_SESSION_EXPIRED", detail: "IREPS answered with its login page" }, dues: due() });
+    await loggedOut.scheduler.wake("ireps page");
+    eq(loggedOut.scheduler.getState().waitingFor, "ireps", "IREPS's login page: log in to IREPS (and the badge)");
+  });
+
+  await test("Scheduler (1.12): a claim given back because a manual run took the job first (BUSY) waits for that run, and goes on at once when it has ended", async () => {
+    const dues = () => [{ due: [slot(1, "crn")], running: null, next_check_at: null, slots: [] }, { due: [], running: null, next_check_at: null, slots: [] }];
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => ({}), details: noDetails }) });
+    const taken = await factory.exportRunner(async () => ({ started: false, error: { code: "DOCUMENT_BUSY" } }))({});
+    eq(JSON.stringify([taken.outcome, taken.countsAsAttempt, taken.waitForJob]), JSON.stringify(["failed", false, true]));
+    const opts = { dues: dues(), outcomes: { crn: taken }, during: async () => void (opts.busy = true) };
+    const waiting = harness(opts);
+    await waiting.scheduler.wake("ireps page");
+    eq(waiting.scheduler.getState().waitingFor, "busy", "so scheduler-job.js jobEnded wakes it when that run ends");
+    const ended = harness({ dues: dues(), outcomes: { crn: taken } });
+    await ended.scheduler.wake("ireps page");
+    for (let i = 0; i < 50 && ended.calls.due.length < 2; i++) await new Promise((r) => setTimeout(r, 0));
+    eq(ended.calls.due.length, 2, "the run that held the job had ended already: looked again at once");
   });
 
   await test("Scheduler: the winner's check meets IREPS's login page -> 'IREPS is not logged in here', recorded", async () => {
@@ -544,6 +625,31 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(skipped.result.skipped, 1);
   });
 
+  await test("Runners (1.11): IREPS saying it has no record is done, nothing new; never a failed run retried every 10 minutes", async () => {
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => ({ saved: 0, skipped: 0, failed: 0, notReported: 0 }), details: noDetails }) });
+    for (const code of ["IREPS_NO_RECORDS", "IREPS_CRN_NOT_FOUND", "IREPS_RNOTE_NOT_FOUND"]) {
+      const run = await factory.exportRunner(async () => ({ started: true, done: Promise.resolve({ ok: false, code }) }))({ slot: { doc_type: "crn" }, params: { dateTo: "18/11/2026" } });
+      eq(run.outcome, "done", code);
+      eq(run.result.records, 0);
+      eq(slotText({ status: "done", done_by: { name: "Priya" }, ended_at: "2026-11-18T04:00:00Z", result: run.result }), "Done by Priya at 09:30 · nothing new in IREPS");
+    }
+    const unrecognised = await factory.exportRunner(async () => ({ started: true, done: Promise.resolve({ ok: false, code: "IREPS_CRN_RESULTS_INVALID" }) }))({});
+    eq(unrecognised.outcome, "failed", "a page DocLink does not recognise is no 'nothing found'");
+  });
+
+  await test("Runners (1.1): a CRN / R-NOTE list short of IREPS's total is not done (retried), and says the shortfall", async () => {
+    let stats = { saved: 1, skipped: 0, failed: 0, notReported: 0 };
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => stats, details: noDetails }) });
+    const incomplete = "IREPS reported 500 CRN result(s) but 450 were read";
+    const start = async () => ({ started: true, done: Promise.resolve({ ok: true, summary: { recordCount: 450, storedPath: "s3://bronze/crn/CRN.xlsx", incomplete } }) });
+    const short = await factory.exportRunner(start)({ slot: { doc_type: "crn" }, params: { dateTo: "18/11/2026" } });
+    eq(JSON.stringify([short.outcome, short.code, short.result.records, short.result.warnings]), JSON.stringify(["partial", "SCHEDULE_LIST_INCOMPLETE", 450, [incomplete]]));
+    stats = { saved: 0, skipped: 1, failed: 0, notReported: 0 };
+    const again = await factory.exportRunner(start)({ slot: { doc_type: "crn" }, params: {} });
+    eq(JSON.stringify([again.outcome, again.code, again.countsAsAttempt]), JSON.stringify(["failed", "SCHEDULE_LIST_INCOMPLETE", true]), "the same short list was already saved: still not done");
+    eq(describeError("SCHEDULE_LIST_INCOMPLETE").title, "IREPS list not read in full");
+  });
+
   await test("Runners: a manual run holds the job -> given back without an attempt; a lost session -> no attempt", async () => {
     const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ saveExport: () => {}, stats: () => ({}), details: noDetails }) });
     const busy = await factory.exportRunner(async () => ({ started: false, error: { code: "DOCUMENT_BUSY" } }))({});
@@ -567,6 +673,44 @@ export async function runSchedulerTests({ test, assert, eq }) {
     const lost = await run({});
     eq(lost.outcome, "failed");
     eq(lost.code, "SCHEDULE_CLAIM_LOST");
+  });
+
+  await test("Runners (1.7, 1.2): rows without a PDF link, failed searches and short lists are named; partial when something was saved, failed when nothing was", async () => {
+    let counts = { saved: 2, skipped: 0, failed: 0, notReported: 0, aborted: null };
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ documentHooks: {}, finishDocuments: async () => counts, details: noDetails }) });
+    const run = (end) => factory.documentRunner(async () => ({ started: true, done: Promise.resolve({ ok: true, ...end }) }))({ slot: { doc_type: "poDate" }, params: { dateFrom: "17/11/2026", dateTo: "18/11/2026" } });
+    const noLink = { id: "po-3", label: "PO 27253922000301", status: "skipped", error: { code: "IREPS_PO_LINK_NOT_FOUND", detail: "IREPS did not provide a PO PDF link for this row" } };
+    const alreadySaved = { id: "po-4", label: "PO 4", status: "skipped", skip: { reason: "already_saved_for_account" }, error: null };
+
+    const rows = await run({ items: [{ id: "po-1", status: "completed" }, { id: "po-2", status: "completed" }, noLink, alreadySaved] });
+    eq(JSON.stringify([rows.outcome, rows.code, rows.result.failed]), JSON.stringify(["partial", "IREPS_PO_LINK_NOT_FOUND", 1]), "a row never fetched is not 'done' (1.7)");
+    eq(JSON.stringify(rows.result.failures), JSON.stringify([{ doc: "PO 27253922000301", code: "IREPS_PO_LINK_NOT_FOUND", detail: "IREPS did not provide a PO PDF link for this row" }]));
+    eq(rows.log.failures.length, 1, "the run log names it too");
+
+    counts = { saved: 0, skipped: 0, failed: 0, notReported: 0, aborted: null };
+    const searches = await run({ items: [], problems: [{ doc: "Notification 77 (PO 27253922100240 Sr. 001)", code: "IREPS_IC_SEARCH_FAILED", detail: "IREPS returned HTTP 503" }] });
+    eq(JSON.stringify([searches.outcome, searches.code, searches.countsAsAttempt]), JSON.stringify(["failed", "IREPS_IC_SEARCH_FAILED", true]), "no IC read: never 'done, nothing new in IREPS' (1.2)");
+    eq(searches.result.failures[0].doc, "Notification 77 (PO 27253922100240 Sr. 001)");
+    const line = slotText({ status: "failed", code: searches.code, result: searches.result });
+    assert(!/nothing new/.test(line) && line.includes("1 failed"), line);
+
+    counts = { saved: 3, skipped: 0, failed: 0, notReported: 0, aborted: null };
+    const shortList = "IC dates 17/11/2026 to 18/11/2026: IREPS reported 5 inspection calls but 3 were read; some ICs may be missing.";
+    const short = await run({ items: [{}, {}, {}], warnings: [shortList] });
+    eq(JSON.stringify([short.outcome, short.code, short.result.warnings]), JSON.stringify(["partial", "SCHEDULE_LIST_INCOMPLETE", [shortList]]));
+    eq(slotDetails({ id: 9, doc_type: "icDate", status: "partial", code: short.code, result: short.result }).warnings.join(), shortList, "the Schedule view lists the warning");
+
+    counts = { saved: 0, skipped: 2, failed: 1, notReported: 0, aborted: null };
+    eq((await run({ items: [{}, {}, {}] })).outcome, "failed", "nothing saved and a document failed: failed, not partial");
+    counts = { saved: 0, skipped: 2, failed: 0, notReported: 0, aborted: null };
+    eq((await run({ items: [{}, {}] })).outcome, "done", "everything already saved: done");
+  });
+
+  await test("Scheduled batches (1.2, 4.3): a batch's list warnings and the notifications it could not read reach the runner", () => {
+    const end = batchRunEnd({ phase: "complete", items: [{ id: "ic-1" }], sessionExpired: false, warnings: ["short"], problems: [{ doc: "Notification 1", code: "IREPS_IC_SEARCH_FAILED", detail: null }] });
+    eq(JSON.stringify([end.ok, end.items.length, end.warnings, end.problems.map((p) => p.code)]), JSON.stringify([true, 1, ["short"], ["IREPS_IC_SEARCH_FAILED"]]));
+    const stopped = batchRunEnd({ phase: "error", error: { code: "IREPS_NOTIFICATIONS_FAILED", message: "DocLink could not read the notifications" }, items: [] });
+    eq(JSON.stringify([stopped.ok, stopped.code, stopped.detail]), JSON.stringify([false, "IREPS_NOTIFICATIONS_FAILED", "DocLink could not read the notifications"]));
   });
 
   await test("Runners: the result names the failed documents (the first 20, then how many more) and the range; the log has them all", async () => {
@@ -606,6 +750,17 @@ export async function runSchedulerTests({ test, assert, eq }) {
     const checked = await hooks.documentHooks.preflight(items);
     eq(checked.skip.size, 2);
     eq(hooks.stats().aborted, "SCHEDULE_CLAIM_LOST");
+  });
+
+  await test("Shared hooks: documents left out because the reservation failed are never counted as 'already saved' (1.9)", async () => {
+    const items = [pdfItem(1), pdfItem(2), pdfItem(3)];
+    const hooks = createSharedRunHooks({ api: hooksApi({ reserveError: new ScheduleApiError("SCHEDULE_BACKEND_UNAVAILABLE") }), claimId: "c1", account: ACCOUNT, isClaimLive: () => true });
+    const checked = await hooks.documentHooks.preflight(items);
+    eq(checked.skip.size, 3, "none is downloaded");
+    eq(JSON.stringify([hooks.stats().skipped, hooks.details().skipped.length, hooks.stats().aborted]), JSON.stringify([0, 0, "SCHEDULE_BACKEND_UNAVAILABLE"]), "nothing was checked, so nothing is 'already saved'");
+    const taken = createSharedRunHooks({ api: hooksApi({ taken: { [items[0].log.key]: { status: "done", by: { name: "Rahul" } } } }), claimId: "c2", account: ACCOUNT, isClaimLive: () => true });
+    await taken.documentHooks.preflight(items);
+    eq(taken.stats().skipped, 1, "a document someone saved still counts");
   });
 
   await test("Shared hooks: the ECM only - a refused upload fails the document (no local save); a lost claim uploads nothing", async () => {
@@ -862,6 +1017,25 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(isIrepsActivityUrl("https://www.ireps.gov.in/epsn/home/showHome.do", ""), false, "no configured portal: nothing counts");
   });
 
+  await test("IREPS activity (5.1): a page loading in a tab DocLink opened itself (a print tab, or a popup of one) never counts, also after a worker restart", async () => {
+    const session = memoryArea();
+    const local = memoryArea();
+    const signals = createLocalSignals({ session, local, now: () => T0 });
+    const base = "https://www.ireps.gov.in";
+    const letter = `${base}/epsn/supply/tds/publishLOALetter.do`;
+    const context = { irepsBaseUrl: base, signals };
+    await signals.recordOwnTab(41); // tender-print.js's print tab (NOTE_OWN_TAB)
+    eq(await isUserIrepsActivity(letter, { id: 41 }, context), false, "the print tab");
+    eq(await isUserIrepsActivity(letter, { id: 42, openerTabId: 41 }, context), false, "a popup the letter page opened");
+    eq(await isUserIrepsActivity(letter, { id: 43, openerTabId: 42 }, context), false, "a tab that popup opened in turn");
+    eq(await isUserIrepsActivity(letter, { id: 7 }, context), true, "the user's own IREPS tab still counts");
+    const restarted = createLocalSignals({ session, local, now: () => T0 });
+    eq(await isUserIrepsActivity(letter, { id: 41 }, { irepsBaseUrl: base, signals: restarted }), false, "kept in chrome.storage.session across a worker restart");
+    await restarted.forgetOwnTab(41);
+    eq(await isUserIrepsActivity(letter, { id: 41 }, { irepsBaseUrl: base, signals: restarted }), true, "a closed tab is forgotten");
+    eq(await restarted.irepsReady(), false, "and none of those loads was recorded as IREPS activity");
+  });
+
   await test("Schedule view: slot lines say who did what, in IST", () => {
     eq(istTime("2026-11-17T04:38:00+00:00"), "10:08");
     eq(slotText({ status: "done", done_by: { name: "Priya" }, ended_at: "2026-11-17T04:38:00+00:00", result: { saved: 1, skipped: 2 } }), "Done by Priya at 10:08 · 1 saved, 2 already saved");
@@ -877,6 +1051,19 @@ export async function runSchedulerTests({ test, assert, eq }) {
     for (const status of ["pending", "missed", "in_progress", "done", "partial", "failed"]) {
       assert(!/[\u2013\u2014]/.test(slotText({ status, holder: { name: "R" }, done_by: { name: "P" }, ...nineToNoon }, null, T0)), `${status}: only the plain "-" in the panel, never an en or em dash`);
     }
+  });
+
+  await test("Schedule view (1.13): a slot that ran but did not end clean before its window closed is never shown as 'Not run'", () => {
+    const nineToTen = { window_start_at: "2026-11-17T03:30:00+00:00", window_end_at: "2026-11-17T04:30:00+00:00" };
+    const ran = { id: 4, doc_type: "poDate", status: "missed", code: "SCHEDULE_DOWNLOAD_FAILED", attempts: 2, started_at: "2026-11-17T03:40:00+00:00", ended_at: "2026-11-17T03:44:00+00:00", result: { saved: 3, failed: 1, failures: [{ doc: "PO 1", code: "ECM_UNAVAILABLE", detail: null }] }, ...nineToTen };
+    eq(slotText(ran), `Ran, but not finished during 09:00-10:00 (last: ${describeError("SCHEDULE_DOWNLOAD_FAILED").title}) \u00b7 3 saved, 1 failed`);
+    const later = Date.parse("2026-11-17T06:00:00Z");
+    const ranDetails = slotDetails(ran, { log: { runs: [], events: [] }, now: later });
+    assert(!ranDetails.events.some((e) => /noted nothing/.test(e)), "it ran: no 'Chrome was closed'");
+    eq(ranDetails.failures[0].doc, "PO 1");
+    const never = { id: 5, doc_type: "ma", status: "missed", ...nineToTen };
+    eq(slotText(never), "Not run during 09:00-10:00");
+    assert(slotDetails(never, { log: { runs: [], events: [] }, now: later }).events[0].includes("noted nothing"), "a slot no DocLink ran still says what this browser noted");
   });
 
   await test("Schedule view: the scheduler's last failure is shown in the status line", () => {
@@ -1058,7 +1245,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
       user: { name: "Priya", canRun: true, canManage: true },
       waitingFor: null,
       lastError: null,
-      version: "1.6.7",
+      version: "1.6.8",
       slots: [
         { id: 1, doc_type: "billStatus", period: "day", status: "missed", ...nineToTen },
         { id: 3, doc_type: "tenderNit", period: "10:30", status: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", attempts: 1, started_at: "2026-11-19T05:15:00+00:00", ended_at: "2026-11-19T05:22:00+00:00", window_start_at: "2026-11-19T05:00:00+00:00", window_end_at: "2026-11-19T06:00:00+00:00", next_try_at: "2026-11-19T05:45:00+00:00", result: { saved: 35, skipped: 18, failed: 2, range: "17/11/2026 - 18/11/2026", failures } }
@@ -1359,6 +1546,38 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(JSON.stringify([r2.code, r2.countsAsAttempt]), JSON.stringify(["SCHEDULE_RUNNER_NOT_OPENED", false]));
   });
 
+  await test("Tender runner (5.7): Chrome throttling the hidden runner tab's timers never stops a live run; before an upload the tab asks the worker again when its answer is old", async () => {
+    const { createClaimWatch, RUNNER_PING_MS: PING, RUNNER_LIVE_MS: LIVE } = await import("../services/scheduler/tender-runner.js");
+    let clock = T0;
+    const asked = [];
+    let live = true;
+    const watch = createClaimWatch({ ask: async () => (asked.push(clock), { ok: true, live }), now: () => clock, wait: () => new Promise(() => {}) });
+    eq(await watch.isClaimLive(), true, "live when the worker opened the tab");
+    eq(asked.length, 0, "an answer younger than the ping interval is used as it is");
+    // none of the tab's timers ran for 70 s (hidden for 5 minutes, Chrome wakes them once a minute at most)
+    clock += 70000;
+    eq(await watch.isClaimLive(), true, "the worker is asked again, and the run goes on");
+    eq(await watch.isClaimLive(), true);
+    eq(asked.length, 1, "a fresh answer is not asked for again");
+    clock += PING;
+    live = false;
+    eq(await watch.isClaimLive(), false, "the worker says the claim is lost: the next upload is refused");
+    // a worker that does not answer: the last "live" answer counts for RUNNER_LIVE_MS, never longer
+    const silent = createClaimWatch({ ask: () => new Promise(() => {}), now: () => clock, wait: async () => {} });
+    clock += PING;
+    eq(await silent.isClaimLive(), true, `an answer ${PING / 1000} s old still counts`);
+    clock += LIVE - PING;
+    eq(await silent.isClaimLive(), false, `no answer for ${LIVE / 1000} s: the claim may be lost`);
+    // the tab's interval and an upload asking at the same time are one question to the worker
+    const once = createClaimWatch({ ask: () => (asked.push("once"), new Promise((resolve) => setTimeout(() => resolve({ live: true }), 0))), now: () => clock, wait: () => new Promise(() => {}) });
+    clock += PING;
+    await Promise.all([once.refresh(), once.isClaimLive()]);
+    eq(asked.filter((a) => a === "once").length, 1);
+    // the worker says "live" until LEASE_MS - HEARTBEAT_MS after its last heartbeat, so a "live" answer leaves HEARTBEAT_MS
+    // of lease: the oldest answer the tab relies on still leaves at least a minute of it
+    assert(HEARTBEAT_MS - LIVE >= 60000 && PING < LIVE && LIVE < LEASE_MS, `${LIVE} ms of trust inside the ${HEARTBEAT_MS} ms a live answer leaves`);
+  });
+
   await test("Tender runner: with the browser's own timers (none injected) a run starts and ends", async () => {
     const h = tenderHarness({ realTimers: true });
     const ended = h.runner.run(h.ctx);
@@ -1369,14 +1588,16 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(h.tabs.closed.join(), "41");
   });
 
-  await test("Tender run outcome: aborted reservation, session lost, failures -> partial, else done", () => {
+  await test("Tender run outcome: aborted reservation, session lost, failures -> partial (failed when nothing was saved), else done", () => {
     const counts = (o = {}) => ({ saved: 0, skipped: 0, failed: 0, notReported: 0, aborted: null, ...o });
     eq(tenderRunOutcome({ result: {}, counts: counts({ aborted: "SCHEDULE_CLAIM_LOST" }) }).code, "SCHEDULE_CLAIM_LOST");
     const expired = tenderRunOutcome({ error: { code: "SESSION_EXPIRED" }, counts: counts({ saved: 1 }) });
-    eq(JSON.stringify([expired.code, expired.countsAsAttempt, expired.sessionExpired]), JSON.stringify(["IREPS_SESSION_EXPIRED", false, true]));
+    eq(JSON.stringify([expired.outcome, expired.code, expired.countsAsAttempt, expired.sessionExpired]), JSON.stringify(["failed", "IREPS_SESSION_EXPIRED", false, true]), "an expired session stays failed, also after a save");
     eq(tenderRunOutcome({ result: { letters: { aborted: { code: "SESSION_EXPIRED" } } }, counts: counts() }).code, "IREPS_SESSION_EXPIRED", "a job that stopped early");
     eq(tenderRunOutcome({ result: {}, counts: counts({ saved: 3, failed: 1 }) }).outcome, "partial");
-    eq(tenderRunOutcome({ result: { summary: { failed: 1 } }, counts: counts() }).outcome, "partial", "a tender the job could not handle");
+    eq(tenderRunOutcome({ result: {}, counts: counts({ failed: 1 }) }).outcome, "failed", "nothing saved, a document failed");
+    eq(tenderRunOutcome({ result: { summary: { failed: 1 } }, counts: counts() }).outcome, "failed", "a tender the job could not handle, nothing saved");
+    eq(tenderRunOutcome({ result: { summary: { failed: 1 } }, counts: counts({ saved: 1 }) }).outcome, "partial", "a tender the job could not handle, after a save");
     const done = tenderRunOutcome({ result: { summary: { failed: 0 } }, counts: counts({ saved: 2, skipped: 5 }) });
     eq(JSON.stringify([done.outcome, done.result.saved, done.result.skipped]), JSON.stringify(["done", 2, 5]));
     eq(tenderCode("ACCOUNT_CHANGED"), "SCHEDULE_ACCOUNT_MISMATCH");
@@ -1413,9 +1634,8 @@ export async function runSchedulerTests({ test, assert, eq }) {
     await t.documentSaved({ doc_type: "loa", doc_key: "tender:LOA|T1|1", filename: "LOA_T1.pdf", destination: "ecm" });
     const counts = await hooks.finishTenderRun();
     eq(JSON.stringify([counts.saved, counts.skipped, counts.failed, counts.aborted]), JSON.stringify([1, 1, 1, null]));
-    const last = api.calls.complete[api.calls.complete.length - 1];
-    eq(last.done.map((d) => d.doc_key).join(), "tender:LOA|T1|1");
-    eq(last.failed.map((d) => d.doc_key).join(), "tender:LOA|T1|3", "reserved but not saved: released");
+    eq(api.calls.complete.flatMap((c) => c.done.map((d) => d.doc_key)).join(), "tender:LOA|T1|1", "the saved one is reported (at once, 5.8)");
+    eq(api.calls.complete.at(-1).failed.map((d) => d.doc_key).join(), "tender:LOA|T1|3", "reserved but not saved: released");
 
     const down = createSharedRunHooks({ api: hooksApi({ reserveError: conflict("SCHEDULE_CLAIM_LOST") }), claimId: "c2", account: ACCOUNT, isClaimLive: () => true });
     let thrown = null;
@@ -1426,6 +1646,50 @@ export async function runSchedulerTests({ test, assert, eq }) {
     }
     eq(thrown && thrown.code, "SCHEDULE_CLAIM_LOST");
     eq((await down.finishTenderRun()).aborted, "SCHEDULE_CLAIM_LOST");
+  });
+
+  await test("Shared hooks (tender, 5.8): each saved tender document is reported as soon as it is saved, so a run the runner time limit stops has reported all it saved", async () => {
+    const api = hooksApi();
+    const hooks = createSharedRunHooks({ api, claimId: "c1", account: ACCOUNT, isClaimLive: () => true });
+    const t = hooks.tenderHooks;
+    const keys = Array.from({ length: 12 }, (_, i) => `tender:FINANCIAL_TABULATION|T${i}|-`);
+    await t.reserveDocuments(keys);
+    for (const key of keys.slice(0, 9)) await t.documentSaved({ doc_type: "tender_result", doc_key: key, filename: `${key.split("|")[1]}.pdf`, destination: "ecm" });
+    // the worker's time limit (RUNNER_TIMEOUT_MS) closes the runner tab here: finishTenderRun never runs
+    eq(api.calls.complete.flatMap((c) => c.done.map((d) => d.doc_key)).join(), keys.slice(0, 9).join(), "the nine saved documents are with the Recon Engine already");
+    eq(JSON.stringify([api.calls.complete.length, api.calls.complete.every((c) => c.done.length === 1 && c.failed.length === 0)]), JSON.stringify([9, true]), "one report per saved document");
+  });
+
+  await test("Shared hooks (5.7): a claim check that answers later (the runner tab asking the worker) is waited for before each reservation and upload", async () => {
+    let live = true;
+    const api = hooksApi();
+    const uploads = [];
+    const hooks = createSharedRunHooks({
+      api,
+      claimId: "c1",
+      account: ACCOUNT,
+      isClaimLive: () => new Promise((resolve) => setTimeout(() => resolve(live), 0)),
+      uploadEcm: async (doc) => (uploads.push(doc.filename), { uid: "u1", site: "hosur", path: "/x", deduplicated: false })
+    });
+    const t = hooks.tenderHooks;
+    eq([...(await t.reserveDocuments(["tender:LOA|T1|1"])).granted].join(), "tender:LOA|T1|1");
+    await t.ecmSink.save({ kind: "loi", title: "T1 - LOA", bytes: new Uint8Array([1]), filename: "LOA_T1_1.pdf" });
+    live = false;
+    let lost = null;
+    try {
+      await t.ecmSink.save({ kind: "loi", title: "T1 - LOA", bytes: new Uint8Array([1]), filename: "LOA_T1_2.pdf" });
+    } catch (error) {
+      lost = error;
+    }
+    eq(lost && lost.code, "SCHEDULE_CLAIM_LOST");
+    let refused = null;
+    try {
+      await t.reserveDocuments(["tender:LOA|T1|2"]);
+    } catch (error) {
+      refused = error;
+    }
+    eq(refused && refused.code, "SCHEDULE_CLAIM_LOST");
+    eq(JSON.stringify([uploads, api.calls.reserve.length]), JSON.stringify([["LOA_T1_1.pdf"], 1]), "nothing uploaded or reserved once the answer was 'lost'");
   });
 
   /* ------------------------------------------------- what a run tells (logs) */
@@ -1440,13 +1704,37 @@ export async function runSchedulerTests({ test, assert, eq }) {
     t.documentFailed({ key: keys[1], doc: "Tender T7 - Annexure A", code: "NOT_PDF", detail: "The file was not a valid PDF." });
     await hooks.finishTenderRun({ stopped: "SESSION_EXPIRED" });
     const sent = api.calls.complete.at(-1).failed;
-    eq(sent.map((f) => `${f.doc_key}|${f.code}`).join(), `${keys[1]}|SCHEDULE_TENDER_FAILED,${keys[2]}|IREPS_SESSION_EXPIRED`);
+    // one document that was not downloaded: "Scheduled document not downloaded", not "the download stopped" (1.14)
+    eq(sent.map((f) => `${f.doc_key}|${f.code}`).join(), `${keys[1]}|SCHEDULE_DOWNLOAD_FAILED,${keys[2]}|IREPS_SESSION_EXPIRED`);
     const d = hooks.details();
     eq(JSON.stringify(d.failures), JSON.stringify([
-      { doc: "Tender T7 - Annexure A", code: "SCHEDULE_TENDER_FAILED", detail: "The file was not a valid PDF." },
+      { doc: "Tender T7 - Annexure A", code: "SCHEDULE_DOWNLOAD_FAILED", detail: "The file was not a valid PDF." },
       { doc: "Tender T7 corrigendum c1", code: "IREPS_SESSION_EXPIRED", detail: "not downloaded: the run stopped before it" }
     ]));
     eq(JSON.stringify(d.saved), JSON.stringify([{ doc: "Tender T7 tender PDF", note: "T7.pdf in ECM /ECM/Hosur/Tenders" }]));
+  });
+
+  await test("Shared hooks (tender): a failure reported for a document without a reservation of its own, or saved only in part, is named and counted; only reservations are released", async () => {
+    const api = hooksApi();
+    const hooks = createSharedRunHooks({ api, claimId: "c1", account: ACCOUNT, isClaimLive: () => true });
+    const t = hooks.tenderHooks;
+    const letter = "pending:833|1|2|3|letter";
+    const corrigendum = "tender:CORRIGENDA|T7|c1";
+    await t.reserveDocuments([letter, corrigendum]);
+    // an attachment of a letter (never reserved on its own), and a corrigendum whose page was saved but not its attachment
+    t.documentFailed({ key: "pending:833|1|2|3|attachment:ab", doc: "Tender A - letter 1 attachment", code: "HTTP", detail: "IREPS returned HTTP 500." });
+    await t.documentSaved({ doc_type: "tender_corrigendum", doc_key: corrigendum, filename: "C1.pdf", destination: "ecm" });
+    t.documentFailed({ key: corrigendum, doc: "Tender T7 - Corrigendum 1 attachment", code: "TIMEOUT", detail: "Failed because IREPS is not responding." });
+    t.documentFailed({ doc: "Tender T7 - an attachment with no key", code: "NOT_PDF", detail: "not a PDF" });
+    const counts = await hooks.finishTenderRun();
+    eq(counts.failed, 4, "the letter never saved, and the three reported failures");
+    eq(api.calls.complete.at(-1).failed.map((f) => f.doc_key).join(), letter, "only a reservation that was not saved is released");
+    eq(JSON.stringify(hooks.details().failures.map((f) => [f.doc, f.code])), JSON.stringify([
+      ["Correspondence letter 3", "SCHEDULE_DOWNLOAD_FAILED"],
+      ["Tender A - letter 1 attachment", "SCHEDULE_IREPS_ERROR"],
+      ["Tender T7 - Corrigendum 1 attachment", "IREPS_UNAVAILABLE"],
+      ["Tender T7 - an attachment with no key", "SCHEDULE_DOWNLOAD_FAILED"]
+    ]));
   });
 
   await test("Tender runner: the tab's failures, warnings and lists reach the worker short and redacted", async () => {
@@ -1471,10 +1759,126 @@ export async function runSchedulerTests({ test, assert, eq }) {
     const details = { failures: [{ doc: "Tender 5 LOA 9", code: "IREPS_SESSION_EXPIRED", detail: "not downloaded: the run stopped before it" }], saved: [], skipped: [], more: {} };
     const stopped = tenderRunOutcome({ result: { letters: { aborted: { code: "SESSION_EXPIRED", message: "IREPS logged this session out." } } }, counts, details, range: "17/11/2026 - 18/11/2026" });
     eq(JSON.stringify([stopped.outcome, stopped.code, stopped.result.detail, stopped.result.range, stopped.result.failures.length]), JSON.stringify(["failed", "IREPS_SESSION_EXPIRED", "IREPS logged this session out.", "17/11/2026 - 18/11/2026", 1]));
-    eq(stopped.log, details, "the full lists go to this browser's run log");
+    eq(JSON.stringify(stopped.log), JSON.stringify(details), "the full lists go to this browser's run log");
     eq(stoppedCode(null, { code: "TIMEOUT" }), "TIMEOUT");
     eq(stoppedCode({ tabulations: { aborted: { code: "ACCOUNT_CHANGED" } } }), "ACCOUNT_CHANGED");
     eq(stoppedCode({ summary: { failed: 1 } }), null);
+  });
+
+  /** The counts finishTenderRun gives, and a category of a tender job (tender-workflows.js newCategory). */
+  const tenderCounts = (o = {}) => ({ saved: 0, skipped: 0, failed: 0, notReported: 0, aborted: null, ...o });
+  const category = (o = {}) => ({ status: "DOWNLOADED", discovered: 1, downloaded: 1, failed: 0, files: [], warnings: [], note: "", ...o });
+
+  await test("Tender run outcome: a letter list that did not open, or was read only in part, is never 'done'; the list is named (known issue 1, 1.5)", () => {
+    const letters = (o) => ({ letters: { tenders: [], listErrors: {}, listWarnings: {}, aborted: null, summary: { newLetters: 0 }, ...o } });
+    const closed = tenderRunOutcome({ result: letters({ listErrors: { MyNegotiation: "IREPS failed to open the Negotiation page - IREPS is not responding." } }), counts: tenderCounts(), details: noDetails() });
+    eq(JSON.stringify([closed.outcome, closed.code]), JSON.stringify(["failed", "SCHEDULE_LIST_INCOMPLETE"]), "nothing read, nothing saved");
+    eq(closed.result.warnings[0], "Negotiation letter list: IREPS failed to open the Negotiation page - IREPS is not responding.");
+    const inPart = tenderRunOutcome({
+      result: letters({ tenders: [{ tenderNo: "P1", categories: { negotiation: category() } }], listWarnings: { MyNegotiation: "The Negotiation list was not read in full (HTTP 500); letters on the part not read were not downloaded." } }),
+      counts: tenderCounts({ saved: 1 }), details: noDetails()
+    });
+    eq(JSON.stringify([inPart.outcome, inPart.code]), JSON.stringify(["partial", "SCHEDULE_LIST_INCOMPLETE"]), "the letters read were saved, the rest is fetched at the next check");
+    assert(/^Negotiation letter list: The Negotiation list was not read in full/.test(inPart.result.warnings[0]), inPart.result.warnings[0]);
+    eq(describeError("SCHEDULE_LIST_INCOMPLETE").title, "IREPS list not read in full");
+    const clean = tenderRunOutcome({ result: letters({ tenders: [{ tenderNo: "P1", categories: { negotiation: category() } }] }), counts: tenderCounts({ saved: 1 }), details: noDetails() });
+    eq(JSON.stringify([clean.outcome, clean.result.warnings]), JSON.stringify(["done", undefined]), "a list read to its end, every letter saved");
+  });
+
+  await test("Tender run outcome: a tender a letters or tabulations run could not handle is named and the run is not 'done'; a run stopped after saves is partial (known issue 1, 1.4)", () => {
+    const busy = "IREPS is not responding (its home page answered HTTP 503). This is not a logout: try again in a minute.";
+    const tabulations = {
+      tenders: [
+        { tenderNo: "42263731", categories: { financialTabulation: category(), commercialTabulation: category() } },
+        { tenderNo: "69261051", status: "FAILED", code: "IREPS_UNAVAILABLE", error: busy, categories: {} },
+        { tenderNo: "24261658", status: "SKIPPED", code: "IREPS_UNAVAILABLE", error: `Skipped: ${busy}`, categories: {} },
+        { tenderNo: "11111111", notAvailable: true, categories: {} }
+      ],
+      aborted: { code: "IREPS_UNAVAILABLE", message: busy }, incomplete: "", summary: { downloaded: 2, withTabulation: 3, notAvailable: 1 }
+    };
+    const stopped = tenderRunOutcome({ result: { tabulations }, counts: tenderCounts({ saved: 2 }), details: noDetails() });
+    eq(JSON.stringify([stopped.outcome, stopped.code, stopped.result.detail]), JSON.stringify(["partial", "IREPS_UNAVAILABLE", busy]), "two tabulations saved, then IREPS stopped answering");
+    eq(JSON.stringify(stopped.result.failures.map((f) => [f.doc, f.code])), JSON.stringify([["Tender 69261051", "IREPS_UNAVAILABLE"], ["Tender 24261658", "IREPS_UNAVAILABLE"]]));
+    eq(stopped.result.failed, 2);
+    eq(tenderRunOutcome({ result: { tabulations }, counts: tenderCounts(), details: noDetails() }).outcome, "failed", "the same stop before anything was saved");
+    const thrown = { tenderNo: "T9", status: "FAILED", code: "", error: "the tender record could not be written", categories: {} };
+    const one = tenderRunOutcome({ result: { tabulations: { ...tabulations, tenders: [tabulations.tenders[0], thrown], aborted: null } }, counts: tenderCounts({ saved: 2 }), details: noDetails() });
+    eq(JSON.stringify([one.outcome, one.code, one.result.failures[0].doc, one.result.failures[0].code]), JSON.stringify(["partial", "SCHEDULE_DOWNLOAD_FAILED", "Tender T9", "SCHEDULE_TENDER_FAILED"]), "one tender's step threw: partial, the tender named");
+    const day = tenderRunOutcome({ result: { tabulations: { ...tabulations, tenders: [tabulations.tenders[0]], aborted: null, incomplete: "IREPS did not return the list (Search Tender 20/10/2026 page 2: IREPS returned HTTP 500)." } }, counts: tenderCounts({ saved: 2 }), details: noDetails() });
+    eq(JSON.stringify([day.outcome, day.code]), JSON.stringify(["partial", "SCHEDULE_LIST_INCOMPLETE"]), "a closing day not read to its end");
+    assert(/Search Tender 20\/10\/2026 page 2/.test(day.result.warnings[0]), day.result.warnings[0]);
+  });
+
+  await test("Tender run outcome: NIT Documents - a message IREPS did not open, or My Messages not read to its end, is not 'done'; a message naming no tender, and My Offer left out, are notes (1.3, 2.4)", () => {
+    const nit = (o) => ({ messages: { scanned: 3, relevant: 2, opened: 2, pagesRead: 1, total: 3, truncated: false, incomplete: "" }, tenders: [], review: [], failedMessages: [], notes: [], aborted: null, summary: { downloaded: 0, failed: 0, needsReview: 0 }, ...o });
+    const notOpened = tenderRunOutcome({ result: nit({ failedMessages: [{ sentDate: "24/11/2026", subject: "NIT for CSD/PER/SOUTHERN RLY, Tender Number: 78266659", code: "HTTP", reason: "IREPS did not open the message: Message detail returned HTTP 503." }] }), counts: tenderCounts(), details: noDetails() });
+    eq(JSON.stringify([notOpened.outcome, notOpened.code]), JSON.stringify(["failed", "SCHEDULE_DOWNLOAD_FAILED"]), "retried at the next check");
+    eq(JSON.stringify(notOpened.result.failures), JSON.stringify([{ doc: "Message of 24/11/2026: NIT for CSD/PER/SOUTHERN RLY, Tender Number: 78266659", code: "SCHEDULE_IREPS_ERROR", detail: "IREPS did not open the message: Message detail returned HTTP 503." }]));
+    assert(!(notOpened.result.warnings || []).some((w) => /could not be matched/.test(w)), "never 'could not be matched to a tender'");
+    for (const messages of [{ truncated: true, incomplete: "" }, { truncated: false, incomplete: "IREPS answered with a page DocLink does not recognise (My Messages page 2: \"Error\")." }]) {
+      const cut = tenderRunOutcome({ result: nit({ messages: { ...nit().messages, ...messages } }), counts: tenderCounts({ saved: 1 }), details: noDetails() });
+      eq(JSON.stringify([cut.outcome, cut.code]), JSON.stringify(["partial", "SCHEDULE_LIST_INCOMPLETE"]), JSON.stringify(messages));
+      assert(/^My Messages was not read to the end: /.test(cut.result.warnings[0]), cut.result.warnings[0]);
+    }
+    const noted = tenderRunOutcome({ result: nit({ review: [{ oid: "1", reason: "No labelled tender number found in the subject or body." }], notes: ["My Offer is not part of scheduled downloads."] }), counts: tenderCounts({ saved: 2 }), details: noDetails() });
+    eq(noted.outcome, "done", "IREPS's message names no tender: nothing to retry");
+    eq(JSON.stringify(noted.result.warnings), JSON.stringify(["1 IREPS message(s) could not be matched to a tender: open NIT Documents in the panel to review them.", "My Offer is not part of scheduled downloads."]));
+  });
+
+  await test("Tender run outcome: a category failure the hooks named is listed once; one they could not name is named; 'Partly done' always says why (1.8)", () => {
+    const known = [{ doc: "Tender T7 - Annexure A", code: "SCHEDULE_DOWNLOAD_FAILED", detail: "The file was not a valid PDF." }];
+    const result = {
+      messages: { truncated: false, incomplete: "" }, review: [], failedMessages: [], summary: { downloaded: 1, failed: 1, needsReview: 0 },
+      tenders: [{ tenderNo: "T7", status: "FAILED", categories: {
+        tenderPdf: category({ status: "FAILED", downloaded: 0, failed: 1, files: [{ fileName: "", status: "FAILED", error: "Could not open the NIT page (HTTP 500)." }] }),
+        attachments: category({ status: "PARTIAL", discovered: 2, failed: 1, files: [{ fileName: "a0.pdf", status: "DOWNLOADED" }, { fileName: "", id: "a1", status: "FAILED", error: "The file was not a valid PDF.", code: "NOT_PDF" }] }),
+        corrigenda: category({ status: "PARTIAL", failed: 1, warnings: ["Corrigendum_01_T7.pdf: an attached document could not be downloaded (HTTP 500)"] })
+      } }]
+    };
+    const o = tenderRunOutcome({ result, counts: tenderCounts({ saved: 2, failed: 1 }), details: { failures: known, saved: [], skipped: [], more: {} } });
+    eq(JSON.stringify([o.outcome, o.code, o.result.failed]), JSON.stringify(["partial", "SCHEDULE_DOWNLOAD_FAILED", 3]));
+    eq(JSON.stringify(o.result.failures.map((f) => [f.doc, f.detail])), JSON.stringify([
+      ["Tender T7 - Annexure A", "The file was not a valid PDF."],
+      ["Tender T7 - NIT", "Could not open the NIT page (HTTP 500)."],
+      ["Tender T7 - Corrigenda", "Corrigendum_01_T7.pdf: an attached document could not be downloaded (HTTP 500)"]
+    ]), "the attachment the hooks named once; the NIT step that failed before reserving, and the corrigendum attachment, named here");
+    eq(o.log.failures.length, 3, "the run log has them all");
+    const unnamed = tenderRunOutcome({ result: { summary: { failed: 2 } }, counts: tenderCounts({ saved: 1 }), details: noDetails() });
+    eq(unnamed.outcome, "partial");
+    assert(unnamed.result.failures || (unnamed.result.warnings && /could not tell which/.test(unnamed.result.warnings[0])), JSON.stringify(unnamed.result));
+    const problems = tenderJobProblems({ tenders: [{ tenderNo: "T1", status: "ALREADY_DOWNLOADED", categories: {} }] });
+    eq(JSON.stringify([problems.failures, problems.lists, problems.review]), JSON.stringify([[], 0, 0]), "a tender already downloaded is no problem");
+  });
+
+  await test("Tender run outcome: correspondence - a record DocLink could not read is named; letters and rows it could not match are 'Needs review', never 'done' (1.6, 1.8)", () => {
+    const corres = (o) => ({ empty: false, summary: { pendingRecords: 2, failed: 0, needsReview: 0 }, skipped: [], failedRecords: [], needsReview: [], aborted: null, ...o });
+    const o = tenderRunOutcome({
+      result: corres({ failedRecords: [{ tenderNo: "A", code: "HTTP", error: "IREPS returned HTTP 500." }], needsReview: [{ tenderNo: "B", letterNo: "502", reason: "The letter belongs to a different nitOid than the pending record; not downloaded." }, { tenderNo: "C", reason: "No pending-correspondence action with a nitOid was found on this row" }] }),
+      counts: tenderCounts(), details: noDetails()
+    });
+    eq(JSON.stringify([o.outcome, o.code]), JSON.stringify(["failed", "SCHEDULE_DOWNLOAD_FAILED"]));
+    eq(JSON.stringify(o.result.failures.map((f) => [f.doc, f.code])), JSON.stringify([["Correspondence of tender A", "SCHEDULE_IREPS_ERROR"], ["Tender B - letter 502", "SCHEDULE_NEEDS_REVIEW"], ["Correspondence of tender C", "SCHEDULE_NEEDS_REVIEW"]]));
+    const review = tenderRunOutcome({ result: corres({ needsReview: [{ tenderNo: "C", reason: "No pending-correspondence action with a nitOid was found on this row" }] }), counts: tenderCounts({ saved: 1 }), details: noDetails() });
+    eq(JSON.stringify([review.outcome, review.code]), JSON.stringify(["partial", "SCHEDULE_NEEDS_REVIEW"]), "letters saved, one row needs review");
+    eq(describeError("SCHEDULE_NEEDS_REVIEW").title, "Needs review");
+    eq(tenderRunOutcome({ result: corres({ empty: true, summary: { pendingRecords: 0 } }), counts: tenderCounts(), details: noDetails() }).outcome, "done", "IREPS lists nothing pending");
+  });
+
+  await test("Run details: tender IREPS errors get IREPS texts, never the Bill Status or network text (1.14)", () => {
+    for (const code of ["TIMEOUT", "UNREACHABLE", "IREPS_UNAVAILABLE"]) eq(tenderCode(code), "IREPS_UNAVAILABLE", code);
+    eq(describeError(tenderCode("TIMEOUT")).title, "IREPS not responding");
+    eq(describeError(tenderCode("HTTP")).title, "IREPS answered with an error");
+    eq(JSON.stringify(["PAGE", "LIST", "SEARCH_INCOMPLETE", "LOA_SCRIPT", "ACCOUNT", "TENDER_SEARCH_SHORT"].map((c) => tenderCode(c))),
+      JSON.stringify(["TENDER_PAGE_NOT_RECOGNISED", "TENDER_LIST_FAILED", "TENDER_SEARCH_INCOMPLETE", "TENDER_LOA_SCRIPT_UNREADABLE", "SCHEDULE_ACCOUNT_UNVERIFIED", "TENDER_SEARCH_SHORT"]));
+    eq(tenderCode("NOT_PDF", "SCHEDULE_DOWNLOAD_FAILED"), "SCHEDULE_DOWNLOAD_FAILED", "one document: not downloaded, not 'the download stopped'");
+    for (const code of ["TIMEOUT", "UNREACHABLE", "HTTP", "PAGE", "LIST", "SEARCH_INCOMPLETE", "NOT_PDF", "EMPTY"]) {
+      const text = describeError(tenderCode(code, "SCHEDULE_DOWNLOAD_FAILED"));
+      assert(!/Bill Status|network connection/i.test(`${text.title} ${text.message}`), `${code}: ${text.title} - ${text.message}`);
+    }
+    for (const code of ["SCHEDULE_IREPS_ERROR", "SCHEDULE_LIST_INCOMPLETE", "SCHEDULE_NEEDS_REVIEW"]) {
+      const text = describeError(code);
+      assert(text.code === code && !/[\u2013\u2014]/.test(`${text.title}${text.message}`), `${code} has its own text, with no en or em dash`);
+    }
   });
 
   await test("90 days: Bill Status, CRN and R-NOTE always search the last 90 days, whatever the schedule's look-back", () => {

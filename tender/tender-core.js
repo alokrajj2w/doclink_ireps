@@ -184,10 +184,70 @@ function pageRefusal(pathname) {
   return '';
 }
 
+/** Every key with its value in a JSON body, at any depth ([] when the body is not a JSON object or array). */
+function jsonFields(text) {
+  const t = text.trim();
+  if (!/^[[{]/.test(t)) return [];
+  let data;
+  try {
+    data = JSON.parse(t);
+  } catch {
+    return [];
+  }
+  const out = [];
+  const walk = (value, key) => {
+    if (Array.isArray(value)) value.forEach((v) => walk(v, key));
+    else if (value && typeof value === 'object') for (const [k, v] of Object.entries(value)) walk(v, k);
+    else if (key && value !== null && value !== undefined) out.push([key, String(value)]);
+  };
+  walk(data, '');
+  return out;
+}
+
+/**
+ * Every part's name and text in a multipart body ([] when the body is not one): a part starts at a boundary line
+ * ("--..."), its headers end at the first empty line, and its text runs to the next boundary. Read line by line, so a
+ * body a page sends can never make the guard work for long.
+ */
+function multipartFields(text) {
+  if (!/content-disposition\s*:\s*form-data/i.test(text)) return [];
+  const out = [];
+  let part = null;
+  const close = () => {
+    if (part && part.name !== null && !part.inHeaders) out.push([part.name, part.lines.join('\n')]);
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('--')) {
+      close();
+      part = { name: null, inHeaders: true, lines: [] };
+    } else if (part?.inHeaders) {
+      if (line === '') part.inHeaders = false;
+      else part.name = /^content-disposition\s*:\s*form-data\s*;.*?\bname\s*=\s*"([^"]*)"/i.exec(line)?.[1] ?? part.name;
+    } else if (part) {
+      part.lines.push(line);
+    }
+  }
+  close();
+  return out;
+}
+
+/**
+ * The fields of a request body as the server could read them (10.4): a urlencoded form, and when the body is a JSON
+ * document or a multipart form, also its fields (JSON: each key with its value, at any depth; multipart: each part's
+ * name and text). A write action in any of them is so refused like one in a urlencoded form.
+ */
+export function bodyFields(body) {
+  if (!body) return [];
+  if (body instanceof URLSearchParams) return [...body];
+  const text = String(body);
+  return [...new URLSearchParams(text), ...jsonFields(text), ...multipartFields(text)];
+}
+
 /**
  * Why DocLink refuses to send this request, or null when it may: { code: 'EXCLUDED' (a tabulation out of scope)
- * | 'BLOCKED' (a write action), message }. `url` is the URL as sent and `body` the POST form (string or
- * URLSearchParams); `trusted` = inside an allowed tabulation response (isExcludedTrustedLink).
+ * | 'BLOCKED' (a write action), message }. `url` is the URL as sent and `body` the POST body (string or
+ * URLSearchParams: a form, JSON or multipart, bodyFields); `trusted` = inside an allowed tabulation response
+ * (isExcludedTrustedLink).
  */
 export function requestRefusal({ method = 'GET', url, body = null, trusted = false } = {}) {
   let u;
@@ -197,17 +257,18 @@ export function requestRefusal({ method = 'GET', url, body = null, trusted = fal
     return { code: 'BLOCKED', message: 'Malformed request refused.' };
   }
   const form = body ? (body instanceof URLSearchParams ? body : new URLSearchParams(String(body))) : null;
+  const fields = bodyFields(body);
   // the request as the server sees it: every query AND body field (a POST's form counts, and a form field never
   // hides behind a query field of the same name - the tabulation rule runs on what is really sent)
   const seen = new URL(u.toString());
-  for (const [k, v] of form || []) seen.searchParams.append(k, v);
+  for (const [k, v] of fields) seen.searchParams.append(k, v);
   if (trusted ? isExcludedTrustedLink(seen.toString(), trusted) : isExcludedUrl(seen.toString())) return { code: 'EXCLUDED', message: EXCLUDED_MSG };
   const verb = String(method || 'GET').toUpperCase();
   if (verb !== 'GET' && verb !== 'POST') return { code: 'BLOCKED', message: blockedMsg(`a ${verb} request`) };
   if (isLoaViewedUpdate(verb, u, form)) return null;
   const page = pageRefusal(u.pathname);
   if (page) return { code: 'BLOCKED', message: page };
-  const action = [...u.searchParams, ...(form || [])].find(([k, v]) => ACTION_PARAMS.test(k) && namesWriteAction(v));
+  const action = [...u.searchParams, ...fields].find(([k, v]) => ACTION_PARAMS.test(k) && namesWriteAction(v));
   return action ? { code: 'BLOCKED', message: blockedMsg(`${action[0]}=${action[1]}`) } : null;
 }
 
@@ -379,6 +440,17 @@ export const listFailed = (what, status) => {
   e.status = status;
   return e;
 };
+
+/**
+ * TenderError TIMEOUT / UNREACHABLE: IREPS did not answer `what` (`error`: the request's own TIMEOUT or UNREACHABLE).
+ * After pages were read, a list says so in its `incomplete` and keeps what it read, as for an HTTP error (listFailed).
+ */
+export const listUnanswered = (what, error) =>
+  new TenderError(error.code, describeError('TENDER_LIST_FAILED', { detail: `${what}: ${error.code === 'TIMEOUT' ? 'IREPS did not answer in time' : 'IREPS could not be reached'}` }).message);
+
+/** TenderError LIST_LIMIT: DocLink read `pages` pages of `what`, its limit, while IREPS showed more (never a silent partial list). */
+export const listCut = (what, pages) =>
+  new TenderError('LIST_LIMIT', describeError('TENDER_LIST_LIMIT', { detail: `${pages} pages of ${what}` }).message);
 
 // ---------------------------------------------------------------- what DocLink itself opened (M23)
 // The print tabs DocLink creates, the blob: URLs it downloads from and the files it saved: during a run only
@@ -631,12 +703,28 @@ export function sniffKind(bytes) {
 
 const KIND_EXT = { pdf: '.pdf', zip: '.zip', ole: '.doc', png: '.png', jpg: '.jpg', gif: '.gif', tiff: '.tif', rtf: '.rtf', text: '.txt' };
 
+/**
+ * decodeURIComponent that never throws (10.2): an IREPS file name may carry a "%" of its own ("Rates 50%.zip" as a
+ * link text, filename="Price 10%.xlsx" in a Content-Disposition), which decodeURIComponent refuses with "URI
+ * malformed". Then only the well-formed %XX runs are decoded and every other character is kept as it is.
+ */
+export function safeDecode(text) {
+  const s = String(text ?? '');
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+      try { return decodeURIComponent(run); } catch { return run; }
+    });
+  }
+}
+
 /** Original extension from the URL / Content-Disposition when it is a sane document type. */
 export function hintedExtension(res, nameHint = '') {
   const cd = res?.headers?.['content-disposition'] || '';
   const fromCd = /filename\*?=(?:UTF-8'')?"?([^";]+)/i.exec(cd)?.[1] || '';
   for (const cand of [fromCd, nameHint, (() => { try { return new URL(res.url).pathname; } catch { return ''; } })()]) {
-    const m = /\.([A-Za-z0-9]{2,5})$/.exec(decodeURIComponent(String(cand).split('?')[0]));
+    const m = /\.([A-Za-z0-9]{2,5})$/.exec(safeDecode(String(cand).split('?')[0]));
     if (m && !/^(do|jsp|html?|php|aspx?)$/i.test(m[1])) return '.' + m[1].toLowerCase();
   }
   return '';

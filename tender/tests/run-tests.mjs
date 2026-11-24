@@ -3,7 +3,7 @@
 import { createRequire } from 'node:module';
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeIreps, PDF, corresPage, fakeChromeDebugger, LOA_SCRIPT, resultsPage, resultRow } from './fake-ireps.js';
+import { FakeIreps, PDF, corresPage, fakeChromeDebugger, LOA_SCRIPT, resultsPage, resultRow, searchFormPage } from './fake-ireps.js';
 
 const req = createRequire((process.env.JSDOM_ROOT || process.cwd()) + '/');
 const { JSDOM } = req('jsdom');
@@ -253,6 +253,19 @@ test('3g. IREPS busy during a run => the parts it stops say "IREPS is not respon
   assert.ok(failed.length >= 1, JSON.stringify(r.categories));
   assert.ok(failed.every((c) => /IREPS is not responding/.test(JSON.stringify(c)) && !/session expired/i.test(JSON.stringify(c))), JSON.stringify(failed));
 }));
+test('3h. A step stopped before it downloads anything keeps the error\'s own code on its FAILED file (a scheduled run names it)', () => quickRetries(async () => {
+  mk({ tenders: [T({})] });
+  const orig = server.handle.bind(server);
+  let n = 0;
+  // the run's start sees the home page; the step's own account check finds IREPS busy
+  server.handle = async (m, u, b) => (u.includes('showHome.do') && ++n >= 2
+    ? { status: 503, type: 'text/html', bytes: new TextEncoder().encode('<html><body>Service Unavailable</body></html>') }
+    : orig(m, u, b));
+  const c = (await run('29263265', { only: ['tenderPdf'] })).categories.tenderPdf;
+  assert.deepEqual([c.status, c.files.length, c.files[0].status, c.files[0].code], ['FAILED', 1, 'FAILED', 'IREPS_UNAVAILABLE']);
+  assert.equal(c.files[0].error, c.note);
+  assert.match(c.files[0].error, /IREPS is not responding/);
+}));
 test('4. Switching accounts refreshes the context', async () => {
   assert.equal((await acct.getActiveIrepsAccountContext()).irepsAccountId, '833');
   server.s.account = { id: '55', company: 'OTHER CO LIMITED-DELHI' };
@@ -373,6 +386,20 @@ test('10b. Tender PDF is validated: HTML/login response is never saved as .pdf (
   const r = await run();
   assert.equal(r.categories.tenderPdf.status, 'FAILED');
   assert.ok(!savedNames().some((n) => n.includes('NIT_')));
+});
+test('10.2: a "%" in an IREPS file name (the link text, a Content-Disposition, a URL) never fails the download with "URI malformed"', async () => {
+  assert.equal(core.safeDecode('Spec%20A 50%.pdf'), 'Spec A 50%.pdf', 'the well-formed %XX runs are decoded, the lone "%" is kept');
+  assert.equal(core.safeDecode('Annex%E2%82.pdf'), 'Annex%E2%82.pdf', 'an incomplete sequence stays as it is');
+  assert.equal(core.safeDecode('Annexure%201.pdf'), 'Annexure 1.pdf');
+  const res = { headers: { 'content-disposition': 'attachment; filename="Price 10%.xlsx"' }, url: 'https://www.ireps.gov.in/ireps/upload/att/Rates 5%.zip' };
+  assert.equal(core.hintedExtension(res, 'Rates 50%.zip'), '.xlsx');
+  assert.equal(core.hintedExtension({ headers: {}, url: res.url }, 'Rates 50%.zip'), '.zip');
+  assert.equal(core.extensionFor('zip', { headers: {}, url: res.url }, ''), '.zip');
+  // a NIT attachment (not a PDF) whose name on the NIT page holds a "%"
+  mk({ tenders: [T({ attachments: [{ name: 'Rates 50%.zip', desc: 'RATES', href: '/ireps/upload/att/rates.zip' }] })] });
+  const c = (await run('29263265', { only: ['attachments'] })).categories.attachments;
+  assert.deepEqual([c.status, c.downloaded], ['DOWNLOADED', 1], JSON.stringify(c));
+  assert.ok(savedNames().some((n) => /NIT_and_Supporting_Documents\/rates\.zip$/.test(n)), savedNames().join('\n'));
 });
 test('11/12/14/19. No attachments / no corrigenda / no letters are NOT_AVAILABLE, not FAILED', async () => {
   mk({ tenders: [T({})] });
@@ -612,16 +639,18 @@ test('Corrigendum with an attached document: the corrigendum page (printed) AND 
     withoutDebugger();
   }
 });
-test('Corrigendum attachments: several are numbered in page order; one that fails is a warning and the rest are kept', async () => {
+test('Corrigendum attachments: several are numbered in page order; one that fails is a failed document (PARTIAL) and the rest are kept (2.1)', async () => {
   mk({ tenders: [ATT_CORR(['Revised_Spec.pdf', 'missing.pdf', 'Annexure.pdf'])] });
   fakeDebugger();
   try {
     const c = (await run('29263265', { only: ['corrigenda'] })).categories.corrigenda;
-    assert.equal(c.status, 'DOWNLOADED', 'the corrigendum is saved even when an attachment fails');
-    assert.deepEqual(c.files.map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Revised_Spec.pdf', 'Annexure.pdf']);
+    assert.deepEqual([c.status, c.downloaded, c.failed], ['PARTIAL', 1, 1], 'the corrigendum is saved, the attachment that failed is a failed document');
+    assert.deepEqual(c.files.filter((f) => f.status === 'DOWNLOADED').map((f) => f.fileName), ['Corrigendum_02_29263265.pdf', 'Revised_Spec.pdf', 'Annexure.pdf']);
     assert.match(savedText('Corrigenda/Annexure.pdf'), /Annexure\.pdf/);
-    assert.equal(c.warnings.length, 1);
-    assert.match(c.warnings[0], /Corrigendum_02_29263265\.pdf: an attached document could not be downloaded/);
+    const failed = c.files.filter((f) => f.status === 'FAILED');
+    assert.deepEqual(failed.map((f) => [f.role, f.code]), [['attachment', 'HTTP']]);
+    assert.match(failed[0].error, /Corrigendum_02_29263265\.pdf: an attached document \(missing\.pdf\) could not be downloaded \(IREPS returned HTTP 404/);
+    assert.deepEqual(c.warnings, [], 'said once, by the failed document');
   } finally {
     withoutDebugger();
   }
@@ -1432,6 +1461,26 @@ test('Tender search (13 Nov meeting): when two railways use one tender number, t
   assert.match(await find({ railway: 'STORES / WESTERN RLY' }), new RegExp(`^${dmyDay(nf)}`), 'a railway no row has: as without a hint');
   assert.equal(search.railwayOf('LOWER PAREL/WESTERN RLY'), search.railwayOf('DAHOD / WESTERN RLY'));
 });
+test('Tender search (6.5): the railway or due-date hint picks between the tenders of every date window with the number; a first window that fits sends no further search', async () => {
+  const nf = new Date(NOW() + 10 * D); // in the first window searched (-90 .. 90 days)
+  const ec = new Date(NOW() + 200 * D); // only in the second (90 .. 270 days)
+  mk({ tenders: [T({ no: '10263703', nitId: '71', oid: '710', dept: 'STORES/N F RLY', closing: nf }), T({ no: '10263703', nitId: '72', oid: '720', dept: 'STORES/EAST CENTRAL RLY', closing: ec })] });
+  const find = async (prefer) => {
+    server.log.length = 0;
+    const r = await search.searchTender('https://www.ireps.gov.in', '10263703', { prefer });
+    return { day: r.closingDate.slice(0, 10), nitId: core.qparam(r.row.actions.flatMap((a) => a.urls).find((u) => /nitPublish/.test(u)) || '', 'nitId'),
+      searches: server.log.filter((l) => l.path === '/epsn/search/advancedSearch.do' && l.method === 'POST' && 'advancedSearch' in l.body).length };
+  };
+  assert.deepEqual(await find({ railway: 'TRS-GMO-STORES / EAST CENTRAL RLY' }), { day: dmyDay(ec), nitId: '72', searches: 2 }, 'the first window has only the N F RLY tender: the next window is searched too, and its EAST CENTRAL RLY tender taken');
+  assert.deepEqual(await find({ railway: 'KATIHAR / N F RLY' }), { day: dmyDay(nf), nitId: '71', searches: 1 }, 'the first window fits: no further search');
+  assert.deepEqual(await find({}), { day: dmyDay(nf), nitId: '71', searches: 1 }, 'no hint: the first window\'s tender, as before');
+  assert.deepEqual(await find({ dueDate: new Date(ec.getFullYear(), ec.getMonth(), ec.getDate(), 14, 0) }), { day: dmyDay(ec), nitId: '72', searches: 2 }, 'the NIT message\'s due date, found in the one window that holds that day');
+  assert.deepEqual(await find({ railway: 'KATIHAR / N F RLY', dueDate: new Date(ec.getFullYear(), ec.getMonth(), ec.getDate(), 14, 0) }), { day: dmyDay(nf), nitId: '71', searches: 2 },
+    'the railway weighs more than the due date: only the window holding the due day is searched for a row of both, and the N F RLY tender is kept');
+  // a hint no tender fits: every window is searched (IREPS answering "no results" twice in a window with none: Stores,
+  // then all departments), and the first window's tender is taken, as without a hint
+  assert.deepEqual(await find({ railway: 'STORES / WESTERN RLY' }), { day: dmyDay(nf), nitId: '71', searches: 10 });
+});
 test('ECM (13 Nov meeting): letters by date take the tender date of the letter\'s own railway when another railway uses the tender number', async () => {
   const nf = new Date(NOW() - 20 * D);
   const ec = new Date(NOW() - 5 * D);
@@ -1460,6 +1509,57 @@ test('Automatic mode (13 Nov meeting): when two railways use one tender number, 
   assert.equal(r.tenders[0].status, 'DOWNLOADED');
   const nit = savedNames().filter((n) => n.includes('/Tender_10263703/NIT_and_Supporting_Documents/viewNitPdf_'));
   assert.deepEqual(nit.map((n) => n.split('/').pop()), ['viewNitPdf_72.pdf'], 'the EAST CENTRAL RLY tender, due on the message\'s date');
+});
+test('Automatic mode (6.1): two railways\' NIT messages with one tender number are two tenders, each opened with its railway; the NIT of one does not make the other "already downloaded"', async () => {
+  // the subjects as IREPS writes them (27 Oct 2026 capture: "NIT for CSD/PER/SOUTHERN RLY, Tender Number: 78266659")
+  const msg = (railway) => ({ date: dmy(NOW()), subject: `NIT for STORES/${railway}, Tender Number: 10263703` });
+  const twoRailways = [futureT({ no: '10263703', nitId: '71', oid: '710', dept: 'STORES/N F RLY', closing: new Date(NOW() + 10 * D), attachments: att('d71') }), futureT({ no: '10263703', nitId: '72', oid: '720', dept: 'STORES/EAST CENTRAL RLY', closing: new Date(NOW() + 40 * D), attachments: att('d72') })];
+  const nitPdfs = () => savedNames().filter((n) => /\/Tender_10263703\/NIT_and_Supporting_Documents\/viewNitPdf_/.test(n)).map((n) => n.split('/').pop()).sort();
+  mk({ tenders: twoRailways, messages: [msg('N F RLY'), msg('EAST CENTRAL RLY')] });
+  const both = await autoRun();
+  assert.deepEqual(both.tenders.map((t) => [t.tenderNo, t.railwayUnit, t.status]), [['10263703', 'STORES/N F RLY', 'DOWNLOADED'], ['10263703', 'STORES/EAST CENTRAL RLY', 'DOWNLOADED']]);
+  assert.notEqual(both.tenders[0].key, both.tenders[1].key);
+  assert.deepEqual(nitPdfs(), ['viewNitPdf_71.pdf', 'viewNitPdf_72.pdf'], 'each railway\'s own NIT');
+  // the N F RLY NIT first; the EAST CENTRAL RLY message arrives later: its NIT is still downloaded
+  mk({ tenders: twoRailways, messages: [msg('N F RLY')] });
+  await autoRun();
+  assert.deepEqual(nitPdfs(), ['viewNitPdf_71.pdf']);
+  server.s.messages.push(msg('EAST CENTRAL RLY'));
+  const later = await autoRun();
+  assert.deepEqual(later.tenders.map((t) => [t.railwayUnit, t.status]), [['STORES/EAST CENTRAL RLY', 'DOWNLOADED']]);
+  assert.deepEqual(nitPdfs(), ['viewNitPdf_71.pdf', 'viewNitPdf_72.pdf']);
+  assert.deepEqual(Object.keys(store['doclink.tender.ledger.833'].nit).sort(), ['10263703|EAST CENTRAL RLY', '10263703|N F RLY'], 'one NIT mark per railway');
+});
+// T({}) is the SOUTH EASTERN RLY tender 29263265; WESTERN RLY uses the same number (6.2)
+const OTHER_RLY = { unit: 'DAHOD / WESTERN RLY', nitOid: '900' };
+const OWN_RLY = { unit: 'STORES / SOUTH EASTERN RLY', nitOid: '107200478' };
+const corresOf = (r, id, subject) => ({ nitOid: r.nitOid, tenderNo: '29263265', unit: r.unit, letters: [{ no: id, id, corresId: `c${id}`, subject }] });
+test('Two railways, one tender number (6.2): the tender\'s letter list and its correspondence take only the rows of the tender\'s own railway', async () => {
+  mk({
+    tenders: [T({})], liveInbox: true, letterAsPdf: true,
+    inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [
+      { no: '29263265', oid: OTHER_RLY.nitOid, letter: '111', date: daysAgo(3), unit: OTHER_RLY.unit },
+      { no: '29263265', oid: OWN_RLY.nitOid, letter: '222', date: daysAgo(4), unit: OWN_RLY.unit },
+    ] },
+    corresRows: [{ ...OTHER_RLY, no: '29263265' }, { ...OWN_RLY, no: '29263265' }],
+    corres: { [OTHER_RLY.nitOid]: corresOf(OTHER_RLY, '9001', 'Other railway'), [OWN_RLY.nitOid]: corresOf(OWN_RLY, '1072', 'Ours') },
+  });
+  const c = (await run('29263265', { only: ['loa', 'correspondence'] })).categories;
+  assert.deepEqual(c.loa.files.map((f) => f.id), ['222'], 'only the SOUTH EASTERN RLY LOA');
+  assert.deepEqual(c.correspondence.files.map((f) => f.id), ['1072'], 'only its correspondence');
+  assert.ok(!server.log.some((l) => l.body.nitOid === OTHER_RLY.nitOid), 'the WESTERN RLY correspondence page is never opened');
+  // one railway in the list, or no unit column (the fake's default list): every row, as before
+  mk({ tenders: [T({})], letterAsPdf: true, inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [{ no: '29263265', oid: '1', letter: '333', date: daysAgo(3) }, { no: '29263265', oid: '2', letter: '444', date: daysAgo(4) }] } });
+  assert.deepEqual((await run('29263265', { only: ['loa'] })).categories.loa.files.map((f) => f.id), ['333', '444']);
+});
+test('Two railways, one tender number (6.2): a correspondence page of another railway is discarded, nothing of it is downloaded', async () => {
+  mk({ tenders: [T({})], corresRows: [{ ...OTHER_RLY, no: '29263265' }], corres: { [OTHER_RLY.nitOid]: corresOf(OTHER_RLY, '9001', 'Other railway') } });
+  const c = (await run('29263265', { only: ['correspondence'] })).categories.correspondence;
+  assert.equal(c.status, 'FAILED');
+  assert.match(c.note, /The correspondence page is for tender 29263265 of WESTERN RLY, not of SOUTH EASTERN RLY; nothing was downloaded/);
+  assert.ok(!server.log.some((l) => l.path === '/epsn/corres/rly/viewpubIndltr.do'), 'no letter of the other railway is fetched');
+  mk({ tenders: [T({})], corresRows: [{ ...OWN_RLY, no: '29263265' }], corres: { [OWN_RLY.nitOid]: corresOf(OWN_RLY, '1072', 'Ours') } });
+  assert.equal((await run('29263265', { only: ['correspondence'] })).categories.correspondence.status, 'DOWNLOADED', 'its own railway: as before');
 });
 
 // =========================== parallel scanning =============================================
@@ -1664,6 +1764,24 @@ test('Download log: cancelling the Recon sign-in stops the run before anything i
     globalThis.document.dispatchEvent = (event) => { event.detail.resolve(false); return false; };
     await assert.rejects(run(), (e) => e.code === 'SIGN_IN_REQUIRED');
     assert.equal(server.log.length, 0, 'IREPS was not called');
+  });
+});
+test('Download log (2.1): a corrigendum whose attached document failed is not logged as downloaded, so the next run fetches it again without asking', async () => {
+  mk({ tenders: [ATT_CORR(['Revised_Spec.pdf', 'Annexure.pdf'])], failPaths: ['Annexure.pdf'] });
+  const corrKey = dlog.downloadKey.tender('CORRIGENDA', '29263265', '1204999');
+  const logged = new Set();
+  await withDownloadLog((k) => logged.has(k), async (seen) => {
+    const keep = async () => { await dlog.flushDownloadLog(); for (const x of seen.logged) logged.add(x.doc_key); };
+    assert.equal((await run('29263265', { only: ['corrigenda'] })).categories.corrigenda.status, 'PARTIAL');
+    await keep();
+    assert.ok(!logged.has(corrKey), 'the corrigendum is not logged while its attachment is missing');
+    assert.ok(logged.has(`${corrKey}#1`), 'the attachment that was saved is logged');
+    server.s.failPaths = [];
+    assert.equal((await run('29263265', { only: ['corrigenda'] })).categories.corrigenda.status, 'DOWNLOADED');
+    assert.equal(seen.prompts.length, 0, 'never asked "download again?": it was not logged as downloaded');
+    assert.ok(savedNames().some((n) => n.endsWith('Corrigenda/Annexure.pdf')), 'the attachment is fetched');
+    await keep();
+    assert.ok(logged.has(corrKey), 'complete now: logged');
   });
 });
 
@@ -2104,6 +2222,69 @@ test('H4: letters by date - a page that is not the list (no rows, no list form) 
   assert.equal(r.tenders.length, 0);
   assert.match(r.listErrors.MyNegotiation, /does not recognise .*Maintenance/);
 });
+// ---- what the panel's tender view (tender-ui.js, in the real popup.html under jsdom) says after a run
+let panelDom = null;
+/** Run `fn($)` with popup.html as the page and tender-ui.js loaded in it; the globals are put back afterwards. */
+async function withTenderPanel(fn) {
+  const { readFileSync } = await import('node:fs');
+  panelDom ||= new JSDOM(readFileSync(new URL('../../popup/popup.html', import.meta.url), 'utf8').replace(/<script[^>]*><\/script>/g, ''), { pretendToBeVisual: true });
+  const keep = ['document', 'window', 'MutationObserver', 'Event', 'CustomEvent'].map((k) => [k, Object.getOwnPropertyDescriptor(globalThis, k)]);
+  const w = panelDom.window;
+  Object.assign(globalThis, { document: w.document, window: w, MutationObserver: w.MutationObserver, Event: w.Event, CustomEvent: w.CustomEvent });
+  try {
+    await import('../tender-ui.js');
+    return await fn((id) => w.document.getElementById(id));
+  } finally {
+    for (const [k, d] of keep) { if (d) Object.defineProperty(globalThis, k, d); else delete globalThis[k]; }
+  }
+}
+/** Click a run button of the tender view and wait for its result (or error). */
+async function clickRun($, id, { from, to } = {}) {
+  const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  $('auto-from').value = iso(from || new Date(NOW()));
+  $('auto-to').value = iso(to || new Date(NOW()));
+  $(id).click();
+  for (let i = 0; i < 500 && (($('tender-result').hidden && $('tender-error').hidden) || $('btn-auto-run').disabled); i++) await sleepMs(10);
+}
+/** The rows of a result list: [label, value, value's class]. */
+const panelRows = ($, id) => [...$(id).children].map((li) => [li.children[0].firstChild?.textContent?.trim() || '', li.children[1].textContent, li.children[1].className]);
+test('Panel (1.15): a letter or tabulation found but not downloaded reads "failed" in red, never "none for these dates" / "nothing new"; letters downloaded before say so', () => withTenderPanel(async ($) => {
+  mk({ inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [{ no: 'L1', oid: '9', letter: '77', date: new Date(NOW()) }] }, loaAck: 'Try Again' });
+  await clickRun($, 'btn-letter-loa');
+  let rows = panelRows($, 'tender-result-rows');
+  assert.deepEqual(rows[0].slice(1), ['1 failed', 'tender-bad'], JSON.stringify(rows));
+  assert.deepEqual(rows[1].slice(1), ['LOA: failed', 'tender-bad'], 'the tender row is red');
+  assert.match($('tender-result-totals').textContent, /Failed: 1/);
+  // the same letter once it was downloaded: the next run says it was downloaded before (known issue 2)
+  server.s.loaAck = 'OK';
+  await clickRun($, 'btn-letter-loa');
+  assert.deepEqual(panelRows($, 'tender-result-rows')[0].slice(1), ['1 downloaded', 'tender-ok']);
+  await clickRun($, 'btn-letter-loa');
+  rows = panelRows($, 'tender-result-rows');
+  assert.deepEqual(rows[0].slice(1), ['1 already downloaded', 'tender-muted'], JSON.stringify(rows));
+  // a Financial Tabulation IREPS shows only as a web page: found, not downloaded
+  mk({ tenders: [bid('42263731')], tabulationAsHtml: true });
+  await clickRun($, 'btn-tab-financial', { from: new Date(2026, 9, 20), to: new Date(2026, 9, 20) });
+  rows = panelRows($, 'tender-result-rows');
+  assert.deepEqual(rows[0].slice(1), ['1 failed', 'tender-bad'], JSON.stringify(rows));
+  assert.deepEqual(rows[1].slice(1), ['Financial Tabulation: failed', 'tender-bad']);
+  // NIT Documents: a message IREPS did not open is a failed row, and "Retry failed" is offered (1.3)
+  mk({ tenders: [futureT({ no: 'M1', nitId: '1', oid: '10' })], messages: [nitMsg('M1')] });
+  intercept((m, u) => u.includes('ViewMessageDetailAction.do'), () => ({ status: 503, type: 'text/html', bytes: enc8('<html><body>Service Unavailable</body></html>') }));
+  await clickRun($, 'btn-auto-run');
+  rows = panelRows($, 'auto-discovered-rows');
+  assert.deepEqual(rows.map((r) => r.slice(1)), [['failed', 'tender-bad']], JSON.stringify(rows));
+  assert.equal($('auto-review').hidden, true, 'not "needs review"');
+  assert.equal($('btn-auto-retry').hidden, false);
+  assert.match($('tender-result-totals').textContent, /Messages not opened: 1/);
+  // two railways' tenders with one number: a row each (6.1)
+  mk({ tenders: [futureT({ no: '10263703', nitId: '71', oid: '710', dept: 'STORES/N F RLY' }), futureT({ no: '10263703', nitId: '72', oid: '720', dept: 'STORES/EAST CENTRAL RLY' })],
+    messages: ['N F RLY', 'EAST CENTRAL RLY'].map((rly) => ({ date: dmy(NOW()), subject: `NIT for STORES/${rly}, Tender Number: 10263703` })) });
+  await clickRun($, 'btn-auto-run');
+  rows = panelRows($, 'auto-discovered-rows');
+  assert.equal(rows.length, 2, JSON.stringify(rows));
+  assert.ok(rows.every((r) => r[0] === '10263703' && r[2] === 'tender-ok'), JSON.stringify(rows));
+}));
 test('H4: NIT Documents - a first My Messages page that is not the inbox is an error; a later one keeps the messages read and says so', async () => {
   const notInbox = (n) => intercept((m, u, b) => b.get('listType') === 'MyMsg' && b.get('pageNo') === String(n), html200('Error', 'Please try again later.'));
   mk({ messages: [nitMsg('Z1')], tenders: [futureT({ no: 'Z1', nitId: '1', oid: '10' })] });
@@ -2157,6 +2338,82 @@ test('H4: Search Tender - a page of another search (IREPS\'s count far off, or n
   assert.deepEqual([r.tabulations.listed, r.tabulations.summary.downloaded], [1, 1], 'a tender of another day is not taken for this one');
   assert.match(r.tabulations.incomplete, /Search Tender 20\/10\/2026 page 2: none of its tenders closes on 20\/10\/2026, so another search in this IREPS session replaced this one/);
 });
+/** IREPS cannot be reached for the requests `when` picks: fetch rejects, as Chrome's does on a network failure. */
+const unreachable = (when) => { const orig = server.handle.bind(server); server.handle = async (m, u, b) => { if (when(m, u, new URLSearchParams(b || ''))) throw new TypeError('Failed to fetch'); return orig(m, u, b); }; };
+test('2.5: Search Tender - a later result page IREPS cannot be reached for keeps the tenders read; the days after it are said not searched', () => quickRetries(async () => {
+  mk({ searchPageSize: 1, tenders: [bid('42263731'), bid('69261051'), bid('77261111', { closing: new Date(2026, 9, 21) })] });
+  unreachable((m, u) => m === 'GET' && /advancedSearch\.do\?.*pageNo=2/.test(u));
+  const r = await auto.runTabulations({ pdfType: 'financialTabulation', from: new Date(2026, 9, 20), to: new Date(2026, 9, 21) });
+  assert.deepEqual([r.tabulations.listed, r.tabulations.summary.downloaded], [1, 1], 'the tender of page 1 is downloaded');
+  assert.match(r.tabulations.incomplete, /Search Tender 20\/10\/2026 page 2: IREPS could not be reached/);
+  assert.match(r.tabulations.incomplete, /Search Tender 21\/10\/2026\.\.21\/10\/2026: not searched, as IREPS stopped answering/);
+  assert.ok(!searchPosts().some((l) => l.body.dateFrom === '21/10/2026'), 'nothing more is sent once IREPS stopped answering');
+}));
+test('2.5: letter lists - a later page IREPS cannot be reached for keeps the letters read and says the list was not read in full (by date, and for one tender)', async () => {
+  const loaRows = (no) => [1, 2].map((n) => ({ no: no || `P${n}`, oid: `70${n}`, letter: `80${n}`, date: new Date(NOW() - 3 * D), page: n }));
+  const page2 = () => unreachable((m, u, b) => b.get('status') === 'MyAdvanceAcceptanceLetter' && b.get('pageNo') === '2');
+  mk({ inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: loaRows() }, inboxPages: { MyAdvanceAcceptanceLetter: 2 }, letterAsPdf: true });
+  page2();
+  const r = await jobs.downloadLettersByDate({ dates: [dmy(NOW() - 3 * D)], statuses: ['MyAdvanceAcceptanceLetter'] });
+  assert.deepEqual(r.tenders.map((t) => t.tenderNo), ['P1'], 'the letter of page 1 is downloaded');
+  assert.match(r.listWarnings.MyAdvanceAcceptanceLetter, /not read in full .*Advance Acceptance Letter list page 2: IREPS could not be reached/);
+  mk({ tenders: [T({})], inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: loaRows('29263265') }, inboxPages: { MyAdvanceAcceptanceLetter: 2 }, letterAsPdf: true });
+  page2();
+  const c = (await run('29263265', { only: ['loa'] })).categories.loa;
+  assert.deepEqual([c.status, c.downloaded], ['PARTIAL', 1], 'the letter of page 1 is downloaded');
+  assert.match(c.note, /Advance Acceptance Letter list .* page 2: IREPS could not be reached/);
+});
+test('2.5: Closed Tenders and My Messages - a later page IREPS cannot be reached for (or fails to give) keeps what was read and says so', async () => {
+  const closedPage2 = (m, u, b) => b.get('status') === 'MyBidsClosed' && b.get('pageNo') === '2';
+  mk({ closed: [closed('42263731'), closed('69261051', { page: 2 })] });
+  unreachable(closedPage2);
+  let scan = await closedScan(new Date(2026, 9, 15), new Date(2026, 9, 23));
+  assert.deepEqual(scan.rows.map((x) => x.tenderNo), ['42263731']);
+  assert.match(scan.incomplete, /Closed Tenders 15\/10\/2026\.\.23\/10\/2026 page 2: IREPS could not be reached/);
+  mk({ closed: [closed('42263731'), closed('69261051', { page: 2 })] });
+  intercept(closedPage2, () => ({ status: 500, type: 'text/html', bytes: enc8('<html><body>boom</body></html>') }));
+  scan = await closedScan(new Date(2026, 9, 15), new Date(2026, 9, 23));
+  assert.deepEqual(scan.rows.map((x) => x.tenderNo), ['42263731'], 'an HTTP error on a later page keeps the rows read too');
+  assert.match(scan.incomplete, /page 2: IREPS returned HTTP 500/);
+  // My Messages: the NIT notices (scanInbox) and NIT Documents (scanMessages)
+  mk({ msgPageSize: 1, messages: [nitMsg('Z1'), nitMsg('Z2')] });
+  unreachable((m, u, b) => b.get('listType') === 'MyMsg' && b.get('pageNo') === '2');
+  const notices = await wf.findNitNotices({ base: 'https://www.ireps.gov.in' }, [dmy(NOW())]);
+  assert.deepEqual(notices.map((n) => n.tenderNo), ['Z1']);
+  assert.match(notices.incomplete, /My Messages page 2: IREPS could not be reached/);
+  const messages = await msgs.scanMessages('https://www.ireps.gov.in', { from: TODAY(), to: TODAY() });
+  assert.equal(messages.rows.length, 1);
+  assert.match(messages.incomplete, /My Messages page 2: IREPS could not be reached/);
+});
+test('10.1: a letter list and Closed Tenders stopped at their 60-page limit say so; never a silent partial list', async () => {
+  mk({ inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: Array.from({ length: 61 }, (_, i) => ({ no: `L${i}`, oid: `9${i}`, letter: `7${i}`, date: new Date(NOW()) })) }, inboxPageSize: 1 });
+  const probe = { base: 'https://www.ireps.gov.in', ctx: { tenderNo: '' }, inboxCache: new Map(), onProgress: () => {} };
+  const list = await wf.scanPostTenderList(probe, 'MyAdvanceAcceptanceLetter', { stopBefore: TODAY() });
+  assert.equal(list.entries.length, 60, 'the 60 pages are read');
+  assert.match(list.incomplete, /DocLink read 60 pages of the Advance Acceptance Letter list, its page limit, and stopped there/);
+  mk({ closed: Array.from({ length: 61 }, (_, i) => closed(`4226${String(i).padStart(4, '0')}`, { page: i + 1 })) });
+  const scan = await closedScan(new Date(2026, 9, 15), new Date(2026, 9, 23));
+  assert.equal(scan.rows.length, 60);
+  assert.match(scan.incomplete, /DocLink read 60 pages of Closed Tenders 15\/10\/2026\.\.23\/10\/2026, its page limit/);
+});
+test('10.1: inbox scans stopped at their 15-page limit say so (one tender\'s letter list, the My Messages notices)', async () => {
+  const mine = Array.from({ length: 16 }, (_, i) => ({ no: '29263265', oid: '107200478', letter: `60${String(i).padStart(2, '0')}`, date: daysAgo(3) }));
+  mk({ tenders: [T({})], inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: mine }, inboxPageSize: 1, letterAsPdf: true });
+  const c = (await run('29263265', { only: ['loa'] })).categories.loa;
+  assert.deepEqual([c.status, c.downloaded], ['PARTIAL', 15]);
+  assert.match(c.note, /DocLink read 15 pages of the Advance Acceptance Letter list \S+\.\.\S+, its page limit/);
+  // (each page's message looks different: a page that repeats the one before ends the scan)
+  mk({ msgPageSize: 1, messages: Array.from({ length: 16 }, (_, i) => ({ date: dmy(NOW()), subject: `NIT for S${i}, Tender Number: N${i}` })) });
+  const notices = await wf.findNitNotices({ base: 'https://www.ireps.gov.in' }, [dmy(NOW())]);
+  assert.equal(notices.length, 15);
+  assert.match(notices.incomplete, /DocLink read 15 pages of My Messages, its page limit/);
+});
+test('10.1: My Messages stopped at its 60-page limit says so in `incomplete`, besides `truncated`', async () => {
+  mk({ msgPageSize: 1, messages: Array.from({ length: 61 }, (_, i) => ({ date: dmy(NOW()), subject: `Message ${i}` })) });
+  const scan = await msgs.scanMessages('https://www.ireps.gov.in', { from: TODAY(), to: TODAY() });
+  assert.deepEqual([scan.pagesRead, scan.rows.length, scan.truncated], [60, 60, true]);
+  assert.match(scan.incomplete, /DocLink read 60 pages of My Messages, its page limit, and stopped there/);
+});
 test('M2: each day\'s Search Tender search and result pages wait for the IREPS form lock', async () => {
   const formLock = await import('../../services/ireps-form-lock.js');
   mk({ tenders: [bid('42263731')] });
@@ -2169,10 +2426,50 @@ test('M2: each day\'s Search Tender search and result pages wait for the IREPS f
   await held;
   assert.equal((await p).tabulations.summary.downloaded, 1);
 });
+test('5.3: a tender search by number and My Messages wait for the IREPS form lock, and never take it twice', async () => {
+  const formLock = await import('../../services/ireps-form-lock.js');
+  const hold = () => { let release; const held = formLock.withIrepsFormLock(() => new Promise((r) => { release = r; })); return { held, release: () => release() }; };
+  // a run that took the lock inside the lock would wait for ever (Web Locks are not re-entrant)
+  const settle = async (p) => {
+    let timer;
+    try {
+      return await Promise.race([p, new Promise((_, no) => { timer = setTimeout(() => no(new Error('the run waits for ever: it took the IREPS form lock twice')), 5000); })]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  mk({ tenders: [T({})] });
+  let lock = hold();
+  const p = run('29263265', { only: ['tenderPdf'] });
+  await sleepMs(50);
+  assert.ok(!server.log.some((l) => l.path === '/epsn/search/advancedSearch.do'), 'no tender search while another IREPS form sequence holds the lock');
+  lock.release();
+  await lock.held;
+  assert.equal((await settle(p)).categories.tenderPdf.status, 'DOWNLOADED');
+  mk({ messages: [nitMsg('Z1')], tenders: [futureT({ no: 'Z1', nitId: '1', oid: '10' })] });
+  lock = hold();
+  const q = autoRun();
+  await sleepMs(50);
+  assert.ok(!server.log.some((l) => l.body.listType === 'MyMsg'), 'My Messages is not read while another sequence holds the lock');
+  lock.release();
+  await lock.held;
+  assert.deepEqual((await settle(q)).tenders.map((t) => t.status), ['DOWNLOADED']);
+});
 test('H4: a tender search IREPS does not answer (HTTP errors) is "search incomplete", never "not found"', async () => {
   mk({ tenders: [T({})] });
   intercept((m, u, b) => b.get('advancedSearch'), () => ({ status: 500, type: 'text/html', bytes: enc8('<html><body>error</body></html>') }));
   await assert.rejects(() => run(), (e) => e.code === 'SEARCH_INCOMPLETE' && /could not tell whether the tender is in IREPS/.test(e.message));
+});
+test('4.4: the Search Tender form\'s own notes are not IREPS refusing the search: a page that is no result is "search incomplete", never "not found", and starts no search per department', async () => {
+  const kind = (page) => search.classifySearchResponse(core.parseHtml(page));
+  assert.equal(kind(new TextDecoder().decode(searchFormPage())), 'other', 'the form page as captured: department list, notes, hidden date-range note');
+  assert.equal(kind('<html><body><form>Please select Department <input type=text></form></body></html>'), 'invalid', 'IREPS refusing the search');
+  assert.equal(kind(readFileSync(new URL('./fixtures/search-tender-20nov.html', import.meta.url), 'utf8')), 'results');
+  mk({ tenders: [T({})] });
+  const searches = [];
+  intercept((m, u, b) => m === 'POST' && b.get('submit') === 'Show Results' && searches.push(b.get('division')), () => ({ status: 200, type: 'text/html', bytes: searchFormPage() }));
+  await assert.rejects(() => run(), (e) => e.code === 'SEARCH_INCOMPLETE' && /could not tell whether the tender is in IREPS/.test(e.message));
+  assert.deepEqual([searches.length, [...new Set(searches)].sort()], [12, ['-1', '19']], 'six date ranges, Stores and all departments: no search per department');
 });
 
 // ---- H7: a NIT message is done only when every NIT category succeeded
@@ -2188,6 +2485,38 @@ test('H7: NIT Documents retries a NIT whose attachment failed; the next run fetc
   assert.deepEqual(savedNames().slice(before), ['DocLink/HOSUR/Tender_R1/NIT_and_Supporting_Documents/r2.pdf'], 'only the attachment that failed: the NIT PDF, the other attachment and My Offer are not downloaded again');
   assert.equal((await autoRun()).messages.opened, 0, 'now done: not opened again');
 });
+/** Tender C1 with a corrigendum dated today that links two attached documents, and its corrigendum message. */
+const corrWithAttachments = (o = {}) => mk({
+  tenders: [futureT({ no: 'C1', nitId: '71', oid: '710', corrigenda: [{ id: '7001', cn: '1', date: `${dmy(NOW())} 10:00`, attached: ['First.pdf', 'Second.pdf'] }] })],
+  messages: [{ date: dmy(NOW()), subject: 'Issue of Corrigendum towards STORES/X RLY, Tender no: C1' }], ...o,
+});
+test('2.1: NIT Documents retries a corrigendum whose attached document failed; the next run saves only that attachment (not the corrigendum again), then the message is done', async () => {
+  corrWithAttachments({ failPaths: ['Second.pdf'] });
+  const r1 = await autoRun();
+  assert.deepEqual([r1.tenders[0].status, r1.tenders[0].categories.corrigenda.status], ['FAILED', 'PARTIAL']);
+  const before = saved.length;
+  server.s.failPaths = [];
+  const r2 = await autoRun();
+  assert.equal(r2.messages.opened, 1, 'the message is opened again');
+  assert.deepEqual([r2.tenders[0].status, r2.tenders[0].categories.corrigenda.status], ['DOWNLOADED', 'DOWNLOADED']);
+  assert.deepEqual(savedNames().slice(before), ['DocLink/HOSUR/Tender_C1/Corrigenda/Second.pdf'], 'the corrigendum page (and its .html) and First.pdf are not saved twice');
+  assert.equal((await autoRun()).messages.opened, 0, 'now done: not opened again');
+});
+test('2.1: a corrigendum the user chooses to download again is downloaded in full, also after a run left it without an attachment', async () => {
+  corrWithAttachments({ failPaths: ['Second.pdf'] });
+  const corrKey = dlog.downloadKey.tender('CORRIGENDA', 'C1', '7001');
+  let loggedElsewhere = false; // as when a later run by tender number completed it and logged it
+  await withDownloadLog((k) => loggedElsewhere && k === corrKey, async (seen) => {
+    assert.equal((await autoRun()).tenders[0].categories.corrigenda.status, 'PARTIAL');
+    loggedElsewhere = true;
+    server.s.failPaths = [];
+    seen.answer = (q) => ({ redownload: q.alreadyDownloaded.map((a) => a.id), sameForRun: false });
+    const before = saved.length;
+    assert.equal((await autoRun()).tenders[0].categories.corrigenda.status, 'DOWNLOADED');
+    assert.equal(seen.prompts.length, 1, 'asked once');
+    assert.deepEqual(savedNames().slice(before).map((n) => n.split('/').pop()).sort(), ['Corrigendum_01_C1.html', 'Corrigendum_01_C1.pdf', 'First.pdf', 'Second.pdf'], 'all of it again, as asked');
+  });
+});
 
 // ---- M21: the ledger is saved as it goes, and stays small
 test('M21: the ledger is saved after every tender, so a run cut short keeps what it did', async () => {
@@ -2197,12 +2526,14 @@ test('M21: the ledger is saved after every tender, so a run cut short keeps what
   const orig = server.handle.bind(server);
   server.handle = async (m, u, b) => { if (new URLSearchParams(b || '').get('advancedSearch') === 'S2') await held; return orig(m, u, b); };
   const running = autoRun();
-  for (let i = 0; i < 300 && !ledgerOf()?.nit?.S1; i++) await sleepMs(10);
-  assert.ok(ledgerOf()?.nit?.S1, 'S1 is recorded while S2 is still being looked for');
+  // the NIT mark is the tender number and the railway the message names (6.1)
+  const s1 = 'S1|SOUTH EASTERN RLY';
+  for (let i = 0; i < 300 && !ledgerOf()?.nit?.[s1]; i++) await sleepMs(10);
+  assert.ok(ledgerOf()?.nit?.[s1], 'S1 is recorded while S2 is still being looked for');
   assert.equal(Object.keys(ledgerOf().msgs).length, 1);
   release();
   await running;
-  assert.ok(ledgerOf().nit.S2);
+  assert.ok(ledgerOf().nit['S2|SOUTH EASTERN RLY']);
 });
 test('M21: pruning drops old and surplus entries and keeps the newest tender records within the byte budget (the correspondence record stays)', () => {
   const now = Date.parse('2026-11-15T10:00:00Z');
@@ -2262,6 +2593,105 @@ test('M20: a print tab still open when the side panel closes is stopped, detache
     await assert.rejects(printing, (e) => e.code === 'PRINT' && /side panel was closed/.test(e.message));
     assert.deepEqual(dbg.tabs.removed, [7]);
     assert.ok(dbg.calls.some((c) => c[0] === 'detach'));
+  } finally {
+    withoutDebugger();
+  }
+});
+test('10.3: a print tab that could not be handed the letter page is never printed: the letter keeps its text PDF and the run says why', async () => {
+  loaOnly();
+  const dbg = fakeDebugger({ fulfillError: 'Invalid InterceptionId.' });
+  try {
+    const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
+    assert.deepEqual([loa.status, loa.downloaded], ['DOWNLOADED', 1]);
+    assert.ok(!dbg.calls.some((c) => c[0] === 'Page.printToPDF'), 'the blank tab is not printed');
+    const files = saved.filter((s) => s.filename.includes('Advance_Acceptance_LOA'));
+    assert.deepEqual(files.map((s) => s.filename.split('/').pop()), ['LOA_29263265.pdf']);
+    assert.doesNotMatch(new TextDecoder().decode(files[0].bytes), /chrome-print/);
+    assert.match(new TextDecoder('latin1').decode(files[0].bytes), /Letter 1461928/, 'the text PDF of the letter');
+    assert.notEqual(loa.files[0].printed, true);
+    assert.ok(loa.warnings.some((w) => /could not be handed to the print tab \(Invalid InterceptionId\.\)/.test(w)), loa.warnings.join('\n'));
+    assert.deepEqual(dbg.tabs.removed, [7]);
+  } finally {
+    withoutDebugger();
+  }
+});
+const multipartBody = (fields) => `${fields.map(([k, v]) => `------WebKitFormBoundaryQ1\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`).join('')}------WebKitFormBoundaryQ1--\r\n`;
+test('10.4: a write action in a JSON or multipart body is refused like one in a form; the "LOA viewed" exception stays the exact form POST', () => {
+  const code = (body, path = '/epsn/supply/tds/ajxdata.do') => core.requestRefusal({ method: 'POST', url: BASE + path, body })?.code || 'ok';
+  assert.deepEqual([
+    code('{"ajaxMode":"updateBidAmount","docId":"1"}'),
+    code('{"request":{"items":[{"activity":"saveBid"}]}}'),
+    code(multipartBody([['opValue', 'SubmitBid'], ['bidId', '1']])),
+    code(multipartBody([['ajaxMode', 'updateLoaViewedDataByBidder'], ['docId', '1488946'], ['docType', '11']])),
+    code('{"ajaxMode":"updateLoaViewedDataByBidder","docId":"1488946","docType":"11"}'),
+    code(multipartBody([['pdfType', 'technoCommercialTabulation'], ['tenderOID', '1']]), '/epsn/tbo/commTboPdfAction.do'),
+  ], ['BLOCKED', 'BLOCKED', 'BLOCKED', 'BLOCKED', 'BLOCKED', 'EXCLUDED']);
+  assert.deepEqual([
+    code('{"ajaxMode":"getLetterDetails","docId":"1"}'),
+    code(multipartBody([['ajaxMode', 'getLetterDetails'], ['docId', '1']])),
+    code('ajaxMode=updateLoaViewedDataByBidder&docId=1488946&docType=11'),
+    code('[1, 2, 3]'),
+    code('{not json'),
+  ], ['ok', 'ok', 'ok', 'ok', 'ok']);
+  assert.deepEqual(core.bodyFields(multipartBody([['a', '1'], ['b', 'two words']])).slice(-2), [['a', '1'], ['b', 'two words']]);
+});
+test('10.4: in the print tab a POST body CDP leaves out is read through CDP and checked, or refused when it cannot be read; the letter still prints', async () => {
+  loaOnly();
+  const ajx = `${BASE}/epsn/supply/tds/ajxdata.do`;
+  const b64 = (s) => Buffer.from(s).toString('base64');
+  const dbg = fakeDebugger({
+    pageRequests: [
+      { method: 'POST', url: ajx, postData: '{"ajaxMode":"updateBidAmount","docId":"1"}' },
+      { method: 'POST', url: ajx, postData: multipartBody([['ajaxMode', 'submitBid'], ['docId', '1']]) },
+      { method: 'POST', url: ajx, postData: '{"ajaxMode":"getLetterDetails","docId":"1"}' },
+      { method: 'POST', url: ajx, hasPostData: true, networkId: 'n4' },
+      { method: 'POST', url: ajx, hasPostData: true, networkId: 'n5' },
+      { method: 'POST', url: ajx, hasPostData: true, networkId: 'n6' },
+      { method: 'POST', url: ajx, hasPostData: true },
+      { method: 'POST', url: ajx, hasPostData: true, postDataEntries: [{ bytes: b64('opValue=Submit') }, { bytes: b64('Bid&bidId=1') }] },
+      { method: 'POST', url: ajx, hasPostData: true, postDataEntries: [{ bytes: b64('ajaxMode=getLetter') }, { bytes: b64('Details&docId=1') }] },
+      { method: 'POST', url: `${BASE}/epsn/supply/tds/viewLetter.do` },
+    ],
+    postData: { n4: 'ajaxMode=getLetterDetails&docId=1', n5: 'activity=saveBid&docId=1' },
+  });
+  try {
+    const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
+    assert.deepEqual([loa.status, loa.downloaded, loa.warnings], ['DOWNLOADED', 1, []]);
+    assert.match(new TextDecoder().decode(saved.find((s) => s.filename.includes('Advance_Acceptance_LOA')).bytes), /chrome-print/);
+    await sleepMs(10);
+    assert.deepEqual(['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'p8', 'p9', 'p10'].map(dbg.outcome),
+      ['failed', 'failed', 'continued', 'continued', 'failed', 'failed', 'failed', 'failed', 'continued', 'continued']);
+    assert.deepEqual(dbg.calls.filter((c) => c[0] === 'Network.getRequestPostData').map((c) => c[1].requestId), ['n4', 'n5', 'n6'], 'read through CDP when it left the body out');
+  } finally {
+    withoutDebugger();
+  }
+});
+test('10.4: the letter page in a print tab opens no window: window.open gives nothing, a form or link aimed at a new window is dropped (one aimed at the page or its frame goes on); a window it opens anyway is closed at once', async () => {
+  loaOnly();
+  const dbg = fakeDebugger({ popup: true });
+  try {
+    const loa = (await run('29263265', { only: ['loa'] })).categories.loa;
+    assert.deepEqual([loa.status, loa.downloaded], ['DOWNLOADED', 1]);
+    await sleepMs(10);
+    assert.ok(dbg.tabs.removed.includes(8), `the window the page opened is closed (closed: ${dbg.tabs.removed.join()})`);
+    // the script the print tab runs in every document before the page's own scripts
+    const page = new JSDOM('<html><body><iframe name="content"></iframe><form id="own" action="/x"></form><form id="frame" target="content" action="/y"></form>'
+      + '<form id="blank" target="_blank" action="/z"></form><form id="named" target="newWin" action="/w"></form><a id="a1" href="/v" target="_blank">v</a><a id="a2" href="/u">u</a></body></html>', { runScripts: 'outside-only' });
+    const w = page.window;
+    const sent = [];
+    w.HTMLFormElement.prototype.submit = function submit() { sent.push(this.id); };
+    w.eval(dbg.cmd('Page.addScriptToEvaluateOnNewDocument').source);
+    assert.equal(w.open('/epsn/supply/bid/viewBid.do', 'newWin'), null);
+    for (const id of ['own', 'frame', 'blank', 'named']) w.document.getElementById(id).submit();
+    assert.deepEqual(sent, ['own', 'frame'], 'only the forms aimed at the page itself or at its frame are sent');
+    const followed = (id) => {
+      let dropped = null;
+      const a = w.document.getElementById(id);
+      a.addEventListener('click', (e) => { dropped = e.defaultPrevented; e.preventDefault(); });
+      a.click();
+      return !dropped;
+    };
+    assert.deepEqual([followed('a1'), followed('a2')], [false, true], 'a link into a new window is dropped, a link in the page is not');
   } finally {
     withoutDebugger();
   }
@@ -2455,11 +2885,13 @@ test('Scheduled run: an ECM refusal fails the letter; it is never saved locally'
 test('Scheduled run: a document that fails is reported to the scheduler with its key, its name and the reason', async () => {
   scheduledCo();
   const shared = fakeShared({ refuse: true });
-  await scheduled(shared, coRun);
+  const r = await scheduled(shared, coRun);
   assert.equal(shared.calls.failed.length, 1);
   const f = shared.calls.failed[0];
   assert.deepEqual([f.key, f.code, f.detail], [coKey, 'ECM_REFUSED', 'ECM refused']);
   assert.match(f.doc, /^Tender 29263265 - /, f.doc);
+  const file = r.letters.tenders[0].categories.counterOffer.files.find((x) => x.status === 'FAILED');
+  assert.deepEqual([file.error, file.code], [f.detail, f.code], 'the failed file says what was reported, so the run lists it once');
 });
 test('Scheduled run: a document saved is never reported as failed', async () => {
   scheduledCo();
@@ -2473,6 +2905,216 @@ test('Scheduled run: a reservation that cannot be made fetches nothing', async (
   await scheduled(shared, coRun);
   assert.ok(!server.log.some((l) => l.path.endsWith('publishCounterOfferLetter.do')));
   assert.deepEqual([shared.calls.ecm.length, saved.length], [0, 0]);
+});
+
+// ---- how a scheduled tender run ends (done / partial / failed), as tender/schedule-runner.js computes it
+const sharedHooksMod = await import('../../services/scheduler/shared-run-hooks.js');
+const tenderRunner = await import('../../services/scheduler/tender-runner.js');
+/**
+ * A scheduled run as schedule-runner.js runs it: the real shared hooks on a fake Recon Engine (`taken`: keys
+ * someone saved) and a fake ECM, the job, then the slot's outcome. -> { result, error, outcome, api }
+ */
+async function scheduledOutcome(job, { taken = [] } = {}) {
+  const api = { reserved: [], completed: [] };
+  api.reserve = async (req) => { api.reserved.push(...req.keys); return { granted: req.keys.filter((k) => !taken.includes(k)), taken: Object.fromEntries(req.keys.filter((k) => taken.includes(k)).map((k) => [k, { status: 'done', by: { name: 'Priya' } }])) }; };
+  api.complete = async (req) => { api.completed.push(req); return {}; };
+  const hooks = sharedHooksMod.createSharedRunHooks({ api, claimId: 'c1', account: { irepsAccountId: '833', operatingUnit: 'HOSUR' }, isClaimLive: () => true, sleep: async () => {},
+    uploadEcm: async (doc) => ({ uid: `u-${doc.filename}`, site: 'hosur', path: '/ECM/Hosur/Tenders', deduplicated: false }) });
+  let result = null;
+  let error = null;
+  sharedRun.beginSharedRun(hooks.tenderHooks);
+  try {
+    result = await job();
+  } catch (e) {
+    error = { code: e.code || 'UNKNOWN', message: e.message };
+  } finally {
+    sharedRun.endSharedRun();
+  }
+  const counts = await hooks.finishTenderRun({ stopped: tenderRunner.stoppedCode(result, error) });
+  return { result, error, api, outcome: tenderRunner.tenderRunOutcome({ result, error, counts, details: hooks.details() }) };
+}
+const letterRun = (status) => () => auto.runLetterType({ status, from: new Date(NOW()), to: new Date(NOW()) });
+const tabulationRun = (from, to) => async () => {
+  const job = await jobs.beginJob({});
+  return { tabulations: await jobs.downloadTabulationsByDate({ from, to, job }) };
+};
+test('Scheduled run: a letter list read only in part, or one IREPS did not open, never ends "done"; the list is named (known issue 1, 1.5)', async () => {
+  const rows = [1, 2].map((n) => ({ no: `P${n}`, oid: `70${n}`, letter: `80${n}`, date: new Date(NOW()), page: n }));
+  mk({ inbox: { MyNegotiation: rows, MyCounterOffer: [], MyAdvanceAcceptanceLetter: [] }, inboxPages: { MyNegotiation: 2 }, letterAsPdf: true });
+  intercept((m, u, b) => b.get('status') === 'MyNegotiation' && b.get('pageNo') === '2', () => ({ status: 500, type: 'text/html', bytes: enc8('<html><body>boom</body></html>') }));
+  const inPart = (await scheduledOutcome(letterRun('MyNegotiation'))).outcome;
+  assert.deepEqual([inPart.outcome, inPart.code, inPart.result.saved], ['partial', 'SCHEDULE_LIST_INCOMPLETE', 1], JSON.stringify(inPart));
+  assert.match(inPart.result.warnings[0], /^Negotiation letter list: The Negotiation list was not read in full .*HTTP 500/);
+  mk({ inbox: { MyNegotiation: rows, MyCounterOffer: [], MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
+  intercept((m, u, b) => u.includes('vendorInboxLink') && b.has('pageNo'), html200('Maintenance', 'IREPS is under maintenance, please visit later.'));
+  const notOpened = (await scheduledOutcome(letterRun('MyNegotiation'))).outcome;
+  assert.deepEqual([notOpened.outcome, notOpened.code], ['failed', 'SCHEDULE_LIST_INCOMPLETE'], JSON.stringify(notOpened));
+  assert.match(notOpened.result.warnings[0], /^Negotiation letter list: Could not read the Negotiation page/);
+});
+test('Scheduled run: IREPS not answering its home page during a letters run stops the run; the tender is named, the rest skipped, never "done" (known issue 1)', () => quickRetries(async () => {
+  mk({ inbox: { MyNegotiation: [], MyCounterOffer: ['CO1', 'CO2', 'CO3'].map((no, i) => ({ no, oid: `90${i}`, letter: `91${i}`, date: new Date(NOW()) })), MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
+  const orig = server.handle.bind(server);
+  let lettersServed = 0;
+  server.handle = async (m, u, b) => {
+    if (u.includes('publishCounterOfferLetter.do')) lettersServed++;
+    // once the first tender's letter is saved, IREPS answers its home page (the account check) with 503
+    if (u.includes('showHome.do') && lettersServed >= 1) return { status: 503, type: 'text/html', bytes: enc8('<html><body>Service Unavailable</body></html>') };
+    return orig(m, u, b);
+  };
+  const { result, outcome } = await scheduledOutcome(letterRun('MyCounterOffer'));
+  const l = result.letters;
+  assert.equal(l.aborted?.code, 'IREPS_UNAVAILABLE', 'the run stopped');
+  assert.deepEqual(l.tenders.map((t) => [t.tenderNo, t.status || 'DOWNLOADED']), [['CO1', 'DOWNLOADED'], ['CO2', 'FAILED'], ['CO3', 'SKIPPED']]);
+  assert.equal(lettersServed, 1, 'no other tender was tried while IREPS was down');
+  assert.deepEqual([outcome.outcome, outcome.code, outcome.result.saved], ['partial', 'IREPS_UNAVAILABLE', 1], JSON.stringify(outcome));
+  assert.deepEqual(outcome.result.failures.map((f) => [f.doc, f.code]), [['Tender CO2', 'IREPS_UNAVAILABLE'], ['Tender CO3', 'IREPS_UNAVAILABLE']]);
+  assert.match(outcome.result.detail, /IREPS is not responding/);
+}));
+test('Scheduled run: tabulations - a tender whose step failed is named, and a closing day not read to its end makes the run partial (1.4)', () => quickRetries(async () => {
+  mk({ tenders: [bid('42263731'), bid('69261051')] });
+  const orig = server.handle.bind(server);
+  let tabsServed = 0;
+  server.handle = async (m, u, b) => {
+    if (u.includes('commTboPdfAction.do')) tabsServed++;
+    if (u.includes('showHome.do') && tabsServed >= 2) return { status: 503, type: 'text/html', bytes: enc8('<html><body>Service Unavailable</body></html>') };
+    return orig(m, u, b);
+  };
+  const day = new Date(2026, 9, 20);
+  const stopped = await scheduledOutcome(tabulationRun(day, day));
+  assert.deepEqual(stopped.result.tabulations.tenders.map((t) => [t.tenderNo, t.status || 'DOWNLOADED']), [['42263731', 'DOWNLOADED'], ['69261051', 'FAILED']]);
+  assert.deepEqual([stopped.outcome.outcome, stopped.outcome.code, stopped.outcome.result.saved], ['partial', 'IREPS_UNAVAILABLE', 2], JSON.stringify(stopped.outcome));
+  assert.deepEqual(stopped.outcome.result.failures.map((f) => f.doc), ['Tender 69261051']);
+  mk({ searchPageSize: 1, tenders: [bid('42263731'), bid('69261051')] });
+  intercept((m, u) => m === 'GET' && /advancedSearch\.do\?.*pageNo=2/.test(u), html200('Busy', 'The server is busy.'));
+  const short = (await scheduledOutcome(tabulationRun(day, day))).outcome;
+  assert.deepEqual([short.outcome, short.code, short.result.saved], ['partial', 'SCHEDULE_LIST_INCOMPLETE', 2], JSON.stringify(short));
+  assert.match(short.result.warnings[0], /Search Tender 20\/10\/2026 page 2/);
+}));
+test('Scheduled run: NIT Documents - a message IREPS did not open is a failure, opened again next time; never "could not be matched to a tender" (1.3)', async () => {
+  mk({ tenders: [futureT({ no: 'M1', nitId: '1', oid: '10' })], messages: [nitMsg('M1')] });
+  let busy = true;
+  intercept((m, u) => busy && u.includes('ViewMessageDetailAction.do'), () => ({ status: 503, type: 'text/html', bytes: enc8('<html><body>Service Unavailable</body></html>') }));
+  const first = await scheduledOutcome(() => autoRun());
+  assert.deepEqual([first.result.failedMessages.length, first.result.review.length, first.result.summary.failedMessages], [1, 0, 1]);
+  assert.deepEqual([first.outcome.outcome, first.outcome.code], ['failed', 'SCHEDULE_DOWNLOAD_FAILED'], JSON.stringify(first.outcome));
+  assert.match(first.outcome.result.failures[0].doc, /^Message of \d{2}\/\d{2}\/\d{4}: NIT for STORES-PCMM\/SOUTH EASTERN RLY, Tender Number: M1$/);
+  assert.equal(first.outcome.result.failures[0].code, 'SCHEDULE_IREPS_ERROR');
+  assert.ok(!(first.outcome.result.warnings || []).some((w) => /could not be matched/.test(w)));
+  busy = false;
+  const second = await scheduledOutcome(() => autoRun());
+  assert.equal(second.result.messages.opened, 1, 'the message is opened again');
+  assert.deepEqual([second.outcome.outcome, second.result.tenders[0].status], ['done', 'DOWNLOADED'], JSON.stringify(second.outcome));
+});
+test('Scheduled run: NIT Documents leaves My Offer out (the ECM has no kind for it), says so once, and the NIT is done (2.4); a manual run still downloads it', async () => {
+  mk({ tenders: [futureT({ no: 'O1', nitId: '1', oid: '10', offer: true }), futureT({ no: 'O2', nitId: '2', oid: '20', offer: true })], messages: [nitMsg('O1'), nitMsg('O2')] });
+  const first = await scheduledOutcome(() => autoRun());
+  assert.ok(!server.log.some((l) => l.path === '/epsn/tbo/commTboPdfAction.do'), 'My Offer is not requested');
+  assert.deepEqual(first.result.tenders.map((t) => [t.tenderNo, t.status, Object.keys(t.categories).sort().join()]), [['O1', 'DOWNLOADED', 'attachments,tenderPdf'], ['O2', 'DOWNLOADED', 'attachments,tenderPdf']]);
+  assert.deepEqual([first.outcome.outcome, first.outcome.result.warnings], ['done', [auto.MY_OFFER_NOT_SCHEDULED]], JSON.stringify(first.outcome));
+  assert.equal((await scheduledOutcome(() => autoRun())).result.messages.opened, 0, 'the NIT is done: its message is not opened every hour');
+  mk({ tenders: [futureT({ no: 'O1', nitId: '1', oid: '10', offer: true })], messages: [nitMsg('O1')] });
+  const manual = await autoRun();
+  assert.equal(manual.tenders[0].categories.myOffer.status, 'DOWNLOADED');
+  assert.deepEqual(manual.notes, []);
+});
+test('Scheduled run: a letter saved while IREPS\'s tender search did not answer is saved without the ECM tender date, says so, and the search is tried again (2.6)', async () => {
+  mk({ tenders: [T({ no: 'LD1', nitId: '81', oid: '810', closing: new Date(NOW() - 5 * D) })], inbox: { MyNegotiation: [], MyCounterOffer: [], MyAdvanceAcceptanceLetter: [{ no: 'LD1', oid: '5003', letter: '31', date: new Date(NOW()) }] }, letterAsPdf: true });
+  let searchDown = true;
+  let busySearches = 0;
+  intercept((m, u, b) => searchDown && m === 'POST' && b.get('advancedSearch') === 'LD1' && ++busySearches > 0, () => ({ status: 503, type: 'text/html', bytes: enc8('<html><body>busy</body></html>') }));
+  const { result, outcome } = await scheduledOutcome(letterRun('MyAdvanceAcceptanceLetter'));
+  assert.match(result.letters.tenders[0].tenderDateProblem, /tender date was left blank: IREPS's tender search did not answer/);
+  assert.deepEqual([outcome.outcome, outcome.result.saved], ['done', 1], 'the letter itself is saved');
+  assert.match(outcome.result.warnings[0], /^The ECM tender date was left blank for tender LD1/);
+  // within one job, a search that got no answer is tried again, and is not kept as "no closing date"
+  const job = { base: BASE };
+  const unanswered = [];
+  const before = busySearches;
+  assert.equal(await jobs.closingDateFor(job, 'LD1', () => {}, { onUnanswered: (why) => unanswered.push(why) }), '');
+  const perTry = before / 2;
+  assert.equal(busySearches - before, 2 * perTry, 'the search was tried twice');
+  assert.equal(unanswered.length, 1);
+  searchDown = false;
+  assert.match(await jobs.closingDateFor(job, 'LD1'), /^\d{2}\/\d{2}\/\d{4}/, 'IREPS answers now: the date is found, not the blank of the failed search');
+});
+test('Scheduled run (5.10): when IREPS stops answering at the account check after the letter was reserved, it is reported failed with that reason', () => quickRetries(async () => {
+  scheduledCo();
+  const shared = fakeShared();
+  const orig = server.handle.bind(server);
+  let home = 0;
+  // the job's own check and the one before the letter's list pass; the re-check after the reservation finds IREPS busy
+  server.handle = async (m, u, b) => (u.includes('showHome.do') && ++home >= 3 ? { status: 503, type: 'text/html', bytes: enc8('<html><body>Service Unavailable</body></html>') } : orig(m, u, b));
+  await scheduled(shared, coRun);
+  assert.deepEqual(shared.calls.reserved, [coKey], 'the letter was reserved');
+  assert.ok(!server.log.some((l) => l.path.endsWith('publishCounterOfferLetter.do')), 'and not fetched');
+  assert.deepEqual(shared.calls.failed.map((f) => [f.key, f.code]), [[coKey, 'IREPS_UNAVAILABLE']], 'never "reserved, but no error was reported"');
+  assert.match(shared.calls.failed[0].detail, /IREPS is not responding/);
+}));
+test('Scheduled run (5.10): a tender step whose account re-check fails after its reservation reports the document failed, and its FAILED file says the same with the same code', () => quickRetries(async () => {
+  mk({ tenders: [T({})] });
+  const shared = fakeShared();
+  const orig = server.handle.bind(server);
+  let home = 0;
+  // the run's start and the step's own check pass; the re-check after the NIT is reserved finds IREPS busy
+  server.handle = async (m, u, b) => (u.includes('showHome.do') && ++home >= 3 ? { status: 503, type: 'text/html', bytes: enc8('<html><body>Service Unavailable</body></html>') } : orig(m, u, b));
+  const c = (await scheduled(shared, () => run('29263265', { only: ['tenderPdf'] }))).categories.tenderPdf;
+  const nitKey = dlog.downloadKey.tender('TENDER_PDF', '29263265', '5569207');
+  assert.deepEqual(shared.calls.reserved, [nitKey]);
+  assert.ok(!server.log.some((l) => /viewNitPdf_/.test(l.path)), 'the NIT is not fetched');
+  assert.deepEqual(shared.calls.failed.map((f) => [f.key, f.code]), [[nitKey, 'IREPS_UNAVAILABLE']]);
+  assert.deepEqual([c.status, c.files[0].code, c.files[0].error], ['FAILED', 'IREPS_UNAVAILABLE', shared.calls.failed[0].detail], 'one failure, told the same way twice');
+}));
+test('Scheduled run (2.1): a corrigendum whose attached document fails is released as failed, never as saved; the next run reserves it again and uploads only what was missing', async () => {
+  const { createSharedRunHooks } = await import('../../services/scheduler/shared-run-hooks.js');
+  corrWithAttachments({ failPaths: ['Second.pdf'] });
+  // the Recon Engine's document status for the account, and what each run reported
+  const status = new Map();
+  const reported = [];
+  const api = {
+    reserve: async ({ keys }) => {
+      const granted = keys.filter((k) => status.get(k) !== 'done');
+      for (const k of granted) status.set(k, 'in_progress');
+      return { granted, taken: Object.fromEntries(keys.filter((k) => !granted.includes(k)).map((k) => [k, { status: 'done', by: null, at: null }])) };
+    },
+    complete: async ({ done, failed }) => {
+      reported.push({ done: done.map((x) => x.doc_key), failed: failed.map((f) => [f.doc_key, f.code]) });
+      for (const x of done) status.set(x.doc_key, 'done');
+      for (const f of failed) status.set(f.doc_key, 'failed');
+      return { done: done.length, failed: failed.length };
+    },
+  };
+  const uploads = [];
+  const uploadEcm = async (doc) => { uploads.push(doc.filename); return { uid: `u${uploads.length}`, site: 'hosur', path: `/x/${doc.filename}`, deduplicated: false }; };
+  const told = []; // what the tender code reported failed, as it sent it
+  const scheduledRun = async () => {
+    const hooks = createSharedRunHooks({ api, claimId: 'c1', account: { irepsAccountId: '833', operatingUnit: 'HOSUR' }, isClaimLive: () => true, uploadEcm });
+    reported.length = 0;
+    uploads.length = 0;
+    told.length = 0;
+    sharedRun.beginSharedRun({ ...hooks.tenderHooks, documentFailed: (f) => { told.push(f); hooks.tenderHooks.documentFailed(f); } });
+    let result;
+    try {
+      result = await autoRun();
+    } finally {
+      sharedRun.endSharedRun();
+    }
+    return { ...(await hooks.finishTenderRun()), result };
+  };
+  const corrKey = dlog.downloadKey.tender('CORRIGENDA', 'C1', '7001');
+  const first = await scheduledRun();
+  assert.equal(first.failed, 1, 'the slot ends partial');
+  assert.deepEqual(uploads, ['Corrigendum_01_C1.pdf', 'First.pdf']);
+  // the attachment's IREPS HTTP error keeps an IREPS text in the slot (run-details.js TENDER_CODES: HTTP -> SCHEDULE_IREPS_ERROR)
+  assert.deepEqual(reported.flatMap((x) => x.failed), [[corrKey, 'SCHEDULE_IREPS_ERROR']], 'the corrigendum is released as failed, with the attachment\'s reason');
+  assert.ok(!reported.some((x) => x.done.includes(corrKey)), 'never reported saved without its attachment');
+  const failedFile = first.result.tenders[0].categories.corrigenda.files.find((f) => f.status === 'FAILED');
+  assert.deepEqual([told.length, failedFile.error, failedFile.code], [1, told[0].detail, told[0].code], 'the failed file says what was reported, so the run lists it once');
+  server.s.failPaths = [];
+  const second = await scheduledRun();
+  assert.deepEqual([second.failed, second.saved], [0, 2]);
+  assert.deepEqual(uploads, ['Second.pdf'], 'the corrigendum page and the attachment saved before are not uploaded again');
+  assert.equal(status.get(corrKey), 'done', 'complete now');
+  assert.deepEqual(saved, [], 'nothing local');
 });
 test('Scheduled run: a manual run after it is unchanged (no hooks left installed)', async () => {
   scheduledCo();

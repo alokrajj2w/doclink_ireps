@@ -19,8 +19,15 @@ export function homePage(a) {
 
 export const loginPage = () => html('<form action="/epsn/home/userLogin.do">Sign In</form>', 'IREPS Login');
 
+/**
+ * The Search Tender form page. As on every captured Search Tender page (corrigendum response.har, the form page and
+ * the results page), it carries IREPS's empty message box (errorStyle), the note on the search term, the department
+ * list's "Please Select Department" and the hidden note on the date range: none of them is an answer to a search.
+ */
 export function searchFormPage() {
-  return html(`<form name="advancedSearchForm" method="post" action="/epsn/search/advancedSearch.do">
+  return html(`<table><tr><td class="formLabel"><b><div class="errorStyle"></div> <br></td></tr></table>
+<form name="advancedSearchForm" method="post" action="/epsn/search/advancedSearch.do">
+<table><tr height="40px;"><td class="formLabel" colspan="4"> <font size="1">Note:- Please enter minimum first 3 characters of Tender Number or PLNO (these are case sensitive) or any 3 consecutive characters of Tender title or item description. </font></td></tr></table>
 <select name="searchOption"><option value="1">Tender Number</option></select>
 <select name="searchOptorOption" id="searchOptorOption"></select>
 <input type="text" name="advancedSearch" maxlength="19" value="">
@@ -37,6 +44,7 @@ export function searchFormPage() {
 <input type="text" name="dateFrom" value="09/10/2026" readonly><input type="text" name="dateTo" value="09/10/2026" readonly>
 <select name="direction"><option value="P">Previous</option></select><input type="number" name="noMonthDay" value=""><select name="monthDay"><option value="M">M</option></select>
 <input type="radio" name="radioDuration" value="-3"><input type="radio" name="radioDuration" value="0" checked>
+<table><tr height="20px;"><td align="left" COLSPAN=4><div style="display: none" id="dateRangeDiv"><font color="brown"><br>&nbsp;*Date range should be within 6 months.</font></div></td></tr></table>
 <input type="submit" name="submit" value="Show Results"><input type="hidden" name="searchParam" id="searchParam">
 </form>`, 'Search-Indian Railways tenders');
 }
@@ -163,18 +171,24 @@ export function inboxRows(status, tenderNo, rows, { more = false, loaScript = LO
 
 /** The heading IREPS shows on every Tender Related Correspondence page (list and details). */
 const CORRES_HEADING = '<table><tr><td class="formLabel">Tender Related Correspondence</td></tr></table>';
-/** The Tender Related Correspondence list with an empty Pending table. */
-export const corresList = () => html(`${CORRES_HEADING}<table><tr><td class="cvap-block-heading"><b>Correspondence - Pending</b></td></tr></table><table><thead><tr><th>Dept/Rly</th><th>Tender No.</th><th>Status</th><th>Action</th></tr></thead><tbody></tbody></table>`, 'Tender Related Correspondence');
+/**
+ * The Tender Related Correspondence list: the Pending table, empty unless rows are given ([{ unit, no, nitOid }],
+ * each row as captured in pending-list.html: Dept/Rly, Tender No., ..., the link to the tender's correspondence page).
+ */
+export const corresList = (rows = []) => html(`${CORRES_HEADING}<table><tr><td class="cvap-block-heading"><b>Correspondence - Pending</b></td></tr></table><table><thead><tr><th>Dept/Rly</th><th>Tender No.</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows.map((r) => `<tr><td class="dataText">${r.unit}</td><td class="dataText">${r.no}</td><td class="dataText">Pending</td><td><a href="#" class="linkStyle" onclick="postRequest('/epsn/corres/vendorCorrespondencePendingReply.do?nitOid=${r.nitOid}')"><img title="View Related Correspondence Letter(s)"></a></td></tr>`).join('')}</tbody></table>`, 'Tender Related Correspondence');
 /** A tender's correspondence page without any letter. */
 export const corresEmpty = () => html(`${CORRES_HEADING}<table><tr><td>Tender No</td></tr></table>`, 'Tender Related Correspondence');
 
+/** A tender's correspondence page; c.unit: its "Dept/Rly. Unit", shown as captured (pending-reply-single.html). */
 export function corresPage(c) {
   const rows = c.letters.map((l) => `<tr><td class="dataText">${l.no} dated : ${l.date || '11/09/2026'}</td><td class="dataText">${l.subject}</td><td>12/09/2026</td><td>
 <a href="#" onclick="viewPublishedLtr('${c.nitOid}', '${l.corresId}', '${l.id}');" title="View Published Letter"><img src="v.png"></a>
 <a href="#" class="linkStyle" onclick="postRequest('/epsn/corres/vendor/vendorCorresSubmitReply.do?nitOid=${c.nitOid}&corresId=${l.corresId}&letterId=${l.id}&bidId=9')"><img title="Submit Response"></a></td></tr>`).join('');
   return html(`${CORRES_HEADING}<table><tr><td class="formLabel">Tender No</td><td class="dataText">
  ${c.tenderNo}
-</td><td class="formLabel">Closing Date</td><td>09/09/2026</td></tr></table>
+</td><td class="formLabel">Closing Date</td><td>09/09/2026</td></tr>${c.unit ? `<tr><td class="formLabel">Dept/Rly. Unit</td><td class="dataText" colspan="3">
+ ${c.unit.replace(' / ', ' &nbsp;/&nbsp;\n ')}
+</td></tr>` : ''}</table>
 <table><tr><td>Letter No &amp; date</td><td>Subject</td><td>Last date</td><td>Action</td></tr>${rows}</table>
 <script>
 function viewPublishedLtr(nitOid, corresId, letterId){
@@ -469,7 +483,7 @@ export class FakeIreps {
       const m = (this.s.messages || [])[idx];
       return m ? ok(messageDetail(m, idx)) : ok(html('no such message'));
     }
-    if (p === '/epsn/corres/vendorRelatedCorrespondence.do') return ok(corresList());
+    if (p === '/epsn/corres/vendorRelatedCorrespondence.do') return ok(corresList(this.s.corresRows || []));
     if (p === '/epsn/corres/vendorCorrespondencePendingReply.do') {
       const c = this.s.corres[body.get('nitOid')];
       return ok(c ? corresPage(c) : corresEmpty());
@@ -482,20 +496,26 @@ export class FakeIreps {
  * A fake chrome.debugger + chrome.tabs answering like the DevTools protocol (tender-print.js):
  * navigate -> the page request pauses -> fulfilled -> load -> printToPDF returns a PDF.
  *   attachError: attach throws (blocked by policy); cancel: the user cancels the "started debugging" bar.
- *   pageRequests: what the letter's page then asks for, [{ method, url, postData, resourceType }] (each pauses
- *     as Fetch.requestPaused, requestId p1, p2 ...); hang: the page never finishes loading.
+ *   pageRequests: what the letter's page then asks for, [{ method, url, postData, resourceType, hasPostData,
+ *     postDataEntries, networkId }] (each pauses as Fetch.requestPaused, requestId p1, p2 ...); hang: the page never
+ *     finishes loading.
+ *   postData: networkId -> the body Network.getRequestPostData reads (any other id: CDP answers with an error).
+ *   fulfillError: Fetch.fulfillRequest fails with this message, and the tab loads a blank page instead.
+ *   popup: when the page is handed over, it opens a window (tab 8, opener 7; chrome.tabs.onCreated).
  * Closing the tab while attached ends the session (onDetach 'target_closed'), as Chrome does.
  */
-export function fakeChromeDebugger(chrome, { attachError = null, cancel = false, pageRequests = [], hang = false } = {}) {
+export function fakeChromeDebugger(chrome, { attachError = null, cancel = false, pageRequests = [], hang = false, postData = {}, fulfillError = null, popup = false } = {}) {
   const onEvent = new Set();
   const onDetach = new Set();
+  const onCreated = new Set();
   const calls = [];
   const tabs = { created: 0, removed: [] };
   let attached = false;
   const fire = (set, ...args) => setTimeout(() => set.forEach((f) => f({ tabId: 7 }, ...args)), 0);
   chrome.tabs = {
     create: async () => { tabs.created++; return { id: 7 }; },
-    remove: async (id) => { tabs.removed.push(id); if (attached) { attached = false; fire(onDetach, 'target_closed'); } },
+    remove: async (id) => { tabs.removed.push(id); if (attached && id === 7) { attached = false; fire(onDetach, 'target_closed'); } },
+    onCreated: { addListener: (f) => onCreated.add(f), removeListener: (f) => onCreated.delete(f) },
   };
   chrome.debugger = {
     onEvent: { addListener: (f) => onEvent.add(f), removeListener: (f) => onEvent.delete(f) },
@@ -510,8 +530,18 @@ export function fakeChromeDebugger(chrome, { attachError = null, cancel = false,
         return { frameId: 'main' };
       }
       if (method === 'Fetch.fulfillRequest') {
-        pageRequests.forEach((r, i) => fire(onEvent, 'Fetch.requestPaused', { requestId: `p${i + 1}`, frameId: r.frameId || 'main', resourceType: r.resourceType || 'XHR', request: { url: r.url, method: r.method || 'GET', ...(r.postData ? { postData: r.postData } : {}) } }));
+        if (fulfillError) {
+          if (!hang) fire(onEvent, 'Page.loadEventFired', {});
+          throw new Error(fulfillError);
+        }
+        pageRequests.forEach((r, i) => fire(onEvent, 'Fetch.requestPaused', { requestId: `p${i + 1}`, frameId: r.frameId || 'main', resourceType: r.resourceType || 'XHR', ...(r.networkId ? { networkId: r.networkId } : {}),
+          request: { url: r.url, method: r.method || 'GET', ...(r.postData ? { postData: r.postData } : {}), ...(r.hasPostData ? { hasPostData: true } : {}), ...(r.postDataEntries ? { postDataEntries: r.postDataEntries } : {}) } }));
+        if (popup) setTimeout(() => onCreated.forEach((f) => f({ id: 8, openerTabId: 7, pendingUrl: 'https://www.ireps.gov.in/epsn/supply/bid/viewBid.do' })), 0);
         if (!hang) fire(onEvent, 'Page.loadEventFired', {});
+      }
+      if (method === 'Network.getRequestPostData') {
+        if (!(params.requestId in postData)) throw new Error('No resource with given id was found');
+        return { postData: postData[params.requestId] };
       }
       if (method === 'Page.printToPDF') return { data: Buffer.from(PDF('chrome-print')).toString('base64') };
       return {};

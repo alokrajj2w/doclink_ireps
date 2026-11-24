@@ -5,7 +5,8 @@
  *   ecmBackendAws  true  -> through the Recon Engine's ECM gateway (services/ecm-service.js)
  *                  false -> straight to the ECM (Nuxeo) from DocLink (services/ecm-direct.js),
  *                           for local testing
- *   ecm.env        TEST | PROD: which ECM folders (services/ecm-catalog.js)
+ *   ecm.env        TEST | PROD: which ECM folders (services/ecm-catalog.js); not set = TEST;
+ *                  any other value = none: the direct upload fails closed (ECM_NOT_CONFIGURED)
  *   ecm.domain     the ECM origin, e.g. http://wctsrvecmtstsn1.wabtec.com:8080 (it must be
  *                  in manifest.json host_permissions)
  *   ecm.clientId / ecm.clientSecret   the ECM's client-credentials pair (direct mode only)
@@ -57,14 +58,20 @@ function text(v) {
 function settingsFrom(config) {
   const c = config && typeof config === "object" ? config : {};
   const e = c.ecm && typeof c.ecm === "object" ? c.ecm : {};
-  const env = text(e.env).toUpperCase();
-  // a typo must not quietly pick the TEST folders for a production build: say which value was used
-  if (env && env !== ECM_ENV.PROD && env !== ECM_ENV.TEST) logger.warn(`config.json ecm.env "${text(e.env)}" is neither TEST nor PROD; the TEST ECM folders are used`);
+  const given = text(e.env);
+  const env = given.toUpperCase();
+  const known = env === ECM_ENV.PROD || env === ECM_ENV.TEST;
+  // a typo must never pick an ECM's folders, the TEST ones least of all for a production build: no
+  // environment, and every direct ECM call fails closed with ECM_NOT_CONFIGURED (ecmDirectProblem) (8.7)
+  const envProblem = given && !known ? `ecm.env "${given}" is neither TEST nor PROD` : "";
+  if (envProblem) logger.warn(`config.json ${envProblem}: nothing is sent to the ECM until it is fixed`);
   const timeout = Number(e.timeoutMs);
   return Object.freeze({
     // anything but an explicit true is direct mode
     backendAws: c.ecmBackendAws === true,
-    env: env === ECM_ENV.PROD ? ECM_ENV.PROD : ECM_ENV.TEST,
+    // not set: TEST, as always; set to anything else than TEST or PROD: none
+    env: !given ? ECM_ENV.TEST : known ? env : "",
+    envProblem,
     domain: text(e.domain).replace(/\/+$/, ""),
     clientId: text(e.clientId),
     clientSecret: text(e.clientSecret),
@@ -97,7 +104,7 @@ export async function loadEcmConfig({ force = false } = {}) {
     // which file the client id / secret come from (never their values): config.local.json
     // wins, so its placeholders hide real values put in config.json by mistake
     const fromLocal = Boolean(local && local.ecm && (local.ecm.clientId || local.ecm.clientSecret));
-    logger.info(`ECM config loaded: ${current.backendAws ? "through the Recon Engine gateway" : `direct to ${current.domain || "(no ecm.domain)"} (${current.env})`}`, {
+    logger.info(`ECM config loaded: ${current.backendAws ? "through the Recon Engine gateway" : `direct to ${current.domain || "(no ecm.domain)"} (${current.env || current.envProblem})`}`, {
       localOverrides: Boolean(local),
       credentials: current.clientId && current.clientSecret ? (fromLocal ? "config.local.json" : "config.json") : "missing"
     });
@@ -113,11 +120,13 @@ export function isDirectEcm() {
 }
 
 /**
- * Why the ECM cannot be called directly, or "" when it can: ecm.domain must be set, valid
- * and covered by host_permissions, and both client credentials must be set.
+ * Why the ECM cannot be called directly, or "" when it can: ecm.env must be TEST or PROD (or not
+ * set), ecm.domain must be set, valid and covered by host_permissions, and both client credentials
+ * must be set.
  */
 export function ecmDirectProblem(hostPermissions) {
-  const { domain, clientId, clientSecret } = current;
+  const { domain, clientId, clientSecret, envProblem } = current;
+  if (envProblem) return envProblem;
   if (!domain) return "ecm.domain is not set in config.json";
   try {
     new URL(domain);

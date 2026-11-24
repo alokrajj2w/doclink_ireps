@@ -6,7 +6,8 @@
  * The order of checks never contacts IREPS before this DocLink has won a claim, and never on a
  * timer: Recon sign-in -> known account -> due? -> nothing running locally -> recent IREPS activity
  * -> claim -> ONE IREPS check -> run. Twenty DocLinks waking at 09:00 send one IREPS request in
- * total (the winner's). Only one slot of an account runs at a time; the rest follow one by one.
+ * total (the winner's). Only one slot of an account runs at a time; the rest follow one by one, on
+ * that check while it is younger than ACCOUNT_CHECK_MS, else each after a check of its own.
  *
  * No chrome.* here: the wiring (background/scheduler-job.js) passes the API, the local signals,
  * the runners, the alarm, the clock and the run log, so every rule is tested with fakes
@@ -35,6 +36,15 @@ export const IDLE_RECHECK_MS = 30 * 60000;
 export const JITTER_MS = 30000;
 /** Slots run one after the other in one wake; this many at most. */
 const MAX_SLOTS_PER_WAKE = 10;
+/**
+ * How long one IREPS account check covers the slots that follow it in a wake (5.6). A run can take an
+ * hour, and an IREPS account switched in the meantime must never get another account's downloads: past
+ * this, the next slot is checked again after its claim, and only right after an IREPS page load
+ * (local-signals.js IREPS_ACTIVITY_MS), like the first one. Two minutes: slots that end at once (nothing
+ * new to download) still share one check, and while the last IREPS page load is less than IREPS_ACTIVITY_MS
+ * (4 minutes) old, the next slot is checked again at once, without waiting for a new page load.
+ */
+export const ACCOUNT_CHECK_MS = 2 * 60000;
 
 export const RUN_PERMISSION = "doclink.schedule.run";
 export const MANAGE_PERMISSION = "doclink.schedule.manage";
@@ -250,6 +260,7 @@ export function createScheduler(deps) {
 
     let account = await deps.signals.account();
     let verified = null;
+    let verifiedAt = 0;
     if (!account) {
       // the first time: the account is read from IREPS, but only while the user is active there
       if (deps.isBusy() || !(await deps.signals.irepsReady())) {
@@ -265,6 +276,7 @@ export function createScheduler(deps) {
       account = String(check.account.irepsAccountId);
       await deps.signals.recordAccount(account);
       verified = check;
+      verifiedAt = now();
     }
     state.account = account;
 
@@ -302,6 +314,11 @@ export function createScheduler(deps) {
         note("busy", `${dueText}. Waiting for the DocLink run in this browser to end.`, dueTypes);
         return publish({ waitingFor: "busy" });
       }
+      if (verified && now() - verifiedAt > ACCOUNT_CHECK_MS) {
+        // the last run took a while: this slot gets its own account check, as the first one did (5.6)
+        logger.debug(`Scheduler: the IREPS account check is ${Math.round((now() - verifiedAt) / 1000)} s old; checking it again for the next slot`);
+        verified = null;
+      }
       if (!verified && !(await deps.signals.irepsReady())) {
         note("ireps", `${dueText}. Waiting for IREPS: no IREPS page has loaded in this browser in the last 4 minutes (log in to IREPS and open any IREPS page).`, dueTypes);
         return publish({ waitingFor: "ireps" });
@@ -327,12 +344,21 @@ export function createScheduler(deps) {
           await finish(claimed, { outcome: "failed", code, countsAsAttempt: false });
           if (!irepsAnswersLater(code)) await deps.signals.recordIrepsCheckFailed();
           if (check.ok && check.account) await deps.signals.recordAccount(check.account.irepsAccountId);
-          return publish({ waitingFor: "ireps", running: null });
+          // only IREPS's login page means "log in to IREPS" (and the "!" badge); IREPS not answering, another
+          // account logged in or an account that cannot be read is the last check's failure, said as it is
+          if (code === "IREPS_SESSION_EXPIRED") return publish({ waitingFor: "ireps", running: null });
+          return publish({ waitingFor: null, running: null, lastError: { code, detail: check.ok ? why : check.detail || null } });
         }
         verified = check;
+        verifiedAt = now();
       }
 
       const result = await runClaimed(claimed, verified.account);
+      if (result.waitForJob && !deps.isBusy()) {
+        // the run that held the job ended before this wake waited for it: look again once this wake ends
+        wake("job ended", { force: true });
+        return;
+      }
       if (result.stopWake) return;
     }
   }
@@ -411,9 +437,12 @@ export function createScheduler(deps) {
     await finish(claimed, outcome);
     logOutcome(slot, outcome);
     await logRun(() => runLog.runFinished(claimId, outcome));
-    publish({ running: null, lastRun: { docType: slot.doc_type, outcome: outcome.outcome, code: outcome.code || null, result: outcome.result || null, at: new Date(now()).toISOString() } });
+    // a manual run took the job first (BUSY): given back, and run when that job ends (scheduler-job.js jobEnded)
+    const waitForJob = outcome.waitForJob === true;
+    if (waitForJob) note("busy", `${labelOf(slot.doc_type)}: a DocLink run in this browser started first; this download runs when it ends.`, [slot.doc_type]);
+    publish({ running: null, ...(waitForJob ? { waitingFor: "busy" } : {}), lastRun: { docType: slot.doc_type, outcome: outcome.outcome, code: outcome.code || null, result: outcome.result || null, at: new Date(now()).toISOString() } });
     // an expired IREPS session or a lost claim ends this wake; the next trigger starts afresh
-    return { stopWake: outcome.sessionExpired === true || lost || outcome.stopWake === true };
+    return { stopWake: outcome.sessionExpired === true || lost || outcome.stopWake === true, waitForJob };
   }
 
   /**

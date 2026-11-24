@@ -18,6 +18,11 @@
  * The notification's REF_ID is compared with the row's Call Id and reported
  * (`refIdMatchesCallId`) as extra verification only; it is never treated as
  * the certificate number.
+ *
+ * A search that read fewer inspection calls than IREPS's "Total Records" is never "no record": a
+ * notification with no match then fails (retried), and one with matches carries a warning. The final
+ * state names what the run could not do besides downloading (`problems`: failed or unread searches,
+ * unreadable notifications, no matching IC-issued call), so a scheduled run never ends "done" over them.
  */
 
 import { IrepsError, IREPS_ERROR } from "../ireps-api.js";
@@ -29,6 +34,7 @@ import { buildIcSearchRequest, IC_ERROR } from "./ic-api.js";
 import { runIcSearch } from "./ic-search.js";
 import { parseIcSearchResults, icNumberFromUrl } from "./ic-parser.js";
 import { icFiling } from "./ic-service.js";
+import { comparablePoNo } from "../po/po-parser.js";
 
 export const IC_NOTIF_STATUS = Object.freeze({ ...BATCH_ITEM_STATUS, DUPLICATE: "duplicate" });
 
@@ -56,13 +62,14 @@ const MAX_PAGES = 100;
 const IC_ISSUED_STATUS_RE = /ic\s*issued/i;
 
 /**
- * Rows of a parsed result that belong to the notification: exact PO number,
- * exact PO serial, IC-issued status. Rows are annotated with whether the
- * notification REF_ID equals their Call Id.
+ * Rows of a parsed result that belong to the notification: the same PO number (compared as every PO
+ * and IC flow compares it, comparablePoNo), exact PO serial, IC-issued status. Rows are annotated with
+ * whether the notification REF_ID equals their Call Id.
  */
 export function matchIcRows(records, { poNo, poSerial, refId }) {
+  const wanted = comparablePoNo(poNo);
   return (records || [])
-    .filter((r) => r.poNo === poNo && r.poSerial === poSerial && IC_ISSUED_STATUS_RE.test(r.callStatus || ""))
+    .filter((r) => comparablePoNo(r.poNo) === wanted && r.poSerial === poSerial && IC_ISSUED_STATUS_RE.test(r.callStatus || ""))
     .map((r) => ({ ...r, refIdMatchesCallId: !!refId && r.callId === refId }));
 }
 
@@ -72,7 +79,8 @@ export function matchIcRows(records, { poNo, poSerial, refId }) {
  *
  * @param {{ poNo: string, poSerial: string, refId?: string|null }} target
  * @param {{ fetch?: typeof fetch, parseHtml?: Function, sleep?: Function, retryDelayMs?: number }} deps
- * @returns {Promise<{ rows: object[], scanned: number, pages: number, widened: boolean }>}
+ * @returns {Promise<{ rows: object[], scanned: number, pages: number, widened: boolean, incomplete: string|null }>}
+ *          incomplete: the search whose rows these are read fewer calls than IREPS's "Total Records"
  */
 export async function findIcRows(target, deps = {}) {
   const parseHtml = deps.parseHtml || ((html, options) => parseIcSearchResults(html, target.poNo, options));
@@ -80,7 +88,7 @@ export async function findIcRows(target, deps = {}) {
 
   const attempt = async (widen) => {
     const records = [];
-    const { pages } = await runIcSearch(
+    const { pages, incomplete } = await runIcSearch(
       {
         buildRequest: (form) => buildIcSearchRequest(form, target.poNo, { poSerial: target.poSerial, ...(widen ? { dateFrom: IC_WIDE_FROM, dateFromIC: IC_WIDE_FROM } : {}) }),
         parseHtml,
@@ -92,10 +100,10 @@ export async function findIcRows(target, deps = {}) {
       },
       { fetch: deps.fetch, retry }
     );
-    return { records, pages };
+    return { records, pages, incomplete: incomplete || null };
   };
 
-  let { records, pages } = await attempt(false);
+  let { records, pages, incomplete } = await attempt(false);
   let rows = matchIcRows(records, target);
   let widened = false;
   if (rows.length === 0) {
@@ -104,9 +112,10 @@ export async function findIcRows(target, deps = {}) {
     widened = true;
     records = wide.records;
     pages += wide.pages;
+    incomplete = wide.incomplete;
     rows = matchIcRows(records, target);
   }
-  return { rows, scanned: records.length, pages, widened };
+  return { rows, scanned: records.length, pages, widened, incomplete };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -132,10 +141,44 @@ function publicError(error) {
   return { code: "UNKNOWN", detail: null, status: null };
 }
 
-/** Register the rows found for one notification as download items (deduplicated by URL). */
+/** A list read short of IREPS's total, said once in the run's warnings. */
+function addWarning(state, text) {
+  if (!state.warnings) state.warnings = [];
+  if (!state.warnings.includes(text)) state.warnings.push(text);
+}
+
+/**
+ * What the run could not do besides downloading, each named with its notification: an IC search that
+ * failed (or was not made: the session expired), a notification whose PO details could not be read, and
+ * one with no matching IC-issued call. A row without an IC link is a skipped item of its own instead.
+ * @param {object} state
+ * @returns {{ doc: string, code: string, detail: string|null }[]}
+ */
+export function notificationProblems(state) {
+  const name = (n) => `Notification ${n.notificationId || "?"}${n.poNo && n.poSerial ? ` (PO ${n.poNo} Sr. ${n.poSerial})` : ""}`;
+  const problems = [];
+  for (const n of state.notifications || []) {
+    if (n.outcome === NOTIFICATION_OUTCOME.ERROR || n.outcome === NOTIFICATION_OUTCOME.SESSION_EXPIRED) {
+      const error = n.error || {};
+      problems.push({ doc: name(n), code: error.code || IC_ERROR.SEARCH_FAILED, detail: error.detail || (error.status ? `IREPS returned HTTP ${error.status}` : null) });
+    } else if (n.outcome === NOTIFICATION_OUTCOME.UNPARSED) {
+      problems.push({ doc: name(n), code: NOTIFICATION_ERROR.INVALID_RESPONSE, detail: "an IC-issued notification without a readable PO number or PO serial" });
+    } else if (n.outcome === NOTIFICATION_OUTCOME.NOT_FOUND) {
+      problems.push({ doc: name(n), code: IC_ERROR.NOT_LISTED, detail: `no completed / IC-issued call for PO ${n.poNo} Sr. ${n.poSerial}` });
+    }
+  }
+  return problems;
+}
+
+/**
+ * Register the rows found for one notification as download items (deduplicated by URL). An IC that
+ * IREPS lists twice for this notification is one item of it: that item keeps its own outcome and the
+ * repeat is noted in `note.repeats`, the only row reported as a duplicate (9.3).
+ */
 function addRows(state, note, rows) {
   const urls = state.urlIndex;
   note.itemIds = [];
+  note.repeats = [];
   let usable = 0;
   for (const row of rows) {
     const url = row.icPdfUrl || null;
@@ -143,6 +186,10 @@ function addRows(state, note, rows) {
       // Same document already queued for another notification (or an earlier row).
       state.counts.duplicates++;
       const existing = urls.get(url);
+      if (note.itemIds.includes(existing.id)) {
+        note.repeats.push({ itemId: existing.id, callId: row.callId || null });
+        continue;
+      }
       note.itemIds.push(existing.id);
       existing.notificationIds.push(note.notificationId);
       note.duplicateOf = (note.duplicateOf || []).concat(existing.id);
@@ -197,6 +244,13 @@ async function lookupNotification(state, note, deps) {
     const rows = found.rows.map((r) => ({ ...r, refIdMatchesCallId: !!note.refId && r.callId === note.refId }));
     note.scanned = found.scanned;
     note.pages = found.pages;
+    if (rows.length === 0 && found.incomplete) {
+      // the call may be among the rows DocLink could not read: not "no record", and searched again (4.3)
+      note.outcome = NOTIFICATION_OUTCOME.ERROR;
+      note.error = { code: IC_ERROR.PARSE_FAILED, detail: found.incomplete, status: null };
+      note.note = `${found.incomplete}: the call may be one DocLink could not read. Retry to search again.`;
+      return;
+    }
     if (rows.length === 0) {
       note.outcome = NOTIFICATION_OUTCOME.NOT_FOUND;
       note.note = `No completed / IC-issued inspection call matched PO ${note.poNo}, PO Sr. ${note.poSerial}${found.widened ? " (also searched back to " + IC_WIDE_FROM + ")" : ""}.`;
@@ -205,6 +259,7 @@ async function lookupNotification(state, note, deps) {
     }
     addRows(state, note, rows);
     note.error = null;
+    if (found.incomplete) addWarning(state, `PO ${note.poNo} Sr. ${note.poSerial}: ${found.incomplete}; some of its ICs may be missing.`);
   } catch (error) {
     note.error = publicError(error);
     if (error instanceof IrepsError && error.code === IREPS_ERROR.SESSION_EXPIRED) {
@@ -251,6 +306,21 @@ export function buildIcManifest(state) {
         error: duplicate ? null : item.error ? item.error.code : null,
         reason: duplicate ? `same document as ${id}` : item.error ? item.error.detail : null
       });
+      // IREPS listed the same IC again for this notification: only that repeat is a duplicate (9.3)
+      for (const repeat of (note.repeats || []).filter((r) => r.itemId === id)) {
+        const callId = repeat.callId || item.callId;
+        rows.push({
+          ...base,
+          callId,
+          refIdMatchesCallId: !!note.refId && callId === note.refId,
+          icPdfUrl: item.url,
+          filename: item.filename,
+          ecm: null,
+          outcome: "duplicate_skipped",
+          error: null,
+          reason: `same document as ${id}`
+        });
+      }
     }
   }
   return rows;
@@ -274,6 +344,8 @@ export async function runIcNotificationDownload(deps = {}) {
     notifications: [],
     items: [],
     manifest: [],
+    warnings: [],
+    problems: [],
     // working indexes (not part of the public snapshot, see publicIcState)
     urlIndex: new Map(),
     pathIndex: new Set(),
@@ -319,6 +391,7 @@ function finish(state, deps) {
   state.finishedAt = new Date().toISOString();
   summarise(state);
   state.manifest = buildIcManifest(state);
+  state.problems = notificationProblems(state);
   if (typeof deps.onUpdate === "function") deps.onUpdate(state);
   return state;
 }

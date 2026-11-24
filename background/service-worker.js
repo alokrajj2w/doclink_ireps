@@ -64,14 +64,15 @@ import { saveToEcmOrLocally, canReplaceInEcm } from "../services/ecm-service.js"
 import { loadDownloadLogConfig, preflightDownloads, logDownload, flushDownloadLog, downloadRecord, runDestination } from "../services/download-log.js";
 import { readIrepsAccount } from "../services/ireps-account-service.js";
 import { downloadPo, PO_FLOW_STAGES } from "../services/po/po-service.js";
-import { downloadInspectionCertificates, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
+import { downloadInspectionCertificates, IC_FLOW_STAGES, IC_ERROR } from "../services/inspection-certificate/ic-service.js";
+import { downloadIrepsDocuments, DOCUMENT_DOWNLOAD_STATUS } from "../services/search-po/document-downloader.js";
 import { runPoDateDownload, retryPoDateFailures } from "../services/po/po-date-service.js";
 import { runIcNotificationDownload, retryIcNotificationFailures, publicIcState } from "../services/inspection-certificate/ic-notification-service.js";
 import { runIcDateDownload, retryIcDateFailures } from "../services/inspection-certificate/ic-date-service.js";
 import { isoToIrepsDate } from "../services/batch-utils.js";
 import { IC_DOWNLOAD_SUBFOLDER } from "../utils/filename.js";
 import { buildDocumentExportDownloadPath, buildDocumentExportFilename, buildBillStatusExportDownloadPath, buildBillStatusExportFilename } from "../utils/filename.js";
-import { MESSAGE_TYPES, TARGETS, STAGES, DOCUMENT_STAGES, MA_STAGES, PO_STAGES, IC_STAGES, documentStageLabel, describeError, STORAGE_KEYS, SESSION_KEYS } from "../utils/messages.js";
+import { MESSAGE_TYPES, TARGETS, STAGES, DOCUMENT_STAGES, MA_STAGES, PO_STAGES, IC_STAGES, documentStageLabel, describeError, STORAGE_KEYS, SESSION_KEYS, SCHEDULED_RUN } from "../utils/messages.js";
 import { logger, installLogCollector, installConsoleHelpers } from "../utils/logger.js";
 import { holdWorker } from "./keep-alive.js";
 import { withIrepsFormLock } from "../services/ireps-form-lock.js";
@@ -171,6 +172,13 @@ function broadcast(type, payload = {}) {
   });
 }
 
+/**
+ * The panel a run request came from (popup.js send: the panel's tab id), or null. Every job state and
+ * broadcast carries who started the run (`startedBy`: this, or SCHEDULED_RUN for a scheduled run), so a
+ * panel shows only its own runs as its own (popup-gate.js isOwnRun).
+ */
+const panelTabOf = (message) => (Number.isInteger(message && message.panelTabId) ? message.panelTabId : null);
+
 /** Last Bill Status step written to the log (the same step can be reported by two layers). */
 let lastLoggedStep = "";
 
@@ -179,7 +187,7 @@ async function progress(stage, message, detail) {
   if (text !== lastLoggedStep) logger.info(`Bill Status: ${text}`, ...(detail ? [{ detail }] : []));
   lastLoggedStep = text;
   await setJobState({ status: "running", stage: stage.id, message: text, detail: detail || "", error: undefined });
-  broadcast(MESSAGE_TYPES.IREPS_PROGRESS, { stage: stage.id, message: text, detail: detail || "" });
+  broadcast(MESSAGE_TYPES.IREPS_PROGRESS, { stage: stage.id, message: text, detail: detail || "", startedBy: jobState.startedBy ?? null });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -332,17 +340,19 @@ const REDOWNLOAD_ANSWER_TIMEOUT_MS = 4 * 60 * 1000;
  * The `ask` of preflightDownloads for a run started from the side panel of tab `panelTabId`:
  * that panel shows which files are already downloaded / in the ECM and answers which to
  * download again. No answer (panel closed, or no choice within 4 minutes) = download none
- * of them again.
+ * of them again. The question carries the time this run stops waiting (`deadline`), so a
+ * question the panel shows after another one is never answered after it (7.4).
  */
 function askPanel(panelTabId) {
   return async (question) => {
     let timer;
+    const deadline = Date.now() + REDOWNLOAD_ANSWER_TIMEOUT_MS;
     const timeout = new Promise((resolve) => {
       timer = setTimeout(() => resolve(null), REDOWNLOAD_ANSWER_TIMEOUT_MS);
     });
     try {
       const answer = await Promise.race([
-        chrome.runtime.sendMessage({ target: TARGETS.POPUP, type: MESSAGE_TYPES.CONFIRM_REDOWNLOAD, panelTabId: panelTabId ?? null, question }).catch(() => null),
+        chrome.runtime.sendMessage({ target: TARGETS.POPUP, type: MESSAGE_TYPES.CONFIRM_REDOWNLOAD, panelTabId: panelTabId ?? null, question, deadline }).catch(() => null),
         timeout
       ]);
       if (!answer) logger.info("Download again? not answered: those files are skipped");
@@ -550,11 +560,14 @@ function sanitiseOptions(raw) {
 /**
  * Start a Bill Status run. `done` settles when it ends: { ok: true, summary } or
  * { ok: false, code, error } (the scheduler waits for it; a panel click does not).
+ * `panelTabId`: the panel that started it, or SCHEDULED_RUN (its state and broadcasts say so).
  */
 async function launchBillStatusJob(rawOptions, panelTabId, hooks = {}) {
   await restoreJobState();
   if (jobRunning) return { started: false, error: describeError("BUSY") };
   jobRunning = true;
+  const startedBy = panelTabId ?? null;
+  jobState = { ...jobState, startedBy };
   const options = sanitiseOptions(rawOptions);
   lastLoggedStep = "";
   logger.info("Bill Status started", { mode: options.mode || "last90Days", zone: options.zone || "-1", destination: options.destination });
@@ -563,7 +576,7 @@ async function launchBillStatusJob(rawOptions, panelTabId, hooks = {}) {
     try {
       const summary = await runDownloadWorkflow(options, panelTabId, hooks);
       await setJobState({ status: "complete", stage: STAGES.COMPLETE.id, message: STAGES.COMPLETE.label, result: summary, error: undefined });
-      broadcast(MESSAGE_TYPES.IREPS_DOWNLOAD_COMPLETE, summary);
+      broadcast(MESSAGE_TYPES.IREPS_DOWNLOAD_COMPLETE, { ...summary, startedBy });
       logger.info(`Bill Status complete: ${summary.recordCount} bills saved as ${summary.storedPath || summary.filename}`, summary);
       return { ok: true, summary };
     } catch (error) {
@@ -574,7 +587,7 @@ async function launchBillStatusJob(rawOptions, panelTabId, hooks = {}) {
       if (code === IREPS_ERROR.SESSION_EXPIRED) forgetSessionChecks();
       await recordLastStatus(described.title);
       await setJobState({ status: "error", stage: STAGES.ERROR.id, message: described.title, error: described, result: undefined });
-      broadcast(MESSAGE_TYPES.IREPS_DOWNLOAD_ERROR, described);
+      broadcast(MESSAGE_TYPES.IREPS_DOWNLOAD_ERROR, { ...described, startedBy });
       return { ok: false, code, error: described };
     } finally {
       jobRunning = false;
@@ -664,7 +677,7 @@ async function documentProgress(criteria, stage, message, detail) {
   const text = message || documentStageLabel(stage, typeLabel(criteria));
   logger.info(`${typeLabel(criteria)}: ${text}`);
   await setDocumentJob(criteria, { status: "running", stage: stage.id, message: text, detail: detail || "", error: undefined });
-  broadcast(MESSAGE_TYPES.DOCUMENT_PROGRESS, { criteria, stage: stage.id, message: text, detail: detail || "" });
+  broadcast(MESSAGE_TYPES.DOCUMENT_PROGRESS, { criteria, stage: stage.id, message: text, detail: detail || "", startedBy: documentJob(criteria).startedBy ?? null });
 }
 
 const DOCUMENT_STAGE_FOR_PROGRESS = {
@@ -696,10 +709,14 @@ function sanitiseDocumentOptions(raw) {
  * popup the railway list. Cached for a few seconds like the Bill Status check.
  */
 async function loadSearchPoFormInfo({ useCache = true } = {}) {
-  if (useCache && lastSearchPoFormCheck && Date.now() - lastSearchPoFormCheck.at < SESSION_CHECK_CACHE_MS) return lastSearchPoFormCheck.result;
+  const fresh = useCache && lastSearchPoFormCheck && Date.now() - lastSearchPoFormCheck.at < SESSION_CHECK_CACHE_MS ? lastSearchPoFormCheck.result : null;
+  if (fresh && fresh.authenticated) return fresh;
   // while a DocLink search holds the IREPS session, loading the form would replace its Struts token (M2):
-  // the railway list does not change, so the last one (or none) is answered instead
-  return withIrepsFormLock(loadSearchPoFormInfoNow, { ifBusy: () => (lastSearchPoFormCheck ? lastSearchPoFormCheck.result : { ...SESSION_BUSY_RESULT, form: null }) });
+  // the railway list does not change, so the last one is answered instead; but only an answer that was
+  // logged in, as the running search shows the session is alive: a cached "login required" or "IREPS not
+  // responding" is never answered then, the busy answer is (as performSessionCheck does, 4.8)
+  const whileBusy = () => (lastSearchPoFormCheck && lastSearchPoFormCheck.result.authenticated ? lastSearchPoFormCheck.result : { ...SESSION_BUSY_RESULT, form: null });
+  return withIrepsFormLock(async () => fresh || loadSearchPoFormInfoNow(), { ifBusy: whileBusy });
 }
 
 async function loadSearchPoFormInfoNow() {
@@ -790,6 +807,8 @@ async function runDocumentDownloadWorkflow(criteria, options, panelTabId, hooks 
     recordCount: result.recordCount,
     columnCount: file.columnCount,
     warningCount: (result.warnings || []).length,
+    // fewer records read than IREPS reported (search-po-service.js): the panel and a scheduled run say so
+    incomplete: result.incomplete || null,
     pagesFetched: result.pagination.pagesFetched,
     search: result.search,
     filter: result.filter,
@@ -802,13 +821,15 @@ async function runDocumentDownloadWorkflow(criteria, options, panelTabId, hooks 
   return summary;
 }
 
-/** Start a CRN / R-NOTE run; `done` settles like launchBillStatusJob's. */
+/** Start a CRN / R-NOTE run; `done` settles like launchBillStatusJob's (`panelTabId` too). */
 async function launchDocumentJob(rawCriteria, rawOptions, panelTabId, hooks = {}) {
   const criteria = SEARCH_PO_DOCUMENT_TYPES.some((t) => t.criteria === rawCriteria) ? rawCriteria : null;
   if (!criteria) return { started: false, error: describeError(SEARCH_PO_ERROR.UNSUPPORTED_CRITERIA, { detail: String(rawCriteria) }) };
   await restoreDocumentJobs();
   if (documentJobRunning) return { started: false, error: describeError("DOCUMENT_BUSY") };
   documentJobRunning = criteria;
+  const startedBy = panelTabId ?? null;
+  documentJobs[criteria] = { ...documentJob(criteria), startedBy };
   const options = sanitiseDocumentOptions(rawOptions);
   logger.info(`${criteria} download started`, { mode: options.mode || "(inferred)", railway: options.railway || "-1", format: options.format, destination: options.destination });
 
@@ -817,7 +838,7 @@ async function launchDocumentJob(rawCriteria, rawOptions, panelTabId, hooks = {}
       const summary = await runDocumentDownloadWorkflow(criteria, options, panelTabId, hooks);
       const doneLabel = documentStageLabel(DOCUMENT_STAGES.COMPLETE, typeLabel(criteria));
       await setDocumentJob(criteria, { status: "complete", stage: DOCUMENT_STAGES.COMPLETE.id, message: doneLabel, result: summary, error: undefined });
-      broadcast(MESSAGE_TYPES.DOCUMENT_DOWNLOAD_COMPLETE, summary);
+      broadcast(MESSAGE_TYPES.DOCUMENT_DOWNLOAD_COMPLETE, { ...summary, startedBy });
       logger.info(`${typeLabel(criteria)} complete: ${summary.recordCount} records saved as ${summary.storedPath || summary.filename}`, { records: summary.recordCount, pages: summary.pagesFetched, format: summary.format, destination: summary.destination, downloadId: summary.downloadId });
       return { ok: true, summary };
     } catch (error) {
@@ -827,7 +848,7 @@ async function launchDocumentJob(rawCriteria, rawOptions, panelTabId, hooks = {}
       else logger.warn(`${typeLabel(criteria)} stopped: ${described.title}`, { code, message: described.message, status: (error && error.details && error.details.status) ?? null });
       if (code === SEARCH_PO_ERROR.SESSION_EXPIRED) forgetSessionChecks();
       await setDocumentJob(criteria, { status: "error", stage: DOCUMENT_STAGES.ERROR.id, message: described.title, error: described, result: undefined });
-      broadcast(MESSAGE_TYPES.DOCUMENT_DOWNLOAD_ERROR, described);
+      broadcast(MESSAGE_TYPES.DOCUMENT_DOWNLOAD_ERROR, { ...described, startedBy });
       return { ok: false, code, error: described };
     } finally {
       documentJobRunning = null;
@@ -846,14 +867,23 @@ const startDocumentDownloadJob = (rawCriteria, rawOptions, panelTabId) => launch
 /* -------------------------------------------------------------------------- */
 
 /**
+ * The MA list a panel searched (startedBy: its tab id), and its downloads.
  * @type {{ status: "idle"|"searching"|"ready"|"downloading"|"complete"|"error", stage: string, message: string,
  *          detail?: string, search?: object|null, filter?: string|null, dateFilter?: object|null, fetchedAt?: string|null,
  *          recordCount: number, allRecordCount: number, records: object[], form?: object|null, warnings?: string[],
- *          pagination?: object|null, downloads?: object|null, error?: object|null, updatedAt: number }}
+ *          incomplete?: string|null, pagination?: object|null, downloads?: object|null, error?: object|null,
+ *          startedBy?: number|null, updatedAt: number }}
  */
 let maState = emptyMaState();
 let maRunning = false;
+/** Who holds the MA job while it runs: a panel's tab id, SCHEDULED_RUN, or null. */
+let maRunningFor = null;
 let maRestored = false;
+/**
+ * The records a scheduled MA run found (background/scheduler-job.js runMa): kept apart from the panel's
+ * list (maState), so an hourly slot never replaces the list or the selection someone is working on.
+ */
+let scheduledMaRecords = [];
 
 function emptyMaState() {
   return {
@@ -870,9 +900,11 @@ function emptyMaState() {
     records: [],
     form: null,
     warnings: [],
+    incomplete: null,
     pagination: null,
     downloads: null,
     error: null,
+    startedBy: null,
     updatedAt: Date.now()
   };
 }
@@ -885,34 +917,33 @@ async function setMaState(patch) {
   }
 }
 
-/** Reload the MA state after a service-worker restart (memory-only storage). */
+/**
+ * Reload the MA state after a service-worker restart (memory-only storage). A search or download that Chrome
+ * cut off shows as interrupted (JOB_INTERRUPTED, as every other job): a search keeps no list; a download
+ * keeps the list to download from again, without the summary of the run before it (7.16).
+ */
 async function restoreMaState() {
   if (maRestored) return;
   maRestored = true;
-  if (maState.status !== "idle") return;
-  try {
-    const stored = await chrome.storage.session.get(SESSION_KEYS.MA_STATE);
-    const saved = stored[SESSION_KEYS.MA_STATE];
-    if (saved && saved.status && saved.status !== "idle") {
-      if (saved.status === "searching") {
-        const described = describeError("UNKNOWN");
-        maState = { ...emptyMaState(), status: "error", stage: MA_STAGES.ERROR.id, error: described, message: described.title };
-      } else if (saved.status === "downloading") {
-        maState = { ...saved, status: "ready", stage: MA_STAGES.READY.id, message: `${saved.recordCount} MA(s) found`, records: saved.records || [] };
-      } else {
-        maState = { ...saved, records: saved.records || [] };
-      }
-    }
-  } catch (error) {
-    logger.debug("Could not restore MA state", error);
-  }
+  if (maState.status !== "idle" || maRunning) return;
+  const saved = await restoreSavedJob(SESSION_KEYS.MA_STATE, (s) => s.status === "searching" || s.status === "downloading", (s, error) =>
+    s.status === "searching"
+      ? { ...emptyMaState(), status: "error", stage: MA_STAGES.ERROR.id, message: error.title, error, startedBy: s.startedBy ?? null }
+      : { ...s, status: "ready", stage: MA_STAGES.READY.id, message: error.title, downloads: null, error }
+  );
+  if (saved && saved.status && saved.status !== "idle" && maState.status === "idle" && !maRunning) maState = { ...saved, records: saved.records || [] };
 }
 
 function maProgress(stage, message, detail) {
   const text = message || stage.label;
   logger.info(`MA: ${text}`);
   setMaState({ status: maState.status === "downloading" ? "downloading" : "searching", stage: stage.id, message: text, detail: detail || "", error: null });
-  broadcast(MESSAGE_TYPES.MA_PROGRESS, { stage: stage.id, message: text, detail: detail || "", status: maState.status });
+  broadcast(MESSAGE_TYPES.MA_PROGRESS, { stage: stage.id, message: text, detail: detail || "", status: maState.status, startedBy: maState.startedBy ?? null });
+}
+
+/** A step of a scheduled MA run, as the panels hear it: only that an MA job runs (their MA list is left as it is). */
+function scheduledMaStep(type, payload = {}) {
+  broadcast(type, { ...payload, startedBy: SCHEDULED_RUN });
 }
 
 const MA_STAGE_FOR_PROGRESS = {
@@ -956,17 +987,24 @@ function describeJobError(error, what) {
   return described;
 }
 
-/** Start an MA search; `done` settles with { ok: true, recordCount } or { ok: false, code, error }. */
-async function launchMaSearch(rawOptions) {
+/**
+ * Start an MA search; `done` settles with { ok: true, recordCount, incomplete } or { ok: false, code, error }.
+ * `panelTabId`: the panel that searches (its list becomes maState), or SCHEDULED_RUN: a scheduled run's
+ * search keeps its records apart and leaves the panel's list and selection as they are.
+ */
+async function launchMaSearch(rawOptions, panelTabId = null) {
   await restoreMaState();
   if (maRunning) return { started: false, error: describeError("MA_BUSY") };
   maRunning = true;
+  maRunningFor = panelTabId ?? null;
+  const scheduled = panelTabId === SCHEDULED_RUN;
   const options = sanitiseMaOptions(rawOptions);
-  logger.info("MA search started", { railway: options.railway || "-1", dateMode: options.dateMode || "date", date: options.date || "(today)", poNo: options.poNo ? "yes" : "no" });
+  logger.info("MA search started", { railway: options.railway || "-1", dateMode: options.dateMode || "date", date: options.date || "(today)", poNo: options.poNo ? "yes" : "no", scheduled });
 
   const done = holdWorker(async () => {
     try {
-      maState = { ...emptyMaState(), status: "searching" };
+      if (scheduled) return await scheduledMaSearch(options);
+      maState = { ...emptyMaState(), status: "searching", startedBy: panelTabId ?? null };
       maProgress(MA_STAGES.CHECKING_SESSION);
       const result = await searchMa(options, {
         parseHtml: (html, parseOptions) => parseSearchPoInOffscreen(html, parseOptions),
@@ -993,6 +1031,8 @@ async function launchMaSearch(rawOptions) {
         records: result.records,
         form: result.form,
         warnings: result.warnings.slice(0, 50),
+        // fewer MAs read than IREPS reported: the MA view says so (the list is not complete)
+        incomplete: result.incomplete || null,
         pagination: result.pagination,
         downloads: null,
         error: null
@@ -1000,16 +1040,21 @@ async function launchMaSearch(rawOptions) {
       lastSearchPoFormCheck = { at: Date.now(), result: { authenticated: true, code: "OK", reason: null, status: 200, form: result.form } };
       broadcast(MESSAGE_TYPES.MA_SEARCH_COMPLETE, publicMaState());
       logger.info("MA search complete", { matched: result.recordCount, total: result.allRecordCount, pages: result.pagination.pagesFetched, filter: result.filter });
-      return { ok: true, recordCount: result.recordCount };
+      return { ok: true, recordCount: result.recordCount, incomplete: result.incomplete || null };
     } catch (error) {
       const described = describeJobError(error, "MA search");
       if (described.code === MA_ERROR.SESSION_EXPIRED) forgetSessionChecks();
-      logger.warn(`MA search stopped: ${described.title}`, { code: described.code, message: described.message, status: (error && error.status) ?? null });
-      await setMaState({ status: "error", stage: MA_STAGES.ERROR.id, message: described.title, error: described, records: [], recordCount: 0, downloads: null });
-      broadcast(MESSAGE_TYPES.MA_ERROR, { ...described, phase: "search" });
+      logger.warn(`MA search stopped: ${described.title}`, { code: described.code, message: described.message, status: (error && error.status) ?? null, scheduled });
+      if (scheduled) {
+        scheduledMaStep(MESSAGE_TYPES.MA_ERROR, { ...described, phase: "search" });
+      } else {
+        await setMaState({ status: "error", stage: MA_STAGES.ERROR.id, message: described.title, error: described, records: [], recordCount: 0, downloads: null });
+        broadcast(MESSAGE_TYPES.MA_ERROR, { ...described, phase: "search", startedBy: maState.startedBy ?? null });
+      }
       return { ok: false, code: described.code, error: described };
     } finally {
       maRunning = false;
+      maRunningFor = null;
       localJobEnded();
     }
   });
@@ -1017,33 +1062,57 @@ async function launchMaSearch(rawOptions) {
   return { started: true, done };
 }
 
-const startMaSearch = (rawOptions) => launchMaSearch(rawOptions).then(startedOnly);
+/** The search of a scheduled MA run: its records are kept for its own download (scheduledMaRecords), never in maState. */
+async function scheduledMaSearch(options) {
+  scheduledMaRecords = [];
+  scheduledMaStep(MESSAGE_TYPES.MA_PROGRESS, { stage: MA_STAGES.SEARCHING.id, message: "Scheduled download: searching MAs...", status: "searching" });
+  const result = await searchMa(options, { parseHtml: (html, parseOptions) => parseSearchPoInOffscreen(html, parseOptions) });
+  scheduledMaRecords = result.records;
+  lastSearchPoFormCheck = { at: Date.now(), result: { authenticated: true, code: "OK", reason: null, status: 200, form: result.form } };
+  scheduledMaStep(MESSAGE_TYPES.MA_SEARCH_COMPLETE, { status: "ready", recordCount: result.recordCount });
+  logger.info("Scheduled MA search complete", { matched: result.recordCount, total: result.allRecordCount, pages: result.pagination.pagesFetched, filter: result.filter });
+  return { ok: true, recordCount: result.recordCount, incomplete: result.incomplete || null };
+}
+
+const startMaSearch = (rawOptions, panelTabId) => launchMaSearch(rawOptions, panelTabId).then(startedOnly);
 
 /**
  * Start downloading MA copies; `done` settles with { ok: true, summary } or { ok: false, code, error }.
  * @param {string[]|"all"} selection   record ids to download, or "all"
  * @param {string} [destination]        SAVE_DESTINATION ("recon" = ECM / S3)
+ * @param {number|string|null} panelTabId   the panel that downloads from its list, or SCHEDULED_RUN (the
+ *        scheduled run's own records, saved through its hooks; the panel's MA state is not touched)
  * @param {{ documentHooks?: object }} [hooks]   a scheduled run's preflight / saveFile / onSaved
  */
 async function launchMaDownload(selection, destination, panelTabId, hooks = {}) {
   await restoreMaState();
   if (maRunning) return { started: false, error: describeError("MA_BUSY") };
-  if (!Array.isArray(maState.records) || maState.records.length === 0) return { started: false, error: describeError(MA_ERROR.NOT_FOUND, { detail: "no MA list loaded" }) };
+  const scheduled = panelTabId === SCHEDULED_RUN;
+  // a panel downloads from the list it shows: never from a list another tab's search has put in its place (ids are positions)
+  if (!scheduled && maState.startedBy != null && panelTabId != null && maState.startedBy !== panelTabId) {
+    return { started: false, error: describeError("MA_LIST_REPLACED", { detail: "the MA list DocLink holds was searched in another tab" }) };
+  }
+  const list = scheduled ? scheduledMaRecords : maState.records;
+  if (!Array.isArray(list) || list.length === 0) return { started: false, error: describeError(MA_ERROR.NOT_FOUND, { detail: "no MA list loaded" }) };
   const wanted = selection === "all" ? null : new Set(Array.isArray(selection) ? selection.map(String) : []);
-  const records = wanted ? maState.records.filter((r) => wanted.has(String(r.id))) : maState.records;
+  const records = wanted ? list.filter((r) => wanted.has(String(r.id))) : list;
   if (records.length === 0) return { started: false, error: describeError("MA_NO_SELECTION") };
 
   maRunning = true;
-  logger.info("MA download started", { count: records.length });
+  const startedBy = panelTabId ?? maState.startedBy ?? null;
+  maRunningFor = startedBy;
+  logger.info("MA download started", { count: records.length, scheduled });
   const done = holdWorker(async () => {
     try {
-      await setMaState({ status: "downloading", stage: MA_STAGES.DOWNLOADING.id, message: `Downloading ${records.length} MA cop${records.length === 1 ? "y" : "ies"}...`, error: null });
-      broadcast(MESSAGE_TYPES.MA_PROGRESS, { stage: MA_STAGES.DOWNLOADING.id, message: maState.message, status: "downloading" });
+      if (scheduled) return await scheduledMaDownload(records, hooks);
+      // the run before this one's summary goes: it is never shown (or restored) as this run's (7.16)
+      await setMaState({ status: "downloading", stage: MA_STAGES.DOWNLOADING.id, message: `Downloading ${records.length} MA cop${records.length === 1 ? "y" : "ies"}...`, downloads: null, error: null });
+      broadcast(MESSAGE_TYPES.MA_PROGRESS, { stage: MA_STAGES.DOWNLOADING.id, message: maState.message, status: "downloading", startedBy });
       const summary = await downloadMaPdfs(records, {
         ...(hooks.documentHooks || (await documentRunHooks(destination, panelTabId))),
         onProgress: (snapshot) => {
           maState = { ...maState, downloads: snapshot, updatedAt: Date.now() };
-          broadcast(MESSAGE_TYPES.MA_DOWNLOAD_PROGRESS, { downloads: snapshot });
+          broadcast(MESSAGE_TYPES.MA_DOWNLOAD_PROGRESS, { downloads: snapshot, startedBy });
         }
       });
       const described = summary.sessionExpired ? describeError("MA_SESSION_EXPIRED_DURING_DOWNLOAD") : null;
@@ -1063,29 +1132,50 @@ async function launchMaDownload(selection, destination, panelTabId, hooks = {}) 
         lastFilter: maState.filter,
         lastStatus: summary.failed ? `${summary.completed} downloaded, ${summary.failed} failed` : "Downloaded successfully"
       });
-      broadcast(MESSAGE_TYPES.MA_DOWNLOAD_COMPLETE, { downloads: summary, error: described, message: maState.message });
+      broadcast(MESSAGE_TYPES.MA_DOWNLOAD_COMPLETE, { downloads: summary, error: described, message: maState.message, startedBy });
       logger.info("MA download finished", { completed: summary.completed, failed: summary.failed, skipped: summary.skipped, sessionExpired: summary.sessionExpired });
       flushDownloadLog();
       return { ok: true, summary };
     } catch (error) {
       const described = describeJobError(error, "MA download");
-      logger.warn(`MA download stopped: ${described.title}`, { code: described.code, message: described.message, status: (error && error.status) ?? null });
-      await setMaState({ status: "ready", stage: MA_STAGES.READY.id, message: described.title, error: described });
-      broadcast(MESSAGE_TYPES.MA_ERROR, { ...described, phase: "download" });
+      logger.warn(`MA download stopped: ${described.title}`, { code: described.code, message: described.message, status: (error && error.status) ?? null, scheduled });
+      if (scheduled) {
+        scheduledMaStep(MESSAGE_TYPES.MA_ERROR, { ...described, phase: "download" });
+      } else {
+        await setMaState({ status: "ready", stage: MA_STAGES.READY.id, message: described.title, error: described });
+        broadcast(MESSAGE_TYPES.MA_ERROR, { ...described, phase: "download", startedBy });
+      }
       return { ok: false, code: described.code, error: described };
     } finally {
       maRunning = false;
+      maRunningFor = null;
       localJobEnded();
     }
   });
   return { started: true, done };
 }
 
+/** The download of a scheduled MA run: S3 / ECM through its shared hooks only; the panel's MA state is not touched. */
+async function scheduledMaDownload(records, hooks) {
+  // never the local save a panel run falls back to: without the scheduled run's hooks nothing is downloaded
+  if (!hooks.documentHooks) throw new Error("a scheduled MA download needs the scheduled run's hooks");
+  scheduledMaStep(MESSAGE_TYPES.MA_PROGRESS, { stage: MA_STAGES.DOWNLOADING.id, message: `Scheduled download: ${records.length} MA cop${records.length === 1 ? "y" : "ies"}...`, status: "downloading" });
+  const summary = await downloadMaPdfs(records, { ...hooks.documentHooks });
+  if (summary.sessionExpired) forgetSessionChecks();
+  scheduledMaStep(MESSAGE_TYPES.MA_DOWNLOAD_COMPLETE, { message: `Scheduled download: ${summary.completed} of ${summary.total} MA copies saved` });
+  logger.info("Scheduled MA download finished", { completed: summary.completed, failed: summary.failed, skipped: summary.skipped, sessionExpired: summary.sessionExpired });
+  flushDownloadLog();
+  return { ok: true, summary };
+}
+
 const startMaDownload = (selection, destination, panelTabId) => launchMaDownload(selection, destination, panelTabId).then(startedOnly);
 
-/** State handed to the popup (records included; never HTML or tokens). */
+/**
+ * State handed to the popup (records included; never HTML or tokens). `busyWith`: who holds the MA job
+ * while it runs (a scheduled run leaves this list as it is, but the MA buttons wait for it).
+ */
 function publicMaState() {
-  return { ...maState, running: maRunning };
+  return { ...maState, running: maRunning, busyWith: maRunning ? maRunningFor : null };
 }
 
 async function resetMaState() {
@@ -1109,8 +1199,9 @@ let poState = { status: "idle", stage: PO_STAGES.IDLE.id, message: "", poNumber:
 let poRunning = false;
 
 /**
+ * `retryItems`: the run's download items (each IC's link and filing), kept for its Retry; never sent to the panel.
  * @type {{ status: "idle"|"searching"|"downloading"|"complete"|"error", stage: string, message: string,
- *          poNumber?: string|null, count: number, downloads?: object|null, error?: object|null, updatedAt: number }}
+ *          poNumber?: string|null, count: number, downloads?: object|null, error?: object|null, retryItems?: object[], updatedAt: number }}
  */
 let icState = { status: "idle", stage: IC_STAGES.IDLE.id, message: "", poNumber: null, count: 0, downloads: null, error: null, updatedAt: Date.now() };
 let icRunning = false;
@@ -1137,7 +1228,10 @@ async function setPoState(patch) {
 
 async function setIcState(patch) {
   icState = { ...icState, ...patch, updatedAt: Date.now() };
-  await persistSession(SESSION_KEYS.IC_STATE, icState, "IC state");
+  // a long IC list's retry items can exceed the session quota: then keep the state without them (a Retry then searches again)
+  if (!(await persistSession(SESSION_KEYS.IC_STATE, icState, "IC state with its retry items; storing without them"))) {
+    await persistSession(SESSION_KEYS.IC_STATE, { ...icState, retryItems: [] }, "IC state");
+  }
 }
 
 const PO_STAGE_FOR_PROGRESS = {
@@ -1164,12 +1258,13 @@ async function startPoDownload(rawPoNo, destination, panelTabId) {
   const poNo = sanitisePoNumber(rawPoNo);
   if (!poNo) return { started: false, error: describeError("IREPS_INVALID_REQUEST", { detail: "Please enter a PO Number." }) };
   poRunning = true;
+  const startedBy = panelTabId ?? null;
   logger.info("PO download started", { poNo });
 
   holdWorker(async () => {
     try {
-      await setPoState({ status: "running", stage: PO_STAGES.CHECKING_SESSION.id, message: PO_STAGES.CHECKING_SESSION.label, poNumber: poNo, error: null, result: undefined });
-      broadcast(MESSAGE_TYPES.PO_PROGRESS, { poNumber: poNo, stage: PO_STAGES.CHECKING_SESSION.id, message: PO_STAGES.CHECKING_SESSION.label });
+      await setPoState({ status: "running", stage: PO_STAGES.CHECKING_SESSION.id, message: PO_STAGES.CHECKING_SESSION.label, poNumber: poNo, error: null, result: undefined, startedBy });
+      broadcast(MESSAGE_TYPES.PO_PROGRESS, { poNumber: poNo, stage: PO_STAGES.CHECKING_SESSION.id, message: PO_STAGES.CHECKING_SESSION.label, startedBy });
       const result = await downloadPo(poNo, {
         ...(await documentRunHooks(destination, panelTabId)),
         parseHtml: (html, options) => parseSearchPoInOffscreen(html, { ...options, criteria: SEARCH_PO_CRITERIA.PO }),
@@ -1178,24 +1273,28 @@ async function startPoDownload(rawPoNo, destination, panelTabId) {
           if (!s) return;
           logger.info(`PO ${poNo}: ${s.label}`);
           setPoState({ stage: s.id, message: s.label });
-          broadcast(MESSAGE_TYPES.PO_PROGRESS, { poNumber: poNo, stage: s.id, message: s.label });
+          broadcast(MESSAGE_TYPES.PO_PROGRESS, { poNumber: poNo, stage: s.id, message: s.label, startedBy });
         }
       });
-      const message = result.skipped ? `PO ${poNo} not downloaded again` : PO_STAGES.COMPLETE.label;
+      // the PO as IREPS shows it, the number it is filed under (item 6.6), else the number typed
+      const filedAs = result.poNumber || poNo;
+      const message = result.skipped ? `PO ${filedAs} not downloaded again` : PO_STAGES.COMPLETE.label;
       await setPoState({ status: "complete", stage: PO_STAGES.COMPLETE.id, message, result, error: null });
       if (!result.skipped) {
-        await rememberLastDownload(STORAGE_KEYS.LAST_PO_DOWNLOAD, { lastDownloadAt: new Date().toISOString(), lastDownloadFilename: result.filename, lastPoNumber: poNo, lastStatus: "Downloaded successfully" });
+        await rememberLastDownload(STORAGE_KEYS.LAST_PO_DOWNLOAD, { lastDownloadAt: new Date().toISOString(), lastDownloadFilename: result.filename, lastPoNumber: filedAs, lastStatus: "Downloaded successfully" });
       }
-      broadcast(MESSAGE_TYPES.PO_DOWNLOAD_COMPLETE, { poNumber: poNo, ...result });
+      broadcast(MESSAGE_TYPES.PO_DOWNLOAD_COMPLETE, { poNumber: poNo, ...result, startedBy });
       logger.info(result.skipped ? "PO download skipped: already downloaded" : "PO download complete", { poNo, filename: result.filename, skip: result.skip ? result.skip.reason : null });
       flushDownloadLog();
     } catch (error) {
       const described = describeJobError(error, "PO download");
       if (error instanceof IrepsError) logger.warn(`PO download stopped: ${described.title}`, { poNo, code: error.code, message: described.message, status: error.status ?? null });
       await setPoState({ status: "error", stage: PO_STAGES.ERROR.id, message: described.title, error: described, result: undefined });
-      broadcast(MESSAGE_TYPES.PO_DOWNLOAD_ERROR, { poNumber: poNo, ...described });
+      broadcast(MESSAGE_TYPES.PO_DOWNLOAD_ERROR, { poNumber: poNo, ...described, startedBy });
     } finally {
       poRunning = false;
+      // a scheduled download that waited for this one may start now (5.9)
+      localJobEnded();
     }
   });
 
@@ -1208,60 +1307,172 @@ async function startIcDownload(rawPoNo, destination, panelTabId) {
   const poNo = sanitisePoNumber(rawPoNo);
   if (!poNo) return { started: false, error: describeError("IREPS_INVALID_REQUEST", { detail: "Please enter a PO Number." }) };
   icRunning = true;
+  const startedBy = panelTabId ?? null;
   logger.info("IC download started", { poNo });
 
   holdWorker(async () => {
     try {
-      await setIcState({ status: "searching", stage: IC_STAGES.CHECKING_SESSION.id, message: IC_STAGES.CHECKING_SESSION.label, poNumber: poNo, count: 0, downloads: null, error: null });
-      broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: IC_STAGES.CHECKING_SESSION.id, message: IC_STAGES.CHECKING_SESSION.label, status: "searching" });
+      await setIcState({ status: "searching", stage: IC_STAGES.CHECKING_SESSION.id, message: IC_STAGES.CHECKING_SESSION.label, poNumber: poNo, count: 0, downloads: null, warnings: [], error: null, retryItems: [], startedBy });
+      broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: IC_STAGES.CHECKING_SESSION.id, message: IC_STAGES.CHECKING_SESSION.label, status: "searching", startedBy });
       let announcedCount = false;
+      const hooks = await documentRunHooks(destination, panelTabId);
+      let items = [];
       const result = await downloadInspectionCertificates(poNo, {
-        ...(await documentRunHooks(destination, panelTabId)),
+        ...hooks,
+        // every IC's download item passes here before anything is fetched: kept, so that a Retry fetches only
+        // the failed ICs again, by the links this search read (7.3)
+        preflight: async (list) => {
+          items = list;
+          return hooks.preflight ? hooks.preflight(list) : { skip: new Map() };
+        },
         parseHtml: (html, options) => parseIcInOffscreen(html, poNo, options),
         onProgress: (stage) => {
           const s = IC_STAGE_FOR_PROGRESS[stage];
           if (!s) return;
           logger.info(`IC ${poNo}: ${s.label}`);
           setIcState({ stage: s.id, message: s.label });
-          broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: s.id, message: s.label, status: "searching" });
+          broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: s.id, message: s.label, status: "searching", startedBy });
         },
         onDownloadProgress: (snapshot) => {
           if (!announcedCount) {
             announcedCount = true;
             const label = `${snapshot.total} issued Inspection Certificate${snapshot.total === 1 ? "" : "s"} found`;
             setIcState({ status: "downloading", stage: IC_STAGES.DOWNLOADING.id, message: snapshot.total ? `Downloading ${label}...` : "No issued Inspection Certificates were found for this PO.", count: snapshot.total, downloads: snapshot });
-            broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: IC_STAGES.DOWNLOADING.id, message: label, status: "downloading" });
+            broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: IC_STAGES.DOWNLOADING.id, message: label, status: "downloading", startedBy });
           } else {
             icState = { ...icState, downloads: snapshot, updatedAt: Date.now() };
           }
-          broadcast(MESSAGE_TYPES.IC_DOWNLOAD_PROGRESS, { poNumber: poNo, downloads: snapshot });
+          broadcast(MESSAGE_TYPES.IC_DOWNLOAD_PROGRESS, { poNumber: poNo, downloads: snapshot, startedBy });
         }
       });
-      const described = result.downloads.sessionExpired ? describeError("IC_SESSION_EXPIRED_DURING_DOWNLOAD") : null;
-      if (result.downloads.sessionExpired) forgetSessionChecks();
-      const message =
-        result.count === 0
-          ? "No issued Inspection Certificates were found for this PO."
-          : `${result.downloads.completed} of ${result.downloads.total} Inspection Certificate${result.downloads.total === 1 ? "" : "s"} downloaded${result.downloads.skipped ? ` (${result.downloads.skipped} skipped: already downloaded)` : ""}`;
-      await setIcState({ status: "complete", stage: IC_STAGES.COMPLETE.id, message, count: result.count, downloads: result.downloads, error: described });
-      await rememberLastDownload(STORAGE_KEYS.LAST_IC_DOWNLOAD, {
-        lastDownloadAt: result.downloads.finishedAt,
-        lastPoNumber: poNo,
-        lastCount: result.count,
-        lastCompleted: result.downloads.completed,
-        lastFailed: result.downloads.failed,
-        lastStatus: result.downloads.failed ? `${result.downloads.completed} downloaded, ${result.downloads.failed} failed` : message
-      });
-      broadcast(MESSAGE_TYPES.IC_DOWNLOAD_COMPLETE, { poNumber: poNo, count: result.count, downloads: result.downloads, error: described, message });
-      logger.info("IC download finished", { poNo, count: result.count, completed: result.downloads.completed, failed: result.downloads.failed, skipped: result.downloads.skipped });
-      flushDownloadLog();
+      await finishIcRun(poNo, result, startedBy, items);
     } catch (error) {
-      const described = describeJobError(error, "IC download");
-      if (error instanceof IrepsError) logger.warn(`IC download stopped: ${described.title}`, { poNo, code: error.code, message: described.message, status: error.status ?? null });
-      await setIcState({ status: "error", stage: IC_STAGES.ERROR.id, message: described.title, error: described });
-      broadcast(MESSAGE_TYPES.IC_DOWNLOAD_ERROR, { poNumber: poNo, ...described });
+      await failIcRun(poNo, error, startedBy, "IC download");
     } finally {
       icRunning = false;
+      // a scheduled download that waited for this one may start now (5.9)
+      localJobEnded();
+    }
+  });
+
+  return { started: true };
+}
+
+/**
+ * An IC run (or its retry) ended: its state (with the download items a Retry needs), the last IC download
+ * line, and the panel's result.
+ */
+async function finishIcRun(poNo, result, startedBy, retryItems) {
+  const described = result.downloads.sessionExpired ? describeError("IC_SESSION_EXPIRED_DURING_DOWNLOAD") : null;
+  if (result.downloads.sessionExpired) forgetSessionChecks();
+  // the search's own warnings (a list short of IREPS's total, a page limit) are shown with the result (1.19)
+  const warnings = result.warnings || [];
+  const message =
+    result.count === 0
+      ? "No issued Inspection Certificates were found for this PO."
+      : `${result.downloads.completed} of ${result.downloads.total} Inspection Certificate${result.downloads.total === 1 ? "" : "s"} downloaded${result.downloads.skipped ? ` (${result.downloads.skipped} skipped: already downloaded)` : ""}`;
+  await setIcState({ status: "complete", stage: IC_STAGES.COMPLETE.id, message, count: result.count, downloads: result.downloads, warnings, error: described, retryItems });
+  await rememberLastDownload(STORAGE_KEYS.LAST_IC_DOWNLOAD, {
+    lastDownloadAt: result.downloads.finishedAt,
+    lastPoNumber: poNo,
+    lastCount: result.count,
+    lastCompleted: result.downloads.completed,
+    lastFailed: result.downloads.failed,
+    lastStatus: result.downloads.failed ? `${result.downloads.completed} downloaded, ${result.downloads.failed} failed` : message
+  });
+  broadcast(MESSAGE_TYPES.IC_DOWNLOAD_COMPLETE, { poNumber: poNo, count: result.count, downloads: result.downloads, warnings, error: described, message, startedBy });
+  logger.info("IC download finished", { poNo, count: result.count, completed: result.downloads.completed, failed: result.downloads.failed, skipped: result.downloads.skipped });
+  flushDownloadLog();
+}
+
+/** An IC run (or its retry) stopped with an error. */
+async function failIcRun(poNo, error, startedBy, what) {
+  const described = describeJobError(error, what);
+  if (error instanceof IrepsError) logger.warn(`${what} stopped: ${described.title}`, { poNo, code: error.code, message: described.message, status: error.status ?? null });
+  await setIcState({ status: "error", stage: IC_STAGES.ERROR.id, message: described.title, error: described });
+  broadcast(MESSAGE_TYPES.IC_DOWNLOAD_ERROR, { poNumber: poNo, ...described, startedBy });
+}
+
+/** The IC downloader's error codes, as ic-service.js downloads ICs: a retried IC fails as it would in its run. */
+const IC_DOWNLOAD_CODES = Object.freeze({
+  LINK_NOT_FOUND: IC_ERROR.LINK_NOT_FOUND,
+  DOWNLOAD_FAILED: IC_ERROR.DOWNLOAD_FAILED,
+  INVALID_PDF: IC_ERROR.INVALID_PDF,
+  SESSION_EXPIRED: IC_ERROR.SESSION_EXPIRED
+});
+
+/** The download items of the IC run's failed ICs worth another try (a row without an IC link never succeeds). */
+function failedIcItems(state) {
+  const items = (state.downloads && state.downloads.items) || [];
+  const failed = new Set(items.filter((i) => i.status === DOCUMENT_DOWNLOAD_STATUS.FAILED && !(i.error && i.error.code === IC_ERROR.LINK_NOT_FOUND)).map((i) => i.id));
+  return (state.retryItems || []).filter((item) => item.url && failed.has(item.id));
+}
+
+/** The IC run's downloads with the retried ICs' new outcome; every other IC stays as it ended. */
+function mergeIcDownloads(previous, retried) {
+  const byId = new Map(retried.items.map((i) => [i.id, i]));
+  const items = previous.items.map((i) => byId.get(i.id) || i);
+  const count = (status) => items.filter((i) => i.status === status).length;
+  return {
+    ...previous,
+    total: items.length,
+    queued: count(DOCUMENT_DOWNLOAD_STATUS.QUEUED),
+    downloading: count(DOCUMENT_DOWNLOAD_STATUS.DOWNLOADING),
+    completed: count(DOCUMENT_DOWNLOAD_STATUS.COMPLETED),
+    failed: count(DOCUMENT_DOWNLOAD_STATUS.FAILED),
+    skipped: count(DOCUMENT_DOWNLOAD_STATUS.SKIPPED),
+    sessionExpired: retried.sessionExpired === true,
+    warnings: [...new Set([...(previous.warnings || []), ...(retried.warnings || [])])],
+    items,
+    finishedAt: retried.finishedAt || previous.finishedAt
+  };
+}
+
+/**
+ * "Retry failed downloads" of the IC result (7.3): the failed ICs of the last IC run, for that run's own PO
+ * (never the PO now typed in the box), fetched again by the links its search read, without a new search,
+ * and only from the panel that started the run. A run whose items were not kept (one from before a worker
+ * update) is searched again, for its own PO.
+ */
+async function retryIcDownload(destination, panelTabId) {
+  await restorePoIcStates();
+  if (icRunning) return { started: false, error: describeError("IC_BUSY") };
+  const owner = icState.startedBy ?? null;
+  if (owner === SCHEDULED_RUN || (owner !== null && panelTabId !== null && owner !== panelTabId)) {
+    return { started: false, error: describeError("BATCH_RETRY_ELSEWHERE", { detail: "the Inspection Certificate download DocLink holds was not started in this tab" }) };
+  }
+  const items = icState.status === "complete" ? failedIcItems(icState) : [];
+  if (items.length === 0) return startIcDownload(icState.poNumber, destination, panelTabId);
+  icRunning = true;
+  const poNo = icState.poNumber;
+  const previous = icState.downloads;
+  const startedBy = panelTabId ?? owner;
+  logger.info("IC retry started", { poNo, count: items.length });
+
+  holdWorker(async () => {
+    try {
+      const message = `Retrying ${items.length} Inspection Certificate${items.length === 1 ? "" : "s"}...`;
+      await setIcState({ status: "downloading", stage: IC_STAGES.DOWNLOADING.id, message, error: null, startedBy });
+      broadcast(MESSAGE_TYPES.IC_PROGRESS, { poNumber: poNo, stage: IC_STAGES.DOWNLOADING.id, message, status: "downloading", startedBy });
+      // a retry only fetches what failed, so it is not checked against the download log again (as a batch retry)
+      const { saveFile, onSaved } = await documentRunHooks(destination, panelTabId, { preflight: false });
+      const retried = await downloadIrepsDocuments(items, {
+        saveFile,
+        onSaved,
+        codes: IC_DOWNLOAD_CODES,
+        onProgress: (snapshot) => {
+          const downloads = mergeIcDownloads(previous, snapshot);
+          icState = { ...icState, downloads, updatedAt: Date.now() };
+          broadcast(MESSAGE_TYPES.IC_DOWNLOAD_PROGRESS, { poNumber: poNo, downloads, startedBy });
+        }
+      });
+      await finishIcRun(poNo, { count: icState.count, downloads: mergeIcDownloads(previous, retried), warnings: icState.warnings || [] }, startedBy, icState.retryItems);
+    } catch (error) {
+      await failIcRun(poNo, error, startedBy, "IC retry");
+    } finally {
+      icRunning = false;
+      // a scheduled download that waited for this one may start now (5.9)
+      localJobEnded();
     }
   });
 
@@ -1279,17 +1490,36 @@ async function startIcDownload(rawPoNo, destination, panelTabId) {
  * (throttled) as BATCH_UPDATE, mirrored into chrome.storage.session for a
  * popup that opens later, and the full state (including what a retry needs)
  * stays in memory here.
+ *
+ * `batch` holds the last batch a panel started (startedBy: its tab id): what the panel shows and what
+ * its Retry repeats. A scheduled run's batch is kept apart in `scheduledBatch`: it never replaces the
+ * panel's finished batch, and its failures are never offered for a Retry in the panel (7.1, 7.2).
  */
 const BATCH_KINDS = ["po-date", "ic-date", "ic-notif"];
 const batch = { "po-date": null, "ic-date": null, "ic-notif": null };
+const scheduledBatch = { "po-date": null, "ic-date": null, "ic-notif": null };
 const batchRunning = { "po-date": false, "ic-date": false, "ic-notif": false };
+/** Who runs the batch of a kind while it runs: a panel's tab id, SCHEDULED_RUN, or null. */
+const batchRunningFor = { "po-date": null, "ic-date": null, "ic-notif": null };
 const anyBatchRunning = () => BATCH_KINDS.some((k) => batchRunning[k]);
 const batchTimers = {};
 
+/**
+ * The panel's batch state of a kind. `running`: its own run goes on; `busyWith`: who runs a batch of
+ * the kind now (a scheduled run is busy without being this state's run).
+ */
 function publicBatchState(kind) {
   const state = batch[kind];
-  if (!state) return { kind, phase: "idle", running: batchRunning[kind] };
-  return { ...(kind === "ic-notif" ? publicIcState(state) : state), running: batchRunning[kind] };
+  const busyWith = batchRunning[kind] ? batchRunningFor[kind] : null;
+  const running = batchRunning[kind] && busyWith !== SCHEDULED_RUN;
+  // a panel's run that has just started has no state yet: it is still that panel's (startedBy)
+  if (!state) return { kind, phase: "idle", running, busyWith, startedBy: running ? busyWith : null };
+  return { ...(kind === "ic-notif" ? publicIcState(state) : state), running, busyWith };
+}
+
+/** A scheduled batch starts or ends: the panels hear only that (their own batch state is left as it is). */
+function announceScheduledBatch(kind, running) {
+  broadcast(MESSAGE_TYPES.BATCH_UPDATE, { kind, state: { kind, phase: running ? "searching" : "complete", running, busyWith: running ? SCHEDULED_RUN : null, startedBy: SCHEDULED_RUN } });
 }
 
 function pushBatchState(kind, { immediately = false } = {}) {
@@ -1331,10 +1561,10 @@ function ensureIcIndexes(state) {
   return state;
 }
 
-function batchErrorState(kind, previous, error) {
+function batchErrorState(kind, previous, error, startedBy = null) {
   const described = describeJobError(error, `${kind} batch`);
   if (error instanceof IrepsError) logger.warn(`${kind} batch stopped: ${described.title}`, { code: error.code, status: error.status ?? null });
-  return { ...(previous || { kind }), kind, phase: "error", error: described, finishedAt: new Date().toISOString() };
+  return { ...(previous || { kind }), kind, phase: "error", error: described, finishedAt: new Date().toISOString(), startedBy };
 }
 
 /** Save the IC manifest (identifiers and outcomes only - never cookies, tokens or headers). */
@@ -1353,28 +1583,39 @@ async function saveIcManifest(state) {
   }
 }
 
-/** `saveManifest: false` (a scheduled run: S3 / ECM only) leaves out the IC run's local manifest file. */
-function runBatch(kind, work, { saveManifest = true } = {}) {
-  return holdWorker(() => runBatchHeld(kind, work, { saveManifest }));
+/**
+ * `saveManifest: false` (a scheduled run: S3 / ECM only) leaves out the IC run's local manifest file.
+ * `startedBy`: the panel's tab id, or SCHEDULED_RUN (its state goes to scheduledBatch, never to the panel's).
+ */
+function runBatch(kind, work, { saveManifest = true, startedBy = null } = {}) {
+  return holdWorker(() => runBatchHeld(kind, work, { saveManifest, startedBy }));
 }
 
-async function runBatchHeld(kind, work, { saveManifest }) {
+async function runBatchHeld(kind, work, { saveManifest, startedBy }) {
+  const scheduled = startedBy === SCHEDULED_RUN;
+  const store = scheduled ? scheduledBatch : batch;
   batchRunning[kind] = true;
+  batchRunningFor[kind] = startedBy;
+  if (scheduled) announceScheduledBatch(kind, true);
   const update = (state) => {
-    batch[kind] = state;
-    pushBatchState(kind);
+    state.startedBy = startedBy;
+    store[kind] = state;
+    if (!scheduled) pushBatchState(kind);
   };
   try {
     const finalState = await work(update);
-    batch[kind] = finalState;
+    finalState.startedBy = startedBy;
+    store[kind] = finalState;
     if (kind === "ic-notif" && saveManifest) await saveIcManifest(finalState);
     if (finalState.sessionExpired) forgetSessionChecks();
     await chrome.storage.local.set({ [`doclink.last.${kind}`]: { at: new Date().toISOString(), counts: finalState.counts } }).catch((error) => logger.debug("Could not record the batch summary", error));
   } catch (error) {
-    batch[kind] = batchErrorState(kind, batch[kind], error);
+    store[kind] = batchErrorState(kind, store[kind], error, startedBy);
   } finally {
     batchRunning[kind] = false;
-    pushBatchState(kind, { immediately: true });
+    batchRunningFor[kind] = null;
+    if (scheduled) announceScheduledBatch(kind, false);
+    else pushBatchState(kind, { immediately: true });
     flushDownloadLog();
     localJobEnded();
   }
@@ -1391,47 +1632,61 @@ function batchParser(kind) {
  * Save to (Local / ECM / S3) applies to a batch as to a single PO or IC download: each run and
  * each retry takes the user's current choice. The saver is built inside the run, so an
  * account lookup that fails ends as the batch's error state, not an unanswered message.
- * `done` settles with the batch's final state; a scheduled run passes its own documentHooks.
+ * `done` settles with the batch's final state; a scheduled run (panelTabId SCHEDULED_RUN) passes its own
+ * documentHooks, and its state is kept apart from the panel's (scheduledBatch).
  */
 async function launchBatch(message, hooks = {}) {
   const kind = message.kind;
   if (!BATCH_KINDS.includes(kind)) return { started: false, error: describeError("UNKNOWN", { detail: "unknown download type" }) };
   if (anyBatchRunning()) return { started: false, error: describeError("BATCH_BUSY") };
+  const startedBy = message.panelTabId ?? null;
+  const scheduled = startedBy === SCHEDULED_RUN;
+  const store = scheduled ? scheduledBatch : batch;
   const destination = sanitiseDestination(message.destination);
-  const runHooks = async () => hooks.documentHooks || documentRunHooks(destination, message.panelTabId);
-  const options = { saveManifest: !hooks.documentHooks };
+  const runHooks = async () => hooks.documentHooks || documentRunHooks(destination, startedBy);
+  const options = { saveManifest: !hooks.documentHooks, startedBy };
   let running;
   if (kind === "po-date") {
     const dateFrom = isoToIrepsDate(message.dateFrom) || message.dateFrom;
     const dateTo = isoToIrepsDate(message.dateTo) || message.dateTo;
-    batch[kind] = null;
+    store[kind] = null;
     running = runBatch(kind, async (update) => runPoDateDownload({ dateFrom, dateTo }, { parseHtml: batchParser(kind), ...(await runHooks()), onUpdate: update }), options);
   } else if (kind === "ic-date") {
     const dateFrom = isoToIrepsDate(message.dateFrom) || message.dateFrom;
     const dateTo = isoToIrepsDate(message.dateTo) || message.dateTo;
-    batch[kind] = null;
+    store[kind] = null;
     running = runBatch(kind, async (update) => runIcDateDownload({ dateFrom, dateTo }, { parseHtml: batchParser(kind), ...(await runHooks()), onUpdate: update }), options);
   } else {
-    batch[kind] = null;
+    store[kind] = null;
     running = runBatch(kind, async (update) => runIcNotificationDownload({ parseHtml: batchParser(kind), ...(await runHooks()), onUpdate: update }), options);
   }
-  pushBatchState(kind, { immediately: true });
-  return { started: true, done: running.then(() => batch[kind]) };
+  if (!scheduled) pushBatchState(kind, { immediately: true });
+  return { started: true, done: running.then(() => store[kind]) };
 }
 
 const startBatch = (message) => launchBatch(message).then(startedOnly);
 
+/**
+ * Retry the failed documents of the panel's finished batch, from the panel that started it. A batch
+ * another tab started (or a newer one that replaced the panel's) is refused, and a scheduled run's
+ * batch is never in `batch` at all: its failures go to the next scheduled check, never to a panel run.
+ */
 async function retryBatch(kind, rawDestination, panelTabId) {
   await restoreBatchState(kind);
   if (anyBatchRunning()) return { started: false, error: describeError("BATCH_BUSY") };
   const state = batch[kind];
   if (!state || state.phase !== "complete") return { started: false, error: describeError("UNKNOWN", { detail: "nothing to retry" }) };
+  const startedBy = state.startedBy ?? null;
+  if (startedBy === SCHEDULED_RUN || (startedBy !== null && panelTabId !== null && startedBy !== panelTabId)) {
+    return { started: false, error: describeError("BATCH_RETRY_ELSEWHERE", { detail: "the batch DocLink holds was not started in this tab" }) };
+  }
   const destination = sanitiseDestination(rawDestination);
   // a retry only fetches what failed, so it is not checked against the log again
   const hooks = async () => documentRunHooks(destination, panelTabId, { preflight: false });
-  if (kind === "po-date") runBatch(kind, async (update) => retryPoDateFailures(state, { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }).then(() => state));
-  else if (kind === "ic-date") runBatch(kind, async (update) => retryIcDateFailures(state, { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }).then(() => state));
-  else runBatch(kind, async (update) => retryIcNotificationFailures(ensureIcIndexes(state), { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }));
+  const options = { startedBy: panelTabId ?? startedBy };
+  if (kind === "po-date") runBatch(kind, async (update) => retryPoDateFailures(state, { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }).then(() => state), options);
+  else if (kind === "ic-date") runBatch(kind, async (update) => retryIcDateFailures(state, { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }).then(() => state), options);
+  else runBatch(kind, async (update) => retryIcNotificationFailures(ensureIcIndexes(state), { parseHtml: batchParser(kind), ...(await hooks()), onUpdate: () => update(state) }), options);
   pushBatchState(kind, { immediately: true });
   return { started: true };
 }
@@ -1443,7 +1698,9 @@ async function retryBatch(kind, rawDestination, panelTabId) {
 /** Bill upload (ECM invoice -> IREPS supplier bill, started by hand): background/bill-upload-job.js */
 const billUploadJob = createBillUploadJob({
   broadcast,
-  parseSearchPo: (html, options) => parseSearchPoInOffscreen(html, options)
+  parseSearchPo: (html, options) => parseSearchPoInOffscreen(html, options),
+  // a scheduled download that waited for the bill upload may run once its step ends (inspection 5.9)
+  onJobEnded: () => localJobEnded()
 });
 
 /** Phase 1 scheduled downloads (config.json "schedular_phase1"): background/scheduler-job.js */
@@ -1469,7 +1726,7 @@ const handlers = {
     if (result.authenticated && !result.busy) schedulerJob.onIrepsActive().catch((error) => logger.warn("Scheduler: IREPS activity not recorded", error));
     return publicSessionInfo(result);
   },
-  [MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS]: (message) => startDownloadJob(message.options, message.panelTabId),
+  [MESSAGE_TYPES.DOWNLOAD_IREPS_BILL_STATUS]: (message) => startDownloadJob(message.options, panelTabOf(message)),
   [MESSAGE_TYPES.GET_JOB_STATE]: async () => {
     await restoreJobState();
     return jobState;
@@ -1505,15 +1762,15 @@ const handlers = {
 
   // PO Search document workflows (CRN, R-NOTE)
   [MESSAGE_TYPES.SEARCH_PO_LOAD_FORM]: (message) => loadSearchPoFormInfo({ useCache: !message.force }),
-  [MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS]: (message) => startDocumentDownloadJob(message.criteria, message.options, message.panelTabId),
+  [MESSAGE_TYPES.DOWNLOAD_IREPS_DOCUMENTS]: (message) => startDocumentDownloadJob(message.criteria, message.options, panelTabOf(message)),
   [MESSAGE_TYPES.GET_DOCUMENT_JOB_STATE]: async (message) => {
     await restoreDocumentJobs();
     return { ...documentJob(message.criteria), criteria: message.criteria, running: documentJobRunning };
   },
 
   // MA copies
-  [MESSAGE_TYPES.MA_SEARCH]: (message) => startMaSearch(message.options),
-  [MESSAGE_TYPES.MA_DOWNLOAD]: (message) => startMaDownload(message.ids, message.destination, message.panelTabId),
+  [MESSAGE_TYPES.MA_SEARCH]: (message) => startMaSearch(message.options, panelTabOf(message)),
+  [MESSAGE_TYPES.MA_DOWNLOAD]: (message) => startMaDownload(message.ids, message.destination, panelTabOf(message)),
   [MESSAGE_TYPES.GET_MA_STATE]: async () => {
     await restoreMaState();
     return publicMaState();
@@ -1521,20 +1778,23 @@ const handlers = {
   [MESSAGE_TYPES.MA_RESET]: () => resetMaState(),
 
   // PO / Inspection Certificate (one PO number, two independent downloads)
-  [MESSAGE_TYPES.PO_DOWNLOAD]: (message) => startPoDownload(message.poNo, message.destination, message.panelTabId),
+  [MESSAGE_TYPES.PO_DOWNLOAD]: (message) => startPoDownload(message.poNo, message.destination, panelTabOf(message)),
   [MESSAGE_TYPES.GET_PO_STATE]: async () => {
     await restorePoIcStates();
     return { ...poState, running: poRunning };
   },
-  [MESSAGE_TYPES.IC_DOWNLOAD]: (message) => startIcDownload(message.poNo, message.destination, message.panelTabId),
+  [MESSAGE_TYPES.IC_DOWNLOAD]: (message) => startIcDownload(message.poNo, message.destination, panelTabOf(message)),
+  [MESSAGE_TYPES.IC_RETRY]: (message) => retryIcDownload(message.destination, panelTabOf(message)),
   [MESSAGE_TYPES.GET_IC_STATE]: async () => {
     await restorePoIcStates();
-    return { ...icState, running: icRunning };
+    // the run's download items (IREPS links) stay here: the panel shows only how each IC ended
+    const { retryItems, ...state } = icState;
+    return { ...state, running: icRunning };
   },
 
   // Batch downloads: PO by date, IC from notifications
-  [MESSAGE_TYPES.BATCH_START]: (message) => startBatch(message),
-  [MESSAGE_TYPES.BATCH_RETRY]: (message) => retryBatch(message.kind, message.destination, message.panelTabId),
+  [MESSAGE_TYPES.BATCH_START]: (message) => startBatch({ ...message, panelTabId: panelTabOf(message) }),
+  [MESSAGE_TYPES.BATCH_RETRY]: (message) => retryBatch(message.kind, message.destination, panelTabOf(message)),
   [MESSAGE_TYPES.BATCH_GET_STATE]: async (message) => {
     await restoreBatchState(message.kind);
     return publicBatchState(message.kind);
@@ -1549,6 +1809,7 @@ const IREPS_JOB_TYPES = new Set([
   MESSAGE_TYPES.MA_DOWNLOAD,
   MESSAGE_TYPES.PO_DOWNLOAD,
   MESSAGE_TYPES.IC_DOWNLOAD,
+  MESSAGE_TYPES.IC_RETRY,
   MESSAGE_TYPES.BATCH_START,
   MESSAGE_TYPES.BATCH_RETRY,
   // bill upload steps that call IREPS (the receipt search from here, the bill calls, the signer
@@ -1675,9 +1936,10 @@ if (chrome.alarms) {
 // a scheduled tender download's runner tab closed before it finished: its slot is given back
 chrome.tabs.onRemoved.addListener((tabId) => schedulerJob.onTabRemoved(tabId));
 
+// the tab goes along: a page loading in a tab DocLink opened itself (a print tab) is never the user's IREPS activity
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (changeInfo.status !== "complete" || !tab || !tab.url) return;
   loadIrepsConfig()
-    .then(() => schedulerJob.onPageLoaded(tab.url))
+    .then(() => schedulerJob.onPageLoaded(tab.url, tab))
     .catch((error) => logger.warn("Scheduler: page load not handled", error));
 });

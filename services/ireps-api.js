@@ -178,6 +178,8 @@ export const IREPS_ERROR = Object.freeze({
   REQUEST_FAILED: "IREPS_REQUEST_FAILED",
   TOKEN_NOT_FOUND: "IREPS_TOKEN_NOT_FOUND",
   INVALID_RESPONSE: "IREPS_INVALID_RESPONSE",
+  /** The Bill Status page came back with IREPS's own message (not "no records") and no bills. */
+  SEARCH_REJECTED: "IREPS_SEARCH_REJECTED",
   PARSE_FAILED: "IREPS_PARSE_FAILED",
   NO_RECORDS: "IREPS_NO_RECORDS",
   INVALID_REQUEST: "IREPS_INVALID_REQUEST",
@@ -307,6 +309,15 @@ export async function requestIreps(request, deps = {}) {
     html = await response.text();
   } catch (error) {
     clearTimeout(timer);
+    // the deadline covers the page too: IREPS stopped sending it in time, which is no unreadable answer (4.7)
+    if (controller.signal.aborted || (error && error.name === "AbortError")) {
+      throw new IrepsError(IREPS_ERROR.REQUEST_FAILED, "IREPS did not respond in time", {
+        reason: "timeout",
+        status: response.status,
+        detail: "IREPS did not respond in time",
+        cause: error
+      });
+    }
     throw new IrepsError(IREPS_ERROR.REQUEST_FAILED, "IREPS response could not be read", {
       reason: "network",
       status: response.status,

@@ -6,6 +6,11 @@
  * chrome.storage.local, key "doclink.billUploads": { [receiptKey]: entry }. Entries hold
  * identifiers only (bill reg no., dispatch no., invoice / PO numbers), never amounts, bank
  * or GST data. The storage area is injectable for tests.
+ *
+ * A write is recorded as `unknown` right before it is sent, and stays so when its answer does not
+ * arrive (the tab was reloaded, the network dropped, the deadline passed, IREPS answered 5xx, or
+ * the service worker stopped): IREPS may have saved it. Only IREPS's answer, or the user's
+ * confirmation that they checked the bill in IREPS, clears it (bill-upload-service.js, review 3.1).
  */
 
 const STORE_KEY = "doclink.billUploads";
@@ -13,13 +18,15 @@ const STORE_KEY = "doclink.billUploads";
 /**
  * @typedef {Object} BillUploadEntry
  * @property {string} receiptKey
- * @property {"header-saved"|"item-saved"} status
- * @property {string} billRegNo
+ * @property {"header-saved"|"item-saved"} [status]  absent while the header's own outcome is unknown
+ * @property {string|null} billRegNo                   null until IREPS answered the header
  * @property {string|null} dispatchNo
  * @property {string} invoiceNo
  * @property {string} poNumber
  * @property {string} poSr
  * @property {string} roNo
+ * @property {{ step: "header"|"item"|"document", why: string, at: string, fileName?: string, fileDesc?: string }|null} [unknown]
+ *           a write whose answer did not arrive (IREPS may have saved it)
  * @property {string} createdAt   ISO
  * @property {string} updatedAt   ISO
  */

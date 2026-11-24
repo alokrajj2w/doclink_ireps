@@ -58,18 +58,28 @@ const FLUSH_DELAY_MS = 250;
  * credential. They cover header / query / form text (name=value, name: value), JSON
  * ("name": "value") and HTML (<input name="...TOKEN" value="...">, either attribute order).
  */
-const SECRET_NAME = String.raw`(?:client[_-]?secret|access[_-]?token|refresh[_-]?token|id[_-]?token|code[_-]?verifier|api[_-]?key|x-api-key|password|passwd|pwd|security[_-]?key|token|secret)`;
+const SECRET_NAME = String.raw`(?:client[_-]?secret|access[_-]?token|refresh[_-]?token|id[_-]?token|code[_-]?verifier|api[_-]?key|x-api-key|password|passwd|pwd|security[_-]?key|session[_-]?id|token|secret)`;
+/** Words that make a JSON key's value a secret ("access_token", "clientSecret", "JSESSIONID", "sessionId", ...). */
+const SECRET_JSON_KEY = String.raw`(?:token|secret|password|passwd|api_?key|apikey|authorization|cookie|session_?id)`;
+/** A JSON key with one of those words and its colon, the quotes escaped or not (group q: their backslashes). */
+const SECRET_JSON_NAME = String.raw`(?<q>\\*)"[^"\n]*?${SECRET_JSON_KEY}[^"\n]*?\k<q>"\s*:\s*`;
 const REDACTION_PATTERNS = [
   [/(cookie\s*[:=]\s*)[^\n]*/gi, "$1[REDACTED]"],
   [/(set-cookie\s*[:=]\s*)[^\n]*/gi, "$1[REDACTED]"],
-  [/(jsessionid\s*[:=]\s*)[^;\s&"']*/gi, "$1[REDACTED]"],
+  // the value quoted or not: JSESSIONID=..., JSESSIONID: "...", ;jsessionid=... in a URL
+  [/(jsessionid\s*[:=]\s*)(?:"[^"\n]*"?|'[^'\n]*'?|[^;\s&"']*)/gi, "$1[REDACTED]"],
   [/(authorization\s*[:=]\s*)[^\n]*/gi, "$1[REDACTED]"],
   [/(bearer\s+)[a-z0-9\-._~+/]+=*/gi, "$1[REDACTED]"],
   [/(x-csrf-token\s*[:=]\s*)[^\n]*/gi, "$1[REDACTED]"],
-  // name=value / name: value (query strings, form bodies, headers): TOKEN=..., client_secret=..., x-api-key: ...
-  [new RegExp(String.raw`(${SECRET_NAME}\s*[:=]\s*)[^\s&"',;<>]+`, "gi"), "$1[REDACTED]"],
-  // JSON: "access_token": "...", "clientSecret": "...", "token": "..."
-  [/("[^"\n]*(?:token|secret|password|passwd|api_?key|apikey|authorization|cookie)[^"\n]*"\s*:\s*")[^"]*(")/gi, "$1[REDACTED]$2"],
+  // name=value / name: value (query strings, form bodies, headers), the value quoted or not: TOKEN=..., client_secret=..., x-api-key: ..., sessionId=...
+  [new RegExp(String.raw`(${SECRET_NAME}\s*[:=]\s*)(?:"[^"\n]*"?|'[^'\n]*'?|[^\s&"',;<>]+)`, "gi"), "$1[REDACTED]"],
+  // an OAuth answer in a URL or a form body: ?code=...&state=... (the Okta sign-in's redirect, the code exchange)
+  [/((?:^|[?&#])(?:code|state)=)[^&#\s"'<>]+/gim, "$1[REDACTED]"],
+  // JSON "name": "value", also escaped inside another JSON string ({\"access_token\":\"...\"}): up to the
+  // value's own closing quote (an escaped quote inside the value does not end it), or the end of the line
+  [new RegExp(String.raw`(${SECRET_JSON_NAME}\k<q>")[^\n]*?((?<!\\)\k<q>"|$)`, "gim"), "$1[REDACTED]$3"],
+  // JSON "name": 123456 (a numeric security key or PIN); true, false, null, objects and lists stay readable
+  [new RegExp(String.raw`(${SECRET_JSON_NAME})(?!(?:true|false|null)\b)[^\s"\\,{}\[\]]+`, "gi"), "$1[REDACTED]"],
   // HTML: the Struts token (or any *token*) field of a page, name before or after value
   [/(<input\b[^>]*\bname\s*=\s*["']?[^"'>\s]*token[^"'>\s]*["']?[^>]*?\bvalue\s*=\s*["']?)[^"'>\s]*/gi, "$1[REDACTED]"],
   [/(<input\b[^>]*?\bvalue\s*=\s*["']?)[^"'>\s]*(["']?[^>]*\bname\s*=\s*["']?[^"'>\s]*token)/gi, "$1[REDACTED]$2"]

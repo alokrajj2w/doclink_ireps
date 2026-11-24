@@ -783,6 +783,30 @@ input[type="radio"] {
   font-size: 12px;
 }
 
+/* a list read short of IREPS's own total (the MA results) */
+.result-warning {
+  margin-top: 4px;
+  color: var(--warning);
+  font-size: 12px;
+}
+
+/* Runs this panel did not start (a scheduled download, another tab's run): a neutral line above the views */
+.background-runs {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: pre-line;
+}
+body[data-gate="on"] .app-main > .background-runs,
+body[data-recon-login="on"] .app-main > .background-runs,
+body[data-redownload="on"] .app-main > .background-runs {
+  display: none;
+}
+
 .result-text {
   white-space: pre-line;
 }
@@ -1009,8 +1033,11 @@ body[data-gate="on"] .app-main > .save-to,
 /* -------------------------------------------------------- not-on-IREPS gate */
 
 /* While the gate is up, every other view and the footer are hidden without
-   touching their own [hidden] state, so a running job is intact on return. */
-body[data-gate="on"] .app-main > .view:not(#view-gate),
+   touching their own [hidden] state, so a running job is intact on return.
+   The panel's two pages that cover it stay above the gate: one overlay shows at
+   a time, never none (7.5). In order: the download-again question (a run waits
+   for its answer), the Recon sign-in page, the gate. */
+body[data-gate="on"] .app-main > .view:not(#view-gate):not(#view-recon-login):not(#view-redownload),
 body[data-gate="on"] .app-footer {
   display: none !important;
 }
@@ -1216,12 +1243,10 @@ body[data-gate="on"] .header-icon {
 }
 
 /* Like the gate: every other view and the Save to switch step aside without
-   touching their own [hidden] state, so a running job is intact on return. */
-body[data-recon-login="on"] .app-main > .view:not(#view-recon-login),
+   touching their own [hidden] state, so a running job is intact on return.
+   It covers the gate too; only the download-again question covers it (7.5). */
+body[data-recon-login="on"] .app-main > .view:not(#view-recon-login):not(#view-redownload),
 body[data-recon-login="on"] .app-main > .save-to {
-  display: none !important;
-}
-body[data-gate="on"] #view-recon-login {
   display: none !important;
 }
 
@@ -1353,12 +1378,11 @@ body[data-gate="on"] #view-recon-login {
   color: var(--warning);
 }
 
-/* "Already downloaded - download again?" covers the panel the same way. */
+/* "Already downloaded - download again?" covers the panel the same way, the gate and
+   the Recon sign-in page included: a run waits for this answer, so it is never hidden
+   (it would run out of time unseen, 7.5). */
 body[data-redownload="on"] .app-main > .view:not(#view-redownload),
 body[data-redownload="on"] .app-main > .save-to {
-  display: none !important;
-}
-body[data-gate="on"] #view-redownload {
   display: none !important;
 }
 .redownload-select-all {

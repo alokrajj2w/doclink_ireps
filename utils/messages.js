@@ -29,6 +29,8 @@ export const MESSAGE_TYPES = Object.freeze({
   PO_DOWNLOAD: "PO_DOWNLOAD",
   GET_PO_STATE: "GET_PO_STATE",
   IC_DOWNLOAD: "IC_DOWNLOAD",
+  // retry the failed ICs of the last IC run (its own PO; only those ICs, no new search)
+  IC_RETRY: "IC_RETRY",
   GET_IC_STATE: "GET_IC_STATE",
 
   // popup -> service worker: batch downloads (PO by date, IC from notifications)
@@ -47,6 +49,7 @@ export const MESSAGE_TYPES = Object.freeze({
   BILL_UPLOAD_RESET: "BILL_UPLOAD_RESET",
   BILL_UPLOAD_FORGET: "BILL_UPLOAD_FORGET",
   BILL_UPLOAD_ADD_DOCUMENT: "BILL_UPLOAD_ADD_DOCUMENT",
+  BILL_UPLOAD_CONFIRM_CHECKED: "BILL_UPLOAD_CONFIRM_CHECKED",
   // Phase 1 scheduled downloads (services/scheduler/, background/scheduler-job.js)
   SCHEDULE_GET_STATE: "SCHEDULE_GET_STATE",
   SCHEDULE_NUDGE: "SCHEDULE_NUDGE",
@@ -57,6 +60,8 @@ export const MESSAGE_TYPES = Object.freeze({
   SCHEDULE_RUNNER_READY: "SCHEDULE_RUNNER_READY",
   SCHEDULE_RUNNER_PING: "SCHEDULE_RUNNER_PING",
   SCHEDULE_RUNNER_DONE: "SCHEDULE_RUNNER_DONE",
+  // a tab DocLink opened itself (a print tab, tender/tender-print.js): its page loads are not the user's IREPS activity
+  NOTE_OWN_TAB: "NOTE_OWN_TAB",
 
   // service worker -> popup (broadcast)
   IREPS_PROGRESS: "IREPS_PROGRESS",
@@ -98,6 +103,12 @@ export const TARGETS = Object.freeze({
   OFFSCREEN: "offscreen",
   POPUP: "popup"
 });
+
+/**
+ * Who started a run, as job states and broadcasts carry it (`startedBy`): the tab id of the panel that
+ * started it, or this for a scheduled run. A panel shows only its own runs as its own (popup-gate.js isOwnRun).
+ */
+export const SCHEDULED_RUN = "schedule";
 
 /** Workflow stages in order. `label` is what the popup displays. */
 export const STAGES = Object.freeze({
@@ -210,6 +221,11 @@ export const ERROR_CATALOG = Object.freeze({
     title: "Unable to load Bill Status",
     message: "IREPS Bill Status page could not be loaded.",
     connection: "offline"
+  },
+  IREPS_SEARCH_REJECTED: {
+    title: "IREPS did not return the bills",
+    message: "IREPS answered the Bill Status search with a message instead of bills: \"{detail}\". This is not an empty list. Try again in a minute; if it repeats, run the same search in IREPS.",
+    connection: "connected"
   },
   IREPS_PARSE_FAILED: {
     title: "Unable to read the Bill Status records",
@@ -351,6 +367,11 @@ export const ERROR_CATALOG = Object.freeze({
     message: "Select at least one Modification Advice, or use Download All.",
     notice: true
   },
+  MA_LIST_REPLACED: {
+    title: "MA list replaced",
+    message: "The MA list shown here is no longer the one DocLink holds: an MA search was made in another DocLink tab since ({detail}). Nothing was downloaded. Click New search, then Search MAs again.",
+    notice: true
+  },
   DOCUMENT_EXPORT_ERROR: {
     title: "Records retrieved",
     message: "However, DocLink could not build the export file.",
@@ -436,6 +457,11 @@ export const ERROR_CATALOG = Object.freeze({
     message: "The Recon Engine did not accept the upload: {detail}. Nothing was saved.",
     connection: "connected"
   },
+  RECON_ANSWER_UNREADABLE: {
+    title: "Recon Engine answer not read",
+    message: "The Recon Engine answered the upload ({detail}), but DocLink could not read its answer, so it cannot tell what was stored. The file may be saved there: check the Recon Engine before you upload it again.",
+    connection: "connected"
+  },
   RECON_NOT_INGESTED: {
     title: "Saved to S3, not loaded",
     message: "The file was stored by the Recon Engine, but it could not be loaded into reconciliation: {detail}",
@@ -492,6 +518,17 @@ export const ERROR_CATALOG = Object.freeze({
     message: "DocLink could not reach the Recon Engine's download log ({detail}). The files are downloaded anyway and recorded once it is back.",
     notice: true
   },
+  // My downloads (popup-downloads.js): the list cannot be read while the Recon Engine does not answer
+  DOWNLOAD_LOG_LIST_UNAVAILABLE: {
+    title: "Download log unavailable",
+    message: "DocLink could not reach the Recon Engine to read your downloads ({detail}). This is not a sign-in problem: check that the Recon Engine is running, then click Refresh."
+  },
+  // "Already downloaded - download again?" (popup-redownload.js) after the run stopped waiting for the answer
+  REDOWNLOAD_TOO_LATE: {
+    title: "Not answered in time",
+    message: "The download waited 4 minutes for this answer, then went on without {detail}: they were skipped, not downloaded again. To download them again, start the download again and tick them on this page.",
+    notice: true
+  },
   DOCUMENT_BUSY: {
     title: "Download Already Running",
     message: "Please wait for the current CRN / R-NOTE download to finish."
@@ -505,6 +542,10 @@ export const ERROR_CATALOG = Object.freeze({
   TENDER_LIST_FAILED: {
     title: "IREPS list not read",
     message: "IREPS did not return the list ({detail}). Documents on it may be missing from this download: retry it."
+  },
+  TENDER_LIST_LIMIT: {
+    title: "IREPS list not read in full",
+    message: "DocLink read {detail}, its page limit, and stopped there. Documents on the later pages may be missing from this download: choose a shorter date range, or open the list in IREPS."
   },
   TENDER_SEARCH_INCOMPLETE: {
     title: "Tender search incomplete",
@@ -537,6 +578,12 @@ export const ERROR_CATALOG = Object.freeze({
   IREPS_PO_NOT_FOUND: {
     title: "Purchase Order not found",
     message: "Purchase Order {detail} was not found (or is not visible to your IREPS account).",
+    notice: true,
+    connection: "connected"
+  },
+  IREPS_PO_SEVERAL_UNITS: {
+    title: "PO listed for more than one unit",
+    message: "IREPS lists PO {detail}, so DocLink cannot tell which Purchase Order to download. Nothing was downloaded: use Download POs by PO Date with the PO's date, which saves the PO of each unit.",
     notice: true,
     connection: "connected"
   },
@@ -591,6 +638,11 @@ export const ERROR_CATALOG = Object.freeze({
     message: "IREPS did not provide a \"View/ Download IC PDF\" link for this Inspection Certificate ({detail}).",
     connection: "connected"
   },
+  IREPS_IC_NOT_LISTED: {
+    title: "IC not listed in IREPS",
+    message: "IREPS notified an issued Inspection Certificate, but its Inspection Call List shows no IC-issued call for it ({detail}). Check the PO and PO serial in IREPS.",
+    connection: "connected"
+  },
   IREPS_IC_DOWNLOAD_FAILED: {
     title: "IC copy download failed",
     message: "DocLink could not download the Inspection Certificate PDF from IREPS ({detail}).",
@@ -620,6 +672,11 @@ export const ERROR_CATALOG = Object.freeze({
     title: "Download Already Running",
     message: "Please wait for the current download to finish."
   },
+  BATCH_RETRY_ELSEWHERE: {
+    title: "Retry not available here",
+    message: "The download to retry was started in another DocLink tab, or a newer download replaced it ({detail}). Retry it in that tab, or start the download again here.",
+    notice: true
+  },
   IC_BUSY: {
     title: "IC Download Already Running",
     message: "Please wait for the current Inspection Certificate download to finish."
@@ -627,8 +684,12 @@ export const ERROR_CATALOG = Object.freeze({
   /* --------------------------------------- Bill upload (services/bill-upload/) */
   BILL_REQUEST_FAILED: {
     title: "IREPS did not answer",
-    message: "DocLink could not complete the bill request to IREPS ({detail}). Check your network connection and try again.",
+    message: "DocLink could not complete a bill request to IREPS ({detail}). That request saves nothing on the bill. Keep the IREPS tab open on IREPS, check that IREPS responds, then try again.",
     connection: "offline"
+  },
+  BILL_OUTCOME_UNKNOWN: {
+    title: "Check IREPS before you go on",
+    message: "{detail} Until you confirm that you checked, DocLink does not send this step to IREPS again, so that nothing is saved twice."
   },
   BILL_FORM_INVALID: {
     title: "IREPS bill page not recognised",
@@ -653,6 +714,12 @@ export const ERROR_CATALOG = Object.freeze({
   },
   BILL_NOT_BILLABLE: {
     title: "This receipt cannot be billed",
+    message: "{detail}.",
+    notice: true,
+    connection: "connected"
+  },
+  BILL_RECEIPT_REFUSED: {
+    title: "IREPS does not take this receipt",
     message: "{detail}.",
     notice: true,
     connection: "connected"
@@ -692,6 +759,11 @@ export const ERROR_CATALOG = Object.freeze({
     title: "ECM not available",
     message: "DocLink could not read the ECM ({detail})."
   },
+  BILL_ECM_MISMATCH: {
+    title: "ECM invoice is for another receipt",
+    message: "{detail}. DocLink uses an ECM invoice only when its customer PO, PO Sr and quantity are the receipt's. Check the invoice in ECM, or enter the invoice details by hand.",
+    notice: true
+  },
   BILL_FILE_INVALID: {
     title: "Invoice file not usable",
     message: "{detail}. Nothing was sent to IREPS.",
@@ -723,7 +795,7 @@ export const ERROR_CATALOG = Object.freeze({
   },
   BILL_INTERRUPTED: {
     title: "Bill step interrupted",
-    message: "Chrome stopped DocLink's background work during this step ({detail}), so it may not have finished. Before you repeat it, check the bill in IREPS (the PO's Bills for Pay tab), so that no second draft bill is created."
+    message: "Chrome stopped DocLink's background work while it was {detail}."
   },
   BILL_NOT_PREPARED: {
     title: "Bill not prepared",
@@ -822,6 +894,10 @@ export const ERROR_CATALOG = Object.freeze({
     title: "Scheduled document not downloaded",
     message: "The document could not be downloaded from IREPS ({detail}). The next check tries it again."
   },
+  SCHEDULE_LIST_INCOMPLETE: {
+    title: "IREPS list not read in full",
+    message: "The scheduled download could not read an IREPS list to its end ({detail}), so some documents may be missing. What was saved is kept; the next check reads the list again."
+  },
   SCHEDULE_TYPE_NOT_SUPPORTED: {
     title: "Document type not scheduled here",
     message: "This DocLink cannot run that scheduled document type ({detail})."
@@ -841,6 +917,14 @@ export const ERROR_CATALOG = Object.freeze({
   SCHEDULE_TENDER_FAILED: {
     title: "Scheduled tender download failed",
     message: "The scheduled tender download stopped with an error ({detail}). The next check tries again."
+  },
+  SCHEDULE_IREPS_ERROR: {
+    title: "IREPS answered with an error",
+    message: "IREPS answered the scheduled download with an error ({detail}). This is not a logout: the next check tries again."
+  },
+  SCHEDULE_NEEDS_REVIEW: {
+    title: "Needs review",
+    message: "The scheduled download found documents in IREPS that it could not match safely ({detail}), so it did not download them. Open the view in the DocLink panel and check them in IREPS."
   },
   SCHEDULE_MISSED: {
     title: "Scheduled download missed",
@@ -910,5 +994,7 @@ export const SESSION_KEYS = Object.freeze({
   BATCH_STATE: "doclink.batchState",
   BILL_UPLOAD_STATE: "doclink.billUploadState",
   // scheduled downloads: when IREPS was last active / the IREPS check last failed in this browser
-  SCHEDULER_SIGNALS: "doclink.scheduler.signals"
+  SCHEDULER_SIGNALS: "doclink.scheduler.signals",
+  // scheduled downloads: the ids of the tabs DocLink opened itself (print tabs, the tender runner tab)
+  SCHEDULER_OWN_TABS: "doclink.scheduler.ownTabs"
 });

@@ -24,7 +24,9 @@
  * the extension's pages and its worker), so several panels never overwrite each other's
  * records, and one flush at a time posts a queue. A batch the backend refuses outright (HTTP
  * 400 / 413 / 422) is split until the refused records are found; only those are set aside
- * (doclink.downloadLog.rejected), so one bad record cannot block the log.
+ * (doclink.downloadLog.rejected), so one bad record cannot block the log. A batch it took (2xx)
+ * leaves the queue even when its answer is lost on the way, and is never posted twice. A queue
+ * that cannot be read is never written over: that change is dropped and the queue kept as it is.
  *
  * Each queued record remembers the Recon user who was signed in when it was saved (the
  * backend files a record under whoever is signed in when it is POSTED), and a flush posts
@@ -225,22 +227,47 @@ export class DownloadLogError extends Error {
 
 const post = (path, body, deps) => request("POST", path, body, deps);
 
-async function request(method, path, body, deps = {}) {
+/** The JSON of an answer's text, or null when it is none (an empty body, an HTML page). */
+function jsonOf(text) {
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One request to the download log; the answer's headers and body are read inside one deadline.
+ * `taken`: the caller needs only to know that the Recon Engine took the request (the records post).
+ * A 2xx whose body then cannot be read (the connection dropped, or the deadline passed, after the
+ * status arrived) took the records all the same, and posting them again would log them twice: it
+ * answers null (8.4). A body that is read but is not JSON (a proxy's page) is no answer of the
+ * Recon Engine, and the records stay queued.
+ */
+async function request(method, path, body, deps = {}, { taken = false } = {}) {
   await loadReconConfig();
   const baseUrl = RECON_CONFIG.baseUrl;
   const problem = reconConfigProblem(baseUrl, deps.hostPermissions || hostPermissionsOverride || manifestHostPermissions(), path);
   if (problem) throw new DownloadLogError("RECON_NOT_CONFIGURED", { detail: problem });
-  const fetchImpl = deps.fetch || fetchOverride || undefined;
+  const fetchImpl = deps.fetch || fetchOverride || ((...args) => globalThis.fetch(...args));
+  // the answer's status as soon as it arrives, so that a body lost after it is still known to follow a 2xx
+  let head = null;
+  const fetchHead = async (...args) => (head = await fetchImpl(...args));
   const init = method === "GET" ? { method } : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   let response;
-  let answer;
+  let text;
   try {
     // one deadline for the answer's headers and its body (a stalled body must not hold the queue)
-    ({ response, body: answer } = await fetchWithDeadline(`${baseUrl}${path}`, { ...init, credentials: "include" }, { timeoutMs: REQUEST_TIMEOUT_MS, fetch: fetchImpl }));
+    ({ response, body: text } = await fetchWithDeadline(`${baseUrl}${path}`, { ...init, credentials: "include" }, { timeoutMs: REQUEST_TIMEOUT_MS, fetch: fetchHead, read: "text" }));
   } catch (error) {
-    const detail = error instanceof DeadlineError ? error.message : `could not reach ${new URL(baseUrl).origin}`;
+    const detail = error instanceof DeadlineError ? error.message : head ? `its answer (HTTP ${head.status}) could not be read` : `could not reach ${new URL(baseUrl).origin}`;
+    if (taken && head && head.ok && !head.redirected) {
+      logger.warn(`Download log: the Recon Engine took the records (HTTP ${head.status}) but its answer could not be read (${(error && error.message) || "no answer"}); they are not posted again`);
+      return null;
+    }
     throw new DownloadLogError(DOWNLOAD_LOG_ERROR.UNAVAILABLE, { detail });
   }
+  const answer = jsonOf(text);
   if (response.status === 401) throw new DownloadLogError("RECON_AUTH_REQUIRED", { status: 401 });
   if (response.status === 403) throw new DownloadLogError("FORBIDDEN", { status: 403, detail: apiErrorDetail(answer) || "not allowed" });
   if (!response.ok || !answer) throw new DownloadLogError(DOWNLOAD_LOG_ERROR.UNAVAILABLE, { status: response.status, detail: apiErrorDetail(answer) || `HTTP ${response.status}` });
@@ -395,14 +422,14 @@ async function withLock(name, fn, { waitMs = 0 } = {}) {
 
 const withQueue = (fn) => withLock(queueKey(), fn, { waitMs: QUEUE_LOCK_WAIT_MS });
 
+/**
+ * The list stored under `key` ([] when there is none). A storage read that fails throws instead of
+ * answering []: a write built on it would replace every record stored there, other users' too (8.3).
+ */
 async function readKey(key) {
-  try {
-    const stored = await storage().get(key);
-    const q = stored && stored[key];
-    return Array.isArray(q) ? q : [];
-  } catch {
-    return [];
-  }
+  const stored = await storage().get(key);
+  const q = stored && stored[key];
+  return Array.isArray(q) ? q : [];
 }
 
 const readQueue = () => readKey(queueKey());
@@ -486,7 +513,8 @@ export async function logDownload(record) {
       }
     });
   } catch (error) {
-    logger.warn("Could not queue a download log record", error);
+    // a queue that could not be read is left as it is (8.3)
+    logger.warn("Could not queue a download log record; the queue is left as it was", error);
     return;
   }
   if (flushDelayMs > 0 && !flushTimer) {
@@ -504,7 +532,8 @@ export async function logDownload(record) {
  */
 async function postRecords(batch, deps) {
   try {
-    await post("/api/doclink/downloads", { records: batch.map(wireRecord) }, deps);
+    // a 2xx took the records, even when its answer cannot be read (8.4)
+    await request("POST", "/api/doclink/downloads", { records: batch.map(wireRecord) }, deps, { taken: true });
     return { sent: batch, refused: [] };
   } catch (error) {
     if (!(error instanceof DownloadLogError && REJECTED_STATUSES.has(error.status))) return { sent: [], refused: [], error };
@@ -517,14 +546,23 @@ async function postRecords(batch, deps) {
   }
 }
 
+/**
+ * Records the Recon Engine took whose queue entry could not be taken out then (the queue could not be
+ * read): never posted again from this context, and taken out at its next flush (8.3, 8.4).
+ */
+const takenNotRemoved = new Set();
+
 /** Take posted and refused records out of the queue (by their queue id) and keep the refused ones aside. */
 async function settleQueue(sent, refused) {
-  const gone = new Set([...sent, ...refused.map((r) => r.record)].map((r) => r.qid));
+  for (const r of sent) takenNotRemoved.add(r.qid);
   await withQueue(async () => {
+    // every read before the first write: a read that fails leaves the queue and the records set aside as they are (8.3)
     const queue = await readQueue();
+    const aside = refused.length ? await readKey(REJECTED_KEY) : [];
+    const gone = new Set([...takenNotRemoved, ...refused.map((r) => r.record.qid)]);
     await writeQueue(queue.filter((r) => !gone.has(r.qid)));
+    takenNotRemoved.clear();
     if (refused.length) {
-      const aside = await readKey(REJECTED_KEY);
       const at = new Date().toISOString();
       aside.push(...refused.map(({ record, status, detail }) => ({ record: wireRecord(record), status, detail, at })));
       await storage().set({ [REJECTED_KEY]: aside.slice(-MAX_REJECTED) });
@@ -546,11 +584,15 @@ export function flushDownloadLog(deps = {}) {
   // one flush of a queue at a time (in any context); the queue stays free for new records while a batch is posted
   return withLock(`${queueKey()}.flush`, async () => {
     let queue = await withQueue(async () => {
-      const q = await readQueue();
-      if (!q.some((r) => !r.qid)) return q;
+      const read = await readQueue();
+      // records the Recon Engine took at an earlier flush whose removal failed then: out now, never posted again
+      const q = read.filter((r) => !takenNotRemoved.has(r.qid));
+      if (q.length === read.length) takenNotRemoved.clear();
+      if (q.length === read.length && !q.some((r) => !r.qid)) return q;
       // records queued by an older DocLink have no queue id: give them one (stored) so each leaves exactly once
       const withIds = q.map((r) => (r.qid ? r : { ...r, qid: newQueueId() }));
       await writeQueue(withIds);
+      takenNotRemoved.clear();
       return withIds;
     });
     if (!queue.length) return { posted: 0, pending: 0 };
@@ -576,7 +618,7 @@ export function flushDownloadLog(deps = {}) {
       if (result.error) {
         const error = result.error;
         const code = error instanceof DownloadLogError ? error.code : "UNKNOWN";
-        const pending = (await readQueue()).length;
+        const pending = await readQueue().then((q) => q.length, () => -1);
         logger.warn(`Download log: ${pending} record(s) kept for later (${code})`, { status: error.status ?? null });
         return { posted, pending, code, ...(refusedCount ? { refused: refusedCount } : {}) };
       }

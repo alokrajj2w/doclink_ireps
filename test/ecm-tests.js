@@ -12,7 +12,7 @@ import {
   EcmError, ECM_ERROR, ECM_KIND, ECM_OUTCOME, isTransientStatus, ecmErrorCode
 } from "../services/ecm-service.js";
 import { applyReconConfig, RECON_CONFIG } from "../services/recon-service.js";
-import { applyEcmConfig } from "../services/ecm-config.js";
+import { applyEcmConfig, ecmDirectProblem, ECM_CONFIG } from "../services/ecm-config.js";
 import { describeError } from "../utils/messages.js";
 import { DeadlineError } from "../utils/http.js";
 
@@ -109,6 +109,38 @@ export async function runEcmTests({ test, assert, eq }) {
     await rejectsEcm(uploadToEcm(DOC, { fetch: untouched, hostPermissions: HOSTS }), ECM_ERROR.NOT_CONFIGURED, "no reconBaseUrl");
     eq(untouched.calls.length, 0, "nothing sent");
     for (const code of Object.values(ECM_ERROR)) assert(describeError(code).code === code, `${code} has catalog text`);
+  });
+
+  await test("ECM config (8.7): an unknown ecm.env fails closed with ECM_NOT_CONFIGURED naming the value, never the TEST folders; nothing is sent", async () => {
+    const NUXEO_HOSTS = [...HOSTS, "http://ecm.test:8080/*"];
+    const direct = (env) => ({ ecmBackendAws: false, ecm: { env, domain: "http://ecm.test:8080", clientId: "id", clientSecret: "secret" } });
+    const problem = 'ecm.env "PRD" is neither TEST nor PROD';
+    try {
+      applyEcmConfig(direct("PRD"));
+      eq(ECM_CONFIG.env, "", "no ECM environment at all");
+      eq(ecmDirectProblem(NUXEO_HOSTS), problem);
+      const untouched = fakeFetch(() => jsonResponse(200, {}));
+      const error = await rejectsEcm(uploadToEcm(DOC, { fetch: untouched, hostPermissions: NUXEO_HOSTS }), ECM_ERROR.NOT_CONFIGURED);
+      eq(error.detail, problem);
+      assert(describeError(error.code, { detail: error.detail }).message.includes(problem), "the panel names the value");
+      const check = await findInEcm({ kind: ECM_KIND.INSPECTION_CERTIFICATE, account: HOSUR, candidates: [{ ref: "a", fields: DOC.fields }] }, { fetch: untouched, hostPermissions: NUXEO_HOSTS });
+      eq(check.ok, false);
+      eq(check.code, ECM_ERROR.NOT_CONFIGURED);
+      let localSaves = 0;
+      const saved = await saveToEcmOrLocally(DOC, async () => ({ downloadId: ++localSaves, filename: "x.pdf" }), { fetch: untouched, hostPermissions: NUXEO_HOSTS });
+      eq(saved.ecm.code, ECM_ERROR.NOT_CONFIGURED);
+      eq(localSaves, 1, "saved locally, as for every ECM settings problem");
+      eq(untouched.calls.length, 0, "nothing sent to the ECM");
+      for (const env of ["TEST", "prod", " Test "]) {
+        applyEcmConfig(direct(env));
+        eq(ecmDirectProblem(NUXEO_HOSTS), "", `ecm.env "${env}"`);
+      }
+      applyEcmConfig(direct(undefined));
+      eq(ECM_CONFIG.env, "TEST", "not set: TEST, as always");
+      eq(ecmDirectProblem(NUXEO_HOSTS), "");
+    } finally {
+      applyEcmConfig({ ecmBackendAws: true });
+    }
   });
 
   await test("ECM dates: IREPS spellings become YYYY-MM-DD; an unreadable optional date is left out", () => {

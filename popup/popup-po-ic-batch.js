@@ -8,12 +8,19 @@
  * and reopening the panel mid-run just fetches the state again
  * (BATCH_GET_STATE). Everything that came from IREPS is written with
  * textContent, never as markup.
+ *
+ * Only this panel's own batches are shown (popup-gate.js isOwnRun). A scheduled batch, or one another
+ * tab's panel started, is only noted while it runs (its start button waits): it never replaces the
+ * finished batch shown here, nor its Retry. A state read when the view opens may be old: it never sets
+ * the IREPS indicator, and an old "login required" is not shown again (4.10).
  */
 
 import { MESSAGE_TYPES, describeError, asDescribedError } from "../utils/messages.js";
 import { ECM_OUTCOME, describeEcmOutcome, summariseEcm } from "../services/ecm-service.js";
 import { describeSkip, skipChipText } from "../services/download-log.js";
 import { localIsoDate } from "../utils/dates.js";
+import { noteBackgroundRun, backgroundRunText } from "./popup-common.js";
+import { isOwnRun } from "./popup-gate.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -31,6 +38,9 @@ const KINDS = {
 
 /** The kinds with a From / To date pair (inputs <prefix>-from / <prefix>-to). */
 const DATED = ["po-date", "ic-date"];
+
+/** How #background-runs names a batch this panel did not start. */
+const BACKGROUND_LABEL = { "po-date": "POs by PO date", "ic-date": "ICs by IC date", "ic-notif": "ICs from notifications" };
 
 const IDLE_LABEL = { pod: "Download All Matching POs", icd: "Download ICs Issued in Range", icn: "Download IC from Notifications" };
 
@@ -93,18 +103,71 @@ function hideAll(prefix) {
   v.result.hidden = true;
 }
 
-function showError(prefix, error) {
+/** `live`: false for a state read when the view opens, which never sets the IREPS indicator (4.10). */
+function showError(prefix, error, { live = true } = {}) {
   const v = el[prefix];
   const described = asDescribedError(error);
   hideAll(prefix);
   setBusy(prefix, false, idleLabel(prefix));
-  ctx.setConnectionForError(described);
+  if (live) ctx.setConnectionForError(described);
   v.errorTitle.textContent = described.title;
   v.errorMessage.textContent = described.message;
   v.openIreps.hidden = described.connection !== "login";
   v.error.classList.toggle("is-notice", described.notice === true);
   v.error.hidden = false;
 }
+
+/**
+ * A state to draw as nothing: none, idle, or an old "login required" read when the view opens (the live check
+ * decides). A batch that runs is never nothing, also before it has a state of its own (7.10).
+ */
+function blank(state, live) {
+  if (state && state.running) return false;
+  return !state || state.phase === "idle" || (!live && state.phase === "error" && asDescribedError(state.error).loginRequired);
+}
+
+/**
+ * A batch of this panel's that has started but has nothing to show yet (the worker reads the IREPS account and
+ * opens the search first, which can take a while): it says "Starting..." and its button stays busy (7.10).
+ * Returns whether it drew that.
+ */
+function drawStarting(prefix, state) {
+  if (!state || !state.running || state.counts) return false;
+  const v = el[prefix];
+  hideAll(prefix);
+  v.details.hidden = true;
+  v.progress.hidden = false;
+  v.progressMessage.textContent = "Starting...";
+  v.bar.max = 1;
+  v.bar.value = 0;
+  setBusy(prefix, true, "Starting...");
+  return true;
+}
+
+/**
+ * The IREPS indicator after a finished batch: only for a run that just ended (a state read when the view
+ * opens may be old, 4.10), and an expired session shows as such, never as "Connected" (1.18).
+ */
+function finishedConnection(state, live) {
+  if (!live) return;
+  if (state.sessionExpired) ctx.setConnectionForError(describeError("IREPS_SESSION_EXPIRED"));
+  else ctx.setConnection("connected", "Connected");
+}
+
+/**
+ * A batch of `kind` this panel did not start (a scheduled one, another tab's) holds the job: the panel
+ * says so and the kind's start and Retry buttons wait. null: no such run (any more).
+ */
+function noteBackground(kind, startedBy) {
+  const v = el[KINDS[kind].prefix];
+  const running = startedBy !== null && startedBy !== undefined;
+  noteBackgroundRun(`batch:${kind}`, running ? backgroundRunText(BACKGROUND_LABEL[kind], startedBy) : null);
+  if (!v.button.classList.contains("is-busy")) v.button.disabled = running;
+  v.retry.disabled = running;
+}
+
+/** Who runs a batch of the kind now, when it is not this panel's run (else null). */
+const backgroundStarter = (state) => (state && state.busyWith != null && !isOwnRun(state.busyWith) ? state.busyWith : null);
 
 function renderCounts(prefix, rows) {
   const dl = el[prefix].counts;
@@ -158,16 +221,17 @@ function listItem(title, meta, status, labels, why, chipText) {
 /* PO by date                                                                 */
 /* -------------------------------------------------------------------------- */
 
-function renderPoDate(state) {
+function renderPoDate(state, { live = true } = {}) {
   const v = el.pod;
-  if (!state || state.phase === "idle") {
+  if (blank(state, live)) {
     hideAll("pod");
     setBusy("pod", false, idleLabel("pod"));
     v.details.hidden = true;
     return;
   }
+  if (drawStarting("pod", state)) return;
   if (state.phase === "error") {
-    showError("pod", state.error);
+    showError("pod", state.error, { live });
     return;
   }
   const c = state.counts;
@@ -201,7 +265,7 @@ function renderPoDate(state) {
     v.resultText.textContent = "";
   } else {
     setBusy("pod", false, idleLabel("pod"));
-    ctx.setConnection("connected", "Connected");
+    finishedConnection(state, live);
     v.result.hidden = false;
     const retryable = state.items.filter((i) => i.status === "failed" && i.url).length;
     if (c.found === 0) {
@@ -238,16 +302,17 @@ function renderPoDate(state) {
 /* IC by IC date                                                              */
 /* -------------------------------------------------------------------------- */
 
-function renderIcDate(state) {
+function renderIcDate(state, { live = true } = {}) {
   const v = el.icd;
-  if (!state || state.phase === "idle") {
+  if (blank(state, live)) {
     hideAll("icd");
     setBusy("icd", false, idleLabel("icd"));
     v.details.hidden = true;
     return;
   }
+  if (drawStarting("icd", state)) return;
   if (state.phase === "error") {
-    showError("icd", state.error);
+    showError("icd", state.error, { live });
     return;
   }
   const c = state.counts;
@@ -283,7 +348,7 @@ function renderIcDate(state) {
     v.resultText.textContent = "";
   } else {
     setBusy("icd", false, idleLabel("icd"));
-    ctx.setConnection("connected", "Connected");
+    finishedConnection(state, live);
     v.result.hidden = false;
     const retryable = state.items.filter((i) => i.status === "failed" && i.url).length;
     if (c.found === 0) {
@@ -320,16 +385,17 @@ function renderIcDate(state) {
 /* IC from notifications                                                      */
 /* -------------------------------------------------------------------------- */
 
-function renderIcNotif(state) {
+function renderIcNotif(state, { live = true } = {}) {
   const v = el.icn;
-  if (!state || state.phase === "idle") {
+  if (blank(state, live)) {
     hideAll("icn");
     setBusy("icn", false, idleLabel("icn"));
     v.details.hidden = true;
     return;
   }
+  if (drawStarting("icn", state)) return;
   if (state.phase === "error") {
-    showError("icn", state.error);
+    showError("icn", state.error, { live });
     return;
   }
   const c = state.counts;
@@ -366,7 +432,7 @@ function renderIcNotif(state) {
     v.resultText.textContent = "";
   } else {
     setBusy("icn", false, idleLabel("icn"));
-    ctx.setConnection("connected", "Connected");
+    finishedConnection(state, live);
     v.result.hidden = false;
     const already = c.alreadyDownloaded || 0;
     const problems = c.failed + c.skipped - already + c.unparsed + c.notFound + c.searchErrors + c.noLink;
@@ -404,6 +470,10 @@ function renderIcNotif(state) {
       const dup = (n.duplicateOf || []).includes(id);
       const why = dup ? null : i.skip ? describeSkip(i.skip) : i.error ? errorText(i.error) || i.error.detail : describeEcmOutcome(i.ecm) || null;
       rows.push(listItem(`   IC Call ${i.callId || "?"}`, [i.icDate, i.filename].filter(Boolean).join(" · "), dup ? "duplicate" : i.status, ITEM_LABEL, why, !dup && i.skip ? skipChipText(i.skip) : undefined));
+      // the same IC listed again for this notice (`repeats`, item 9.3): one "Duplicate" row each, after the IC
+      for (const repeat of (n.repeats || []).filter((r) => r && r.itemId === id)) {
+        rows.push(listItem(`   IC Call ${repeat.callId || i.callId || "?"}`, [repeat.icDate || i.icDate, i.filename].filter(Boolean).join(" · "), "duplicate", ITEM_LABEL, null));
+      }
     }
   }
   v.list.replaceChildren(...rows);
@@ -436,9 +506,19 @@ async function retry(kind) {
   if (!response || response.started === false) showError(KINDS[kind].prefix, (response && response.error) || describeError("NO_BACKGROUND_RESPONSE", { detail: "no reply to the retry request" }));
 }
 
+/**
+ * A state read when the view opens (it may be old, `live: false`): this panel's own batch only; a batch
+ * another tab's panel started is not shown as this panel's. A batch this panel did not start that runs
+ * now is noted, and the kind's buttons wait for it.
+ */
+function renderOpened(kind, state) {
+  RENDERERS[kind](state && isOwnRun(state.startedBy) ? state : null, { live: false });
+  noteBackground(kind, backgroundStarter(state));
+}
+
 async function refresh(kind) {
   const state = await ctx.send(MESSAGE_TYPES.BATCH_GET_STATE, { kind });
-  RENDERERS[kind](state);
+  renderOpened(kind, state);
   return state;
 }
 
@@ -470,18 +550,30 @@ export function refreshBatchDestination() {
   }
 }
 
-/** Route BATCH_UPDATE broadcasts. Returns true when handled. */
+/**
+ * Route BATCH_UPDATE broadcasts. Returns true when handled. A batch this panel did not start (a scheduled
+ * one, another tab's) is only noted while it runs: the finished batch shown here and its Retry stay.
+ */
 export function handleBatchMessage(message) {
   if (message.type !== MESSAGE_TYPES.BATCH_UPDATE) return false;
-  if (!el.view.hidden && RENDERERS[message.kind]) RENDERERS[message.kind](message.state);
+  const kind = message.kind;
+  if (!RENDERERS[kind]) return true;
+  const state = message.state || {};
+  if (!isOwnRun(state.startedBy)) {
+    noteBackground(kind, state.running ? state.startedBy : null);
+    return true;
+  }
+  if (!el.view.hidden) RENDERERS[kind](state);
   return true;
 }
 
-/** Reopen the batch view when a batch is still running. */
+/** Reopen the batch view when a batch this panel started is still running. */
 export async function restoreBatch() {
   const states = await Promise.all(Object.keys(KINDS).map((kind) => ctx.send(MESSAGE_TYPES.BATCH_GET_STATE, { kind })));
-  if (!states.some((s) => s && s.running)) return false;
+  const own = states.map((s) => (s && isOwnRun(s.startedBy) ? s : null));
+  Object.keys(KINDS).forEach((kind, i) => noteBackground(kind, backgroundStarter(states[i])));
+  if (!own.some((s) => s && s.running)) return false;
   ctx.showView("po-ic-batch");
-  Object.keys(KINDS).forEach((kind, i) => RENDERERS[kind](states[i]));
+  Object.keys(KINDS).forEach((kind, i) => renderOpened(kind, states[i]));
   return true;
 }

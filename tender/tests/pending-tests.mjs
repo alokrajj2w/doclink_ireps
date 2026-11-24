@@ -296,6 +296,25 @@ test('when Chrome cannot print, the letter keeps the text rendering + original .
     delete chrome.tabs;
   }
 });
+test('10.3: when the print tab cannot be handed the letter page, the blank tab is not saved as the letter: the text rendering + original .html are kept, with why', async () => {
+  scenario();
+  const dbg = fakeChromeDebugger(chrome, { fulfillError: 'Invalid InterceptionId.' });
+  try {
+    const r = await go();
+    assert.equal(r.summary.lettersDownloaded, 3);
+    assert.ok(!dbg.calls.some((c) => c[0] === 'Page.printToPDF'), 'the tab that did not get the page is not printed');
+    const letter = saved.find((s) => /Pending\/19264728\/Correspondence_502_.*\.pdf$/.test(s.filename));
+    assert.doesNotMatch(new TextDecoder().decode(letter.bytes), /chrome-print/);
+    assert.match(new TextDecoder('latin1').decode(letter.bytes), /please confirm the offer validity/);
+    assert.ok(saved.some((s) => /Correspondence_502_.*\.html$/.test(s.filename)), 'the original page is kept');
+    const v = stored().letters.find((x) => x.letterId === '9002').files.find((f) => f.role === 'letter').validation;
+    assert.equal(v.kind, 'pdf (rendered from HTML)');
+    assert.match(v.printError, /could not be handed to the print tab \(Invalid InterceptionId\.\)/);
+  } finally {
+    delete chrome.debugger;
+    delete chrome.tabs;
+  }
+});
 // ---- Save to: ECM / S3 (straight to a fake ECM, "ecmBackendAws": false: no Recon sign-in)
 const ecmCfg = await import('../../services/ecm-config.js');
 const NUXEO = 'http://ecm.test:8080';
@@ -443,6 +462,18 @@ test('T8b a failed attachment keeps the letter saved; retry downloads only the m
   assert.equal(pdfs().filter((s) => /\/l\.pdf$/.test(s.filename)).length, 1, 'letter not saved twice');
 });
 
+test('10.2: an attachment that is not a PDF and whose Content-Disposition name holds a "%" is saved under that name, never failed with "URI malformed"', async () => {
+  const OLE = new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0, 0, 0]);
+  mk({
+    rows: [{ no: 'A', oid: '1' }],
+    details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'rates' }] } },
+    letters: { 7: () => ({ status: 200, bytes: enc('<html><body><iframe src="/ireps/corr/l.pdf"></iframe><a href="/ireps/corr/rates.doc">Rates</a></body></html>'), type: 'text/html', extra: {} }) },
+    attachments: { 'l.pdf': letterPdf('l'), 'rates.doc': () => ({ status: 200, bytes: OLE, type: 'application/msword', extra: { 'content-disposition': 'attachment; filename="Rates 10%.doc"' } }) },
+  });
+  const r = await go();
+  assert.deepEqual([r.summary.lettersDownloaded, r.summary.attachmentsDownloaded, r.summary.failed], [1, 1, 0], JSON.stringify(stored().letters.map((l) => l.error)));
+  assert.ok(saved.some((s) => s.filename.endsWith('/Pending/A/Rates 10%.doc')), saved.map((s) => s.filename).join('\n'));
+});
 test('File names: two letters of a tender attach different files with one IREPS name - both are kept, the later with its letter number; again on a re-run', async () => {
   const page = (dir) => () => ({ status: 200, bytes: enc(`<html><body><iframe src="/ireps/corr/${dir}/letter.pdf"></iframe><a href="/ireps/corr/${dir}/Annexure.pdf">Annexure</a></body></html>`), type: 'text/html', extra: {} });
   mk({
@@ -541,6 +572,18 @@ test('H4: a correspondence page without a "Correspondence - Pending" table DocLi
   mk({ rows: [] });
   assert.equal((await go()).empty, true, 'IREPS\'s own empty Pending table is still "No correspondence found"');
 });
+test('1.6: a Pending row DocLink cannot open (no nitOid) is reported for review, never "No correspondence found"', async () => {
+  mk({ rows: [{ no: 'X1', oid: '' }] });
+  const events = [];
+  const r = await go({ onEvent: (e) => events.push(e) });
+  assert.equal(r.empty, false, 'the panel does not say "No correspondence found"');
+  assert.equal(r.summary.needsReview, 1);
+  assert.deepEqual(r.needsReview, [{ tenderNo: 'X1', reason: 'No pending-correspondence action with a nitOid was found on this row' }]);
+  assert.ok(events.some((e) => e.type === 'records' && e.skipped.some((s) => s.tenderNo === 'X1' && s.unreadable)), 'the row is shown in the table, for review');
+  mk({ rows: [{ no: 'X1', oid: '' }, { no: 'A', oid: '1' }], details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'x' }] } }, letters: { 7: letterPdf('a') } });
+  const mixed = await go();
+  assert.deepEqual([mixed.empty, mixed.summary.lettersDownloaded, mixed.summary.needsReview], [false, 1, 1]);
+});
 test('H4: a details page without a "Pending Replies" table fails that record (Retry failed retries it); an empty one is still "no pending letters"', async () => {
   mk({
     rows: [{ no: 'A', oid: '1' }, { no: 'B', oid: '2' }],
@@ -556,6 +599,15 @@ test('H4: a details page without a "Pending Replies" table fails that record (Re
   server.s.details[1].noPendingHeading = false;
   const again = await go({ mode: 'retry' });
   assert.equal(again.summary.lettersDownloaded, 1, 'retried, and downloaded once IREPS shows the table');
+});
+test('2.3: a record that fails this run is counted as failed (Retry failed is offered) even when an earlier run listed its letters', async () => {
+  mk({ rows: [{ no: 'A', oid: '1' }], details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'x' }] } }, letters: { 7: letterPdf('a') } });
+  assert.equal((await go()).summary.lettersDownloaded, 1);
+  server.s.details = {}; // IREPS now answers the record's details page with HTTP 500
+  const r = await go();
+  assert.equal(stored().records.find((x) => x.nitOid === '1').status, 'FAILED');
+  assert.equal(r.summary.failed, 1, 'the red row is counted, so the panel offers "Retry failed"');
+  assert.deepEqual(r.failedRecords.map((f) => [f.tenderNo, f.code]), [['A', 'HTTP']]);
 });
 test('M21: letters and records not seen in a run for 400 days are forgotten; at most 2,000 letters are kept', () => {
   const now = Date.parse('2026-11-15T10:00:00Z');
@@ -598,17 +650,30 @@ test('L12: an attachment GET that cannot reach IREPS is tried again; the letter 
 });
 
 // =========================== UI (real popup.html in jsdom) ==============================
+let panelLoaded = null;
+/** popup.html in jsdom with tender/pending-ui.js loaded, once for all the UI tests (the view's listeners belong to that page). */
+function correspondencePanel() {
+  panelLoaded ||= (async () => {
+    const dom = new JSDOM(readFileSync(new URL('../../popup/popup.html', import.meta.url), 'utf8').replace(/<script[^>]*><\/script>/g, ''), { pretendToBeVisual: true });
+    // the panel's own events (Recon sign-in, download-again prompt) must be jsdom's, as in the real page
+    Object.assign(globalThis, { document: dom.window.document, window: dom.window, MutationObserver: dom.window.MutationObserver, Event: dom.window.Event, CustomEvent: dom.window.CustomEvent });
+    Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
+    await import('../pending-ui.js');
+  })();
+  return panelLoaded;
+}
+const pcEl = (id) => document.getElementById(id);
+/** Until the view's run has ended (its progress line is hidden again). */
+const pcFinished = async () => { for (let i = 0; i < 400 && (pcEl('pc-progress').hidden === true ? i < 3 : true); i++) await new Promise((r) => setTimeout(r, 25)); await new Promise((r) => setTimeout(r, 400)); };
+const pcRows = () => [...document.querySelectorAll('#pc-tbody tr')].map((tr) => tr.textContent.replace(/\s+/g, ' '));
+
 test('UI: clicking "Download All Correspondence" fills the progress table and counts; empty state shown when nothing pending', async () => {
-  const dom = new JSDOM(readFileSync(new URL('../../popup/popup.html', import.meta.url), 'utf8').replace(/<script[^>]*><\/script>/g, ''), { pretendToBeVisual: true });
-  // the panel's own events (Recon sign-in, download-again prompt) must be jsdom's, as in the real page
-  Object.assign(globalThis, { document: dom.window.document, window: dom.window, MutationObserver: dom.window.MutationObserver, Event: dom.window.Event, CustomEvent: dom.window.CustomEvent });
-  Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
-  const $ = (id) => document.getElementById(id);
   scenario();
-  await import('../pending-ui.js');
+  await correspondencePanel();
+  const $ = pcEl;
   assert.equal($('btn-pending-open').textContent, 'Correspondence');
   assert.match($('btn-pc-run').textContent, /Download All Correspondence/);
-  const finished = async () => { for (let i = 0; i < 400 && ($('pc-progress').hidden === true ? i < 3 : true); i++) await new Promise((r) => setTimeout(r, 25)); await new Promise((r) => setTimeout(r, 400)); };
+  const finished = pcFinished;
   $('btn-pc-run').click();
   await finished();
   const text = [...document.querySelectorAll('#pc-tbody tr')].map((tr) => tr.textContent.replace(/\s+/g, ' '));
@@ -624,6 +689,68 @@ test('UI: clicking "Download All Correspondence" fills the progress table and co
   await finished();
   assert.equal($('pc-empty').hidden, false);
   assert.equal($('pc-empty').textContent, 'No correspondence found');
+});
+test('UI (7.12): a run that fails at its start shows its own error alone, never the last run\'s counts, folder or "Retry failed"', async () => {
+  // a run that leaves a letter to retry (IREPS answers it with HTTP 404): its counts, folder and Retry are shown
+  mk({ rows: [{ no: 'A', oid: '1' }], details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'x' }] } }, letters: {} });
+  await correspondencePanel();
+  const $ = pcEl;
+  $('btn-pc-run').click();
+  await pcFinished();
+  assert.deepEqual([$('pc-counts').hidden, $('pc-n-failed').textContent, $('btn-pc-retry').hidden], [false, '1', false]);
+  assert.match($('pc-folder').textContent, /^Downloads\//);
+  // the next run meets IREPS's login page before anything is listed
+  server.s.expired = true;
+  $('btn-pc-run').click();
+  await pcFinished();
+  assert.deepEqual([$('pc-error').hidden, $('pc-error-message').textContent], [false, core.SESSION_MSG]);
+  assert.deepEqual([$('pc-counts').hidden, $('pc-folder').textContent, $('btn-pc-retry').hidden, $('pc-n-failed').textContent], [true, '', true, '0'], 'nothing of the last run next to the error');
+  assert.deepEqual(pcRows(), []);
+});
+test('7.13: "Retry failed" counts what an earlier run saved as already saved, never as new, and a record that earlier run finished shows as downloaded', async () => {
+  const twoRecords = () => mk({
+    rows: [{ no: 'A', oid: '1' }, { no: 'B', oid: '2' }],
+    details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'done' }] }, 2: { oid: '2', tenderNo: 'B', letters: [{ no: '2', id: '8', subject: 'later' }] } },
+    letters: { 7: () => ({ status: 200, bytes: enc('<html><body><iframe src="/ireps/corr/l7.pdf"></iframe><a href="/ireps/corr/a7.pdf">Annex</a></body></html>'), type: 'text/html', extra: {} }) },
+    attachments: { 'l7.pdf': letterPdf('l7'), 'a7.pdf': letterPdf('a7') },
+  });
+  twoRecords();
+  const first = await go();
+  assert.deepEqual([first.summary.lettersDownloaded, first.summary.attachmentsDownloaded, first.summary.failed], [1, 1, 1]);
+  server.s.letters[8] = letterPdf('eight'); // IREPS now gives B's letter
+  const events = [];
+  const again = await go({ mode: 'retry', onEvent: (e) => events.push(e) });
+  assert.deepEqual([again.summary.lettersDownloaded, again.summary.alreadyDownloaded, again.summary.attachmentsDownloaded, again.summary.failed], [2, 1, 0, 0],
+    'B\'s letter is this run\'s; A\'s letter and its attachment were saved by the first run');
+  assert.equal(server.hits['7'], 1, 'A\'s letter is not opened again');
+  const recordA = events.filter((e) => e.type === 'record' && e.nitOid === '1').pop().record;
+  assert.deepEqual([recordA.status, recordA.savedEarlier], ['DOWNLOADED', true]);
+  assert.ok(events.some((e) => e.type === 'letter' && e.letter.letterId === '7' && e.letter.status === 'DOWNLOADED' && e.letter.alreadyDownloaded), 'A\'s letter is listed, as already downloaded');
+  // the same in the view: no row stays "PENDING", and the counts say what the retry did
+  twoRecords();
+  await correspondencePanel();
+  const $ = pcEl;
+  $('btn-pc-run').click();
+  await pcFinished();
+  assert.equal($('btn-pc-retry').hidden, false);
+  server.s.letters[8] = letterPdf('eight');
+  $('btn-pc-retry').click();
+  await pcFinished();
+  assert.ok(!pcRows().some((t) => /PENDING/.test(t)), pcRows().join('\n'));
+  const rowsOfA = pcRows().filter((t) => t.startsWith('A'));
+  assert.ok(rowsOfA.length && rowsOfA.every((t) => /DOWNLOADED/.test(t) && /Downloaded by an earlier run|already downloaded/.test(t)), pcRows().join('\n'));
+  assert.deepEqual([$('pc-n-downloaded').textContent, $('pc-n-attachments').textContent, $('pc-n-failed').textContent], ['2 (1 already saved)', '0', '0']);
+  // a finished record whose letters DocLink no longer keeps (STATE_LIMITS) shows as downloaded too, never "PENDING"
+  twoRecords();
+  $('btn-pc-run').click();
+  await pcFinished();
+  const kept = store['doclink.tender.ledger.833'].manifests['pending-correspondence'];
+  for (const k of Object.keys(kept.letters)) if (kept.letters[k].letterId === '7') delete kept.letters[k];
+  server.s.letters[8] = letterPdf('eight');
+  $('btn-pc-retry').click();
+  await pcFinished();
+  assert.ok(!pcRows().some((t) => /PENDING/.test(t)), pcRows().join('\n'));
+  assert.ok(pcRows().some((t) => t.startsWith('A') && /DOWNLOADED/.test(t) && /Downloaded by an earlier run/.test(t)), pcRows().join('\n'));
 });
 
 // =========================== scheduled downloads, Phase 2 (tender-shared-run.js) ===========================
@@ -656,6 +783,93 @@ test('Scheduled run: each pending letter is reserved; one already saved is not o
   assert.equal(calls.saved.length, calls.ecm.length, 'every ECM save reported');
   assert.ok(calls.saved.every((r) => r.destination === 'ecm' && r.doc_type === dlog.TENDER_DOC_TYPE.PENDING_CORRESPONDENCE));
   assert.ok(Object.keys(store).some((k) => k.endsWith('#scheduled')), 'its own ledger');
+});
+
+// ---- how a scheduled correspondence run ends, as tender/schedule-runner.js computes it
+const sharedHooksMod = await import('../../services/scheduler/shared-run-hooks.js');
+const tenderRunner = await import('../../services/scheduler/tender-runner.js');
+/**
+ * A fake Recon Engine that remembers what was saved for the account (`done`), so the next run's reservation
+ * says "taken" for it; `completeFails`: its answers to `complete` are lost (the runner tab was killed).
+ */
+const reconEngine = () => ({ done: new Set(), completed: [], completeFails: false });
+async function scheduledRun(recon, { uploads = [] } = {}) {
+  const api = {
+    reserve: async (req) => ({ granted: req.keys.filter((k) => !recon.done.has(k)), taken: Object.fromEntries(req.keys.filter((k) => recon.done.has(k)).map((k) => [k, { status: 'done', by: { name: 'Priya' } }])) }),
+    complete: async (req) => {
+      if (recon.completeFails) throw Object.assign(new Error('no answer'), { code: 'SCHEDULE_BACKEND_UNAVAILABLE' });
+      recon.completed.push(req);
+      for (const d of req.done) recon.done.add(d.doc_key);
+      return {};
+    },
+  };
+  const hooks = sharedHooksMod.createSharedRunHooks({ api, claimId: 'c1', account: { irepsAccountId: '833', operatingUnit: 'HOSUR' }, isClaimLive: () => true, sleep: async () => {}, logFallback: async () => {},
+    uploadEcm: async (doc) => (uploads.push(doc.filename), { uid: `u-${doc.filename}`, site: 'hosur', path: '/ECM/Hosur/Tenders', deduplicated: false }) });
+  let result = null;
+  let error = null;
+  sharedRun.beginSharedRun(hooks.tenderHooks);
+  try {
+    result = await go();
+  } catch (e) {
+    error = { code: e.code || 'UNKNOWN', message: e.message };
+  } finally {
+    sharedRun.endSharedRun();
+  }
+  const counts = await hooks.finishTenderRun({ stopped: tenderRunner.stoppedCode(result, error) });
+  return { result, outcome: tenderRunner.tenderRunOutcome({ result, error, counts, details: hooks.details() }), uploads };
+}
+const letterKeyOf = (letterId) => dlog.downloadKey.pending(`833|1|229609|${letterId}`, 'letter');
+test('Scheduled run (2.2): a letter saved without one of its attachments is not done: it is named, and the next check fetches only the missing attachment', async () => {
+  mk({
+    rows: [{ no: 'A', oid: '1' }],
+    details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'with attachment' }] } },
+    letters: { 7: () => ({ status: 200, bytes: enc('<html><body><iframe src="/ireps/corr/l.pdf"></iframe><a href="/ireps/corr/ok.pdf">ok</a><a href="/ireps/corr/bad.pdf">bad</a></body></html>'), type: 'text/html', extra: {} }) },
+    attachments: { 'l.pdf': letterPdf('l'), 'ok.pdf': letterPdf('ok') },
+  });
+  const recon = reconEngine();
+  const first = await scheduledRun(recon);
+  assert.deepEqual([first.outcome.outcome, first.outcome.code], ['partial', 'SCHEDULE_DOWNLOAD_FAILED'], JSON.stringify(first.outcome));
+  assert.deepEqual(first.outcome.result.failures.map((f) => f.doc), ['Tender A - letter 1 (attachment)']);
+  assert.match(first.outcome.result.failures[0].detail, /1 attachment\(s\) could not be downloaded \(the letter itself was saved\)\. IREPS returned HTTP 404/);
+  assert.ok(!recon.done.has(letterKeyOf('7')), 'the letter is not marked saved while its attachment is missing');
+  assert.ok(recon.completed.some((c) => c.failed.some((f) => f.doc_key === letterKeyOf('7'))), 'its reservation is released as failed');
+  server.s.attachments['bad.pdf'] = letterPdf('bad');
+  const second = await scheduledRun(recon);
+  assert.deepEqual(second.uploads, ['bad.pdf'], 'only the missing attachment: the letter and the other attachment are not uploaded again');
+  assert.equal(second.outcome.outcome, 'done', JSON.stringify(second.outcome));
+  assert.ok(recon.done.has(letterKeyOf('7')), 'now the letter is saved for the account');
+  const viewsBefore = server.hits['7'];
+  assert.equal((await scheduledRun(recon)).outcome.outcome, 'done');
+  assert.equal(server.hits['7'], viewsBefore, 'the next check does not open it again');
+});
+test('Scheduled run (1.10): a letter an earlier run saved to the ECM, but never reported (the runner tab was closed), is reported now; the slot ends done', async () => {
+  mk({ rows: [{ no: 'A', oid: '1' }], details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'x' }] } }, letters: { 7: letterPdf('a') } });
+  const recon = reconEngine();
+  recon.completeFails = true; // the tab is gone before it can tell the Recon Engine
+  await scheduledRun(recon);
+  assert.ok(!recon.done.has(letterKeyOf('7')));
+  recon.completeFails = false;
+  const views = server.hits['7'];
+  const next = await scheduledRun(recon);
+  assert.equal(server.hits['7'], views, 'the letter is not downloaded again');
+  assert.deepEqual(next.uploads, []);
+  assert.deepEqual([next.outcome.outcome, next.outcome.result.failed], ['done', 0], JSON.stringify(next.outcome));
+  assert.ok(recon.done.has(letterKeyOf('7')), 'the letter in the ECM is reported, so no check finds it "reserved, but not saved" again');
+});
+test('Scheduled run (1.6): letters and Pending rows DocLink could not match are "Needs review", never a "done" run; nothing pending at all is done', async () => {
+  mk({
+    rows: [{ no: 'A', oid: '1' }, { no: 'X1', oid: '' }],
+    details: { 1: { oid: '1', tenderNo: 'A', letters: [{ no: '1', id: '7', subject: 'ok' }, { no: '2', id: '8', subject: 'foreign', oid: '999' }] } },
+    letters: { 7: letterPdf('a'), 8: letterPdf('b') },
+  });
+  const { outcome } = await scheduledRun(reconEngine());
+  assert.deepEqual([outcome.outcome, outcome.code, outcome.result.saved], ['partial', 'SCHEDULE_NEEDS_REVIEW', 1], JSON.stringify(outcome));
+  assert.deepEqual(outcome.result.failures.map((f) => [f.doc, f.code]), [['Correspondence of tender X1', 'SCHEDULE_NEEDS_REVIEW'], ['Tender A - letter 2', 'SCHEDULE_NEEDS_REVIEW']]);
+  mk({ rows: [{ no: 'X1', oid: '' }] });
+  const unreadable = (await scheduledRun(reconEngine())).outcome;
+  assert.deepEqual([unreadable.outcome, unreadable.code], ['failed', 'SCHEDULE_NEEDS_REVIEW'], 'never "No correspondence found" as done');
+  mk({ rows: [] });
+  assert.equal((await scheduledRun(reconEngine())).outcome.outcome, 'done', 'IREPS lists nothing pending');
 });
 test('Scheduled run: a letter the ECM refuses is reported to the scheduler with its key, its name and the reason', async () => {
   scenario();

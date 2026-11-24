@@ -231,8 +231,12 @@ export async function runMaTests({ test, assert, eq, rejects, fixture }) {
     const bad = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond("<html><body><h2>Invalid Token</h2></body></html>") });
     await rejects(searchMa({}, { fetch: bad.fetchImpl, parseHtml }), "IREPS_MA_RESULTS_INVALID");
     eq(bad.calls.length, 4, "one fresh-token retry");
-    const empty = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(maPageFrom(maPage, "")) });
+    // an empty table that IREPS itself counts as empty ("Total 0 result(s)") is "nothing found"
+    const empty = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(maPageFrom(maPage, "").replace("Total 6 result(s)", "Total 0 result(s)")) });
     await rejects(searchMa({ dateMode: "all" }, { fetch: empty.fetchImpl, parseHtml }), "IREPS_MA_NOT_FOUND");
+    // no row read while IREPS's total says 6: a page DocLink could not read, never "nothing found" (inspection 4.1)
+    const unread = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(maPageFrom(maPage, "")) });
+    await rejects(searchMa({ dateMode: "all" }, { fetch: unread.fetchImpl, parseHtml }), "IREPS_MA_RESULTS_INVALID");
     const crash = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(maPage) });
     await rejects(
       searchMa({}, {

@@ -17,7 +17,7 @@
  * worker to pick the invoice.
  */
 
-import { normaliseInvoice, invoiceRecords, isSentToDoculink } from "./ecm-invoice.js";
+import { normaliseInvoice, invoiceRecords, isSentToDoculink, sameValue as same } from "./ecm-invoice.js";
 import { IrepsError } from "../ireps-api.js";
 import { BILL_ERROR } from "./bill-upload-api.js";
 
@@ -57,18 +57,6 @@ export function receiptInvoiceKey(receipt) {
     invoiceQuantity: String(Number.isFinite(receipt.qty) ? receipt.qty : receipt.qtyText ?? "")
   };
 }
-
-const text = (v) => String(v ?? "").trim();
-const number = (v) => {
-  const t = text(v).replace(/,/g, "");
-  return /^\d+(\.\d+)?$/.test(t) ? Number(t) : null;
-};
-/** Equal as numbers when both are numbers ("001" == "1"), else as trimmed text. */
-const same = (a, b) => {
-  const x = number(a);
-  const y = number(b);
-  return x !== null && y !== null ? x === y : text(a) !== "" && text(a).toUpperCase() === text(b).toUpperCase();
-};
 
 const describeKey = (inv) => `PO ${inv.customerPONumber ?? "?"} / Sr ${inv.customerPOSrNumber ?? "?"} / qty ${inv.quantity ?? "?"}`;
 

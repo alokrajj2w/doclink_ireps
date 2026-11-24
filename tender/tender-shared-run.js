@@ -3,13 +3,16 @@
 //   - every document is reserved for the IREPS account before it is fetched; one that anyone already saved
 //     is skipped without a question (no "download again?" prompt: nobody is looking at the runner tab);
 //   - it goes to the ECM only, never to Downloads (tender-ecm.js tenderEcmSink, tender-core.js createSaver);
-//   - each saved file is reported to the Recon Engine with its download-log record.
+//   - each saved file is reported to the Recon Engine with its download-log record, and each document that could not
+//     be saved with its reason (documentFailed). A document with attachments (a corrigendum) is reported saved only
+//     once all of them are: while one is missing, the document is reported failed, so its reservation is released and
+//     the next check fetches it again (tender-workflows.js resolveAndDownloadIrepsDocument).
 // Outside the runner tab nothing is installed and the tender code behaves exactly as before.
 // The hooks are services/scheduler/shared-run-hooks.js `tenderHooks`.
 
 let current = null;
 
-/** The installed hooks ({ reserveDocuments, ecmSink, documentSaved }), or null in a manual run. */
+/** The installed hooks ({ reserveDocuments, ecmSink, documentSaved, documentFailed }), or null in a manual run. */
 export const sharedRun = () => current;
 
 /** Install `hooks` for this page's one scheduled run. */

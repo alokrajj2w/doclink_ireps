@@ -97,36 +97,85 @@ export function stateCodeOf(text) {
   return null;
 }
 
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * Epoch ms DocLink reads as an invoice date: a day from 2000 to 2099 in IST. A date written as digits
+ * (20261030) or in epoch seconds (1793314800) is far below and would otherwise be a day in January 1970
+ * (review 3.10).
+ */
+const EPOCH_MS_FROM = Date.UTC(2000, 0, 1) - IST_OFFSET_MS;
+const EPOCH_MS_TO = Date.UTC(2100, 0, 1) - IST_OFFSET_MS;
+
+/** A time with its zone after an ISO date: "23:00:00.000Z", "00:00:00+05:30", "00:00+0100". */
+const ZONED_TIME = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*(Z|[+-](\d{2}):?(\d{2})?)$/i;
+
+/** dd/mm/yyyy of a real calendar day, else null. */
+function calendarDay(y, m, d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const date = new Date(Date.UTC(y, m - 1, d));
+  return date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d ? `${pad(d)}/${pad(m)}/${y}` : null;
+}
+
+/**
+ * The IST day of a moment. The ECM stores the invoice day as a midnight that is not UTC (1793314800000 =
+ * 2026-10-29T23:00Z, midnight 30 Oct in UTC+1), so the UTC day can be the day before. Read the day in IST,
+ * the invoice's own time zone.
+ */
+function istDay(ms) {
+  const date = new Date(ms + IST_OFFSET_MS);
+  return Number.isFinite(date.getTime()) ? calendarDay(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()) : null;
+}
+
+/** The moment of an ISO date and a ZONED_TIME match; NaN when the time or the zone is not a real one. */
+function zonedMs(y, m, d, zoned) {
+  const [hours, minutes, seconds] = [Number(zoned[1]), Number(zoned[2]), Number(zoned[3] || 0)];
+  const zone = zoned[4].toUpperCase();
+  const zoneMinutes = Number(zoned[6] || 0);
+  const offset = zone === "Z" ? 0 : (zone[0] === "-" ? -1 : 1) * (Number(zoned[5]) * 60 + zoneMinutes);
+  if (hours > 23 || minutes > 59 || seconds > 59 || zoneMinutes > 59 || Math.abs(offset) > 14 * 60) return NaN;
+  return Date.UTC(y, m - 1, d, hours, minutes, seconds) - offset * 60000;
+}
+
 /**
  * An ECM invoice date as IREPS writes it, dd/mm/yyyy, from "2026-08-18 00:00:00.000", "2026-08-18T..", "18/08/2026",
  * "18-08-2026", "18-Aug-2026" or epoch ms (a number, or the digit string live RetrieveInvoiceData sends); null when
- * it is not a real calendar date. (The panel's date inputs use utils/dates.js toIrepsDate, which takes only an
- * <input type="date"> value.)
+ * it is not a real calendar date. An ISO time with its zone (Nuxeo's "2026-10-29T23:00:00.000Z") and epoch ms give
+ * the IST day of that moment; a number that is not epoch ms of 2000 to 2099 is no date (review 3.10). (The panel's
+ * date inputs use utils/dates.js toIrepsDate, which takes only an <input type="date"> value.)
  */
 export function invoiceDateToIreps(value) {
   if (value === null || value === undefined || value === "") return null;
-  const pad = (n) => String(n).padStart(2, "0");
-  const valid = (y, m, d) => {
-    const date = new Date(Date.UTC(y, m - 1, d));
-    return date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d ? `${pad(d)}/${pad(m)}/${y}` : null;
-  };
   const t = String(value).trim();
-  if (typeof value === "number" || /^\d{12,13}$/.test(t)) {
-    // The ECM stores the invoice day as a midnight that is not UTC (1793314800000 = 2026-10-29T23:00Z, midnight
-    // 30 Oct in UTC+1), so the UTC day can be the day before. Read the day in IST, the invoice's own time zone.
-    const date = new Date(Number(t) + IST_OFFSET_MS);
-    return Number.isFinite(date.getTime()) ? valid(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()) : null;
+  if (typeof value === "number" || /^\d+$/.test(t)) {
+    const ms = Number(t);
+    return Number.isInteger(ms) && ms >= EPOCH_MS_FROM && ms < EPOCH_MS_TO ? istDay(ms) : null;
   }
-  let m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T].*)?$/.exec(t);
-  if (m) return valid(+m[1], +m[2], +m[3]);
+  let m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](.*))?$/.exec(t);
+  if (m) {
+    const day = calendarDay(+m[1], +m[2], +m[3]);
+    const zoned = m[4] === undefined ? null : ZONED_TIME.exec(m[4].trim());
+    // without a zone the day is the one written; with one, the IST day of that moment
+    return day && zoned ? istDay(zonedMs(+m[1], +m[2], +m[3], zoned)) : day;
+  }
   m = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(t);
-  if (m) return valid(+m[3], +m[2], +m[1]);
+  if (m) return calendarDay(+m[3], +m[2], +m[1]);
   m = /^(\d{1,2})[-/ ]([A-Za-z]{3})[A-Za-z]*[-/ ](\d{4})$/.exec(t);
-  if (m && MONTHS[m[2].toLowerCase()]) return valid(+m[3], MONTHS[m[2].toLowerCase()], +m[1]);
+  if (m && MONTHS[m[2].toLowerCase()]) return calendarDay(+m[3], MONTHS[m[2].toLowerCase()], +m[1]);
   return null;
 }
 
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+/**
+ * Why an invoice date is refused (invoiceDateToIreps gave none), in words for the user. A number is said to
+ * be one, so that 20261030 or epoch seconds is never taken for a typing slip in a date (review 3.10).
+ */
+export function invoiceDateRefusal(value) {
+  const t = String(value ?? "").trim();
+  if (typeof value === "number" || /^\d+$/.test(t)) {
+    return `Invoice date "${t}" is a number, but not a date in milliseconds as ECM sends it (1793314800000 is 30/10/2026). DocLink does not read other numbers as dates: check the invoice date, or enter the invoice by hand.`;
+  }
+  return `Invoice date "${t}" is not a date.`;
+}
 
 function irepsDateValue(ddmmyyyy) {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(ddmmyyyy || "");
@@ -140,9 +189,34 @@ export function parseAmount(value) {
   return t && /^-?\d+(\.\d+)?$/.test(t) ? Number(t) : NaN;
 }
 
-/** Two-decimal rounding as the page's toFixed(2) does it, without float drift. */
+/**
+ * Two-decimal rounding of a value DocLink picks itself: a GST rate for the page's drop-down, the ECM
+ * invoice amount for the header (the user would type both). Half up, with a nudge against float drift
+ * for small values (1.005 -> 1.01). It is NOT the bill page's rounding: an amount the page computes is
+ * rounded with pageRound2, which can round a half paisa the other way.
+ */
 export function round2(n) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * The bill page's own two-decimal rounding (billFunctions.js: parseFloat(x.toFixed(2))). It rounds the
+ * binary value, so a half paisa can go down: 595437.75 x 18 / 100 = 107178.795 is 107178.79 on the page
+ * (round2 gives 107178.80). Every amount DocLink sends on the bill item is rounded this way (review 3.9).
+ */
+export function pageRound2(n) {
+  return parseFloat(n.toFixed(2));
+}
+
+/**
+ * billFunctions.js to2Points: the page's reading of an amount field at two decimals (a text that is not
+ * a number is 0, an empty one NaN). Used where DocLink repeats a comparison the page makes.
+ */
+function to2Points(input) {
+  if (isNaN(input)) return 0;
+  const n = parseFloat(input);
+  const two = parseFloat(n.toFixed(2));
+  return two ? two : n;
 }
 
 /** "87 Set" -> 87 */
@@ -243,7 +317,7 @@ export function buildHeader({ receipt, invoice, form, payAuths, stockNonstock, g
   if (!invoiceNo) checks.push(err("The invoice has no invoice number."));
   else if (invoiceNo.length > LIMITS.invoiceNo || !/^[A-Za-z0-9\-/]+$/.test(invoiceNo)) checks.push(err(`Invoice number "${invoiceNo}" is not accepted by IREPS (at most 16 characters; letters, digits, - and / only).`));
   const invoiceDate = invoiceDateToIreps(invoice.invoiceDate);
-  if (!invoiceDate) checks.push(err(`Invoice date "${invoice.invoiceDate ?? ""}" is not a date.`));
+  if (!invoiceDate) checks.push(err(invoiceDateRefusal(invoice.invoiceDate)));
   else if (irepsDateValue(invoiceDate) > Date.UTC(today.getFullYear(), today.getMonth(), today.getDate())) checks.push(err(`Invoice date ${invoiceDate} is in the future.`));
   const amount = parseAmount(invoice.amount);
   if (!(amount > 0)) checks.push(err(`Invoice amount "${invoice.amount ?? ""}" is not a positive amount.`));
@@ -386,19 +460,75 @@ export function gstSplit(rate, supplierState, stateOfSupply) {
 }
 
 /**
- * Amounts of one bill item as the page's calculateExpAmt computes them for a Final bill
- * without discount, PVC or charges: taxable = rate x qty billed x payment% / 100; each GST
- * component = taxable x its rate, to two decimals; total = taxable + tax.
+ * Amounts of one bill item exactly as the page computes them for a Final bill without discount,
+ * PVC or charges (billFunctions.js calcBBR and calculateExpAmt, review 3.9):
+ *   basic rate = the PO rate to 5 decimals (calcBBR: _round(poRate + pvc - discount, 5));
+ *   taxable    = basic rate x qty billed x payment% / 100, kept unrounded;
+ *   each GST component = that taxable x its drop-down rate / 100, rounded with pageRound2;
+ *   tax        = the sum of the rounded components;
+ *   total      = the unrounded taxable + tax, rounded with pageRound2.
+ * Rounding the taxable first, or a half paisa up, differs from the page by 0.01 to 0.03 for some
+ * PO rates with paise. `taxable`, `tax` and `total` are the two-decimal values the page shows and
+ * sends (totalExpense, basicBillAmt, totalBilledAmt); `basicRate` is its basicBillRate.
  */
 export function computeAmounts({ rate, qty, paymentPercent = 100, gstRate, supplierState, stateOfSupply }) {
-  const taxable = round2((rate * qty * paymentPercent) / 100);
   const split = gstSplit(gstRate, supplierState, stateOfSupply);
-  const igst = round2((taxable * split.igst) / 100);
-  const cgst = round2((taxable * split.cgst) / 100);
-  const sgst = round2((taxable * split.sgst) / 100);
-  const utgst = round2((taxable * split.utgst) / 100);
-  const tax = round2(igst + cgst + sgst + utgst);
-  return { taxable, tax, total: round2(taxable + tax), split, igst, cgst, sgst, utgst };
+  const basicRate = parseFloat(rate.toFixed(5));
+  const exactTaxable = (basicRate * qty * paymentPercent) / 100;
+  // the page multiplies by the value its rate drop-down holds ("9", "4.45")
+  const component = (r) => pageRound2((exactTaxable * Number(rateText(r))) / 100);
+  const igst = component(split.igst);
+  const cgst = component(split.cgst);
+  const sgst = component(split.sgst);
+  const utgst = component(split.utgst);
+  const tax = cgst + sgst + utgst + igst;
+  return { basicRate, taxable: pageRound2(exactTaxable), tax: pageRound2(tax), total: pageRound2(exactTaxable + tax), split, igst, cgst, sgst, utgst };
+}
+
+/** The PAN inside a GSTIN (characters 3 to 12): which railway entity it belongs to. */
+const gstinPan = (gstin) => String(gstin || "").slice(2, 12);
+
+/**
+ * The railway GSTIN of the item (rlyGSTIN) and its checks (review 3.2). IREPS's bill page keeps
+ * only the railway GSTINs of the saved state of supply once the header is saved
+ * ($(".rlyGstinSelCls option:not([value^=" + supplyState + "])").remove(), stock HAR #54), and
+ * lists two per state for most states: the railways' own (PAN AAAGM0289C) and IRFC's
+ * (AAACI0681C). So:
+ *   - consignee GSTIN of the state of supply: it is used (it must be in IREPS's list);
+ *   - consignee in another state: the list's GSTIN of the state of supply, when exactly one fits:
+ *     the only one of that state, else the one with the consignee's PAN (the stock capture saved
+ *     29AAAGM0289C1ZF for consignee 37AAAGM0289C1ZI and state of supply 29). The change is a
+ *     warning the user must acknowledge;
+ *   - no single one fits: an error, and the item is not saved.
+ * @param {{ consigneeGstin: string|null, consigneeState?: string|null, stateOfSupply: string, supplierState: string, railwayGstins: { value: string, label?: string }[] }} input
+ * @returns {{ value: string, source: string, checks: { level: string, text: string }[] }}
+ */
+export function railwayGstinFor({ consigneeGstin, consigneeState = null, stateOfSupply, supplierState, railwayGstins = [] }) {
+  const consignee = String(consigneeGstin || "").trim().toUpperCase();
+  if (!consignee) return { value: "", source: "IREPS (consignee)", checks: [err("IREPS returned no consignee GSTIN for the railway GSTIN.")] };
+  const inList = (gstin) => railwayGstins.some((o) => o.value === gstin);
+  if (consignee.slice(0, 2) === stateOfSupply) {
+    const checks = railwayGstins.length && !inList(consignee) ? [err(`Consignee GSTIN ${consignee} is not in IREPS' railway GSTIN list.`)] : [];
+    return { value: consignee, source: "IREPS (consignee)", checks };
+  }
+  const where = `The consignee's GSTIN ${consignee} is in state ${consignee.slice(0, 2)}${consigneeState ? ` (${consigneeState})` : ""}, but the saved state of supply is ${stateOfSupply} ${stateName(stateOfSupply) || ""}`.trim();
+  const ofState = railwayGstins.filter((o) => o.value.slice(0, 2) === stateOfSupply);
+  const samePan = ofState.filter((o) => gstinPan(o.value) === gstinPan(consignee));
+  const pick = ofState.length === 1 ? ofState[0] : samePan.length === 1 ? samePan[0] : null;
+  if (!pick) {
+    const offered = ofState.length ? `it offers ${ofState.map((o) => o.value).join(", ")}` : "it offers none";
+    return {
+      value: "",
+      source: "IREPS railway GSTIN list",
+      checks: [err(`${where}. IREPS's bill page takes only a railway GSTIN of the state of supply, and DocLink cannot tell which one to use (${offered}). Save the item in IREPS yourself (open the draft bill and choose the RLY GSTIN), or delete the draft from the PO's Bills for Pay tab.`)]
+    };
+  }
+  const tax = supplierState !== stateOfSupply ? "IGST" : "CGST + SGST";
+  return {
+    value: pick.value,
+    source: `IREPS railway GSTIN list (state of supply ${stateOfSupply})`,
+    checks: [warn(`${where}. IREPS's bill page takes only a railway GSTIN of the state of supply, so DocLink uses ${pick.label || pick.value} as the railway GSTIN, not the consignee's. Tax: ${tax}, as the saved header says.`)]
+  };
 }
 
 /**
@@ -447,20 +577,18 @@ export function buildItem({ header, billRegNo, receipt, invoice, item, roNo, ro,
     checks.push(err(`Invoice amount ${invoiceAmount} differs from what IREPS computes for this receipt (${amounts.total} = ${amounts.taxable} + ${amounts.tax} GST).`));
   }
   if (Number.isFinite(maxClaim) && claim > maxClaim + 0.001) checks.push(err(`The claim ${claim} is more than IREPS allows (${maxClaim}).`));
-  // The page raises the max claim to the header invoice amount when that is larger (billFunctions.js calculateExpAmt).
+  // The page raises the max claim to the header invoice amount when that is larger, in whole rupees of
+  // its two-decimal reading of the max claim (billFunctions.js calculateExpAmt, to2Points).
   const headerInvoiceAmount = parseAmount(header.invoiceAmount);
-  const maxClaimSent = Number.isFinite(headerInvoiceAmount) && Number.isFinite(maxClaim) && Math.round(headerInvoiceAmount) > Math.round(maxClaim) ? String(headerInvoiceAmount) : ro.maxClaim;
+  const maxClaimSent = Number.isFinite(headerInvoiceAmount) && Number.isFinite(maxClaim) && Math.round(headerInvoiceAmount) > Math.round(to2Points(ro.maxClaim)) ? String(headerInvoiceAmount) : ro.maxClaim;
 
   const hsn = invoiceHsn(invoice);
   const hsnError = hsnCheck(invoice);
   if (hsnError) checks.push(hsnError);
 
-  const rlyGSTIN = item.consigneeGstin || "";
-  if (!rlyGSTIN) checks.push(err("IREPS returned no consignee GSTIN for the railway GSTIN."));
-  else if (railwayGstins.length && !railwayGstins.some((o) => o.value === rlyGSTIN)) checks.push(err(`Consignee GSTIN ${rlyGSTIN} is not in IREPS' railway GSTIN list.`));
-  if (rlyGSTIN && rlyGSTIN.slice(0, 2) !== stateOfSupply) {
-    checks.push(warn(`The consignee is in state ${rlyGSTIN.slice(0, 2)} (${item.consigneeState || "?"}) but the saved state of supply is ${stateOfSupply}; IREPS will apply ${supplierState !== stateOfSupply ? "IGST" : "CGST + SGST"} as saved.`));
-  }
+  const railway = railwayGstinFor({ consigneeGstin: item.consigneeGstin, consigneeState: item.consigneeState, stateOfSupply, supplierState, railwayGstins });
+  const rlyGSTIN = railway.value;
+  checks.push(...railway.checks);
   if (!["TPI", "CONSG"].includes(item.inspectionAgency)) checks.push(warn(`Inspection agency "${item.inspectionAgency}" is neither TPI nor CONSG.`));
 
   const a = amounts || { taxable: 0, tax: 0, igst: 0, cgst: 0, sgst: 0, utgst: 0, split: { igst: 0, cgst: 0, sgst: 0, utgst: 0 } };
@@ -525,7 +653,8 @@ export function buildItem({ header, billRegNo, receipt, invoice, item, roNo, ro,
     stAmt: "0.00",
     oth1Des: item.otherChargeDescriptions[0],
     oth2Des: item.otherChargeDescriptions[1],
-    netBasicRate: item.poRate,
+    // the page's basicBillRate field: the PO rate to 5 decimals, as a number ("1234.50" is sent as 1234.5)
+    netBasicRate: amounts ? String(amounts.basicRate) : item.poRate,
     expenseAmount: a.taxable.toFixed(2),
     basicAmount: a.tax.toFixed(2),
     totalAmount: Number.isFinite(claim) ? claim.toFixed(2) : "",
@@ -583,7 +712,7 @@ export function buildItem({ header, billRegNo, receipt, invoice, item, roNo, ro,
     { key: "amounts", label: "Taxable + tax = total", value: amounts ? `${amounts.taxable.toFixed(2)} + ${amounts.tax.toFixed(2)} = ${amounts.total.toFixed(2)}` : "", source: "computed" },
     { key: "claim", label: "Item-wise claim", value: values.totalAmount, source: `computed; ECM invoice amount ${invoice.amount ?? ""}` },
     { key: "hsn", label: "HSN code", value: hsn, source: invoice.source },
-    { key: "rlyGSTIN", label: "Railway GSTIN", value: rlyGSTIN, source: "IREPS (consignee)" },
+    { key: "rlyGSTIN", label: "Railway GSTIN", value: rlyGSTIN, source: railway.source },
     { key: "inspection", label: "Inspection agency", value: item.inspectionAgency, source: "IREPS" }
   ];
   return { values, amounts, review, checks };

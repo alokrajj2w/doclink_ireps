@@ -103,6 +103,28 @@ export async function runReconTests({ test, assert, eq }) {
     eq(down.status, 502);
   });
 
+  await test("Recon upload (8.5): 408 and 429 are 'try again', never 'refused, nothing was saved'; a 2xx whose answer cannot be read says so", async () => {
+    applyReconConfig({ reconBaseUrl: BASE });
+    for (const status of [408, 429, 503]) {
+      const busy = await rejectsRecon(uploadToRecon(FILE, { fetch: fakeFetch(() => jsonResponse(status, { detail: "slow down" })), hostPermissions: HOSTS }), RECON_ERROR.UNAVAILABLE, `HTTP ${status}`);
+      eq(busy.status, status);
+      eq(busy.detail, "slow down");
+    }
+    const unreadable = [
+      ["an answer that breaks off", () => new Response(new ReadableStream({ start: (c) => c.error(new TypeError("network error")) }), { status: 201, headers: { "Content-Type": "application/json" } })],
+      ["an answer that is not JSON", () => new Response("<html>stored</html>", { status: 201 })],
+      ["an empty answer", () => new Response(null, { status: 200 })]
+    ];
+    for (const [what, respond] of unreadable) {
+      const error = await rejectsRecon(uploadToRecon(FILE, { fetch: fakeFetch(respond), hostPermissions: HOSTS }), RECON_ERROR.ANSWER_UNREADABLE, what);
+      assert(/^HTTP 20[01]/.test(error.detail), error.detail);
+      const text = describeError(error.code, { detail: error.detail }).message;
+      assert(!/Nothing was saved/.test(text) && /could not read its answer/.test(text), text);
+    }
+    // a definite 4xx refusal is still one
+    await rejectsRecon(uploadToRecon(FILE, { fetch: fakeFetch(() => jsonResponse(413, { detail: "file too large" })), hostPermissions: HOSTS }), RECON_ERROR.REJECTED, "HTTP 413");
+  });
+
   await test("Recon upload: unreachable Recon Engine", async () => {
     applyReconConfig({ reconBaseUrl: BASE });
     const fetch = fakeFetch(() => Promise.reject(new TypeError("Failed to fetch")));

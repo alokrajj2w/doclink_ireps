@@ -325,10 +325,19 @@ export function fieldCheck(d) {
 
   let item = [];
   if (i) {
-    const taxable = round2(b.qty * b.rate);
-    const tax = round2((taxable * b.gst) / 100);
+    // as the bill page computes them (billFunctions.js calculateExpAmt): each GST amount is toFixed(2)
+    // of the tax on the unrounded taxable amount, and the total is that taxable amount plus the tax
+    const exactTaxable = (b.rate * b.qty * 100) / 100;
     const interState = h.supplierState !== h.stateOfSupply;
     const half = round2(b.gst / 2);
+    const gstAt = (rate) => parseFloat(((exactTaxable * rate) / 100).toFixed(2));
+    const igst = interState ? gstAt(b.gst) : 0;
+    const cgst = interState ? 0 : gstAt(half);
+    const sgst = cgst;
+    const taxSum = cgst + sgst + igst;
+    const taxable = parseFloat(exactTaxable.toFixed(2));
+    const tax = parseFloat(taxSum.toFixed(2));
+    const total = parseFloat((exactTaxable + taxSum).toFixed(2));
     const gstin = /GST#\s*([0-9A-Z]{15})/.exec(b.consignee)[1];
     item = [
       line("Select PO Sr", "poSrNo", i.poSrNo, b.poSr, "The receipt in IREPS"),
@@ -346,12 +355,12 @@ export function fieldCheck(d) {
       line("IGST Rate(%)", "igstRate", i.igstRate, interState ? b.gst : 0, "PO GST rate, IGST when the states differ", { numeric: true }),
       line("CGST Rate(%)", "cgstRate", i.cgstRate, interState ? 0 : half, "Half the PO GST rate when the states match", { numeric: true }),
       line("SGST Rate(%)", "sgstRate", i.sgstRate, interState ? 0 : half, "Half the PO GST rate when the states match", { numeric: true }),
-      line("IGST Amount", "igstAmount", i.igstAmount, interState ? tax : 0, "Taxable x rate", { numeric: true }),
-      line("CGST Amount", "cgstAmount", i.cgstAmount, interState ? 0 : round2(tax / 2), "Taxable x rate", { numeric: true }),
-      line("SGST Amount", "sgstAmount", i.sgstAmount, interState ? 0 : round2(tax / 2), "Taxable x rate", { numeric: true }),
+      line("IGST Amount", "igstAmount", i.igstAmount, igst, "Taxable x rate", { numeric: true }),
+      line("CGST Amount", "cgstAmount", i.cgstAmount, cgst, "Taxable x rate", { numeric: true }),
+      line("SGST Amount", "sgstAmount", i.sgstAmount, sgst, "Taxable x rate", { numeric: true }),
       line("Taxable Amount", "expenseAmount", i.expenseAmount, taxable, "PO rate x quantity", { numeric: true }),
       line("Tax Amount", "basicAmount", i.basicAmount, tax, "Taxable x GST rate", { numeric: true }),
-      line("Item-wise claim by vendor", "totalAmount", i.totalAmount, round2(taxable + tax), "Taxable + tax", { numeric: true }),
+      line("Item-wise claim by vendor", "totalAmount", i.totalAmount, total, "Taxable + tax", { numeric: true }),
       line("Max Claim", "maxClaim", i.maxClaim, itemValue(b), "The receipt's value in IREPS", { numeric: true })
     ];
   }
@@ -471,8 +480,11 @@ export async function handleBillUpload(h) {
     const dir = field("relative_dir");
     const name = field("pdfName");
     if (!name || !dir) return text(200, "<html><body>File not received</body></html>");
-    console.log(`[mock-ireps] save.php ${name} (${raw.length} bytes, not kept)`);
-    return text(200, `<html><body onload='window.parent.CRISPKI && window.parent.CRISPKI.afterUpload()'>OK~${dir}/${name}~${raw.length}</body></html>`);
+    // stored under the name the bill page registers ([0-9A-Za-z._~-], billFunctions.js uploadResult):
+    // the non-stock capture (3_GENERATEPDF.txt) stored "1061000262 - GSTMANDATE.pdf" as "1061000262-GSTMANDATE.pdf"
+    const stored = name.replace(/[^0-9A-Za-z._~-]/g, "");
+    console.log(`[mock-ireps] save.php ${stored} (${raw.length} bytes, not kept)`);
+    return text(200, `<html><body onload='window.parent.CRISPKI && window.parent.CRISPKI.afterUpload()'>OK~${dir}/${stored}~${raw.length}</body></html>`);
   }
 
   /* ------------------------------------------------------------- IREPS */
@@ -557,6 +569,10 @@ export async function handleBillUpload(h) {
       const createdBy = req.headers["x-mock-screen"] ? "mock screen" : "DocLink";
       drafts.set(regNo, { regNo, bill, header: Object.fromEntries(form), item: null, dispatchNo: null, documents: [], status: "Draft", createdBy, createdOn: stamp(), itemValue: itemValue(bill) });
       console.log(`[mock-ireps] draft bill ${regNo} created for PO ${bill.poNumber} / invoice ${form.get("invoiceNo")} (${createdBy})`);
+      // mock only: the draft is saved but its answer is lost, like an IREPS 5xx after the save
+      // (test/mock/bill-flow-check.mjs sends this header to check DocLink's answer; DocLink never sends it)
+      const lost = Number(req.headers["x-mock-lose-answer"]);
+      if (lost >= 500 && lost <= 599) return text(lost, `<html><body><h1>HTTP Status ${lost}</h1></body></html>`);
       return text(200, `success^^${regNo}`);
     }
     case "/epsn/ct/fetchPOItemDetails.do": {

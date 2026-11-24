@@ -34,9 +34,19 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
   `Downloads/DocLink/<unit>/Tender_<no>/`. A corrigendum is its IREPS page,
   printed as Ctrl+P would (`Corrigendum_NN_<tender>.pdf`); a document attached
   to it is saved next to it under its IREPS name (`Corrigendum_NN_<tender>_Attachment_<n>.<ext>`
-  when IREPS gives none). Negotiation / counter offer / LOA
+  when IREPS gives none). A corrigendum counts as downloaded only with every
+  document attached to it: when one fails its status is PARTIAL, nothing marks
+  it downloaded (ledger, download log, scheduled reservation) and the next run
+  fetches it again; NIT Documents and the daily corrigendum job then save only
+  the attachments still missing (a run by tender number saves it again).
+  Negotiation / counter offer / LOA
   letters have their own buttons (by Letter Date), and correspondence comes
-  from the Correspondence view. An LOA is the published letter page alone,
+  from the Correspondence view. A letter or tabulation found but not
+  downloaded reads "failed" (red), one downloaded before "already downloaded";
+  "none for these dates" only when IREPS lists none. A NIT message IREPS does
+  not open is a failed row, opened again by **Retry failed**. A list cut at
+  DocLink's page limit (60 pages; 15 for a tender's own letter list and the My
+  Messages notice check) says so (`TENDER_LIST_LIMIT`). An LOA is the published letter page alone,
   printed as Ctrl+P would: one `LOA_<tender>.pdf` per tender, and nothing the
   letter links or embeds is downloaded. A counter offer is likewise its
   published letter page, printed (`Counter_Offer_<tender>_<letter id>.pdf`); a
@@ -52,9 +62,10 @@ account's unit (Hosur 833, Rohtak 60828) - see sections 15 and 16.
   against an IREPS R-Note / CRN up to the digital signature - finds the
   billable receipt, gets the invoice from the ECM (or as typed), reads and
   checks everything, then (after the user confirms) saves the bill header and
-  item in IREPS and fetches the invoice's documents from the ECM. Attaching the
-  signed documents and Sign & Submit stay with the user in IREPS. See section 20
-  and `upload.md`.
+  item in IREPS and fetches the invoice's documents from the ECM. It attaches
+  each document to the bill once the user has signed it in the IREPS signer;
+  the final Sign & Submit stays with the user in IREPS. See section 20 and
+  `upload.md`.
 
 **File names.** A PDF (or other file) that IREPS serves keeps the name IREPS gives
 it, in Downloads and in the ECM: the response's `Content-Disposition` file name,
@@ -148,7 +159,7 @@ service worker ──PARSE_BILL_STATUS (html)──▶ offscreen document ──
 ```
 
 The job runs in the service worker, so closing the popup does not cancel it.
-Reopening the popup restores the current or last state via `GET_JOB_STATE`.
+Reopening the panel restores each view's current or last job on its own (`RESTORES` in `popup/popup.js`; Bill Status through `GET_JOB_STATE`).
 
 ---
 
@@ -157,7 +168,6 @@ Reopening the popup restores the current or last state via `GET_JOB_STATE`.
 ```
 doclink/
 ├── manifest.json  config.json  (config.local.json: gitignored overrides, never packaged)
-│                  config.local.prod.example.json  (PROD ECM template for config.local.json; never read)
 ├── background/
 │   ├── service-worker.js      job orchestration, message router (handlers keyed by MESSAGE_TYPES)
 │   ├── offscreen.html / offscreen.js   DOMParser for the worker (one answer() per parse request)
@@ -237,7 +247,7 @@ doclink/
 | `identity` | Only for **Sign in with Okta** to the Recon Engine (section 17): `chrome.identity.launchWebAuthFlow` opens the Okta sign-in window and returns to `https://<extension id>.chromiumapp.org/okta` |
 | `scripting` | Only for **Upload Bill to IREPS**: the supplier bill calls (`/epsn/ct/*`) are sent from inside the user's IREPS tab (`services/bill-upload/tab-transport.js`), so they leave from the portal's own origin like the bill page's own requests. Nothing is injected into other sites |
 | `alarms` | Only for **scheduled downloads** (section 23): one alarm (`doclink.scheduler`) wakes the worker at the next check the Recon Engine names (09:00, 09:10, …). The alarm only asks the Recon Engine what is due; it never sends anything to IREPS |
-| `debugger` | Only for **published letters and corrigenda** (LOA, Negotiation, Counter Offer, Correspondence, Corrigendum - in Download Tender Documents and Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning |
+| `debugger` | Only for **published letters and corrigenda** (LOA, Negotiation, Counter Offer, Correspondence, Corrigendum - in Download Tender Documents and Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning. Every request the letter page makes in that tab passes the write guard (body read as form/JSON/multipart; one Chrome does not hand over is read or refused), and the page cannot open a window. If Chrome cannot hand the page to the tab, the text PDF is kept |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both in `manifest.json`; a production build keeps only the real portal, section 9) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
 | host `http://localhost:8000/*` and `https://wabtec.reconalpha-staging.joulestowatts.com/*` (the Recon Engine, local and staging; add the deployed Recon URL; a production build drops the localhost one) | The Recon Engine sign-in (section 17), the download log (section 18) and the **Save to: ECM / S3** uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
 | host `http://wctsrvecmtstsn1.wabtec.com:8080/*` (the ECM test server) | Only for **Save to: ECM / S3** with `"ecmBackendAws": false`: DocLink calls the ECM (Nuxeo) directly. Must match `config.json` `ecm.domain`. A production build keeps it and warns that it is plain HTTP |
@@ -293,6 +303,18 @@ category), the scheduler, and the ECM unit of a document run
 
 A "login required" Bill Status error is not shown again when the panel is
 reopened. The user may have logged in since, so the live session check decides.
+
+The MA, PO / IC and batch views follow the same rule, and a state read when a
+view opens never sets the IREPS indicator. The side panel shows only the runs
+it started: a scheduled run, or a run from another tab's panel, appears as one
+line above the views while it holds the job, and its buttons wait.
+
+The indicator says "Connected" only once IREPS answered a run's session check,
+never on a Download click or at "Checking IREPS session". While a DocLink
+search holds the IREPS form lock, the PO Search form check answers only an
+earlier logged-in answer, else "busy", never a cached "login required". A
+reopened panel restores every view's job on its own; the view shown is the
+first of main, MA, PO / IC, batches, bill upload with something to show.
 
 **IREPS without www.** IREPS also answers at `https://ireps.gov.in`, and its
 login cookie (`JSESSIONID`, `Domain=.ireps.gov.in`) covers both addresses.
@@ -372,7 +394,8 @@ rules as the IREPS page script (both dates, DD/MM/YYYY, From ≤ To, ≤ 180 day
   Bill Status page (for example the user reloaded IREPS in another tab and
   consumed the token), DocLink loads the page once more, takes the fresh token
   and retries once (only when the first page had a token). A second failure →
-  `IREPS_INVALID_RESPONSE`.
+  `IREPS_INVALID_RESPONSE`. The same single retry is made when IREPS answers
+  with its Bill Status page carrying a message of its own and no bills.
 
 ### Error codes
 
@@ -381,8 +404,9 @@ rules as the IREPS page script (both dates, DD/MM/YYYY, From ≤ To, ≤ 180 day
 | `IREPS_SESSION_EXPIRED` | login page / session-expired page / redirect to login (either request) | "IREPS login required" view |
 | `IREPS_REQUEST_FAILED` | network error, timeout, HTTP ≠ 2xx | "Unable to retrieve Bill Status" |
 | `IREPS_INVALID_RESPONSE` | page is neither login nor Bill Status (after one retry) | "Unable to load Bill Status" |
+| `IREPS_SEARCH_REJECTED` | the search answer is the Bill Status page with an IREPS message (not "no records") and no bills, after one fresh-token retry | "IREPS did not return the bills" (shows IREPS's message) |
 | `IREPS_PARSE_FAILED` | blocks present but unreadable, or parser crashed | "Unable to read the Bill Status records" |
-| `IREPS_NO_RECORDS` | authenticated page, zero blocks | "No Bill Records Found" (notice) |
+| `IREPS_NO_RECORDS` | authenticated page, zero blocks, and IREPS's own "no records" wording or no IREPS message at all | "No Bill Records Found" (notice) |
 | `IREPS_INVALID_REQUEST` | bad mode / invalid date range | "Invalid search options" (notice) |
 | `EXPORT_ERROR` | the Excel file could not be built | "Bill Status Retrieved - However, DocLink could not create the Excel file." |
 
@@ -632,9 +656,9 @@ keeps only the real portal; a `--allow-mock` build keeps both, section 9.)
 | 3 | Session expired (login page returned with HTTP 200) | "IREPS Session Expired"; no file built from the login page |
 | 4 | IREPS returns HTTP 5xx (e.g. simulate with DevTools request blocking / override) | "Unable to retrieve Bill Status" (IREPS returned HTTP 500); button usable again |
 | 5 | Very large Bill Status | All rows in the workbook (browser test covers 600 rows in the PDF writer) |
-| 6 | Bills with missing fields | Missing values shown as "-" |
-| 7 | Long Recovery Details | Text wraps, splits across pages with label repeated |
-| 8 | Download twice | Two files (timestamp differs; same-second collisions get " (1)") |
+| 6 | Bills with missing fields | Missing values are empty cells in the workbook (IREPS's `-`, `NA`, `N/A` become empty) |
+| 7 | Long Recovery Details | The whole text is in its cell in the workbook; in the PDF preview it wraps and splits across pages with its label repeated |
+| 8 | Download twice | With the download log on (the shipped default), the second download asks "Download again?": yes saves a second file (timestamp differs; same-second collisions get " (1)"), no saves nothing. With the log off: two files |
 
 Simulating 2-4 locally: use DevTools → Network → request blocking or a local
 override of `viewBills.do` with `test/fixtures/login-page.html`,
@@ -652,8 +676,10 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
   cookie jar; DocLink never reads it. The Okta client secret is never in the
   extension: the Recon backend exchanges Okta's code. The Struts TOKEN is held in memory only for the duration of one
   request. The logger (`utils/logger.js`) additionally redacts anything that
-  looks like `Cookie:`, `JSESSIONID=`, `Authorization:`, a token (also in JSON
-  and the Struts token field of a page), a client secret, an API key or a password.
+  looks like `Cookie:`, `JSESSIONID` (also quoted or as a JSON key), a session
+  id, `Authorization:`, a token (also in JSON, escaped JSON and the Struts token
+  field of a page), an OAuth `code` / `state` in a URL, a client secret, an API
+  key or a password.
 * Network calls are restricted to `IREPS_CONFIG.baseUrl`; `buildIrepsUrl`
   refuses any other origin. When `config.json` cannot be read, or has no
   valid `"target"` (`"mock"` or `"real"`), there is no IREPS URL at all:
@@ -679,8 +705,11 @@ override of `viewBills.do` with `test/fixtures/login-page.html`,
   same URL returns the Last 90 Days records for all zones.
 * The exact HTML IREPS returns for "no records" and for an expired session was
   not in the capture. An authenticated page with the form but zero
-  `table#table_id` blocks is reported as `IREPS_NO_RECORDS`; login pages are
-  detected by password fields / login vocabulary / session-expired phrases.
+  `table#table_id` blocks is reported as `IREPS_NO_RECORDS` when it shows
+  IREPS's own "no records" wording or no IREPS message at all; one that shows
+  another IREPS message is `IREPS_SEARCH_REJECTED` (after one fresh-token
+  retry). Login pages are detected by password fields / login vocabulary /
+  session-expired phrases.
 * Struts token reuse: if IREPS rejects a consumed token with a page that is
   neither login nor Bill Status, DocLink retries once with a fresh token.
 * Amounts are kept as the strings IREPS prints (e.g. `2968191.9`); a Bill
@@ -930,7 +959,12 @@ The shared layer handles both: `extractSearchPoPagination()` detects such
 links, and `searchIrepsDocuments()` re-posts each page's parameters exactly
 like the portal's `postRequest.js` does (no token) until every page is
 fetched. A partial list is never exported silently: a failing page fails the
-download.
+download. When IREPS's own total is above 0 but no row could be read, the
+search fails as `IREPS_<TYPE>_RESULTS_INVALID`, never "nothing found" (PO by
+date would otherwise take that window as empty). A list that DocLink's page
+limit cuts is not complete either: the result's `incomplete` says so, and a
+scheduled run ends partial. Result pages asked for ahead have all ended before
+the search lets go of the IREPS form lock, also when it fails.
 
 ### Error codes
 
@@ -1027,7 +1061,11 @@ session has expired. Please log in again and retry the MA download."), any
 other non-PDF `IREPS_MA_INVALID_PDF`; nothing that is not a PDF is saved.
 Batches run 3 downloads at a time with Queued / Downloading / Completed /
 Failed per MA; after a session expiry the remaining MAs are not attempted
-and can be retried with **Retry failed downloads**. Files keep the IREPS
+and can be retried with **Retry failed downloads**. **New search** waits while
+an MA search or download runs; a reset the worker refuses keeps the list ("MA
+Task Already Running"). An MA search or download cut off by a worker restart
+shows "Download interrupted" (`JOB_INTERRUPTED`); an interrupted download keeps
+its list and never shows the previous run's summary. Files keep the IREPS
 name (see "File names" above); `MA_<PO-NO>_<MA-NO>.pdf` is used only when IREPS
 gives none, because MA numbers repeat across POs. Files are grouped in a folder per MA date.
 
@@ -1090,9 +1128,10 @@ sign-in required* with a **Sign in to Recon** button.
 |---|---|
 | `RECON_NOT_CONFIGURED` | `reconBaseUrl` empty/invalid, or its origin missing from `host_permissions`; nothing sent |
 | `RECON_AUTH_REQUIRED` | HTTP 401 - not signed in to the Recon Engine; nothing saved |
-| `RECON_UNAVAILABLE` | network error or no answer within 2 minutes |
-| `RECON_REJECTED` | any other non-2xx (e.g. unknown customer); the Recon Engine's reason is shown |
+| `RECON_UNAVAILABLE` | network error, no answer within 2 minutes, or HTTP 408 / 429 / 5xx (try again) |
+| `RECON_REJECTED` | any other 4xx (e.g. unknown customer); the Recon Engine's reason is shown |
 | `RECON_NOT_INGESTED` | HTTP 422 - the file **is stored** in S3 but could not be loaded; the parse error is shown |
+| `RECON_ANSWER_UNREADABLE` | a 2xx whose answer cannot be read (not JSON, cut off, late): the file may be stored; check the Recon Engine before uploading again |
 
 Tests: `test/recon-tests.js` (fake fetch; part of `test/run-tests.html`).
 
@@ -1194,15 +1233,19 @@ no setting to switch them.
 |---|---|
 | NIT and corrigendum | The tender search row's "Due Date/Time"; when the search gives none, the NIT message's "due on" date. |
 | Financial and Commercial Tabulation | The Search Tender row's "Due Date/Time" (one tender found through Closed Tenders: that row's "Closing Date/Time"). |
-| Negotiation, Counter Offer and LOA | A tender search by tender number, once per tender in a run. |
+| Negotiation, Counter Offer and LOA | A tender search by tender number, once per tender in a run. A search IREPS does not answer is tried once more; if it still gets no answer, the letter is saved without the tender date and the result says so (the next letter of that tender searches again). |
 
 Railways reuse tender numbers: 10263703 is both a N F RLY and an EAST CENTRAL RLY tender. When
 the search shows a number more than once, DocLink takes:
 - the row on the letter's own railway (from the list's "Dept/Rly. Unit");
-- in automatic mode, the row due on the NIT message's date.
+- in automatic mode, the row of the railway the NIT message names ("NIT for CSD/PER/SOUTHERN RLY, Tender
+  Number: ..."), then the row due on its date. Two railways' messages with one number are two tenders, each with
+  its own "NIT downloaded" mark.
 
-A hint that fits no row leaves the choice as before (the row with the most actions). This adds no
-request.
+DocLink reads the hint across the date ranges it searches: when the first range with the number has no
+row of the letter's railway (or, in automatic mode, due on the message's date), it also searches the
+later ranges that can hold one and takes the best fit. A hint the first range fits adds no request; one
+no row fits leaves the first range's row with the most actions.
 
 The title is `<document number> - <code>`, the codes of the spec's row 4
 (API: "Example Title - IC", "- PO", "- MA", "- NIT", ...; "- LOA" and "- Result"
@@ -1223,9 +1266,9 @@ step); tender titles are sent by DocLink (`tender/tender-ecm.js`).
   the row says why (`ECM_*` codes in `utils/messages.js`).
 * **Duplicates.** The gateway stores a document once; a re-run answers
   "Already in ECM".
-* **Stays local:** My Offer (no ECM type), the tender `download_manifest.json`
-  (it records each document's ECM uid), and the original `.html` kept beside a
-  print-ready letter's PDF rendering.
+* **Stays local:** My Offer (no ECM type), the tender's download record (kept in
+  extension storage, not as a file; it records each document's ECM uid), and the
+  original `.html` kept beside a print-ready letter's PDF rendering.
 
 Tests: `test/ecm-tests.js` (browser suite), the ECM cases in
 `test/ic-tests.js` / `ma-tests.js` / `po-tests.js`, and the "ECM:" tests in
@@ -1260,11 +1303,14 @@ for the Recon sign-in in direct mode.
   - top-level keys replace those in `config.json`, and `ecm` is merged key by key;
   - it is gitignored and never packaged by `scripts/build.mjs`.
 
-  Reload DocLink after editing either file. The secret and the token are never logged or
+  Reload DocLink after editing either file. A `config.local.json` that is not valid JSON
+  is ignored and reported with the position of the mistake only, never the text around
+  it (it could be part of a secret). The secret and the token are never logged or
   stored. A built extension has no `config.local.json`, so in direct mode it reports
   "ECM not configured" and saves locally. The build stops if `config.json` itself holds
   a real-looking secret (8 characters or more; section 9).
-* **`env`** picks the folders:
+* **`env`** picks the folders (not set: TEST; any value other than TEST or PROD: none, and every
+  direct ECM call fails with "ECM not configured" naming the value; the document is saved locally):
 
   | env | Site | `ecm:ancestorId` | Folders |
   |---|---|---|---|
@@ -1279,10 +1325,10 @@ for the Recon sign-in in direct mode.
   PROD client can write to (`PROD_CREATION_FOLDER` in `services/ecm-catalog.js`). Because
   that folder is shared, a tender both sites download gets one NIT / LOA / Result document,
   not one per site.
-* **Switching to PROD.** Copy `config.local.prod.example.json` to `config.local.json` and
-  fill in the PROD `domain`, `clientId` and `clientSecret` there. Set all four `ecm` keys:
-  any key you leave out comes from `config.json` (the TEST ECM). The PROD origin must also
-  be in `manifest.json` `host_permissions`. DocLink never reads the example file itself.
+* **Switching to PROD.** Put an `ecm` block in `config.local.json` with all four keys:
+  `"env": "PROD"` and the PROD `domain`, `clientId` and `clientSecret`. Any key you leave
+  out comes from `config.json` (the TEST ECM). The PROD origin must also be in
+  `manifest.json` `host_permissions`.
 * **Folder check.** A supplied folder uid is opened once per session (`GET /id/{uid}`).
   If the ECM cannot open it, the upload is refused with the folder's name, path and uid,
   and the document is saved locally. On 26/10/2026 both TEST Tenders folders failed this
@@ -1321,14 +1367,16 @@ DocLink works with two separate logins:
 | Who | The vendor's IREPS account | Your joulestowatts Recon Engine account (password) or Okta |
 | How | In the IREPS tab, with the e-sign / security key, as always | DocLink's **Sign in to Recon Engine** page |
 | Needed for | Everything (reading IREPS) | Every download while the download log is on (§18, the default); only **Save to: ECM / S3** when it is off |
-| Header | `IREPS` pill | `RECON` pill (always shown while the download log is on, else while ECM / S3 is selected; click to sign out) |
+| Header | `IREPS` pill | `RECON` pill (always shown while the download log is on, else while ECM / S3 is selected; click to sign in, under Save to: Local too, or to sign out) |
 | DocLink handles | Nothing - it only checks the session | The typed password, sent once to the Recon Engine |
 
 **When the page appears.** With the download log on (§18), starting any
 download (Bill Status, CRN, R-NOTE, MA, PO, IC, the batches, tender, pending
 correspondence), Local or ECM / S3, asks the Recon Engine who is signed in
 (`GET /api/auth/me`). When nobody is, the sign-in page covers the panel (a
-running job is untouched); **Cancel** leaves the run unstarted
+running job is untouched); it covers the Go to IREPS gate too, and only the
+Already downloaded question covers it (one page at a time, never a blank
+panel); **Cancel** leaves the run unstarted
 (`DOWNLOAD_LOG_SIGN_IN_REQUIRED`). With the log off (`"downloadLog": {
 "enabled": false }`) only ECM / S3 runs ask, and **Use Local instead** switches
 Save to back to Local and the run saves locally.
@@ -1402,9 +1450,14 @@ go to. When there are any, a page covers the panel:
 Each row says when (`Downloaded on 2026-10-22 at 10:05 as PO_x.pdf`) or where
 (`In ECM: /FT/workspaces/Sites/HSR/Invoice Certificate - TS/Inputs/007012`).
 Nothing is ticked by default; **Skip them, download only new files** or
-**Download N files again**. Unanswered for 4 minutes = skip. Skipped documents
-are not fetched from IREPS at all and show an **Already downloaded** /
-**Already in ECM** chip (hover for when / where); the summaries count them.
+**Download N files again**. Unanswered for 4 minutes = skip. The 4 minutes
+count from when the run asked (the worker sends that time with the question),
+also for a question that waited behind another one. When they run out, or an
+answer comes later, the page says "Not answered in time" over the skipped
+files, with OK. The Recon sign-in page and the gate never cover the question.
+Skipped documents are not fetched from IREPS at all and show an **Already
+downloaded** / **Already in ECM** chip (hover for when / where); the summaries
+count them.
 
 **Download again puts the new PDF in the same ECM document** (MA, PO, IC and
 their batches, direct mode `ecmBackendAws: false` only; the page then says so).
@@ -1445,7 +1498,7 @@ the ECM".
 
 | Flow | Checked first | Logged |
 |---|---|---|
-| MA, PO, IC (single) | yes | yes |
+| MA, PO, IC (single) | yes (an IC Retry is not re-checked) | yes |
 | PO by date, IC from notifications | yes (a retry is not re-checked) | yes |
 | Tender documents (all categories, jobs and single tender) | yes, one question per run: *Same answer for the rest of this run* | yes |
 | Correspondence | its own "already saved / Download again" (unchanged) | yes |
@@ -1468,8 +1521,10 @@ DocLink (one `... IN (...)` query per kind).
 everything and says so ("Download log unavailable"). Records are queued in
 `chrome.storage.local` (`doclink.downloadLog.queue.sw` / `.panel`) and posted
 in batches of up to 500; a failed post (backend down, sign-in expired) keeps
-them for the next one. Tender jobs fall back to their local ledger when the
-log does not answer.
+them for the next one. A post the Recon Engine took (2xx) leaves the queue even
+when its answer is lost; a queue `chrome.storage` cannot read is never written
+over. Tender jobs fall back to their local ledger when the log does not
+answer.
 
 **Recon Engine API** (`recon-engine` `backend/app/downloads.py`, table
 `doclink_downloads`, migration `a7d3c9e15b20`; any signed-in role, viewers too):
@@ -1490,7 +1545,10 @@ and "already there" when the ECM already had it, or **S3**). Filters: date range
 Hosur, ECM - Rohtak, S3) and **Document type**; 50 rows at a time with **Load
 more**. An admin also gets **All users**, which adds each row's user under the
 file name. It reads `GET /api/doclink/downloads` (`destination`, `site`,
-`doc_type`, `from`, `to`; `popup/popup-downloads.js`).
+`doc_type`, `from`, `to`; `popup/popup-downloads.js`). When the Recon Engine
+cannot be reached it says "Download log unavailable"
+(`DOWNLOAD_LOG_LIST_UNAVAILABLE`), never that a sign-in is needed. A filter
+changed while a page is being read is applied (the older page is dropped).
 
 **Switch.** `config.json` `"downloadLog": { "enabled": true }` (default).
 `false` turns off the log, the check and the required sign-in; DocLink then
@@ -1530,8 +1588,10 @@ it the way the row does.
 vendor's, so DocLink searches one closing day at a time, as the 20 Nov 2026
 capture does:
 
-* the form is opened once (`POST searchParam=showPage`; it has no Struts
-  token), then each day is one `POST /epsn/search/advancedSearch.do` with the
+* the form is opened once (`POST searchParam=showPage`; its page can carry a
+  Struts token, as the 27 Oct 2026 capture shows, so the form load and every
+  search run under the IREPS form lock), then each day is one
+  `POST /epsn/search/advancedSearch.do` with the
   browser's 21 fields in the browser's order (`closingDaySearchBody`,
   `tender/tender-search.js`): a Tender Number search with the number empty (or
   the optional Tender Number), `selectDate=TENDER_OPENING_DATE` (the page's
@@ -1559,7 +1619,9 @@ capture does:
   search results N"). Fewer tenders, another search, a page DocLink does not
   recognise or an HTTP error say that the day was not read to the end
   (`TENDER_SEARCH_SHORT`, `TENDER_PAGE_NOT_RECOGNISED`, `TENDER_LIST_FAILED`);
-  what was read is still downloaded;
+  what was read is still downloaded; a result page IREPS does not answer at all
+  after a page was read ends the day the same way, and the scan stops there;
+  the days after it are named as not searched (`TENDER_LIST_FAILED`);
 * only the tenders this vendor bid on count (the row shows My Offer, or a
   tabulation link), and each row's own "Due Date/Time" decides;
 * each day's search and result pages run under the IREPS form lock
@@ -1574,7 +1636,9 @@ about that many page requests per day.
   From and To (the optional Tender Number narrows it) and shows the link is
   downloaded to `Downloads/DocLink/<unit>/Tender_<no>/Tabulation/`; one that
   shows My Offer but not the link yet reads "not available yet" (re-run the
-  range later) (`downloadTabulationsByDate`, `tender/tender-jobs.js`;
+  range later); a tabulation found but not downloaded reads "failed" (red), one
+  downloaded before "already downloaded", and "none for these dates" only when
+  IREPS lists none (`downloadTabulationsByDate`, `tender/tender-jobs.js`;
   `runTabulations`, `tender/tender-auto.js`).
 * **Scheduled.** The `tenderTabulations` schedule (section 23) runs the same
   `downloadTabulationsByDate`, for both tabulations.
@@ -1628,17 +1692,21 @@ Started by hand from the side panel (**Bill** on the main view's *Upload* card).
 1 Receipt    PO number -> R-NOTE + CRN search (searchPO.do, read-only)
              -> receipts with a "Bill Claim" link (rly, poKey); others greyed out with the reason
 2 Invoice    ECM RetrieveInvoiceData {customerPO, customerPOSrNo, invoiceQuantity}
-             (exactly one match, not "Sent to Doculink") - or from a JSON file the user picks
+             (exactly one match, not "Sent to Doculink", its customer PO / PO Sr / quantity the
+             receipt's where the record has them) - or from a JSON file the user picks
              (same columns, same match) - or typed by hand
              -> checked before any IREPS call: number, date, amount, HSN code of 4 to 8 digits
-3 Prepare    read-only IREPS calls in the IREPS tab: fetchPODetails.do (bill page), populatePayAuthList,
-             populatePOSrList, getAjaxData (GSTIN), populateROList, populateRODetails
+3 Prepare    read-only IREPS calls in the IREPS tab: fetchPODetails.do (bill page, under the IREPS
+             form lock), populatePayAuthList, populatePOSrList, getAjaxData (GSTIN), populateROList,
+             populateRODetails
              -> every header value with its source + checks; the user may correct supplier GSTIN,
                 state / place of supply and bill description (re-checked)
 4 Create     only with no error, warnings read and the values confirmed:
              saveBillHeader.do (creates the DRAFT bill - the header cannot be edited afterwards)
              -> fetchPOItemDetails / populateROList / populateRODetails -> amounts computed like the
                 bill page -> item checks -> saveBillDetails.do
+             each write is recorded for the receipt before it is sent; a lost answer stops that
+             step (see Safety rules)
 5 Documents  the invoice's ECM documents (per-type NXQL by invoice no. / PO no., newest per type),
              checked (PDF, < 8 MB) and saved to Downloads/DocLink/IREPS/BillUpload/<invoice>/,
              each with the description to type in IREPS
@@ -1658,12 +1726,12 @@ Then in IREPS (manual): open the draft bill, attach any document not uploaded fr
 | `services/bill-upload/bill-rules.js` | Pure rules: `buildHeader`, `buildItem`, `computeAmounts`, GST split (IGST vs CGST + SGST / UTGST from the header states), state codes, the supplier-GSTIN-by-division and state-of-supply derivations, every check |
 | `services/bill-upload/invoice-file.js` | The JSON-file invoice source: `parseInvoiceFile` (a list, `{ "invoices": [...] }` or one invoice, in ECM's column names; at most 1 MB / 500 invoices), `invoiceFromFile` (the receipt's invoice by PO + PO Sr + quantity, numbers compared by value). The file is picked in the panel at run time, never bundled, so it works in the built extension. Sample: `test/mock/sample_upload.json` |
 | `services/bill-upload/ecm-invoice.js` | `retrieveInvoice` (answer read defensively - its format is not documented yet), `manualInvoice`, the bill document types with their IREPS descriptions, document search and fetch |
-| `services/bill-upload/bill-upload-service.js` | The steps above (`findBillableReceipts`, `prepareBill`, `reviewBill`, `createDraftBill`, `saveItem`, `collectBillDocuments`) |
-| `services/bill-upload/bill-upload-store.js` | Per receipt, what DocLink already wrote (bill reg no., dispatch no.; identifiers only) in `chrome.storage.local`: a receipt is never billed twice, also after a restart |
-| `services/bill-upload/tab-transport.js` | A `fetch` that runs in the panel's IREPS tab (`chrome.scripting`) for the bill calls; `tabSignPdf` / `tabSaveFile` for step 5b |
+| `services/bill-upload/bill-upload-service.js` | The steps above (`findBillableReceipts`, `prepareBill`, `reviewBill`, `createDraftBill`, `saveItem`, `collectBillDocuments`, `addDocumentToBill`), `guardedWrite` (every write recorded before it is sent), `confirmCheckedInIreps` |
+| `services/bill-upload/bill-upload-store.js` | Per receipt, what DocLink already wrote (bill reg no., dispatch no.; identifiers only) in `chrome.storage.local`: a receipt is never billed twice, also after a restart; also a write whose answer did not arrive (unknown: step, reason, time), which stops that step until the user confirms they checked IREPS |
+| `services/bill-upload/tab-transport.js` | A `fetch` that runs in the panel's IREPS tab (`chrome.scripting`) for the bill calls, ending at IREPS's 120 s deadline (the request's abort signal) and telling the tab to cancel; `tabSignPdf` / `tabSaveFile` for step 5b |
 | `services/bill-upload/bill-document-upload.js` | Step 5b (`uploadBillDocument`): the signer request and its frames (as IREPS' CRISPKI.js sends them), the signer's answer, the thumbprint check, `save.php` and `uploadBillDocuments.do` |
-| `background/bill-tab-request.js` | Injected into the IREPS tab (isolated world, versioned): sends the bill calls from the portal's own origin, talks to the IREPS signer, stores the signed PDF with `save.php` |
-| `background/bill-upload-job.js` | Service-worker job: `BILL_UPLOAD_*` messages, one step at a time, state in `chrome.storage.session`, `BILL_UPLOAD_UPDATE` to the panel |
+| `background/bill-tab-request.js` | Injected into the IREPS tab (isolated world, versioned): sends the bill calls from the portal's own origin (a request is cancelled on `DOCLINK_TAB_ABORT`), talks to the IREPS signer, stores the signed PDF with `save.php` |
+| `background/bill-upload-job.js` | Service-worker job: `BILL_UPLOAD_*` messages, one step at a time, state in `chrome.storage.session`, `BILL_UPLOAD_UPDATE` to the panel. When a bill step ends, a scheduled download that waited for it may run at once |
 | `popup/popup-bill-upload.js` | The view |
 
 Safety rules: Prepare never writes. The invoice is checked before anything is
@@ -1671,9 +1739,41 @@ sent to IREPS, whatever its source (ECM, JSON file, typed): invoice number, date
 amount, and an HSN code of 4 to 8 digits. A bad one (an HSN such as "12") stops
 Prepare with `BILL_INVOICE_INVALID`, before a draft bill exists. Create needs the
 confirmation tick, refuses while any check is an error, and needs the warnings
-ticked as read. A failure after the header was saved keeps the draft bill's
-number on screen (item can be retried, or finished / deleted in IREPS). A receipt
-with a DocLink bill, or one IREPS already shows a bill for, cannot be billed
+ticked as read.
+
+Every write (header, item, each document registration) is recorded for the
+receipt right before it is sent. When its answer does not arrive (the IREPS tab
+was reloaded, closed or left, the connection broke, IREPS did not answer within
+120 seconds, answered 5xx, or its answer could not be read), IREPS may have
+saved it: DocLink shows `BILL_OUTCOME_UNKNOWN` with what it sent and what to
+check (the PO's *Bills for Pay* tab), and that step stays stopped for the
+receipt, also after a restart, until the user ticks that they checked and clicks
+**Allow ... again**. DocLink never sends a write twice by itself, and Start
+fresh does not clear an unconfirmed header. The ticks are cleared after every
+failed step. An invoice DocLink billed on one receipt is refused on another; a
+receipt IREPS does not list for its PO Sr is stopped, never swapped. The railway
+GSTIN is the consignee's when it is of the state of supply, else IREPS's railway
+GSTIN of the state of supply when exactly one fits (the only one, or the one
+with the consignee's PAN), shown as a warning to acknowledge; else the item
+stops.
+
+Item amounts are the bill page's own to the paisa: each GST amount is
+`toFixed(2)` of the tax on the unrounded taxable amount, the total is that
+amount plus the GST, and `netBasicRate` is the page's basic bill rate
+(`1234.50` is sent as `1234.5`). An invoice date with a time zone is its IST
+day (`2026-10-29T23:00:00.000Z` is 30/10/2026); a number is read only as epoch
+ms of 2000 to 2099, so `20261030` or epoch seconds stop Prepare with a check.
+A PO Sr list IREPS did not answer stops Prepare (`BILL_REQUEST_FAILED`), and a
+refusal is a check in IREPS's words; neither switches Stock / Non-Stock.
+`populateRODetails` "duplicate" and "multi" are a check in plain words
+(`BILL_RECEIPT_REFUSED`). A document is registered with the page's path
+(`relative_dir` + cleaned name, "~" kept), and only when `save.php` answered
+that path with a size above 0 (else `BILL_RESPONSE_INVALID`).
+
+A failure after the header was saved keeps the draft bill's number on screen (an
+item IREPS refused can be retried, one whose answer is missing only after the
+user checked the bill; or finish / delete it in IREPS). A receipt with a DocLink
+bill, or one IREPS already shows a bill for, cannot be billed
 again. **Start fresh** (a new bill for a receipt DocLink already billed) forgets
 only DocLink's record: the old draft's bill number stays on screen with where to
 find it (the PO's *Bills for Pay* tab), as it is still in IREPS, and the new
@@ -1691,14 +1791,16 @@ ECM `gstinRecipient` (else the consignee address), place of supply from
 
 Not supported yet (stopped by a check): advance / part payment, PVC, POs with
 discount / packing / freight / other charges, several paying authorities,
-several receipts per PO Sr without a match, multi-invoice bills. Not verified on
+a receipt IREPS does not list for its PO Sr, an R-Note row without an RO number,
+multi-invoice bills. Not verified on
 the live portal: the ECM `RetrieveInvoiceData` answer (no response captured) and
 re-opening a DocLink-created draft in IREPS to attach the documents (IREPS
 offers "View / Sign & Submit Draft Supplier Bill" from the R-NOTE / CRN row).
-The mock portal serves the flow up to the saved item, including the ECM calls, plus a test hub
+The mock portal serves the flow up to the registered documents, including the ECM calls, plus a test hub
 with the bill screens at http://localhost:8765/mock/bill/ (TESTING.md C9);
-`node test/mock/bill-flow-check.mjs` runs the bill code against every test receipt. The mock
-does not serve step 5b (`save.php`, `uploadBillDocuments.do`), and signing needs the real
+`node test/mock/bill-flow-check.mjs` runs the bill code against every test receipt, and checks that
+a header whose answer is lost (the mock saves it, then answers HTTP 503) is reported as unknown and
+never sent twice. The mock serves `save.php` and `uploadBillDocuments.do`; signing needs the real
 IREPS signer.
 
 ---
@@ -1711,7 +1813,7 @@ No tender / correspondence / letter ids are typed in; all are read from the live
 Request sequence (all in the signed-in browser session, `credentials: include`):
 
 1. `POST /epsn/corres/vendorRelatedCorrespondence.do` (empty body, as the portal menu link). Verified against the HAR.
-2. Parse only the table under the heading **Correspondence - Pending** (found by heading, not position; Lapsed / Replied tables are never read). Rows whose own Status is not `Pending` are listed as *needs review*, not downloaded.
+2. Parse only the table under the heading **Correspondence - Pending** (found by heading, not position; Lapsed / Replied tables are never read). Rows whose own Status is not `Pending`, and Pending rows without a usable `nitOid`, are listed as *needs review*, not downloaded; "No correspondence found" only when the Pending table has no row at all.
 3. For each row: `POST /epsn/corres/vendorCorrespondencePendingReply.do` with form `nitOid=<from the row>`. Verified against the HAR.
 4. Parse only the table under **Pending Replies** (Lapsed / Previous Replies ignored); every row's `viewPublishedLtr('<nitOid>','<corresId>','<letterId>')` gives the ids.
 5. For each letter: the route is read from the page's own `viewPublishedLtr` script (fallback: `POST /epsn/corres/rly/viewpubIndltr.do`, form `nitOid`, **`letterID`**, `corresId`). The response is handled as a direct PDF, an embedded PDF viewer, or an HTML letter (rendered to a text PDF by the existing `buildPdf` utility; the original page is saved next to it).
@@ -1719,10 +1821,10 @@ Request sequence (all in the signed-in browser session, `credentials: include`):
 
 `vendorCorresSubmitReply.do` and anything that looks like a write action is refused in `pcFetch()` (`assertReadOnly`).
 
-Output: `Downloads/DocLink/<verified unit>/Correspondence/Pending/<TenderNo>/Correspondence_<LetterNo>_<dd-mm-yyyy>_<Subject>.pdf` (a letter IREPS serves as a PDF keeps its IREPS name), attachments under their IREPS name (`<name>_<LetterNo>` when another file of the tender's folder has it), and `Downloads/DocLink/<unit>/Correspondence/Pending/download_manifest.json`.
+Output: `Downloads/DocLink/<verified unit>/Correspondence/Pending/<TenderNo>/Correspondence_<LetterNo>_<dd-mm-yyyy>_<Subject>.pdf` (a letter IREPS serves as a PDF keeps its IREPS name), attachments under their IREPS name (`<name>_<LetterNo>` when another file of the tender's folder has it). The run's progress is kept in extension storage; no manifest file is saved.
 Under **Save to: ECM / S3** each letter and attachment goes to the unit's ECM Tenders folder instead, as `crp` with the tender number, titled `<tender no> - CRP - <letter no> - <subject>` (attachments: `<tender no> - CRP - <letter no> - Attachment - <file name>`), with the same Recon sign-in and the same local fallback as the tender documents (section 16). Each letter row shows where it went. When Chrome cannot print a letter, its original `.html` page stays in Downloads.
-Dedupe key: `accountId|nitOid|corresId|letterId` (stored in `chrome.storage.local`, no secrets). **Retry failed** and a repeated run skip letters already saved; tick "Download again" to force.
-Requests are sequential. A GET that cannot reach IREPS (a network failure) is retried after 1 s and 3 s; a POST is never retried, so nothing is ever sent twice. A session expiry stops the job and marks the rest `SESSION_EXPIRED`. A list page DocLink does not recognise (no "Pending Replies" table, an HTTP error) is an error, never "no letters".
+Dedupe key: `accountId|nitOid|corresId|letterId` (stored in `chrome.storage.local`, no secrets). **Retry failed** and a repeated run skip letters already saved; tick "Download again" to force. A record whose details page fails is counted as failed (Retry failed is offered), also when an earlier run listed its letters. A new run starts with an empty summary. In **Retry failed**, a record an earlier run finished shows `DOWNLOADED` ("Downloaded by an earlier run"), its letters as already downloaded, counted as "already saved", never as new downloads or attachments.
+Requests are sequential. A GET that cannot reach IREPS (a network failure) is retried after 1 s and 3 s. The list, Pending Replies and letter POSTs only read, so they are sent again (up to 3 times in all) when IREPS answers 5xx, 429, 408 or nothing; nothing is ever written to IREPS. A session expiry stops the job and marks the rest `SESSION_EXPIRED`. A list page DocLink does not recognise (no "Pending Replies" table, an HTTP error) is an error, never "no letters".
 
 Unverified against the live portal: the exact response of `viewpubIndltr.do` (it is not in the supplied HAR) and the markup of its attachment links.
 
@@ -1739,6 +1841,12 @@ each PO is filed as `poCopy` (`customer_po_number`) and each IC as `inspectionCe
 and the same local fallback when the ECM does not take a document (section 16). A retry uses
 the switch's current choice. The IC manifest records each document's ECM outcome.
 
+**Single PO / IC Retry.** The IC result names its PO. **Retry failed downloads** (`IC_RETRY`) fetches only that run's
+failed ICs with a link, for its own PO whatever the box holds, by the links its search read (no new search, no
+already-downloaded check), only from the panel that started it (`BATCH_RETRY_ELSEWHERE` otherwise). A run whose links
+were not kept is searched again for its own PO. A batch that has started shows "Starting..." with its button busy until
+its first progress.
+
 ### Download POs by PO Date
 `POST /epsn/searchPO.do searchParam=showPage` (token, session check) →
 `POST /epsn/searchPO.do` with `searchCriteria=PO`, `searchRange=2`, `dateFrom`/`dateTo` as `DD/MM/YYYY`,
@@ -1748,7 +1856,10 @@ consecutive windows searched one after another. Rows are re-checked against the 
 PO No. + unit + link, and each row's own "Click to View/Download PO" href is fetched, verified as `%PDF`, and saved as
 `Downloads/DocLink/IREPS/PO/<PO date>/<IREPS file name>` (`PO_<PO>_<date>.pdf`, unit added only when two documents
 would collide, when IREPS gives no name).
-Rows without a link are listed as skipped with the reason.
+Rows without a link are listed as skipped with the reason. A single PO download by PO number is refused when IREPS
+lists that number for two railway units (`IREPS_PO_SEVERAL_UNITS`), instead of downloading the first row; Download
+POs by PO Date saves the PO of each unit. A single PO typed in another spelling (case, spaces) is filed and logged
+under the PO number IREPS shows.
 
 ### Download ICs by IC Date
 Every Inspection Certificate whose **IC Date** is in From-To, for every PO.
@@ -1757,21 +1868,27 @@ the search with `poNo` and `poSr` empty, `dateFromIC`/`dateToIC` = the selected 
 and the Call Date fields (`dateFrom`/`dateTo`) left at the portal's defaults - `dateFrom` is only pulled back when the IC
 From date is earlier, since a call precedes its IC → every `navigate(N)` page (50 calls a page), each with the token of
 the page before. Rows are re-checked here: IC-issued status, IC Date in the range, de-duplicated on the IC PDF href.
+Every IC search (one PO, IC by date, IC from notifications) compares the calls read with IREPS's "Total Records" and
+warns on a shortfall.
 Should IREPS ignore the IC dates, the newest-first list stops being read after two whole pages before From (and at
 most 200 pages are read, with a warning). Each row's "View/ Download IC PDF" href is saved as
 `Downloads/DocLink/IREPS/IC/<PO>/<IREPS file name>` (`IC_<PO>_<SR>_<CALLID>.pdf` when IREPS gives none), with the same download-log key and ECM fields as the other
 IC downloads, so an IC already downloaded by any of them is recognised.
 
 ### Download ICs from Notifications
-Only the IC of each notified PO **and PO serial** (one per "IC issued" notice); for every IC of a period use
-Download ICs by IC Date.
+Only the ICs of each notified PO **and PO serial**: every call of that PO and serial whose status is "IC issued"
+(a notice names the PO and serial, not one IC, so a serial with several issued ICs gives all of them); for every IC
+of a period use Download ICs by IC Date.
 `POST /epsn/vndr/activity/ajax.do ajaxMode=getMyActivitesData` → notifications with subject *Inspection* and message
 "IC issued for PONo : … , POSrNo : …" (everything else ignored; identifiers kept verbatim) → for each distinct
 PO + serial: `POST /epsn/tpi/vendorInspectionCallList.do callType=I&status=I` (fresh token), then the search with `poNo`,
-`poSr`, `statusSelected=Completed / IC Issued`, every `navigate(N)` page → rows with the exact PO number, exact serial and an
+`poSr`, `statusSelected=Completed / IC Issued`, every `navigate(N)` page → rows with the same PO number (case and spaces aside), the exact serial and an
 IC-issued status → each row's "View/ Download IC PDF" href → `Downloads/DocLink/IREPS/IC/<PO>/<IREPS file name>` (`IC_<PO>_<SR>_<CALLID>.pdf` when IREPS gives none).
+A search read short of IREPS's "Total Records" that matches nothing is a failure that a retry searches again, never
+"No record".
 `REF_ID` is compared with the row's Call Id and reported, not trusted as the certificate number. A manifest
 (`IC_notifications_manifest_<time>.json`: ids, outcome, reason - never cookies or tokens) is saved beside the ICs.
+An IC IREPS lists twice for one notice: its row keeps the real outcome, the repeat is `duplicate_skipped`.
 Searches run one at a time (the Struts token belongs to the session); downloads run 3 at a time with up to 2 retries for
 network / timeout / HTTP 5xx only. An expired session is never retried.
 
@@ -1847,7 +1964,8 @@ and was not reopened by the Recon Engine: the new time 11:00-12:00 applies from 
 Everyone sees what ran today. An hourly type shows its
 latest run, the next run, and the earlier runs of the day folded into one line ("Earlier today: 3 of 4 runs
 done, 12 saved"). A slot that has not run reads "Scheduled 18:00-19:00" before its window, "Due 18:00-19:00, not
-run yet" inside it, and "Not run during 09:00-10:00" once missed. What this DocLink waits for (an IREPS login, a
+run yet" inside it, and "Not run during 09:00-10:00" once missed (a slot that ran but did not finish reads "Ran,
+but not finished during ..." with its counts). What this DocLink waits for (an IREPS login, a
 manual run, the Recon Engine) and its last failed check ("Last check failed: …") are in the line at the top.
 
 **What failed, and why.** A row of Today opens (▸) to the details of its run:
@@ -1888,8 +2006,11 @@ caught up by the next run.
 
 **Order of checks** (`services/scheduler/scheduler.js`): config on → Recon signed in with
 `doclink.schedule.run` → last verified IREPS account known → `GET /schedule/due` → no manual job running here →
-an IREPS page loaded in this browser in the last 4 minutes → claim → **one** IREPS check (the home page: logged
-in, same account) → run. Only IREPS's login page fails that check as "not logged in". When IREPS does not answer it
+an IREPS page loaded in a tab of the user's in the last 4 minutes (a tab DocLink opened itself, such as a print
+tab or the tender runner tab, never counts) → claim → **one** IREPS check (the home page: logged
+in, same account) → run. That check covers the slots that follow it for 2 minutes; after a longer run the next
+slot needs an IREPS page load in the last 4 minutes and gets its own check after its claim. Only IREPS's login
+page fails that check as "not logged in". When IREPS does not answer it
 (an HTTP error, a timeout, a busy page), the slot is given back as `IREPS_UNAVAILABLE` and asked again at the next
 check (section 5). Nothing is sent to IREPS before the claim is won, and never on a timer: twenty DocLinks
 waking at 09:00 send one IREPS request between them. A run starts at the alarm, when an IREPS page finishes
@@ -1911,10 +2032,14 @@ Recon sign-in, or when a manual job ends.
 * Before each upload the run must still hold its claim (a heartbeat within the lease); a run that lost its claim
   stops, and the DocLink that took over skips what is already done.
 
-**Outcomes.** `done` (saved, or nothing new); `partial` (some documents failed: retried at the next check);
-`failed` (retried at the next check; an expired IREPS session or a busy local job gives the slot back without
-counting an attempt); `failed_final` (a setting a retry cannot fix); `missed`. The toolbar icon shows `!` while a
-slot of this account waits for an IREPS login in this browser.
+**Outcomes.** `done` (everything read and saved, or IREPS said there was nothing: nothing new); `partial`
+(something was saved, but a document failed, a row had no PDF link, an IC search failed or a list was short of
+IREPS's own total: retried at the next check); `failed` (the run stopped on an error, or nothing was saved and one
+of those happened: retried at the next check; an expired IREPS session or a busy local job gives the slot back
+without counting an attempt); `failed_final` (a setting a retry cannot fix); `missed`. Each document or list not
+read is named in the slot's result (failures, warnings). The toolbar icon shows `!` while a slot of this account
+waits for an IREPS login in this browser. A claim given back because IREPS did not answer, or because another
+account is logged in, shows as the last check's failure, without `!`.
 
 **Code.** `services/scheduler/` (`schedule-types.js` setting and types, `schedule-api.js` Recon client,
 `local-signals.js` IREPS activity / account, `scheduler.js` the checks and claims, `runners.js` outcomes,
@@ -1941,7 +2066,7 @@ ships it off.
 
 | Name | Schedule type | What a run does (with the claim's date range) | Default timing (IST) |
 |---|---|---|---|
-| `NIT` | `tenderNit` | "NIT Documents" (automatic mode): My Messages in the range → each tender's NIT, attachments, My Offer and its corrigenda | hourly, 10:30 … 18:30 |
+| `NIT` | `tenderNit` | "NIT Documents" (automatic mode): My Messages in the range → each tender's NIT, attachments and its corrigenda. My Offer is left out (the ECM has no document type for it; the run says so once): download it from the panel | hourly, 10:30 … 18:30 |
 | `CounterOffer` | `tenderCounterOffer` | Counter Offer letters by Letter Date | hourly, 10:30 … 18:30 |
 | `LOA` | `tenderLoa` | Advance Acceptance (LOA) letters by Letter Date. Sends IREPS's own "LOA viewed" request first, as a manual LOA download does, with nobody clicking | hourly, 10:30 … 18:30 |
 | `Tabulation` | `tenderTabulations` | Financial and Commercial Tabulation of tenders closing in the range, from IREPS Search Tender one closing day at a time, as the panel's buttons (section 19; look-back 15 days: a tabulation appears days after closing) | hourly, 10:30 … 18:30 |
@@ -1965,12 +2090,32 @@ A run is given 50 minutes at most.
   skipped without the "download again?" question; a reservation that fails fetches nothing.
 * The ECM only (NIT, LOA and Result as grouped documents, direct ECM), never Downloads: a refused upload is a
   failed document, retried at the next check. No `.html` copy of a rendered letter is kept.
-* Each saved file is reported with its download-log record. The run must still hold its claim before each upload
-  (the tab asks the worker every 20 s; the worker sends the heartbeats).
+* Each saved file is reported with its download-log record as soon as it is saved, so a run the 50-minute limit
+  or a closed tab stops has reported all it saved. Before each upload the run must still hold its claim: the tab
+  asks the worker every 20 s and again before an upload when its last answer is older than 20 s (Chrome slows a
+  hidden tab's timers to once a minute); an answer counts for 1 minute at most. The worker sends the heartbeats.
+* A corrigendum is reported saved only with all its attached documents; while one fails it is reported failed with
+  that reason, so the slot ends partial and the next check fetches it again.
 * A scheduled run keeps its own tender ledger (`<account>#scheduled`), so a document the user once downloaded to
   Local never makes it skip that document.
 * The Recon sign-in page is never shown in the runner tab: the scheduler checked the sign-in before it claimed.
 * The run is for the account the worker verified: another IREPS account logged in stops it before any download.
+
+**How a tender run ends** (`tenderRunOutcome` / `tenderJobProblems`, `services/scheduler/tender-runner.js`):
+
+* `done`: everything was read and saved (or already saved), or IREPS listed nothing;
+* `partial`: something was saved, but a document, tender, list page or letter failed, was not read, or needs
+  review; also a run that stopped after saving something, when the stop counts as an attempt;
+* `failed`: nothing was saved and something failed. An expired session, a lost claim and the Recon sign-in stay
+  failed with no attempt counted;
+* failures name documents, tenders, NIT messages not opened, correspondence records and `SCHEDULE_NEEDS_REVIEW`
+  items;
+* warnings name lists not read in full (`SCHEDULE_LIST_INCOMPLETE`);
+* IREPS errors keep IREPS's texts;
+* a letters or tabulations run stops when IREPS's home page does not answer the account check, and lists the
+  tenders it did not reach as skipped;
+* a correspondence letter counts as saved only with all its attachments, and one saved but not reported is
+  reported at the next check.
 
 **Code.** `services/scheduler/tender-runner.js` (opens and closes the tab, the job, the outcome),
 `tender/schedule-runner.html` / `schedule-runner.js` (the tab), `tender/tender-shared-run.js` (the switch inside

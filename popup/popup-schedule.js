@@ -85,9 +85,17 @@ function resultText(result) {
   if (result.saved) parts.push(`${result.saved} saved`);
   if (result.skipped) parts.push(`${result.skipped} already saved`);
   if (result.failed) parts.push(`${result.failed} failed`);
-  if (parts.length === 0 && result.found === 0) parts.push("nothing new in IREPS");
+  // "nothing new" only when IREPS listed nothing: never over a run that could not read or save something
+  const troubled = (Array.isArray(result.failures) && result.failures.length > 0) || (Array.isArray(result.warnings) && result.warnings.length > 0);
+  if (parts.length === 0 && !troubled && (result.found === 0 || result.records === 0)) parts.push("nothing new in IREPS");
   return parts.join(", ");
 }
+
+/**
+ * A slot that ran in its window (started, or counted an attempt), as against one no DocLink ever ran:
+ * a run that did not end clean before its window closed is "missed" too, but it did run.
+ */
+const ranInWindow = (slot) => Boolean(slot.started_at) || Number(slot.attempts) > 0;
 
 /** Chip text and class of a slot status. */
 const STATUS_CHIP = {
@@ -188,11 +196,13 @@ export function slotDetails(slot, { earlier = [], log = null, now = Date.now() }
     failures: (localRunOf(s, log) && localRunOf(s, log).failures) || (s.result && Array.isArray(s.result.failures) ? s.result.failures : [])
   }));
 
-  const notRun = slot.status === "missed" || (slot.status === "pending" && Date.parse(slot.window_start_at || "") <= now);
+  // a missed slot that ran (and did not end clean) is no slot that never ran (1.13)
+  const neverRan = slot.status === "missed" && !ranInWindow(slot);
+  const notRun = neverRan || (slot.status === "pending" && Date.parse(slot.window_start_at || "") <= now);
   let events = [];
-  if (notRun || slot.status === "failed") {
+  if (notRun || slot.status === "failed" || slot.status === "missed") {
     events = windowEvents(slot, log).map((e) => `${eventTime(e, now)}: ${e.text}`);
-    if (events.length === 0 && slot.status === "missed") events = [`This browser noted nothing during ${slotWindow(slot)}: Chrome was closed, or its scheduler was not checking this account then.`];
+    if (events.length === 0 && neverRan) events = [`This browser noted nothing during ${slotWindow(slot)}: Chrome was closed, or its scheduler was not checking this account then.`];
   }
   const empty = facts.length + failures.length + warnings.length + earlierRuns.length + events.length === 0;
   return empty ? null : { facts, failures, failuresMore, fromLog, warnings, earlier: earlierRuns, events };
@@ -255,6 +265,8 @@ export function slotText(slot, schedule = null, now = Date.now()) {
     case "failed_final":
       return reason || "Failed";
     case "missed":
+      // a slot that ran but did not end clean before its window closed says so, with what it did (1.13)
+      if (ranInWindow(slot)) return [`Ran, but not finished during ${window}${reason ? ` (last: ${reason})` : ""}`, resultText(slot.result)].filter(Boolean).join(" · ");
       return `Not run during ${window}${reason ? ` (last: ${reason})` : ""}`;
     default:
       return "";

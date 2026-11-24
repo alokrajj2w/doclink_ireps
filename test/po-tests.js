@@ -198,6 +198,24 @@ export async function runPoTests({ test, assert, eq, rejects, fixture }) {
     eq(await withIrepsFormLock(async () => "loaded", { ifBusy: () => "busy" }), "loaded");
   });
 
+  await test("searchPo (1.20): a PO number IREPS lists for two railway units is never answered with 'the first row with a PDF'", async () => {
+    const row = (unit, n) =>
+      `<tr style="line-height: 26px;" class="trPoRow"><td class="searchDtlCls">${n}</td><td class="searchDtlCls">${unit}</td><td class="searchDtlCls"><a href="/ireps/etender/pdfdocs/MMIS/PO/2026/01/${n}27253922100240.pdf" title="Click to View/Download PO" target="_blank">27253922100240 </a></td><td> 16/01/2026</td><td class="searchDtlCls">S</td><td class="searchDtlCls">1000.00</td><td class="dataText"><a title="View/Download PO" class="linkStyle" href="/ireps/etender/pdfdocs/MMIS/PO/2026/01/${n}27253922100240.pdf" target="_blank">v</a></td></tr>`;
+    const twoUnits = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(poPageWithRows(poPage, row("N F RLY/HQ", 1) + row("EAST CENTRAL RLY/HQ", 2), 2)) });
+    const error = await rejects(searchPo("27253922100240", { fetch: twoUnits.fetchImpl, parseHtml }), PO_ERROR.SEVERAL_UNITS);
+    const text = describeError(error.code, { detail: error.detail }).message;
+    assert(text.startsWith("IREPS lists PO 27253922100240 for 2 railway units (N F RLY/HQ, EAST CENTRAL RLY/HQ), so DocLink cannot tell which"), text);
+    const oneUnit = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(poPageWithRows(poPage, row("N F RLY/HQ", 1) + row("N F RLY/HQ", 2), 2)) });
+    eq((await searchPo("27253922100240", { fetch: oneUnit.fetchImpl, parseHtml })).record.railwayUnit, "N F RLY/HQ", "the same unit listed twice is one PO");
+  });
+
+  await test("downloadPo (1.20): the search's own warnings go with the result", async () => {
+    // IREPS says 2 results; the page lists 1: the shortfall is a search warning
+    const ireps = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(poPage.replace("Total 1 result(s)", "Total 2 result(s)")), onPdf: (url, respond) => respond(fakePdfBytes(), { contentType: "application/pdf" }) });
+    const result = await downloadPo("27253922100240", { fetch: ireps.fetchImpl, parseHtml, saveFile: async (bytes, path) => ({ downloadId: 1, filename: path.split("/").pop() }) });
+    assert(result.warnings.some((w) => /IREPS reported 2 PO result\(s\) but 1 were read/.test(w)), JSON.stringify(result.warnings));
+  });
+
   await test("searchPo: PO not found -> IREPS_PO_NOT_FOUND with the PO number as detail", async () => {
     const { fetchImpl } = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(noPoResults(poPage)) });
     const e = await rejects(searchPo("99999999999999", { fetch: fetchImpl, parseHtml }), PO_ERROR.NOT_FOUND);
@@ -241,6 +259,27 @@ export async function runPoTests({ test, assert, eq, rejects, fixture }) {
     eq(seen[0].ecm.kind, "poCopy", "the hook sees how the PO is filed");
     eq(result.ecm.status, "stored");
     eq(result.downloadId, null, "nothing saved locally");
+  });
+
+  await test("downloadPo (6.6): a PO typed in another spelling is filed under the number IREPS shows: one ECM document, one download-log key", async () => {
+    const shown = "L3251421101345";
+    const { fetchImpl: searchFetch } = fakeIreps({ page: searchPage, onSearch: (b, t, respond) => respond(poPage.split("27253922100240").join(shown)) });
+    const combinedFetch = async (url, init) => ((init && init.method) === "POST" ? searchFetch(url, init) : new Response(fakePdfBytes(), { status: 200, headers: { "content-type": "application/pdf" } }));
+    for (const typed of ["l3251421101345", " L3251 421101345 ", shown]) {
+      const checked = [];
+      const saved = [];
+      const result = await downloadPo(typed, {
+        fetch: combinedFetch,
+        parseHtml,
+        preflight: async (items) => (checked.push(...items), { skip: new Map(), warnings: [] }),
+        saveFile: async (bytes, path, item) => (saved.push(item), { filename: path.split("/").pop(), downloadId: 1 })
+      });
+      eq(result.poNumber, shown, `"${typed}": the result names IREPS's PO number`);
+      eq(saved[0].ecm.fields.customer_po_number, shown, "the ECM document is IREPS's PO");
+      eq(saved[0].log.key, `po:${shown}`, "one download-log key, whatever the spelling");
+      eq(checked[0].log.key, `po:${shown}`, "and the download check asks for that key");
+      eq(saved[0].label, `PO ${shown}`);
+    }
   });
 
   await test("downloadPo: search + download the PO PDF (never 'Manage Your Purchase Order'); missing link -> IREPS_PO_LINK_NOT_FOUND", async () => {

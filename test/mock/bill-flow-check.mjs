@@ -10,6 +10,10 @@
  * offered to createDraftBill, which must refuse it. The expected values come from the mock's field
  * check, which doesn't use DocLink's code.
  *
+ * First, a lost answer (review 3.1): the mock saves a draft bill and then answers HTTP 503. DocLink
+ * must report that IREPS may have saved it, refuse a second Create without sending anything, and
+ * the mock must hold exactly one draft. The mock is reset before the receipts above run.
+ *
  * Not covered here, because they need a browser: the R-NOTE / CRN search parsers, the side panel
  * and sending from the IREPS tab. TESTING.md C9 covers those by hand.
  */
@@ -84,6 +88,55 @@ async function runCase(c, cookie, invoices, store) {
   return { outcome: result.outcome, billRegNo: result.context.billRegNo, detail };
 }
 
+/** Code of what a promise rejects with ("resolved" when it does not). */
+async function codeOf(promise) {
+  try {
+    await promise;
+    return { code: "resolved" };
+  } catch (error) {
+    return { code: (error && error.code) || String(error), error };
+  }
+}
+
+/**
+ * The header is saved but its answer is lost (the mock answers HTTP 503 after saving it): DocLink
+ * reports the outcome as unknown and sends no second header. Returns the problems found.
+ */
+async function runLostAnswer(c, cookie, invoices, print) {
+  const problems = [];
+  let lose = true;
+  let headersSent = 0;
+  const deps = {
+    fetch: (url, init = {}) => {
+      const extra = {};
+      if (String(url).endsWith("/saveBillHeader.do")) {
+        headersSent++;
+        if (lose) extra["X-Mock-Lose-Answer"] = "503";
+      }
+      return fetch(url, { ...init, headers: { ...(init.headers || {}), ...extra, Cookie: cookie } });
+    },
+    store: createBillStore(memoryStorageArea()),
+    today: TODAY
+  };
+  const receipt = receiptOf(c);
+  const invoice = await invoiceForReceipt({ receipt, mode: "file", file: { name: "mock-invoices.json", records: invoices } });
+  const context = await prepareBill({ receipt, invoice }, deps);
+  const first = await codeOf(createDraftBill(context, { acknowledged: true }, deps));
+  if (first.code !== BILL_ERROR.OUTCOME_UNKNOWN) problems.push(`the lost answer: expected ${BILL_ERROR.OUTCOME_UNKNOWN}, got ${first.code}`);
+  lose = false;
+  const second = await codeOf(createDraftBill((first.error && first.error.context) || context, { acknowledged: true }, deps));
+  if (second.code !== BILL_ERROR.OUTCOME_UNKNOWN) problems.push(`a second Create: expected ${BILL_ERROR.OUTCOME_UNKNOWN}, got ${second.code}`);
+  if (headersSent !== 1) problems.push(`saveBillHeader.do was sent ${headersSent} times`);
+  const draft = async (regNo) => (await fetch(`${BASE}/mock/bill/check.json?billRegNo=${regNo}`)).status === 200;
+  const drafts = [await draft(3900001), await draft(3900002)];
+  if (!drafts[0] || drafts[1]) problems.push(`the mock holds ${drafts.filter(Boolean).length} draft bill(s), expected exactly 1`);
+  print(`  DocLink: ${first.code}, then ${second.code} for a second Create ${problems.length ? "(NOT as expected)" : "(as expected)"}`);
+  print(`  IREPS:   ${drafts[0] ? "1 draft bill (3900001)" : "no draft bill"}${drafts[1] ? " and a second one (3900002)" : ""}, saveBillHeader.do sent ${headersSent} time(s)`);
+  if (first.error && first.error.detail) print(`  Reason:  ${first.error.detail}`);
+  for (const p of problems) print(`  PROBLEM  ${p}`);
+  return problems;
+}
+
 async function main() {
   // only this script's report, unless asked for DocLink's own log (BILL_CHECK_LOG=1)
   const print = console.log.bind(console);
@@ -100,6 +153,15 @@ async function main() {
   try {
     const cookie = await login();
     const invoices = (await (await fetch(`${BASE}/mock/bill/invoices.json`)).json()).invoices;
+    print(`\nAnswer lost after the header was saved (PO ${CASES[0].poNo}, the mock answers HTTP 503)`);
+    try {
+      failures += (await runLostAnswer(CASES[0], cookie, invoices, print)).length;
+    } catch (error) {
+      failures++;
+      print(`  DocLink: error ${(error && (error.detail || error.message)) || String(error)} (EXPECTED ${BILL_ERROR.OUTCOME_UNKNOWN})`);
+    }
+    // the receipts below start from an empty mock
+    await fetch(`${BASE}/mock/bill/reset`, { method: "POST", redirect: "manual" });
     const store = createBillStore(memoryStorageArea());
     for (const c of CASES) {
       print(`\n${c.name} (PO ${c.poNo})`);

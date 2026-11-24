@@ -25,7 +25,9 @@ import {
   parseRoList,
   parseRoDetails,
   parseSaveDetails,
-  successFields
+  successFields,
+  missingAnswerReason,
+  RO_REFUSALS
 } from "../services/bill-upload/bill-upload-api.js";
 import { parseBillForm, hasBillForm } from "../services/bill-upload/bill-form.js";
 import {
@@ -34,14 +36,18 @@ import {
   computeAmounts,
   gstSplit,
   invoiceDateToIreps,
+  invoiceDateRefusal,
+  pageRound2,
+  round2,
   stateCodeOf,
   deriveStateOfSupply,
   deriveSupplierGstin,
   paymentPercentFrom,
   precheckReceipt,
-  hsnCheck
+  hsnCheck,
+  railwayGstinFor
 } from "../services/bill-upload/bill-rules.js";
-import { normaliseInvoice, invoiceRecords, retrieveInvoice, manualInvoice, isSentToDoculink, billDocumentsQuery, BILL_DOCUMENTS, MAX_DOCUMENT_BYTES } from "../services/bill-upload/ecm-invoice.js";
+import { normaliseInvoice, invoiceRecords, retrieveInvoice, manualInvoice, isSentToDoculink, billDocumentsQuery, receiptMismatches, BILL_DOCUMENTS, MAX_DOCUMENT_BYTES } from "../services/bill-upload/ecm-invoice.js";
 import { createBillStore, memoryStorageArea } from "../services/bill-upload/bill-upload-store.js";
 import { parseInvoiceFile, invoiceFromFile, receiptInvoiceKey, MAX_INVOICE_FILE_BYTES } from "../services/bill-upload/invoice-file.js";
 import {
@@ -54,15 +60,20 @@ import {
   createDraftBill,
   forgetBill,
   saveItem,
+  addDocumentToBill,
+  confirmCheckedInIreps,
+  unknownOutcome,
   collectBillDocuments,
   documentNeed
 } from "../services/bill-upload/bill-upload-service.js";
 import { tabFetch, tabSaveFile } from "../services/bill-upload/tab-transport.js";
-import { finishSteps, startFreshText } from "../popup/popup-bill-upload.js";
+import { finishSteps, startFreshText, initBillUpload, handleBillUploadMessage } from "../popup/popup-bill-upload.js";
+import { createBillUploadJob } from "../background/bill-upload-job.js";
+import { withIrepsFormLock } from "../services/ireps-form-lock.js";
 import { callEcmAutomation, resetEcmDirectState } from "../services/ecm-direct.js";
 import { applyEcmConfig } from "../services/ecm-config.js";
-import { IrepsError, IREPS_ERROR, loadIrepsConfig } from "../services/ireps-api.js";
-import { describeError, ERROR_CATALOG } from "../utils/messages.js";
+import { IrepsError, IREPS_ERROR, IREPS_CONFIG, loadIrepsConfig, requestIreps } from "../services/ireps-api.js";
+import { describeError, ERROR_CATALOG, MESSAGE_TYPES, SESSION_KEYS } from "../utils/messages.js";
 import {
   signerRequest,
   signerFrames,
@@ -119,7 +130,8 @@ const ECM_INVOICE = {
 
 /**
  * A fake IREPS answering the bill endpoints with the captured non-stock answers; records
- * every call. `override(path, body)` may answer a call itself.
+ * every call. `override(path, body)` may answer a call itself: a text (HTTP 200), a Response, or
+ * an Error the transport throws (the answer never arrives).
  */
 function fakeBillIreps(page, { override, billRegNo = "3744921" } = {}) {
   const calls = [];
@@ -129,6 +141,8 @@ function fakeBillIreps(page, { override, billRegNo = "3744921" } = {}) {
     const body = init.body == null ? "" : String(init.body);
     calls.push({ path, body, headers: init.headers || {} });
     const own = override && override(path, body);
+    if (own instanceof Error || (typeof DOMException !== "undefined" && own instanceof DOMException)) throw own;
+    if (own instanceof Response) return own;
     if (own !== undefined && own !== null) return answer(own);
     switch (path) {
       case "/epsn/ct/fetchPODetails.do": return answer(page);
@@ -144,6 +158,29 @@ function fakeBillIreps(page, { override, billRegNo = "3744921" } = {}) {
     }
   };
   return { fetchImpl, calls, writes: () => calls.filter((c) => /saveBill(Header|Details)/.test(c.path)) };
+}
+
+/** What the tab transport throws when the IREPS tab was reloaded, closed or left mid-request. */
+const CHANNEL_CLOSED = "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received";
+const tabGone = () => Object.assign(new TypeError(`the IREPS tab could not run the request: ${CHANNEL_CLOSED}`), { tabTransport: "tab" });
+
+/** Wait (a macrotask at a time) until `ready()` holds; fails after `tries` turns. */
+async function until(ready, what, tries = 400) {
+  for (let i = 0; i < tries; i++) {
+    if (ready()) return;
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+/** The error a promise rejects with (null when it resolves). */
+async function failureOf(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  return null;
 }
 
 export async function runBillUploadTests({ test, assert, eq, rejects, fixture }) {
@@ -428,9 +465,17 @@ export async function runBillUploadTests({ test, assert, eq, rejects, fixture })
     assert(/frt charge/.test(errorsOf({ item: withFreight })), "freight");
     assert(/not in IREPS' railway GSTIN list/.test(errorsOf({ railwayGstins: [{ value: "29AAAGM0289C1ZF" }] })), "rly GSTIN");
     assert(/differs from the receipt quantity/.test(errorsOf({ invoice: { ...ECM_INVOICE, quantity: "14" } })), "qty");
-    const otherState = buildItem({ ...input, header: { ...NS_HEADER, stateOfSupply: "29" } });
-    assert(otherState.checks.some((c) => c.level === "warning" && /consignee is in state 18/.test(c.text)), "consignee warning");
+    // consignee in another state than the saved state of supply (review 3.2): IREPS's page takes
+    // only a railway GSTIN of the state of supply, so the consignee's own is never sent
+    const offered = [{ value: "18AAAGM0289C1ZI" }, { value: "29AAAGM0289C1ZF", label: "29AAAGM0289C1ZF-Karnataka" }, { value: "29AAACI0681C1ZV", label: "29AAACI0681C1ZV-~Karnataka-IRFC" }];
+    const otherState = buildItem({ ...input, header: { ...NS_HEADER, stateOfSupply: "29" }, railwayGstins: offered });
+    eq(otherState.values.rlyGSTIN, "29AAAGM0289C1ZF", "the state of supply's GSTIN with the consignee's PAN");
+    assert(otherState.checks.some((c) => c.level === "warning" && /consignee's GSTIN 18AAAGM0289C1ZI is in state 18 \(Assam\)/.test(c.text) && /uses 29AAAGM0289C1ZF-Karnataka/.test(c.text)), JSON.stringify(otherState.checks));
+    eq(otherState.checks.filter((c) => c.level === "error").length, 0, JSON.stringify(otherState.checks));
     eq(otherState.values.igstRate, "18", "IGST as the saved header says");
+    const noGstinOfState = buildItem({ ...input, header: { ...NS_HEADER, stateOfSupply: "29" } });
+    eq(noGstinOfState.values.rlyGSTIN, "", "never the consignee's GSTIN of another state");
+    assert(/DocLink cannot tell which one to use \(it offers none\)/.test(errorsOf({ header: { ...NS_HEADER, stateOfSupply: "29" } })), "no railway GSTIN of the state of supply: the item stops");
     const sameState = buildItem({ ...input, header: { ...NS_HEADER, supplierState: "18", supplierGSTIN: "18X" } });
     eq(sameState.values.cgstRate, "9");
     eq(sameState.values.sgstRate, "9");
@@ -621,11 +666,12 @@ export async function runBillUploadTests({ test, assert, eq, rejects, fixture })
     const first = await createDraftBill(ctx, { acknowledged: false }, deps);
     eq(first.outcome, "item-review");
     eq(ireps.writes().length, 1, "header only");
-    assert(first.context.item.checks.some((c) => /consignee is in state 29/.test(c.text)));
+    assert(first.context.item.checks.some((c) => c.level === "warning" && /consignee's GSTIN 29AAAGM0289C1ZF is in state 29 \(Karnataka\)/.test(c.text)), JSON.stringify(first.context.item.checks));
     eq((await store.get(receiptNS().key)).status, "header-saved");
     const second = await saveItem(first.context, { acknowledged: true }, deps);
     eq(second.outcome, "item-saved");
     eq(ireps.writes().length, 2);
+    eq(new URLSearchParams(ireps.writes()[1].body).get("rlyGSTIN"), "18AAAGM0289C1ZI", "the state of supply's railway GSTIN, the one IREPS's page keeps");
     await rejects(saveItem(second.context, { acknowledged: true }, deps), BILL_ERROR.DRAFT_EXISTS);
 
     // IREPS refuses the item: the error carries the bill reg no. and the context
@@ -1028,5 +1074,728 @@ export async function runBillUploadTests({ test, assert, eq, rejects, fixture })
   await test("bill form: the registered DSC thumbprint is read", async () => {
     const html = (await billPage(fixture)) + `<input type="hidden" name="certThumbprint" value="${THUMB.toLowerCase()}">`;
     eq(parseBillForm(html).certThumbprint, THUMB);
+  });
+
+  /* ------------------------------------------------- inspection of 24 Nov 2026, section 3 and 5.4 */
+
+  await test("bill upload flow (3.1): a header whose answer is lost (tab reloaded) stays stopped until the user checked Bills for Pay", async () => {
+    const page = await billPage(fixture);
+    const store = createBillStore(memoryStorageArea());
+    let lose = true;
+    const ireps = fakeBillIreps(page, { override: (path) => (path.endsWith("saveBillHeader.do") && lose ? tabGone() : null) });
+    const deps = { fetch: ireps.fetchImpl, store, today: TODAY };
+    const ctx = await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps);
+    const lost = await rejects(createDraftBill(ctx, { acknowledged: true }, deps), BILL_ERROR.OUTCOME_UNKNOWN);
+    assert(/DocLink sent the bill header for invoice 1061000262 \(PO 40265077101806, PO Sr 001\) to IREPS/.test(lost.detail), lost.detail);
+    assert(/the IREPS tab was reloaded, closed or left before IREPS answered/.test(lost.detail) && /Bills for Pay/.test(lost.detail), lost.detail);
+    assert(!/try again|network connection/i.test(describeError(lost.code, { detail: lost.detail }).message), "no blind retry is suggested");
+    assert(lost.cause && /message channel closed/.test(JSON.stringify(String(lost.cause.cause && lost.cause.cause.cause))), "the transport's own error is kept as the cause");
+    eq(ireps.writes().length, 1, "the header was sent once");
+    const entry = await store.get(receiptNS().key);
+    eq(entry.unknown.step, "header");
+    eq(entry.billRegNo, null);
+    eq(entry.invoiceNo, "1061000262");
+    assert(lost.context.header.checks.some((c) => c.level === "error" && /answer did not arrive/.test(c.text)), "the review shows the stop");
+
+    // no second header, whatever is tried: Create again, a new prepare, Start fresh
+    await rejects(createDraftBill(lost.context, { acknowledged: true }, deps), BILL_ERROR.OUTCOME_UNKNOWN);
+    const again = await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps);
+    assert(again.header.checks.some((c) => c.level === "error" && /answer did not arrive/.test(c.text)), "a new prepare shows it too");
+    await rejects(createDraftBill(again, { acknowledged: true }, deps), BILL_ERROR.OUTCOME_UNKNOWN);
+    await rejects(forgetBill(again, deps), BILL_ERROR.OUTCOME_UNKNOWN, "Start fresh does not clear it");
+    eq(startFreshText(publicBill(again)), null, "and is not offered for it");
+    eq(ireps.writes().length, 1, "still the one header");
+
+    // only the user's confirmation clears it, and only for the write they read about
+    const shown = unknownOutcome(entry);
+    assert(/there is no draft bill for invoice 1061000262/.test(shown.confirm), shown.confirm);
+    await rejects(confirmCheckedInIreps(again, { step: "header", at: "2000-01-01T00:00:00.000Z" }, deps), BILL_ERROR.CHECKS_FAILED);
+    const cleared = await confirmCheckedInIreps(again, { step: shown.step, at: shown.at }, deps);
+    eq(await store.get(receiptNS().key), null, "record removed");
+    assert(!cleared.header.checks.some((c) => /answer did not arrive/.test(c.text)), "stop gone");
+    lose = false;
+    eq((await createDraftBill(cleared, { acknowledged: true }, deps)).outcome, "item-saved");
+    eq(ireps.writes().length, 3, "the lost header, then header + item");
+  });
+
+  await test("bill upload flow (3.1): which answers leave a write open (deadline, network, 5xx, unreadable, a page) and which do not (refusal, 4xx, login page)", async () => {
+    const page = await billPage(fixture);
+    const login = await fixture("login-page.html");
+    const cases = [
+      ["the deadline", () => new DOMException("aborted", "AbortError"), BILL_ERROR.OUTCOME_UNKNOWN, /IREPS did not answer within 120 seconds/],
+      ["a network error", () => new TypeError("Failed to fetch"), BILL_ERROR.OUTCOME_UNKNOWN, /the connection to IREPS broke/],
+      ["HTTP 503", () => new Response("<html><body>Service Unavailable</body></html>", { status: 503 }), BILL_ERROR.OUTCOME_UNKNOWN, /a server error \(HTTP 503\)/],
+      ["success without a number", () => "success^^", BILL_ERROR.OUTCOME_UNKNOWN, /answer could not be read/],
+      ["an error page", () => "<html><body><h1>Error</h1>Something went wrong</body></html>", BILL_ERROR.OUTCOME_UNKNOWN, /a page instead of its usual answer/],
+      ["IREPS's refusal", () => "Bill already registered for Invoice No. 1061000262.", BILL_ERROR.IREPS_REJECTED, null],
+      ["HTTP 404", () => new Response("not found", { status: 404 }), BILL_ERROR.REQUEST_FAILED, null],
+      ["the login page", () => login, IREPS_ERROR.SESSION_EXPIRED, null]
+    ];
+    for (const [label, answer, code, why] of cases) {
+      const store = createBillStore(memoryStorageArea());
+      const ireps = fakeBillIreps(page, { override: (path) => (path.endsWith("saveBillHeader.do") ? answer() : null) });
+      const deps = { fetch: ireps.fetchImpl, store, today: TODAY };
+      const error = await rejects(createDraftBill(await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps), { acknowledged: true }, deps), code, label);
+      const entry = await store.get(receiptNS().key);
+      if (why) {
+        assert(why.test(error.detail), `${label}: ${error.detail}`);
+        eq(entry && entry.unknown && entry.unknown.step, "header", `${label}: recorded as unknown`);
+      } else {
+        eq(entry, null, `${label}: IREPS answered, nothing is recorded and the receipt can be billed`);
+      }
+    }
+    eq(missingAnswerReason(new IrepsError(BILL_ERROR.IREPS_REJECTED, "x")), null);
+  });
+
+  await test("bill upload flow (3.1): an item whose answer is lost keeps the bill and stops Save item until the user checked the bill", async () => {
+    const page = await billPage(fixture);
+    const store = createBillStore(memoryStorageArea());
+    let lose = true;
+    const ireps = fakeBillIreps(page, { override: (path) => (path.endsWith("saveBillDetails.do") && lose ? new Response("<html><body>Gateway Timeout</body></html>", { status: 504 }) : null) });
+    const deps = { fetch: ireps.fetchImpl, store, today: TODAY };
+    const lost = await rejects(createDraftBill(await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps), { acknowledged: true }, deps), BILL_ERROR.OUTCOME_UNKNOWN);
+    eq(lost.billRegNo, "3744921", "the draft bill stays on screen");
+    assert(/DocLink sent the item of draft bill 3744921 \(invoice 1061000262\)/.test(lost.detail) && /HTTP 504/.test(lost.detail) && /Bills for Pay/.test(lost.detail), lost.detail);
+    const entry = await store.get(receiptNS().key);
+    eq(entry.status, "header-saved");
+    eq(entry.billRegNo, "3744921");
+    eq(entry.unknown.step, "item");
+    eq(lost.context.existing.unknown.step, "item", "the panel sees the stop");
+    const writes = ireps.writes().length;
+    await rejects(saveItem(lost.context, { acknowledged: true }, deps), BILL_ERROR.OUTCOME_UNKNOWN, "no second item");
+    eq(ireps.writes().length, writes);
+    const shown = unknownOutcome(entry);
+    assert(/draft bill 3744921 in IREPS: its item is not saved/.test(shown.confirm), shown.confirm);
+    const cleared = await confirmCheckedInIreps(lost.context, shown, deps);
+    eq((await store.get(receiptNS().key)).billRegNo, "3744921", "the bill stays recorded");
+    eq(cleared.existing.unknown, null);
+    lose = false;
+    eq((await saveItem(cleared, { acknowledged: true }, deps)).outcome, "item-saved");
+    eq((await store.get(receiptNS().key)).status, "item-saved");
+  });
+
+  await test("bill upload (3.1): a document registration whose answer is lost stops uploads to that bill until its documents were checked", async () => {
+    const store = createBillStore(memoryStorageArea());
+    const context = { receipt: receiptNS(), billRegNo: "3744921" };
+    await store.put(context.receipt.key, { status: "item-saved", billRegNo: "3744921", dispatchNo: "3894570", invoiceNo: "1061000262", poNumber: "40265077101806", poSr: "001", roNo: "35294-26-66158" });
+    let signed = 0;
+    let lose = true;
+    const deps = {
+      store,
+      today: new Date(2026, 8, 15),
+      signPdf: async () => (signed++, signerReply()),
+      saveFile: async (form) => `<html><body>OK~${form.relativeDir}/${form.pdfName}~10</body></html>`,
+      fetch: async () => {
+        if (lose) throw tabGone();
+        return new Response("OK#1<>MA_1.pdf#ireps/upload/x.pdf#MODIFICATION ADVICE#15/09/2026 16:42#USER#1<>", { status: 200 });
+      }
+    };
+    const bill = { billRegNo: "3744921", dispatchNo: "3894570", vendorCode: ":833", thumbprint: THUMB, spmBillRegNo: "null" };
+    const input = { bill, file: { name: "MA 0426.pdf", base64: PDF_B64 }, fileDesc: " MODIFICATION ADVICE " };
+    const lost = await rejects(addDocumentToBill(context, input, deps), BILL_ERROR.OUTCOME_UNKNOWN);
+    assert(/DocLink sent MA0426\.pdf \("MODIFICATION ADVICE"\) to draft bill 3744921 \(invoice 1061000262\)/.test(lost.detail), lost.detail);
+    const entry = await store.get(context.receipt.key);
+    eq(entry.unknown.step, "document");
+    eq(entry.status, "item-saved", "the bill keeps its saved item");
+    await rejects(addDocumentToBill(context, input, deps), BILL_ERROR.OUTCOME_UNKNOWN, "no second upload");
+    eq(signed, 1, "not even signed again");
+    await confirmCheckedInIreps(context, unknownOutcome(entry), { store });
+    lose = false;
+    eq((await addDocumentToBill(context, input, deps)).documents.length, 1);
+    eq((await store.get(context.receipt.key)).unknown, null);
+    eq(signed, 2);
+  });
+
+  await test("bill upload flow (3.1): a write is recorded before it leaves, so one cut off with the service worker still stops a second one", async () => {
+    const page = await billPage(fixture);
+    const store = createBillStore(memoryStorageArea());
+    const ireps = fakeBillIreps(page);
+    let release;
+    const hanging = new Promise((r) => (release = r));
+    let reached = false;
+    const fetch = async (url, init) => {
+      if (String(url).endsWith("saveBillHeader.do")) {
+        reached = true;
+        await hanging;
+      }
+      return ireps.fetchImpl(url, init);
+    };
+    const deps = { fetch, store, today: TODAY };
+    const creating = createDraftBill(await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps), { acknowledged: true }, deps);
+    await until(() => reached, "the header request");
+    const pending = await store.get(receiptNS().key);
+    eq(pending && pending.unknown && pending.unknown.step, "header", "recorded while IREPS has not answered");
+    assert(/background work stopped before IREPS answered/.test(unknownOutcome(pending).text), unknownOutcome(pending).text);
+    release();
+    eq((await creating).outcome, "item-saved");
+    const done = await store.get(receiptNS().key);
+    eq(done.unknown, null, "IREPS's answers cleared it");
+    eq(done.billRegNo, "3744921");
+    eq(done.status, "item-saved");
+
+    // no record, no write: a store that cannot be written stops the header before it is sent
+    const broken = createBillStore(memoryStorageArea());
+    broken.put = async () => {
+      throw new Error("QUOTA_BYTES quota exceeded");
+    };
+    const unsent = fakeBillIreps(page);
+    const brokenDeps = { fetch: unsent.fetchImpl, store: broken, today: TODAY };
+    const refused = await failureOf(createDraftBill(await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, brokenDeps), { acknowledged: true }, brokenDeps));
+    assert(refused && /quota exceeded/.test(refused.message), String(refused));
+    eq(unsent.writes().length, 0, "nothing was sent to IREPS");
+  });
+
+  await test("bill upload job (5.9): each step that ends, failed or not, tells the worker, so a scheduled download that waited may run", async () => {
+    const savedChrome = globalThis.chrome;
+    const savedFetch = globalThis.fetch;
+    globalThis.chrome = { storage: { session: memoryStorageArea(), local: memoryStorageArea() }, runtime: { getPlatformInfo: async () => ({}) } };
+    // IREPS cannot be reached: the search step starts, fails at once and ends
+    globalThis.fetch = async () => {
+      throw new TypeError("Failed to fetch");
+    };
+    try {
+      let ended = 0;
+      const updates = [];
+      const job = createBillUploadJob({ broadcast: (type, payload) => updates.push(payload.state), parseSearchPo: async () => ({ records: [] }), onJobEnded: () => void ended++ });
+      const started = await job[MESSAGE_TYPES.BILL_UPLOAD_SEARCH]({ poNo: "40265077101806", panelTabId: 1 });
+      eq(started.started, true, "the step started");
+      await until(() => ended === 1, "the step's end");
+      eq(updates[updates.length - 1].busy, false, "told after the job is free again");
+    } finally {
+      globalThis.chrome = savedChrome;
+      globalThis.fetch = savedFetch;
+    }
+  });
+
+  await test("bill upload job (3.1, 3.13a): a lost answer from the IREPS tab stops Create, the cause is logged, and only 'I checked' frees it", async () => {
+    const realChrome = globalThis.chrome;
+    const realWarn = console.warn;
+    const page = await billPage(fixture);
+    const ireps = fakeBillIreps(page);
+    const session = memoryStorageArea();
+    const local = memoryStorageArea();
+    const TAB = 9701;
+    let lose = true;
+    let headerSent = 0;
+    const warnings = [];
+    globalThis.chrome = {
+      storage: { session, local },
+      runtime: { getPlatformInfo: async () => ({}) },
+      scripting: { executeScript: async () => [{ result: null }] },
+      tabs: {
+        get: async (tabId) => ({ id: tabId, url: new URL("/epsn/ct/fetchPODetails.do", IREPS_CONFIG.baseUrl).href }),
+        sendMessage: async (tabId, message) => {
+          if (message.type !== "DOCLINK_TAB_FETCH") return undefined;
+          if (message.url.endsWith("saveBillHeader.do")) {
+            headerSent++;
+            if (lose) throw new Error(CHANNEL_CLOSED);
+          }
+          const response = await ireps.fetchImpl(message.url, { method: message.method, headers: message.headers, body: message.body });
+          return { ok: true, status: response.status, statusText: "OK", url: message.url, redirected: false, contentType: "text/html", text: await response.text() };
+        }
+      }
+    };
+    console.warn = (...args) => (warnings.push(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ")), realWarn(...args));
+    try {
+      await session.set({ [SESSION_KEYS.BILL_UPLOAD_STATE]: { step: "receipts", busy: false, message: "", poNo: "40265077101806", receipts: [receiptNS()], warnings: [], receiptKey: null, invoiceMode: "manual", invoice: null, context: null, documents: null, docUpload: null, error: null } });
+      const updates = [];
+      const job = createBillUploadJob({ broadcast: (type, payload) => updates.push(payload.state), parseSearchPo: async () => ({ records: [] }) });
+      const step = async (type, msg) => {
+        const seen = updates.length;
+        const started = await job[type]({ ...msg, panelTabId: TAB });
+        eq(started.started, true, `${type} started`);
+        await until(() => updates.length >= seen + 2 && !updates[updates.length - 1].busy, type);
+        return updates[updates.length - 1];
+      };
+      const typed = { invoiceNumber: "1061000262", invoiceDate: "2026-08-08", amount: "485776.5", quantity: "15", hsn: "85452000", division: "WABRTK", supplyPlace: "Guwahati" };
+      const review = await step(MESSAGE_TYPES.BILL_UPLOAD_PREPARE, { receiptKey: receiptNS().key, invoiceMode: "manual", manualInvoice: typed, overrides: { stateOfSupply: "18" } });
+      eq(review.step, "review");
+      eq(review.bill.header.checks.filter((c) => c.level === "error").length, 0, JSON.stringify(review.bill.header.checks));
+
+      const lost = await step(MESSAGE_TYPES.BILL_UPLOAD_CREATE, { confirmed: true, acknowledged: true });
+      eq(lost.step, "review", "back on the review");
+      eq(lost.error && lost.error.code, "BILL_OUTCOME_UNKNOWN");
+      eq(lost.bill.unknown && lost.bill.unknown.step, "header");
+      assert(/invoice 1061000262/.test(lost.bill.unknown.text) && /reloaded, closed or left/.test(lost.bill.unknown.text), lost.bill.unknown.text);
+      assert(lost.bill.header.checks.some((c) => c.level === "error" && /answer did not arrive/.test(c.text)), "Create is stopped by a check");
+      eq(headerSent, 1);
+      assert(warnings.some((w) => /Bill upload step create stopped/.test(w) && w.includes(CHANNEL_CLOSED)), `the transport's own error is logged: ${warnings.join("\n")}`);
+
+      const refused = await step(MESSAGE_TYPES.BILL_UPLOAD_CREATE, { confirmed: true, acknowledged: true });
+      eq(refused.error && refused.error.code, "BILL_OUTCOME_UNKNOWN", "Create again is refused");
+      eq(headerSent, 1, "nothing sent again");
+
+      const u = refused.bill.unknown;
+      eq((await job[MESSAGE_TYPES.BILL_UPLOAD_CONFIRM_CHECKED]({ step: u.step, at: u.at, checked: false })).ok, false, "the tick is needed");
+      eq((await job[MESSAGE_TYPES.BILL_UPLOAD_CONFIRM_CHECKED]({ step: u.step, at: "2000-01-01T00:00:00.000Z", checked: true })).ok, false, "for the write the user read about");
+      eq((await job[MESSAGE_TYPES.BILL_UPLOAD_CONFIRM_CHECKED]({ step: u.step, at: u.at, checked: true })).ok, true);
+      const freed = await job[MESSAGE_TYPES.BILL_UPLOAD_GET_STATE]({});
+      eq(freed.bill.unknown, null);
+      assert(!freed.bill.header.checks.some((c) => /answer did not arrive/.test(c.text)), "the stop is gone");
+
+      lose = false;
+      const done = await step(MESSAGE_TYPES.BILL_UPLOAD_CREATE, { confirmed: true, acknowledged: true });
+      eq(done.step, "done", JSON.stringify(done.error));
+      eq(done.bill.billRegNo, "3744921");
+      eq(headerSent, 2);
+
+      // a worker restart in the middle of a step: the text names the step and what to check (3.13a)
+      const restarted = (running, context) => {
+        const s = memoryStorageArea();
+        s.set({ [SESSION_KEYS.BILL_UPLOAD_STATE]: { ...done, busy: true, running, message: "Saving the bill item in IREPS...", context } });
+        globalThis.chrome = { ...globalThis.chrome, storage: { session: s, local } };
+        return createBillUploadJob({ broadcast: () => {}, parseSearchPo: async () => ({ records: [] }) });
+      };
+      const billContext = { receipt: receiptNS(), invoice: { invoiceNumber: "1061000262" }, billRegNo: "3744921", existing: null };
+      const item = await restarted("item", billContext)[MESSAGE_TYPES.BILL_UPLOAD_GET_STATE]({});
+      eq(item.error.code, "BILL_INTERRUPTED");
+      assert(/while it was saving the item of draft bill 3744921/.test(item.error.message) && /check bill 3744921 in IREPS/.test(item.error.message), item.error.message);
+      assert(!/second draft/.test(item.error.message), "the item step creates no draft");
+      const header = await restarted("create", { ...billContext, billRegNo: null })[MESSAGE_TYPES.BILL_UPLOAD_GET_STATE]({});
+      assert(/while it was creating the draft bill for invoice 1061000262 \(PO 40265077101806, PO Sr 001\)/.test(header.error.message) && /Bills for Pay/.test(header.error.message), header.error.message);
+      const read = await restarted("prepare", null)[MESSAGE_TYPES.BILL_UPLOAD_GET_STATE]({});
+      assert(/only reads IREPS and ECM/.test(read.error.message), read.error.message);
+    } finally {
+      globalThis.chrome = realChrome;
+      console.warn = realWarn;
+    }
+  });
+
+  await test("bill tab transport (3.8): the IREPS deadline ends a request the tab never answers, and the tab is told to stop it", async () => {
+    const realChrome = globalThis.chrome;
+    const realSetTimeout = globalThis.setTimeout;
+    const sent = [];
+    let finishInjection = null;
+    globalThis.chrome = {
+      runtime: {},
+      scripting: { executeScript: async () => [{ result: null }] },
+      tabs: {
+        get: async (tabId) => ({ id: tabId, url: "http://localhost:8765/epsn/ct/fetchPODetails.do" }),
+        sendMessage: (tabId, message) => {
+          sent.push(message);
+          return message.type === "DOCLINK_TAB_FETCH" ? new Promise(() => {}) : Promise.resolve();
+        }
+      }
+    };
+    try {
+      // the request's own signal ends it at once
+      const controller = new AbortController();
+      const pending = tabFetch(9801)("http://localhost:8765/epsn/ct/populatePOSrList.do", { method: "POST", body: "rly=05", signal: controller.signal });
+      await until(() => sent.some((m) => m.type === "DOCLINK_TAB_FETCH"), "the request in the tab");
+      controller.abort();
+      const stopped = await failureOf(pending);
+      eq(stopped && stopped.name, "AbortError", String(stopped));
+      const asked = sent.find((m) => m.type === "DOCLINK_TAB_FETCH");
+      const cancel = sent.find((m) => m.type === "DOCLINK_TAB_ABORT");
+      assert(asked.id && cancel && cancel.id === asked.id, "the tab is told which request to stop");
+
+      // requestIreps' 120 s deadline (made to pass at once here) reaches the tab transport
+      globalThis.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, ms >= IREPS_CONFIG.timeoutMs ? 0 : ms, ...args);
+      const timedOut = await failureOf(requestIreps({ path: "/epsn/ct/populatePOSrList.do", method: "POST", body: "rly=05" }, { fetch: tabFetch(9801) }));
+      globalThis.setTimeout = realSetTimeout;
+      assert(timedOut instanceof IrepsError && timedOut.code === IREPS_ERROR.REQUEST_FAILED && timedOut.reason === "timeout", String(timedOut));
+      eq(sent.filter((m) => m.type === "DOCLINK_TAB_ABORT").length, 2);
+
+      // a deadline that passes while DocLink's script is still being injected: nothing is sent at all
+      globalThis.chrome.scripting.executeScript = () => new Promise((r) => (finishInjection = () => r([{ result: null }])));
+      const late = new AbortController();
+      const hung = tabFetch(9802)("http://localhost:8765/epsn/ct/saveBillHeader.do", { method: "POST", body: "x=1", signal: late.signal });
+      await until(() => finishInjection, "the injection");
+      late.abort();
+      eq((await failureOf(hung)).name, "AbortError");
+      finishInjection();
+      await new Promise((r) => realSetTimeout(r, 0));
+      assert(!sent.some((m) => m.type === "DOCLINK_TAB_FETCH" && /saveBillHeader/.test(m.url)), "the write never left after the deadline");
+    } finally {
+      globalThis.chrome = realChrome;
+      globalThis.setTimeout = realSetTimeout;
+    }
+  });
+
+  await test("bill upload flow (5.4): the bill page (it carries a Struts token) waits for a running IREPS form sequence", async () => {
+    const page = await billPage(fixture);
+    const ireps = fakeBillIreps(page);
+    let release;
+    const held = withIrepsFormLock(() => new Promise((r) => (release = r)));
+    const preparing = prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, { fetch: ireps.fetchImpl, store: createBillStore(memoryStorageArea()), today: TODAY });
+    await new Promise((r) => setTimeout(r, 50));
+    eq(ireps.calls.length, 0, "nothing is sent while another form sequence holds the lock");
+    release();
+    await held;
+    const ctx = await preparing;
+    eq(ireps.calls[0].path, "/epsn/ct/fetchPODetails.do");
+    eq(ctx.roNo, "35294-26-66158");
+    eq(await withIrepsFormLock(async () => "free"), "free", "the lock is free again once the page is read");
+  });
+
+  await test("bill upload flow (3.5): a receipt IREPS does not list is stopped, never swapped for the one IREPS lists", async () => {
+    const page = await billPage(fixture);
+    const store = createBillStore(memoryStorageArea());
+    const other = fakeBillIreps(page, { override: (path) => (path.endsWith("populateROList.do") ? "success^^1^^35294-26-99999" : null) });
+    const deps = { fetch: other.fetchImpl, store, today: TODAY };
+    const ctx = await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps);
+    eq(ctx.roNo, null, "not switched to the other receipt");
+    assert(ctx.header.checks.some((c) => c.level === "error" && /IREPS does not list receipt 35294-26-66158 for PO Sr 001 \(it lists 35294-26-99999\)/.test(c.text)), JSON.stringify(ctx.header.checks));
+    assert(!other.calls.some((c) => c.path.endsWith("populateRODetails.do")), "the other receipt is not read");
+    await rejects(createDraftBill(ctx, { acknowledged: true }, deps), BILL_ERROR.CHECKS_FAILED);
+    eq(other.writes().length, 0);
+    const noRo = await prepareBill({ receipt: { ...receiptNS(), roNo: null }, invoice: ECM_INVOICE }, { ...deps, fetch: fakeBillIreps(page).fetchImpl });
+    assert(noRo.header.checks.some((c) => c.level === "error" && /shows no RO number/.test(c.text)), JSON.stringify(noRo.header.checks));
+  });
+
+  await test("bill upload flow (3.4): an invoice DocLink billed on one receipt is refused on another", async () => {
+    const page = await billPage(fixture);
+    const store = createBillStore(memoryStorageArea());
+    const deps = { fetch: fakeBillIreps(page).fetchImpl, store, today: TODAY };
+    eq((await createDraftBill(await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps), { acknowledged: true }, deps)).outcome, "item-saved");
+    // another receipt of the PO, offered the same invoice (say, the typed fields were left as they were)
+    const second = receiptFromCrn({ ...CRN_RECEIPT_RECORD, crnNo: "35294-26-66159" });
+    const other = fakeBillIreps(page, { override: (path) => (path.endsWith("populateROList.do") ? "success^^1^^35294-26-66159" : null) });
+    const deps2 = { ...deps, fetch: other.fetchImpl };
+    const ctx = await prepareBill({ receipt: second, invoice: { ...ECM_INVOICE, invoiceNumber: " 1061000262 " } }, deps2);
+    assert(ctx.header.checks.some((c) => c.level === "error" && /Invoice 1061000262 is already on another receipt's bill that DocLink created: draft bill 3744921/.test(c.text)), JSON.stringify(ctx.header.checks));
+    await rejects(createDraftBill(ctx, { acknowledged: true }, deps2), BILL_ERROR.CHECKS_FAILED);
+    eq(other.writes().length, 0, "nothing written");
+    // also when the store learnt of it after the review: Create checks it again
+    const store3 = createBillStore(memoryStorageArea());
+    const deps3 = { ...deps2, store: store3 };
+    const before = await prepareBill({ receipt: second, invoice: ECM_INVOICE }, deps3);
+    eq(before.header.checks.filter((c) => c.level === "error").length, 0, JSON.stringify(before.header.checks));
+    await store3.put(receiptNS().key, { invoiceNo: "1061000262", poNumber: "40265077101806", poSr: "001", roNo: "35294-26-66158", billRegNo: null, unknown: { step: "header", why: "x", at: new Date().toISOString() } });
+    const refused = await rejects(createDraftBill(before, { acknowledged: true }, deps3), BILL_ERROR.CHECKS_FAILED);
+    assert(/a bill whose creation IREPS has not confirmed/.test(refused.detail), refused.detail);
+    eq(other.writes().length, 0);
+  });
+
+  await test("bill upload (3.3): an ECM invoice is used only when its PO, PO Sr and quantity (where it has them) are the receipt's", async () => {
+    const automation = (answer) => async () => answer;
+    const key = { customerPO: "40265077101806", customerPOSrNo: "001", invoiceQuantity: "15" };
+    const record = (extra) => ({ invoiceNumber: "1061000262", onivla: 485776.5, ...extra });
+    const otherPo = await rejects(retrieveInvoice(key, { automation: automation([record({ customerPONumber: "11260000100001", customerPOSrNumber: "001", quantity: 15 })]) }), BILL_ERROR.ECM_MISMATCH);
+    assert(/PO 11260000100001, the receipt's is 40265077101806/.test(otherPo.detail), otherPo.detail);
+    await rejects(retrieveInvoice(key, { automation: automation([record({ customerPONumber: "40265077101806", customerPOSrNumber: "002" })]) }), BILL_ERROR.ECM_MISMATCH, "PO Sr");
+    await rejects(retrieveInvoice(key, { automation: automation([record({ quantity: "14" })]) }), BILL_ERROR.ECM_MISMATCH, "quantity");
+    // a record of another receipt next to this receipt's: this receipt's is used, without ambiguity
+    const mixed = await retrieveInvoice(key, { automation: automation([record({ invoiceNumber: "OTHER", customerPOSrNumber: "002" }), record({ customerPONumber: "40265077101806", customerPOSrNumber: "1", quantity: "15.0" })]) });
+    eq(mixed.invoiceNumber, "1061000262", "numbers compare by value, as in a JSON file");
+    // what ECM does not answer is not checked (it has no PO Sr yet)
+    eq((await retrieveInvoice(key, { automation: automation([record({})]) })).invoiceNumber, "1061000262");
+    eq(receiptMismatches({ customerPONumber: "40265077101806" }, key).length, 0);
+    eq(describeError(BILL_ERROR.ECM_MISMATCH, { detail: "x" }).code, "BILL_ECM_MISMATCH");
+  });
+
+  await test("bill upload (3.2): the railway GSTIN is one IREPS offers for the state of supply; when no single one fits, the item stops", () => {
+    const list = [
+      { value: "18AAAGM0289C1ZI", label: "18AAAGM0289C1ZI-Assam" },
+      { value: "18AAACI0681C1ZY", label: "18AAACI0681C1ZY-~Assam-IRFC" },
+      { value: "29AAAGM0289C1ZF", label: "29AAAGM0289C1ZF-Karnataka" },
+      { value: "29AAACI0681C1ZV", label: "29AAACI0681C1ZV-~Karnataka-IRFC" },
+      { value: "11AAAGM0289C1ZW", label: "11AAAGM0289C1ZW-Sikkim" }
+    ];
+    const pick = (consigneeGstin, stateOfSupply, railwayGstins = list) => railwayGstinFor({ consigneeGstin, stateOfSupply, supplierState: "06", railwayGstins });
+    const same = pick("18AAAGM0289C1ZI", "18");
+    eq(same.value, "18AAAGM0289C1ZI", "the consignee's own when it is of the state of supply");
+    eq(same.checks.length, 0);
+    // the stock capture (HAR #113 / #116): consignee 37AAAGM0289C1ZI, state of supply 29, IREPS saved 29AAAGM0289C1ZF
+    const captured = pick("37AAAGM0289C1ZI", "29");
+    eq(captured.value, "29AAAGM0289C1ZF");
+    eq(captured.checks.map((c) => c.level).join(), "warning", "shown, and to be acknowledged");
+    eq(pick("37AAACI0681C1ZY", "29").value, "29AAACI0681C1ZV", "an IRFC consignee keeps IRFC's GSTIN");
+    eq(pick("37AAACI0681C1ZY", "11").value, "11AAAGM0289C1ZW", "the only one IREPS offers for that state");
+    const none = pick("37AAAGM0289C1ZI", "33");
+    eq(none.value, "");
+    assert(none.checks[0].level === "error" && /it offers none/.test(none.checks[0].text) && /Save the item in IREPS yourself/.test(none.checks[0].text), JSON.stringify(none.checks));
+    const two = pick("37AAAAA0000A1Z5", "29");
+    eq(two.value, "");
+    assert(two.checks[0].level === "error" && /it offers 29AAAGM0289C1ZF, 29AAACI0681C1ZV/.test(two.checks[0].text), JSON.stringify(two.checks));
+    eq(pick(null, "18").checks[0].level, "error", "no consignee GSTIN");
+    eq(pick("18AAAAA0000A1Z5", "18").checks[0].level, "error", "of the state, but not in IREPS's list");
+  });
+
+  await test("bill upload panel (3.1, 3.4): ticks are cleared after a failed step, a typed invoice is not offered for another receipt, a lost answer stops Create", async () => {
+    const doc = new DOMParser().parseFromString(await fixture("../../popup/popup.html"), "text/html");
+    const view = document.importNode(doc.getElementById("view-upload"), true);
+    const opener = document.createElement("button");
+    opener.id = "btn-upload";
+    document.body.append(view, opener);
+    const sent = [];
+    let current = null;
+    const ctx = {
+      send: async (type, payload) => (sent.push({ type, payload }), type === MESSAGE_TYPES.BILL_UPLOAD_GET_STATE ? current : { started: true, ok: true }),
+      showView: () => {},
+      setConnection: () => {},
+      setConnectionForError: () => {},
+      currentPanelTabId: async () => 7
+    };
+    const show = (s) => {
+      current = s;
+      handleBillUploadMessage({ type: MESSAGE_TYPES.BILL_UPLOAD_UPDATE, state: s });
+    };
+    const $ = (id) => document.getElementById(id);
+    try {
+      initBillUpload(ctx);
+      const rA = receiptNS();
+      const rB = { ...receiptFromCrn({ ...CRN_RECEIPT_RECORD, crnNo: "35294-26-66159" }) };
+      const base = { step: "receipts", busy: false, message: "", poNo: rA.poNo, receipts: [rA, rB], warnings: [], receiptKey: null, invoiceMode: "manual", invoice: null, bill: null, documents: null, docUpload: null, documentTypes: [], error: null };
+      show(base);
+      const radio = (key) => Array.from(view.querySelectorAll('input[name="bill-receipt"]')).find((r) => r.value === key);
+      const choose = (key) => {
+        radio(key).checked = true;
+        radio(key).dispatchEvent(new Event("change"));
+      };
+      const type = (id, value) => {
+        $(id).value = value;
+        $(id).dispatchEvent(new Event("input", { bubbles: true }));
+      };
+      // 3.4: an invoice typed for receipt A is emptied when receipt B is chosen
+      choose(rA.key);
+      type("bill-inv-number", "1061000262");
+      type("bill-inv-amount", "485776.5");
+      choose(rA.key);
+      eq($("bill-inv-number").value, "1061000262", "the same receipt keeps it");
+      choose(rB.key);
+      eq($("bill-inv-number").value, "", "another receipt starts empty");
+      eq($("bill-inv-amount").value, "");
+
+      // 3.1: the ticks given for a Create that failed are cleared
+      const header = { review: [], checks: [] };
+      const reviewState = { ...base, step: "review", receiptKey: rA.key, bill: { receipt: rA, header, item: null, billRegNo: null, dispatchNo: null, existing: null, unknown: null, documentsOnBill: null, forgottenBills: [] } };
+      show(reviewState);
+      $("bill-confirm").checked = true;
+      $("bill-confirm").dispatchEvent(new Event("change"));
+      eq($("btn-bill-create").disabled, false, "Create can be clicked once the values are confirmed");
+      show({ ...reviewState, busy: true, message: "Creating the draft bill in IREPS..." });
+      const unknown = { step: "header", at: "2026-11-24T11:02:00.000Z", text: "On 24/11/2026 16:32 DocLink sent the bill header ...", confirm: "I checked the PO's Bills for Pay in IREPS: there is no draft bill for invoice 1061000262.", button: "Allow creating the bill again" };
+      const stopped = { ...reviewState, error: describeError("BILL_OUTCOME_UNKNOWN", { detail: unknown.text }), bill: { ...reviewState.bill, header: { review: [], checks: [{ level: "error", text: unknown.text }] }, existing: { billRegNo: null, unknown }, unknown } };
+      show(stopped);
+      eq($("bill-confirm").checked, false, "the confirmation is given again after a failed write");
+      eq($("btn-bill-create").disabled, true, "Create stays stopped");
+      eq($("bill-forget").hidden, true, "Start fresh is not offered for it");
+      // the box says what to check and frees the step only with its own tick
+      const box = Array.from(view.querySelectorAll(".bill-forget")).find((b) => b.id !== "bill-forget");
+      assert(box && !box.hidden && box.textContent.includes("there is no draft bill for invoice 1061000262"), box && box.textContent);
+      const [tick] = box.querySelectorAll("input[type=checkbox]");
+      const free = box.querySelector("button");
+      eq(free.disabled, true);
+      tick.checked = true;
+      tick.dispatchEvent(new Event("change"));
+      eq(free.disabled, false);
+      free.click();
+      await until(() => sent.some((m) => m.type === MESSAGE_TYPES.BILL_UPLOAD_CONFIRM_CHECKED), "the confirmation");
+      const confirmation = sent.find((m) => m.type === MESSAGE_TYPES.BILL_UPLOAD_CONFIRM_CHECKED).payload;
+      eq(JSON.stringify([confirmation.step, confirmation.at, confirmation.checked]), JSON.stringify(["header", unknown.at, true]));
+
+      // 3.4: once a draft bill exists, the typed invoice is emptied
+      type("bill-inv-number", "1061000262");
+      show({ ...reviewState, step: "done", bill: { ...reviewState.bill, billRegNo: "3744921", dispatchNo: "3894570", existing: { billRegNo: "3744921", status: "item-saved", unknown: null } } });
+      eq($("bill-inv-number").value, "", "emptied after the bill was created");
+    } finally {
+      view.remove();
+      opener.remove();
+    }
+  });
+
+  /* ------------------------------------------------- inspection of 24 Nov 2026, round 2: 3.9 to 3.13 */
+
+  /**
+   * What the bill page itself sends for a Final GST item without PVC, discount or charges, on its own
+   * string fields: billFunctions.js calcBBR and calculateExpAmt as captured (HAR #77), transcribed.
+   */
+  const pageItemAmounts = ({ poRate, roQty, igstRate, cgstRate, sgstRate, utgstRate, payPC = "100" }) => {
+    const basicBillRate = parseFloat(String(parseFloat((parseFloat(poRate) + parseFloat("0")).toFixed(5))));
+    const taxableAmt = (basicBillRate * roQty * payPC) / 100;
+    const gst = (rate) => parseFloat(((taxableAmt * rate) / 100).toFixed(2));
+    const [igstAmt, cgstAmt, sgstAmt, utgstAmt, cessAmt] = [gst(igstRate), gst(cgstRate), gst(sgstRate), gst(utgstRate), gst("0")];
+    const taxAmt = cgstAmt + sgstAmt + utgstAmt + igstAmt + cessAmt;
+    return {
+      netBasicRate: String(basicBillRate),
+      expenseAmount: taxableAmt.toFixed(2),
+      basicAmount: taxAmt.toFixed(2),
+      totalAmount: (taxableAmt + taxAmt).toFixed(2),
+      igstAmount: String(igstAmt),
+      cgstAmount: String(cgstAmt),
+      sgstAmount: String(sgstAmt),
+      utgstAmount: String(utgstAmt)
+    };
+  };
+
+  await test("bill upload (3.9): every item amount is the bill page's own to the paisa, also for PO rates with paise", () => {
+    // a half paisa: 595437.75 x 18 / 100 = 107178.795, which the page's toFixed(2) rounds down
+    const igst = computeAmounts({ rate: 39695.85, qty: 15, gstRate: 18, supplierState: "33", stateOfSupply: "09" });
+    eq(JSON.stringify([igst.taxable, igst.igst, igst.tax, igst.total]), JSON.stringify([595437.75, 107178.79, 107178.79, 702616.54]));
+    const halves = computeAmounts({ rate: 23857.11, qty: 250, gstRate: 18, supplierState: "33", stateOfSupply: "33" });
+    eq(JSON.stringify([halves.cgst, halves.sgst, halves.tax, halves.total]), JSON.stringify([536784.97, 536784.97, 1073569.94, 7037847.44]));
+    const five = computeAmounts({ rate: 8019.37, qty: 100, gstRate: 5, supplierState: "33", stateOfSupply: "33" });
+    eq(JSON.stringify([five.cgst, five.total]), JSON.stringify([20048.42, 842033.84]), "2.5% CGST + 2.5% SGST");
+    eq(pageRound2(1.005), 1, "the page's rounding of the binary value");
+    eq(round2(1.005), 1.01, "round2 stays for the values DocLink picks itself");
+
+    // a sweep: paise and integer rates, a rate with more than 5 decimals, part quantities, IGST / CGST+SGST / UTGST
+    const rateText = (n) => String(round2(n));
+    const fields = ["netBasicRate", "expenseAmount", "basicAmount", "totalAmount", "igstAmount", "cgstAmount", "sgstAmount", "utgstAmount"];
+    let compared = 0;
+    const differ = [];
+    for (const gstRate of [18, 5, 12, 28, 3, 8.9, 13.8, 40]) {
+      for (const [supplierState, stateOfSupply] of [["33", "09"], ["33", "33"], ["04", "04"]]) {
+        for (let i = 0; i < 60; i++) {
+          const paise = (i * 37) % 100;
+          const rupees = 1 + ((i * 7919) % 99000);
+          const text = paise ? `${rupees}.${String(paise).padStart(2, "0")}` : String(rupees);
+          for (const poRate of [text, String(Number(text) / 7)]) {
+            for (const roQty of ["1", "3", "15", "87", "250", "2.5", "1234.567"]) {
+              const a = computeAmounts({ rate: Number(poRate), qty: Number(roQty), gstRate, supplierState, stateOfSupply });
+              const page = pageItemAmounts({ poRate, roQty, igstRate: rateText(a.split.igst), cgstRate: rateText(a.split.cgst), sgstRate: rateText(a.split.sgst), utgstRate: rateText(a.split.utgst) });
+              const ours = { netBasicRate: String(a.basicRate), expenseAmount: a.taxable.toFixed(2), basicAmount: a.tax.toFixed(2), totalAmount: a.total.toFixed(2), igstAmount: String(a.igst), cgstAmount: String(a.cgst), sgstAmount: String(a.sgst), utgstAmount: String(a.utgst) };
+              compared++;
+              const bad = fields.filter((k) => ours[k] !== page[k]);
+              if (bad.length && differ.length < 3) differ.push(`${poRate} x ${roQty} at ${gstRate}% (${supplierState}->${stateOfSupply}): ${bad.map((k) => `${k} ${ours[k]}, the page ${page[k]}`).join("; ")}`);
+            }
+          }
+        }
+      }
+    }
+    assert(compared > 5000, `compared ${compared}`);
+    eq(differ.length, 0, differ.join(" | "));
+
+    // the item body: amounts, the basic rate as the page holds it, the max claim compared as the page does
+    const item = (poRate) => parseItemDetails(NS.item.replace("^^27445^^", `^^${poRate}^^`));
+    const ro = (value, maxClaim = value) => parseRoDetails(`success^^04/09/2026^^15^^Not Applicable^^0^^Not Applicable^^Not Applicable^^0^^NA^^^^15.0^^^^${value}^^0^^${maxClaim}^^http://www.ireps.gov.in/x.pdf`);
+    const input = { header: { ...NS_HEADER, invoiceAmount: "702616.54" }, billRegNo: "3744921", receipt: receiptFromCrn(CRN_RECEIPT_RECORD), roNo: "35294-26-66158", railwayGstins: [{ value: "18AAAGM0289C1ZI" }] };
+    const paise = buildItem({ ...input, invoice: { ...ECM_INVOICE, amount: 702616.54 }, item: item("39695.85"), ro: ro("702616.54") });
+    eq(paise.checks.length, 0, JSON.stringify(paise.checks));
+    const sent = Object.fromEntries(new URLSearchParams(orderedBody(SAVE_DETAILS_FIELDS, paise.values)));
+    eq(JSON.stringify([sent.poRate, sent.netBasicRate, sent.expenseAmount, sent.basicAmount, sent.totalAmount, sent.igstAmount, sent.maxClaim]), JSON.stringify(["39695.85", "39695.85", "595437.75", "107178.79", "702616.54", "107178.79", "702616.54"]));
+    const trailing = buildItem({ ...input, header: { ...NS_HEADER, invoiceAmount: "4370.13" }, invoice: { ...ECM_INVOICE, amount: 4370.13 }, item: item("1234.50"), ro: ro("4370.13") });
+    eq(trailing.values.poRate, "1234.50", "the PO rate as IREPS gave it");
+    eq(trailing.values.netBasicRate, "1234.5", "the page's basicBillRate is a number");
+    // the page compares whole rupees of its two-decimal max claim: 485776.4951 is 485776.50, so 485777 is not more
+    const nearHalf = buildItem({ ...input, header: NS_HEADER, invoice: ECM_INVOICE, item: parseItemDetails(NS.item), ro: ro("485776.5", "485776.4951") });
+    eq(nearHalf.values.maxClaim, "485776.4951", "kept, as the page keeps it");
+    // the captured bills are unchanged (also byte for byte: the non-stock item test above)
+    eq(computeAmounts({ rate: 7916, qty: 87, gstRate: 18, supplierState: "06", stateOfSupply: "37" }).total, 812656.56);
+  });
+
+  await test("bill upload (3.10): an ISO time with its zone gives the IST day; a number that is not epoch ms is refused, never a 1970 date", async () => {
+    eq(invoiceDateToIreps("2026-10-29T23:00:00.000Z"), "30/10/2026", "Nuxeo's midnight 30 Oct in UTC+1");
+    eq(invoiceDateToIreps("2026-08-17T18:30:00.000Z"), "18/08/2026", "midnight in IST");
+    eq(invoiceDateToIreps("2026-08-18T00:00:00.000+05:30"), "18/08/2026");
+    eq(invoiceDateToIreps("2026-10-30T00:00:00+01:00"), "30/10/2026");
+    eq(invoiceDateToIreps("2026-08-18T23:59:59-0400"), "19/08/2026");
+    eq(invoiceDateToIreps("2026-08-18 00:00:00.000"), "18/08/2026", "without a zone the day is the one written");
+    eq(invoiceDateToIreps("2026-08-18T10:00:00"), "18/08/2026");
+    eq(invoiceDateToIreps("2026-02-30T10:00:00Z"), null);
+    eq(invoiceDateToIreps("2026-08-18T25:00:00Z"), null, "not a real time");
+    eq(invoiceDateToIreps("2026-08-18T10:00:00+05:75"), null, "not a real zone");
+    eq(invoiceDateToIreps(1793314800000), "30/10/2026", "epoch ms as before");
+    eq(invoiceDateToIreps("1793314800000"), "30/10/2026");
+    for (const notMs of [20261030, "20261030", 1793314800, "1793314800", -1, 0.5, 1793314800000.5, 99999999999999]) eq(invoiceDateToIreps(notMs), null, `${notMs} is no date`);
+
+    const form = parseBillForm(await billPage(fixture));
+    const header = (invoiceDate) => buildHeader({ receipt: receiptFromCrn(CRN_RECEIPT_RECORD), invoice: { ...ECM_INVOICE, invoiceDate }, form, payAuths: parsePayAuthList(NS.payAuth), stockNonstock: "N", today: TODAY });
+    const refused = header(20261030);
+    eq(refused.values.invoiceDate, "", "no date is sent");
+    const text = refused.checks.filter((c) => c.level === "error").map((c) => c.text).join(" | ");
+    assert(text.includes(invoiceDateRefusal(20261030)) && /"20261030" is a number, but not a date in milliseconds/.test(text), text);
+    assert(!JSON.stringify(refused).includes("1970"), "never a day in 1970");
+    eq(header("2026-10-29T23:00:00.000Z").values.invoiceDate, "30/10/2026");
+    eq(invoiceDateRefusal("2026-13-01"), 'Invoice date "2026-13-01" is not a date.');
+  });
+
+  await test("document upload (3.11): a '~' in the file name stays in the registered filePath; the path is the bill page's, checked against save.php", async () => {
+    const saved = parseSaveResult("<html><body onload='window.parent.CRISPKI.afterUpload()'>OK~ireps/upload/billDocuments/112026/3744921/3894570/INV~2026~A.pdf~1234</body></html>");
+    eq(saved.path, "ireps/upload/billDocuments/112026/3744921/3894570/INV~2026~A.pdf");
+    eq(saved.bytes, 1234);
+    await rejects(Promise.resolve().then(() => parseSaveResult("<html><body>OK~ireps/upload/x.pdf</body></html>")), BILL_ERROR.IREPS_REJECTED, "no size: the page says 'Document not saved!'");
+    await rejects(Promise.resolve().then(() => parseSaveResult("<html><body>OK~ireps/upload/x.pdf~0</body></html>")), BILL_ERROR.IREPS_REJECTED, "size 0");
+
+    const bill = { billRegNo: "3744921", dispatchNo: "3894570", vendorCode: ":833", thumbprint: THUMB, spmBillRegNo: "null" };
+    const run = async (name, answer) => {
+      const calls = [];
+      const deps = {
+        today: new Date(2026, 8, 15),
+        signPdf: async () => signerReply(),
+        saveFile: async (form) => (calls.push({ save: form }), answer(form)),
+        fetch: async (url, init) => (calls.push({ url: String(url), body: init.body }), new Response("OK#1<>x.pdf#ireps/x.pdf#INVOICE#15/09/2026 16:42#USER#1<>", { status: 200 }))
+      };
+      const out = await failureOf(uploadBillDocument({ bill, file: { name, base64: PDF_B64 }, fileDesc: "GUARANTEE WARRANTY CERTIFICATE" }, deps));
+      const registered = calls.find((c) => c.url);
+      return { out, save: calls[0] && calls[0].save, registered: registered ? new URLSearchParams(registered.body) : null };
+    };
+    // the non-stock capture (3_GENERATEPDF.txt, the guarantee / warranty certificate): save.php's answer
+    // and the filePath IREPS's page registered with it
+    const captured = await run("1061000262 - GARRANTYWARRANTYCERTIFICATE.pdf", () => "<html><body onload='window.parent.CRISPKI.afterUpload()'>OK~ireps/upload/billDocuments/092026/3744921/3894570/1061000262-GARRANTYWARRANTYCERTIFICATE.pdf~113626</body></html>");
+    eq(captured.out, null, captured.out && captured.out.detail);
+    eq(captured.registered.get("filePath"), "ireps/upload/billDocuments/092026/3744921/3894570/1061000262-GARRANTYWARRANTYCERTIFICATE.pdf");
+    // a "~" in the name: the whole name is registered
+    const tilde = await run("INV~2026.pdf", (form) => `<html><body onload='window.parent.CRISPKI.afterUpload()'>OK~${form.relativeDir}/${form.pdfName}~37233</body></html>`);
+    eq(tilde.save.pdfName, "INV~2026.pdf");
+    eq(tilde.registered.get("filePath"), "ireps/upload/billDocuments/092026/3744921/3894570/INV~2026.pdf");
+    // IREPS stored it under another name: nothing is registered
+    const elsewhere = await run("INV~2026.pdf", (form) => `<html><body>OK~${form.relativeDir}/INV2026.pdf~37233</body></html>`);
+    eq(elsewhere.out && elsewhere.out.code, BILL_ERROR.RESPONSE_INVALID);
+    assert(/stored the file as .*INV2026\.pdf, not as .*INV~2026\.pdf/.test(elsewhere.out.detail), elsewhere.out.detail);
+    eq(elsewhere.registered, null, "uploadBillDocuments.do is not sent");
+  });
+
+  await test("bill upload flow (3.12): a PO Sr list IREPS did not answer stops as itself; a refusal is shown in IREPS's words; neither switches Stock / Non-Stock", async () => {
+    const page = await billPage(fixture);
+    const store = createBillStore(memoryStorageArea());
+    // the CRN suggests Non-Stock; IREPS would list PO Sr 001 under Stock
+    const portal = (nonStock, stock = "success^^001") =>
+      fakeBillIreps(page, { override: (path, body) => (path.endsWith("populatePOSrList.do") ? (new URLSearchParams(body).get("stockNonstock") === "N" ? nonStock() : stock) : null) });
+    const prepare = (ireps) => prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, { fetch: ireps.fetchImpl, store, today: TODAY });
+
+    const lost = await failureOf(prepare(portal(() => new TypeError("Failed to fetch"))));
+    eq(lost && lost.code, BILL_ERROR.REQUEST_FAILED, "the step stops: IREPS did not answer");
+    assert(/populatePOSrList/.test(lost.detail), lost.detail);
+    const late = await failureOf(prepare(portal(() => new DOMException("The operation was aborted.", "AbortError"))));
+    eq(late && late.code, BILL_ERROR.REQUEST_FAILED);
+    assert(/did not answer within/.test(late.detail), late.detail);
+    const loginPage = await fixture("login-page.html");
+    await rejects(prepare(portal(() => loginPage)), IREPS_ERROR.SESSION_EXPIRED, "IREPS's login page is a logout, not a list");
+
+    const ireps = portal(() => "Server is busy. Please try after some time.");
+    const refused = await prepare(ireps);
+    eq(refused.stockNonstock, "N", "not switched to Stock");
+    const errors = refused.header.checks.filter((c) => c.level === "error").map((c) => c.text);
+    assert(errors.some((t) => /did not give the Non-Stock PO Sr list/.test(t) && t.includes('"Server is busy. Please try after some time."')), JSON.stringify(errors));
+    assert(!refused.header.checks.some((c) => /lists no PO Sr|DocLink uses Stock/.test(c.text)), JSON.stringify(refused.header.checks));
+    eq(ireps.calls.filter((c) => c.path.endsWith("populatePOSrList.do")).length, 1, "the other list is not asked for");
+    await rejects(createDraftBill(refused, { acknowledged: true }, { fetch: ireps.fetchImpl, store, today: TODAY }), BILL_ERROR.CHECKS_FAILED);
+    eq(ireps.writes().length, 0);
+
+    // Non-Stock lists none, Stock is refused: no switch either
+    const other = await prepare(portal(() => "success", "Invalid Paying Authority"));
+    eq(other.stockNonstock, "N");
+    assert(other.header.checks.some((c) => c.level === "error" && /lists no PO Sr 001 under Non-Stock \(none\), and did not give the Stock list; it answered "Invalid Paying Authority"/.test(c.text)), JSON.stringify(other.header.checks));
+  });
+
+  await test("bill upload flow (3.13): populateRODetails 'duplicate' and 'multi' say what IREPS means, in the review and at the item", async () => {
+    const page = await billPage(fixture);
+    for (const [answer, says] of [["duplicate", /already on another bill in IREPS/], ["multi^^", /takes a CRN only once in a bill, and any balance of it only on a separate bill/]]) {
+      const store = createBillStore(memoryStorageArea());
+      const ireps = fakeBillIreps(page, { override: (path) => (path.endsWith("populateRODetails.do") ? answer : null) });
+      const deps = { fetch: ireps.fetchImpl, store, today: TODAY };
+      const ctx = await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps);
+      const stop = ctx.header.checks.find((c) => c.level === "error" && says.test(c.text));
+      assert(stop, JSON.stringify(ctx.header.checks));
+      assert(stop.text.includes(RO_REFUSALS[answer.split("^^")[0]]) && stop.text.includes("receipt 35294-26-66158") && /Bills for Pay/.test(stop.text), stop.text);
+      assert(!/populateRODetails/.test(stop.text), "not IREPS's raw answer");
+      await rejects(createDraftBill(ctx, { acknowledged: true }, deps), BILL_ERROR.CHECKS_FAILED);
+      eq(ireps.writes().length, 0, "nothing written");
+    }
+    // at the item (after the draft bill was created): the item stops with the same text, nothing more is written
+    const store = createBillStore(memoryStorageArea());
+    let reads = 0;
+    const ireps = fakeBillIreps(page, { override: (path) => (path.endsWith("populateRODetails.do") && ++reads > 1 ? "duplicate" : null) });
+    const deps = { fetch: ireps.fetchImpl, store, today: TODAY };
+    const created = await createDraftBill(await prepareBill({ receipt: receiptNS(), invoice: ECM_INVOICE }, deps), { acknowledged: true }, deps);
+    eq(created.outcome, "item-blocked");
+    assert(created.context.item.checks.some((c) => c.level === "error" && c.text.includes(RO_REFUSALS.duplicate)), JSON.stringify(created.context.item.checks));
+    eq(ireps.writes().length, 1, "the header only");
+    // the code itself has a text too (if it ever reaches the panel)
+    const error = await failureOf(Promise.resolve().then(() => parseRoDetails("multi", "013809-26-20009")));
+    eq(error && error.code, BILL_ERROR.RECEIPT_REFUSED);
+    assert(/CRN only once in a bill/.test(describeError(error.code, { detail: error.detail }).message), "described");
   });
 }

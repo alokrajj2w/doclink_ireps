@@ -28,7 +28,7 @@ import { searchIrepsDocuments, SEARCH_PO_FLOW_STAGES } from "../search-po/search
 import { downloadIrepsDocument } from "../search-po/document-downloader.js";
 import { downloadKey, logInfo, LOG_DOC_TYPE } from "../download-log.js";
 import { buildPoDownloadPath } from "../../utils/filename.js";
-import { parsePoSearchResults } from "./po-parser.js";
+import { parsePoSearchResults, comparablePoNo } from "./po-parser.js";
 import { ECM_KIND } from "../ecm-service.js";
 
 /** Controlled error codes for the PO flow (mapped to UI text in utils/messages.js). */
@@ -36,7 +36,9 @@ export const PO_ERROR = Object.freeze({
   ...errorCodesFor(SEARCH_PO_CRITERIA.PO),
   LINK_NOT_FOUND: "IREPS_PO_LINK_NOT_FOUND",
   DOWNLOAD_FAILED: "IREPS_PO_DOWNLOAD_FAILED",
-  INVALID_PDF: "IREPS_PO_INVALID_PDF"
+  INVALID_PDF: "IREPS_PO_INVALID_PDF",
+  // IREPS lists the PO number for more than one railway unit: two documents, and nothing says which one is meant
+  SEVERAL_UNITS: "IREPS_PO_SEVERAL_UNITS"
 });
 export const PO_FLOW_STAGES = SEARCH_PO_FLOW_STAGES;
 
@@ -76,18 +78,21 @@ export async function searchPo(poNumber, deps = {}) {
   }
   // "Total 1 result(s)" is the normal case. Only a row of THIS PO is ever used: a row of another PO
   // (IREPS echoing unrelated rows) must never give its PDF as this PO's. Of several rows for the
-  // same PO No., the first with a PDF is used and the rest are kept in `records` so callers can see them.
+  // same PO No. and unit, the first with a PDF is used and the rest are kept in `records` so callers can see them.
   const wanted = comparablePoNo(poNo);
   const matching = result.records.filter((r) => comparablePoNo(r.poNo) === wanted);
   if (matching.length === 0) {
     throw new IrepsError(PO_ERROR.NOT_FOUND, `IREPS listed ${result.records.length} PO row(s), none for PO ${poNo}`, { detail: poNo });
   }
+  // the number listed for two railway units is two Purchase Orders: nothing says which one is meant (the
+  // ECM's PO copy has no unit either), so none is taken, never "the first with a PDF" (1.20)
+  const units = [...new Set(matching.map((r) => String(r.railwayUnit || "").trim()).filter(Boolean))];
+  if (units.length > 1) {
+    throw new IrepsError(PO_ERROR.SEVERAL_UNITS, `IREPS listed PO ${poNo} for ${units.length} railway units`, { detail: `${poNo} for ${units.length} railway units (${units.join(", ")})` });
+  }
   const record = matching.find((r) => r.poPdfUrl) || matching[0];
   return { ...result, record };
 }
-
-/** A PO number as compared: without spaces, in capitals. */
-const comparablePoNo = (value) => String(value || "").replace(/\s+/g, "").toUpperCase();
 
 /**
  * How a PO copy is filed under Save to: ECM / S3 and recorded in the download log (one rule for every PO flow).
@@ -120,14 +125,18 @@ export function poDownloadItem(record, poNo) {
  * @returns {Promise<{ success: true, poNumber: string, documentType: "PO", url: string, filename: string|null, downloadId: number|null, search: object, skipped?: boolean, skip?: object, warnings?: string[] }>}
  */
 export async function downloadPo(poNumber, deps = {}) {
-  const poNo = normalisePoNumber(poNumber);
-  const found = await searchPo(poNo, deps);
+  const typed = normalisePoNumber(poNumber);
+  const found = await searchPo(typed, deps);
+  // filed and recorded under the PO number IREPS shows, however it was typed: "l325..." is one
+  // document with IREPS's "L325...", never a second ECM document or download-log key (6.6)
+  const poNo = (found.record && found.record.poNo) || typed;
   if (!found.record || !found.record.poPdfUrl) {
     throw new IrepsError(PO_ERROR.LINK_NOT_FOUND, `IREPS did not provide a PO PDF link for PO ${poNo}`, { detail: `IREPS did not provide a PO PDF link for PO ${poNo}.` });
   }
   const item = poDownloadItem(found.record, poNo);
   const checked = typeof deps.preflight === "function" ? await deps.preflight([item]) : null;
-  const warnings = (checked && checked.warnings) || [];
+  // the search's own warnings (a row IREPS listed that could not be read, a list short of its total) go along (1.20)
+  const warnings = [...new Set([...(found.warnings || []), ...((checked && checked.warnings) || [])])];
   const skip = checked && checked.skip && checked.skip.get(item.id);
   if (skip) {
     return { success: true, poNumber: poNo, documentType: "PO", url: item.url, filename: null, downloadId: null, ecm: null, search: found.search, skipped: true, skip, warnings };

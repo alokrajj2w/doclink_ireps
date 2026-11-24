@@ -7,6 +7,7 @@ import {
   irepsFetch, assertSession, parseHtml, formParams, findForm, elementActions, qparam,
 } from './tender-core.js';
 import { describeError } from '../utils/messages.js';
+import { withIrepsFormLock } from '../services/ireps-form-lock.js';
 
 export const SEARCH_PATH = '/epsn/search/advancedSearch.do';
 
@@ -87,24 +88,47 @@ const dmyDay = (text) => {
 const localDay = (d) => (d instanceof Date && !Number.isNaN(d.getTime()) ? `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` : '');
 
 /**
+ * How well a result row fits what the caller knows: 2 when it is of the `railway` hinted, plus 1 when it closes on
+ * the day of the `dueDate` hinted. The railway weighs more, as in preferredRows: a row of the right railway beats
+ * one that only closes on the right day.
+ */
+function hintScore(row, { railway = '', dueDate = null } = {}) {
+  const wantRailway = railwayOf(railway);
+  const wantDay = localDay(dueDate);
+  return (wantRailway && railwayOf(`${row.info.department}/${row.info.railwayUnit}`) === wantRailway ? 2 : 0)
+    + (wantDay && dmyDay(row.info.closingDate) === wantDay ? 1 : 0);
+}
+
+/** The score of a row that fits every hint given (0 without hints). */
+const fullScore = ({ railway = '', dueDate = null } = {}) => (railwayOf(railway) ? 2 : 0) + (localDay(dueDate) ? 1 : 0);
+
+/**
  * Of several result rows with the same tender number (railways reuse numbers: 10263703 is a N F RLY and an
  * EAST CENTRAL RLY tender), the ones that fit what the caller knows: `railway`, a letter list's "Dept/Rly. Unit",
- * and `dueDate`, the NIT message's due date (a Date). A hint that no row fits is ignored, so the choice is then
- * the one made without hints (the row with the most actions).
+ * and `dueDate`, the NIT message's due date (a Date); the railway first, then the due date among the rows of that
+ * railway (hintScore). A hint that no row fits is ignored, so the choice is then the one made without hints (the
+ * row with the most actions).
  *   rows: [{ tr, actions, info: describeRow(tr) }]
  */
-export function preferredRows(rows, { railway = '', dueDate = null } = {}) {
-  const fits = (list, test) => {
-    const kept = list.filter(test);
-    return kept.length ? kept : list;
-  };
-  let pool = rows;
-  const wantRailway = railwayOf(railway);
-  if (wantRailway) pool = fits(pool, (r) => railwayOf(`${r.info.department}/${r.info.railwayUnit}`) === wantRailway);
-  const wantDay = localDay(dueDate);
-  if (wantDay) pool = fits(pool, (r) => dmyDay(r.info.closingDate) === wantDay);
-  return pool;
+export function preferredRows(rows, prefer = {}) {
+  const top = Math.max(...rows.map((r) => hintScore(r, prefer)));
+  return rows.filter((r) => hintScore(r, prefer) === top);
 }
+
+/**
+ * The row searchTender returns, of the rows with the tender number from every date window searched (`win`: the
+ * window's place in the search order): the best fit to the hints (preferredRows), then the earliest window, then
+ * the most actions. Without hints, or with hints no row fits, that is the first window's row with the most actions,
+ * as before the hints were read across windows.
+ */
+function bestRow(rows, prefer) {
+  const pool = preferredRows(rows, prefer);
+  const first = Math.min(...pool.map((r) => r.win));
+  return pool.filter((r) => r.win === first).sort((a, b) => b.actions.length - a.actions.length)[0];
+}
+
+/** Whether date window `win` holds day `day` ("2026-11-24"): the search is by closing date, so only then can it list a row closing that day. */
+const holdsDay = (win, day) => Boolean(day) && localDay(win.from) <= day && day <= localDay(win.to);
 
 /** Parse the live search form: action, defaults, input length limit and department choices. */
 export function readSearchForm(doc) {
@@ -122,12 +146,36 @@ export function readSearchForm(doc) {
   };
 }
 
-/** 'results' | 'none' | 'invalid' | 'other' */
+/**
+ * What a Search Tender page says beyond what every Search Tender page carries. The form page and the results page
+ * (corrigendum response.har, both captured) hold the department list's "Please Select Department", the hidden note
+ * "*Date range should be within 6 months." (#dateRangeDiv, which the page's script shows for a custom date range),
+ * the note "Note:- Please enter minimum first 3 characters of Tender Number ..." and the script's alerts: none of
+ * them is IREPS's answer to a search, so they are left out here.
+ */
+function pageMessageText(doc) {
+  const body = doc.body?.cloneNode(true);
+  if (!body) return '';
+  const ownText = (el) => norm([...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join(' '));
+  for (const el of [...body.querySelectorAll('*')]) {
+    const tag = el.tagName.toLowerCase();
+    if (['script', 'style', 'noscript', 'template', 'select', 'option', 'optgroup', 'datalist'].includes(tag)
+      || /display\s*:\s*none/i.test(el.getAttribute('style') || '') || /^dateRangeDiv$/i.test(el.id || '')
+      || /^note\s*:/i.test(ownText(el))) el.remove();
+  }
+  return norm(body.textContent);
+}
+
+/**
+ * 'results' | 'none' | 'invalid' | 'other'. 'invalid' only when the page itself says the search was refused (a
+ * department is required, a date range too long): the form's own notes and choices never count (pageMessageText).
+ * Any other page is 'other': the search was not answered, never "not found".
+ */
 export function classifySearchResponse(doc) {
   const text = norm(doc.body?.textContent);
   if (/tender\s*no/i.test(text) && [...doc.querySelectorAll('tr')].some((tr) => !tr.querySelector('tr') && tr.querySelector('a') && /View Tender Document|nitPublish/i.test(tr.innerHTML))) return 'results';
   if (/no results found/i.test(text)) return 'none';
-  if (/select department|date range should|within 6 months|please (enter|select)/i.test(text)) return 'invalid';
+  if (/select department|date range should|within 6 months|please (enter|select)/i.test(pageMessageText(doc))) return 'invalid';
   return 'other';
 }
 
@@ -235,12 +283,16 @@ function departmentOrder(divisions) {
  * -> { tenderNo, tenderTitle, department, railwayUnit, tenderStatus, closingDate, searchUrl, row, searchTerm, truncated }
  * NOT_FOUND only when IREPS answered every search (results without the tender, or "No Results Found"); when
  * a search got an HTTP error or a page DocLink does not recognise, the tender may exist: SEARCH_INCOMPLETE (H4).
- *   prefer: { railway, dueDate } picks among rows with the same number (preferredRows); it adds no request
+ *   prefer: { railway, dueDate } picks among rows with the same number, across the date windows (preferredRows,
+ *   bestRow); it adds no request when the first window with the number has a row that fits it (see below)
+ * IREPS keeps one search (and one Struts token) per session, so the form load and each search with the reading of
+ * its answer run under the IREPS form lock, released between searches for DocLink's other form sequences (M2).
+ * The caller must not hold the lock (it is not re-entrant): closingDateFor, openTender and the tender run do not.
  */
 export async function searchTender(base, rawTenderNo, { today = new Date(), onProgress = () => {}, preferWindows = [], prefer = {} } = {}) {
   const tenderNo = norm(rawTenderNo);
   log('Tender', 'Searching tender number');
-  let formInfo = await loadForm(base);
+  let formInfo = await withIrepsFormLock(() => loadForm(base));
   const maxLen = formInfo.maxLen;
   const truncated = !!maxLen && tenderNo.length > maxLen;
   const searchTerm = truncated ? tenderNo.slice(0, maxLen) : tenderNo;
@@ -256,7 +308,8 @@ export async function searchTender(base, rawTenderNo, { today = new Date(), onPr
   let attempts = 0;
   const unanswered = []; // searches IREPS did not answer with a page DocLink recognises
 
-  const attempt = async (win, dept) => {
+  /** One search of window `win` (its place in `windows`: `place`): the rows with the number, or null. */
+  const attempt = (win, dept, place) => withIrepsFormLock(async () => {
     attempts++;
     if (formInfo.hasToken) formInfo = await loadForm(base); // fresh Struts token for each submit
     const p = new URLSearchParams(formInfo.defaults);
@@ -291,30 +344,50 @@ export async function searchTender(base, rawTenderNo, { today = new Date(), onPr
     const rows = findTenderRows(doc, tenderNo);
     log('Tender', `window ${win.label} dept ${dept}: ${rows.length} exact match(es)`);
     if (!rows.length) return null;
-    const described = rows.map((tr) => ({ tr, actions: elementActions(tr), info: describeRow(tr) }));
-    const pool = described.length > 1 ? preferredRows(described, prefer) : described;
-    const best = pool.sort((a, b) => b.actions.length - a.actions.length)[0];
-    if (described.length > 1) {
+    return rows.map((tr) => ({ tr, actions: elementActions(tr), info: describeRow(tr), searchUrl: res.url, win: place }));
+  });
+
+  /** The tender found: the row bestRow takes of the rows with the number, with what IREPS shows of it. */
+  const chosen = (found) => {
+    const best = bestRow(found, prefer);
+    if (found.length > 1) {
       const where = (r) => `${r.info.department}/${r.info.railwayUnit} due ${r.info.closingDate}`;
-      log('Tender', `${described.length} tenders numbered ${tenderNo} (${described.map(where).join('; ')}); took ${where(best)}`);
+      log('Tender', `${found.length} tenders numbered ${tenderNo} (${found.map(where).join('; ')}); took ${where(best)}`);
     }
     log('Tender', 'Exact tender found');
-    return { ...best.info, tenderNo, searchUrl: res.url, row: { tr: best.tr, actions: best.actions }, searchTerm, truncated };
+    return { ...best.info, tenderNo, searchUrl: best.searchUrl, row: { tr: best.tr, actions: best.actions }, searchTerm, truncated };
   };
 
+  // Railways reuse tender numbers, so the hints (prefer) decide between the rows of every date window that has the
+  // number, not only between those of the first one (6.5). They add no request when the first window with the number
+  // already has a row that fits every hint given: that row is taken at once, as before. Only when it has none are the
+  // later windows searched as well, and of those only the ones that can hold a row fitting better: a row of the hinted
+  // railway can be in any window, a row closing on the hinted due day only in a window that holds that day (the
+  // search is by closing date). A hint no row fits leaves the first window's row (bestRow).
+  const found = [];
+  const full = fullScore(prefer);
+  const top = () => Math.max(...found.map((r) => hintScore(r, prefer)));
+  const reach = (win) => (railwayOf(prefer.railway) ? 2 : 0) + (holdsDay(win, localDay(prefer.dueDate)) ? 1 : 0);
   for (const [i, win] of windows.entries()) {
+    if (found.length && top() >= full) break;
+    if (found.length && reach(win) <= top()) continue;
+    if (found.length) log('Tender', `No row of ${tenderNo} found so far fits the railway / due date the caller knows; searching date range ${win.label} too`);
     onProgress(i === 0 ? 'Finding Tender...' : `Finding Tender (date range ${i + 1}/${windows.length})...`);
     for (const dept of first) {
-      const hit = await attempt(win, dept);
-      if (hit) return hit;
+      const rows = await attempt(win, dept, i);
+      if (rows) {
+        found.push(...rows);
+        break;
+      }
     }
   }
+  if (found.length) return chosen(found);
   if (allDeptsRejected) {
     log('Tender', 'IREPS requires a department; trying each department');
     for (const win of windows.slice(0, 3)) {
       for (const dept of rest) {
-        const hit = await attempt(win, dept);
-        if (hit) return hit;
+        const rows = await attempt(win, dept, 0);
+        if (rows) return chosen(rows);
       }
     }
   }

@@ -38,6 +38,17 @@ export const PO_LINK_TITLES = Object.freeze({
   poPdfCell: "click to view/download po"
 });
 
+/**
+ * A PO number as compared: without spaces, in capitals, so "l3251421101345" typed is IREPS's
+ * "L3251421101345". Every PO and IC flow compares PO numbers this way; a document is filed under
+ * the number IREPS shows, never under the spelling typed (6.6).
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function comparablePoNo(value) {
+  return String(value || "").replace(/\s+/g, "").toUpperCase();
+}
+
 /** Typed fields of a PO record. */
 export const PO_FIELDS = [
   { key: "serialNo", label: "Sr. No." },

@@ -78,10 +78,11 @@ function simulator({ searchPage, poPage, listPage, icPage, loginPage }, opts = {
   };
 
   /* ---- vendorInspectionCallList.do ---- */
+  // as the captured page (HAR entry 683): a hidden copy of the IC Date right after Offer Qty. (9.2)
   const icRow = (r) => `<tr><td>05/05/2026</td><td>TPI AGENCY</td><td><a href="#" onclick="viewPastCall('01','1');">${esc(r.poNo)}<br /> dt. 16/01/2026</a></td>
     <td class="dataText">${esc(r.callId)}</td><td class="dataText"><a href="#" onclick="viewPastCallpoSr('${r.poSerial}','01','1');">${esc(r.poSerial)}</a></td>
-    <td class="dataText">ITEM</td><td class="dataText">Product</td><td class="dataText">1</td><td class="dataText">08/05/2026</td><td class="dataText">07/05/2026</td>
-    <td class="dataText">${r.icDate || "08/05/2026"}</td><td class="dataText">09/05/2026</td><td class="dataText">1</td><td class="dataText">${r.status || "Completed (IC Issued)"}</td>
+    <td class="dataText">ITEM</td><td class="dataText">Product</td><td class="dataText">1</td><td class="dataText" style="padding: 5px; display: none;">${r.icDate || "08/05/2026"}</td><td class="dataText">08/05/2026</td><td class="dataText">07/05/2026</td>
+    <td class="dataText">${r.icDate || "08/05/2026"}</td><td class="dataText">1</td><td class="dataText">${r.status || "Completed (IC Issued)"}</td>
     <td class="dataText"><a href="#" onclick="viewCall('1','${r.callId}','01','1');"><img title="View Call Details"></a>${r.link ? `<a href="${r.link}" target="_blank" title="View/ Download IC PDF">p</a>` : ""}<a href="#" onclick="icRevaidate('9');">r</a></td></tr>`;
 
   const icSearch = (p) => {
@@ -561,7 +562,8 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(r.records.map((x) => x.callStatus).join("|"), "Completed (IC Issued)|Completed (IC Issued)|Call Registered");
     eq(r.records.map((x) => x.passedQty).join("|"), "36|36|36");
     eq(r.records.map((x) => x.poNo).join("|"), "P9|P9|P8", "grouped PO number carried to the second row");
-    eq(r.records[1].icDate, "14/10/2026");
+    // the surplus cell (15/10/2026) right after Offer Qty. is where IREPS prints its hidden copy of the IC Date (HAR entry 683): 9.2
+    eq([r.records[1].registrationDate, r.records[1].inspectionStartDate, r.records[1].icDate].join("|"), "09/10/2026|14/10/2026|15/10/2026");
     assert(r.records[0].icPdfUrl.endsWith("/ic/1.pdf") && r.records[1].icPdfUrl.endsWith("/ic/2.pdf") && r.records[2].icPdfUrl === null);
   });
 
@@ -580,6 +582,41 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
       eq([x.offerQty, x.registrationDate, x.inspectionStartDate, x.icDate, x.passedQty, x.callStatus].join("|"), "106|07/05/2026|07/05/2026|08/05/2026|106|Completed (IC Issued)");
     }
     eq(r.records.map((x) => `${x.poNo}/${x.poSerial}/${x.icNumber}`).join(","), "27253922100240/001/3480517,27253922100240/002/2975517");
+  });
+
+  await test("IC parser (9.2): a cell hidden by a class, the hidden attribute or the page's own style is no column either; one hidden out of DocLink's sight is realigned after Offer Qty., never read as the IC Date", () => {
+    const head = ["Call Date", "TPI Agency", "PO No. / Date", "Call Id", "PO Sr.", "PL No: Description", "Type", "Offer Qty.", "Registration Date", "Inspection Start Date", "IC Date", "Passed Qty.", "Call Status", "Actions"];
+    // the captured row (HAR entry 683) with a date of its own in each column; the hidden cell is IREPS's copy of the IC Date
+    const row = (lead, hidden, call, sr, link) => `<tr>${lead}<td class="dataText">${call}</td><td class="dataText"><a href="#" onclick="x()">${sr}</a></td><td class="dataText">DESC</td><td class="dataText">Product - Final Product Inspection</td>
+      <td class="dataText" style="padding: 5px; text-align: right;">106</td>${hidden}
+      <td class="dataText" style="padding: 5px;"> 06/05/2026 </td><td class="dataText" style="padding: 5px;"> 07/05/2026 </td><td class="dataText" style="padding: 5px;">08/05/2026</td><td class="dataText">105</td>
+      <td class="dataText">Completed (IC Issued)</td><td class="dataText"><a href="${link}" target="_blank" title="View/ Download IC PDF">p</a></td></tr>`;
+    const page = (hidden, style = "") => `<html><head>${style}</head><body><form name="inspectionCallForm" action="/epsn/tpi/vendorInspectionCallList.do"><table><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr>
+      ${row(`<td rowspan="2">05/05/2026</td><td rowspan="2">TUV INDIA PVT LTD.-MUMBAI</td><td rowspan="2"><a href="#">27253922100240<br /> dt. 16/01/2026</a></td>`, hidden, "6038184070", "001", "/ireps/etender/ct/tpi/ic/052026/3480517.pdf")}
+      ${row("", hidden, "3778184071", "002", "/ireps/etender/ct/tpi/ic/052026/2975517.pdf")}</table></form></body></html>`;
+    // [how, the hidden cell, the page's <style>, whether DocLink sees it is hidden (else: a surplus cell, realigned)]
+    const variants = [
+      ["an inline style in capitals", '<td class="dataText" style="PADDING:5px;DISPLAY:NONE"> 08/05/2026 </td>', "", true],
+      ["visibility: hidden", '<td class="dataText" style="padding: 5px; visibility: hidden;"> 08/05/2026 </td>', "", true],
+      ["the hidden attribute", '<td class="dataText" hidden> 08/05/2026 </td>', "", true],
+      ["a hiding class", '<td class="dataText hidden"> 08/05/2026 </td>', "", true],
+      ["a Bootstrap class", '<td class="d-none dataText"> 08/05/2026 </td>', "", true],
+      ["a class the page's own style hides", '<td class="dataText hideCol"> 08/05/2026 </td>', "<style>/* kept for the export */ .x { color: red } td.hideCol, .other { display : none }</style>", true],
+      ["a class of a stylesheet DocLink cannot see", '<td class="dataText icCopy"> 08/05/2026 </td>', "", false],
+      ["a class hidden only for printing", '<td class="dataText hideCol"> 08/05/2026 </td>', "<style>@media print { .hideCol { display: none } }</style>", false]
+    ];
+    for (const [how, hidden, style, seen] of variants) {
+      const r = parseIcSearchResults(page(hidden, style), null);
+      eq(r.records.length, 2, how);
+      for (const x of r.records) {
+        eq([x.offerQty, x.registrationDate, x.inspectionStartDate, x.icDate, x.passedQty, x.callStatus].join("|"), "106|06/05/2026|07/05/2026|08/05/2026|105|Completed (IC Issued)", how);
+        // a surplus cell is kept unmapped, under a "Column <n>" name; a cell seen to be hidden is no column at all
+        eq(Object.keys(x.rawColumns).filter((k) => k.startsWith("Column ")).length, seen ? 0 : 1, `${how}: ${seen ? "seen as hidden" : "realigned"}`);
+      }
+      eq(r.records.map((x) => `${x.poNo}/${x.poSerial}/${x.icNumber}`).join(","), "27253922100240/001/3480517,27253922100240/002/2975517", how);
+    }
+    const plain = parseIcSearchResults(page('<td class="dataText hidden-xs">08/05/2026</td>'), null);
+    eq(plain.records[0].icDate, "08/05/2026", "a class that only looks like a hiding one is a cell like the others (realigned as a surplus one)");
   });
 
   const ic = (poNo, poSerial, callId, link = true, extra = {}) => ({ poNo, poSerial, callId, link: link ? `/ireps/etender/ct/tpi/ic/102026/${callId}.pdf` : null, ...extra });
@@ -656,6 +693,15 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(sloppy.length, 1, "exact PO + exact serial + IC-issued status only");
   });
 
+  await test("IC notifications (6.6): the PO number compares as in the PO search (case and spaces aside); the serial stays exact", () => {
+    const rows = [{ poNo: "L3251421101345", poSerial: "001", callStatus: "Completed (IC Issued)" }, { poNo: "L3251421101345", poSerial: "01", callStatus: "Completed (IC Issued)" }, { poNo: "L3251421101346", poSerial: "001", callStatus: "Completed (IC Issued)" }];
+    for (const poNo of ["l3251421101345", "L3251 421101345", "L3251421101345"]) {
+      const found = matchIcRows(rows, { poNo, poSerial: "001" });
+      eq(found.length, 1, poNo);
+      eq(found[0].poNo, "L3251421101345", "the row as IREPS shows it");
+    }
+  });
+
   await test("IC notifications: no IC-issued notification (and an unrelated LOA) -> nothing downloaded, no inspection search made", async () => {
     const sim = simulator(pages, { notifications: [note(1, "LOA issued by STORES/NORTH EASTERN RLY in f/o M/s X against T. No. 24261631", "Letter of Acceptance")], icRows: [ic("P1", "001", "C1")] });
     const { state, files } = await runIc(sim);
@@ -688,6 +734,26 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(state.items[0].url, null);
   });
 
+  await test("IC notifications (4.3, 1.2): a search read short of IREPS's total is no 'not found' (it is searched again); what the run could not do is named", async () => {
+    const sim = simulator(pages, {
+      // PS: one call read (not IC-issued) and one IREPS counts that cannot be read; PM: its IC, and one unreadable row
+      notifications: [note(1, icMsg("PS", "001")), note(2, icMsg("PX", "001")), note(3, "IC issued for PONo : , POSrNo : 001"), note(4, icMsg("PM", "001"), "Inspection", "CM1")],
+      icRows: [ic("PS", "001", "CS1", true, { status: "Call Registered" }), ic("PS", "001", ""), ic("PM", "001", "CM1"), ic("PM", "001", "")]
+    });
+    const { state, files } = await runIc(sim);
+    eq(files.length, 1, "PM's readable IC is downloaded");
+    const [short, none, unreadable, matched] = state.notifications;
+    eq(short.outcome, NOTIFICATION_OUTCOME.ERROR, "the notified call may be the one DocLink could not read: never NOT_FOUND");
+    eq(short.error.code, "IREPS_IC_PARSE_FAILED");
+    eq(none.outcome, NOTIFICATION_OUTCOME.NOT_FOUND);
+    eq(unreadable.outcome, NOTIFICATION_OUTCOME.UNPARSED);
+    eq(matched.outcome, NOTIFICATION_OUTCOME.MATCHED);
+    eq(state.warnings.join(), "PO PM Sr. 001: IREPS reported 2 inspection calls but 1 was read; some of its ICs may be missing.");
+    eq(state.problems.map((p) => p.code).join(), "IREPS_IC_PARSE_FAILED,IREPS_IC_NOT_LISTED,IREPS_NOTIFICATIONS_INVALID", "each named for a scheduled run (1.2)");
+    eq(state.problems[0].doc, "Notification 1 (PO PS Sr. 001)");
+    eq(state.problems[0].detail, "IREPS reported 2 inspection calls but 1 was read");
+  });
+
   await test("IC notifications: when the default window finds nothing the search is widened once before 'not found'", async () => {
     const sim = simulator(pages, { notifications: [note(1, icMsg("P1", "001"), "Inspection", "C1")], icRows: [ic("P1", "001", "C1")], icWindowFrom: "01/01/2020" });
     const { state, files } = await runIc(sim);
@@ -718,6 +784,23 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(files.length, 1);
     eq(sim.state.pdfHits.get("/ireps/etender/ct/tpi/ic/102026/C1.pdf"), 1);
     eq(state.counts.duplicates, 1);
+  });
+
+  await test("IC notifications (9.3): an IC IREPS lists twice for one notice keeps its real outcome; only the repeat is a duplicate", async () => {
+    const twice = () => ({ notifications: [note(1, icMsg("P1", "001"), "Inspection", "C1")], icRows: [ic("P1", "001", "C1"), ic("P1", "001", "C1")] });
+    const sim = simulator(pages, twice());
+    const { state, files } = await runIc(sim);
+    eq(files.length, 1, "downloaded once");
+    eq(state.counts.downloaded, 1);
+    eq(state.counts.duplicates, 1);
+    eq(state.notifications[0].itemIds.join(), state.items[0].id, "the notice's IC is one item");
+    eq(state.manifest.map((m) => m.outcome).join(), "completed,duplicate_skipped", "the first row keeps its own outcome");
+    eq(state.manifest[0].refIdMatchesCallId, true);
+    eq(state.manifest[1].reason, `same document as ${state.items[0].id}`);
+    // a download that fails is reported as failed, not covered by "duplicate_skipped"
+    const failing = await runIc(simulator(pages, { ...twice(), pdf: () => "404" }));
+    eq(failing.state.manifest.map((m) => m.outcome).join(), "failed,duplicate_skipped");
+    assert(failing.state.manifest[0].error, "the failure's code is kept");
   });
 
   await test("IC notifications: result pages (navigate links) are all followed, each page using the token printed on the previous one", async () => {
@@ -869,6 +952,15 @@ export async function runBatchTests({ test, assert, eq, rejects, fixture }) {
     eq(sim.state.icSearches.map((x) => x.pageNo).join(","), "1,2,3");
     assert(sim.state.icSearches.slice(1).every((x) => x.token.startsWith("RTOKEN-")), "pages 2.. carry the previous page's token");
     eq(state.counts.pages, 3);
+    eq(state.warnings.length, 0, "every call IREPS counted was read: no warning");
+  });
+
+  await test("IC date (4.3): fewer inspection calls read than IREPS's Total Records is a warning, never a silent short list", async () => {
+    // IREPS counts a row DocLink cannot read (no Call Id): 5 listed, 4 read
+    const sim = simulator(pages, { icDateFilter: true, icRows: [...inRange, ic("P9", "001", "", true, { icDate: "12/09/2026" })] });
+    const { state, files } = await runIcd(sim);
+    eq(files.length, 4, "what was read is downloaded");
+    eq(state.warnings.join(), "IC dates 10/09/2026 to 18/09/2026: IREPS reported 5 inspection calls but 4 were read; some ICs may be missing.");
   });
 
   await test("IC date: if IREPS ignores the IC dates, the newest-first list stops being read once whole pages fall before From", async () => {

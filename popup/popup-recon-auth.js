@@ -130,6 +130,11 @@ export function currentReconUser() {
   return status && status.signedIn ? status.user : null;
 }
 
+/** Whether the Recon Engine could not be reached at the last check (down, or no network path), as opposed to nobody being signed in. */
+export function reconUnreachable() {
+  return Boolean(status && !status.signedIn && status.reason === "UNAVAILABLE");
+}
+
 /** Ask the Recon Engine who is signed in; never throws. */
 export async function refreshReconStatus() {
   try {
@@ -260,11 +265,19 @@ export async function onReconDestinationChange() {
   } else if (!el.view.hidden && !(waiting && waiting.required)) settle(false);
 }
 
+/**
+ * The sign-in page the user asked for (the RECON pill, a "Sign in to Recon" button): it opens whatever Save
+ * to says, Local too (7.6). Under ECM / S3 it offers "Use Local instead" as before; under Local, Cancel.
+ */
+function askSignIn() {
+  return ensureReconSignedIn({ always: ctx.getDestination() !== SAVE_DESTINATION.RECON });
+}
+
 /** Open the sign-in page from an error panel ("Sign in to Recon"). */
 export async function openReconSignIn() {
   await refreshReconStatus();
   if (status.signedIn) openPage();
-  else await ensureReconSignedIn();
+  else await askSignIn();
 }
 
 /**
@@ -308,7 +321,7 @@ export function initReconAuth(context) {
   });
   el.pill.addEventListener("click", () => {
     if (status && status.signedIn) openPage();
-    else ensureReconSignedIn();
+    else askSignIn();
   });
   renderPill();
 }

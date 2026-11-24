@@ -11,7 +11,9 @@
  * obfuscated it) and asked with chrome.tabs.sendMessage.
  *
  * Only the response status, URL, content type and text come back. Same signature as fetch()
- * so services/ireps-api.js requestIreps() takes it as deps.fetch unchanged.
+ * so services/ireps-api.js requestIreps() takes it as deps.fetch unchanged, including its
+ * deadline: when init.signal aborts (IREPS_CONFIG.timeoutMs), the request ends with an
+ * AbortError at once and the tab is told to cancel its fetch (review 3.8).
  */
 
 import { IREPS_CONFIG, IrepsError } from "../ireps-api.js";
@@ -32,6 +34,63 @@ const injectedTabs = new Map();
 /** Chrome's answer when no script in the tab listens: the message was never delivered. */
 const NO_RECEIVER = /Receiving end does not exist|Could not establish connection/i;
 
+/** Numbers the requests, so DOCLINK_TAB_ABORT names the one to cancel. */
+let requestSeq = 0;
+
+/**
+ * The transport's own failure, a TypeError like fetch()'s network errors (requestIreps reports it
+ * as "network"). `tabTransport` says what went wrong, for the bill upload's texts
+ * (bill-upload-api.js missingAnswerReason): "tab" = the tab could not run the request or went
+ * away before it answered, "fetch" = the page's own fetch failed.
+ */
+function transportError(text, kind) {
+  const error = new TypeError(text);
+  error.tabTransport = kind;
+  return error;
+}
+
+function abortError() {
+  return new DOMException("DocLink stopped waiting for IREPS's answer (deadline passed)", "AbortError");
+}
+
+/**
+ * `promise`, or an AbortError as soon as `signal` aborts; `onAbort` then cancels the request in the
+ * tab. A later answer from the tab is dropped.
+ */
+function untilAborted(promise, signal, onAbort) {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      onAbort();
+      reject(abortError());
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      }
+    );
+  });
+}
+
+/** Ask DocLink's script in the tab to cancel request `id` (nothing is injected for this). */
+function cancelInTab(tabId, id) {
+  try {
+    Promise.resolve(chrome.tabs.sendMessage(tabId, { type: "DOCLINK_TAB_ABORT", id })).catch(() => {});
+  } catch {
+    // the tab is gone: nothing runs there any more
+  }
+}
+
 function injectScript(tabId) {
   const pending = chrome.scripting.executeScript({ target: { tabId }, files: [CONTENT_SCRIPT] });
   injectedTabs.set(tabId, pending);
@@ -46,11 +105,13 @@ function injectScript(tabId) {
  * Send a message to DocLink's script in the tab, injecting it first if this tab has not got it.
  * Sent again (after a new injection) only when Chrome reports that nothing received it, so a
  * request is never run twice; a message that was delivered and then cut off is not resent.
+ * Nothing is sent once `signal` has aborted (the deadline passed while the script was injected).
  */
-async function sendToTab(tabId, message) {
+async function sendToTab(tabId, message, signal = null) {
   for (let attempt = 0; ; attempt++) {
     const injected = injectedTabs.get(tabId) || injectScript(tabId);
     await injected;
+    if (signal && signal.aborted) throw abortError();
     try {
       return await chrome.tabs.sendMessage(tabId, message);
     } catch (error) {
@@ -88,20 +149,31 @@ export async function assertIrepsTab(tabId) {
  */
 export function tabFetch(tabId) {
   return async (url, init = {}) => {
+    const signal = init.signal || null;
+    if (signal && signal.aborted) throw abortError();
+    const id = `bill-${Date.now()}-${++requestSeq}`;
     let result;
     try {
-      result = await sendToTab(tabId, {
-        type: "DOCLINK_TAB_FETCH",
-        url: String(url),
-        method: init.method || "GET",
-        headers: init.headers || {},
-        body: init.body === undefined || init.body === null ? null : String(init.body)
-      });
+      const sent = sendToTab(
+        tabId,
+        {
+          type: "DOCLINK_TAB_FETCH",
+          id,
+          url: String(url),
+          method: init.method || "GET",
+          headers: init.headers || {},
+          body: init.body === undefined || init.body === null ? null : String(init.body)
+        },
+        signal
+      );
+      result = await untilAborted(sent, signal, () => cancelInTab(tabId, id));
     } catch (error) {
+      // the deadline passed: requestIreps reports it as a timeout
+      if (error && error.name === "AbortError") throw error;
       // the tab navigated away / was closed / is not scriptable
-      throw new TypeError(`the IREPS tab could not run the request: ${(error && error.message) || error}`);
+      throw transportError(`the IREPS tab could not run the request: ${(error && error.message) || error}`, "tab");
     }
-    if (!result || !result.ok) throw new TypeError((result && result.error) || "no answer from the IREPS tab");
+    if (!result || !result.ok) throw transportError((result && result.error) || "no answer from the IREPS tab", result ? "fetch" : "tab");
     const headers = new Headers(result.contentType ? { "content-type": result.contentType } : {});
     return {
       ok: result.status >= 200 && result.status < 300,

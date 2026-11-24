@@ -204,7 +204,7 @@ Expected:
   `IREPS_Bill_Status_2026-09-15_14-05-12.pdf`.
 - The mock terminal shows two requests: `POST viewBills.do page` followed by
   `POST viewBills.do search … zone=-1 searchRange=1`.
-- Footer shows "Last download" time and "Status: Downloaded successfully".
+- Footer shows "Last Bill Status download" time and "Status: Downloaded successfully".
 - The PDF exists in `Downloads/DocLink/IREPS/`. **Show in folder** opens it.
 
 Open the PDF and check:
@@ -359,7 +359,9 @@ Remove it again afterwards: IC / PO / MA "Save to ECM" needs the real ECM.
    receipt and lists what it holds. **Prepare bill** for 4800000001 shows the
    same header as step 3, with "JSON file sample_upload.json" as the source of
    the invoice values, and no `RetrieveInvoiceData` in the mock terminal. A
-   file that is not JSON, or has no `invoices`, is refused when picked.
+   file that is not JSON, or has no `invoices`, is refused when picked. An
+   invoice with `"salesInvoiceDate": 20261030` stops Prepare with 'Invoice
+   date "20261030" is a number, but not a date in milliseconds...'.
 10. **Enter it by hand** instead of ECM: leave the HSN empty and click
    **Prepare bill** - "Invoice details incomplete". An HSN such as "12" is
    refused the same way at Prepare ("must be 4 to 8 digits"), and the mock
@@ -368,6 +370,20 @@ Remove it again afterwards: IC / PO / MA "Save to ECM" needs the real ECM.
    code in the ECM (PO `04260000100008`) stops at Prepare too; in
    `bill-flow-check.mjs` it is the "Bad HSN code" case, ending
    `stopped-before-write`.
+11. **A lost answer.** With R-Note 4800000001 billable again (*Start again* on
+    the test hub, step 7):
+    1. Prepare R-Note 4800000001.
+    2. Set the mock scenario to `http500`.
+    3. Tick the confirmation and click **Create draft bill in IREPS**.
+    4. Expected:
+       - "Check IREPS before you go on ... invoice 1331000901 (PO
+         11260000100001, PO Sr 001) ... HTTP 500";
+       - **Create** stays disabled;
+       - the red box asks "I checked the PO's Bills for Pay in IREPS: there is
+         no draft bill for invoice 1331000901".
+    5. Set the scenario back to `auto` and Prepare again: the stop remains.
+    6. Tick the box and click **Allow creating the bill again**: **Create**
+       works.
 
 ### C9a. Test: R-NOTE downloads still work with the captured layout
 
@@ -785,9 +801,9 @@ no secrets in the manifest, and the side-panel UI (real `popup.html` in jsdom).
 all three workflows against an in-memory IREPS simulator: `searchPO.do` (showPage,
 search, `postRequest` page links, the portal's 180-day limit), 
 `vendorInspectionCallList.do` (list page, PO + PO Sr. search, `navigate()`
-paging, results table inside the form, one more data cell than headers - the
-live layout), the notification endpoint and the PDF links. All identifiers in
-the simulator are invented.
+paging, results table inside the form, a hidden copy of the IC Date right
+after Offer Qty., as on the captured page), the notification endpoint and the
+PDF links. All identifiers in the simulator are invented.
 
 Covered: single date, date range, 47 records over 3 pages, no records (empty
 table and "No Record Found" message), out-of-range and duplicate rows,
@@ -802,7 +818,8 @@ dates, every PO and serial in the range, out-of-range / not-issued / repeated
 rows, paging, a list that ignores the dates, nothing in the range, a reversed
 range, a From date before the Call Date default, ECM fields, a row without a
 link, and retry. The IC parser is also checked on the captured page layout
-(a hidden cell after Offer Qty.).
+(a hidden cell after Offer Qty.), also hidden by a class, the hidden attribute
+or the page's style; a cell DocLink cannot see is realigned after Offer Qty.
 
 Manual check against the mock (`node test/mock/mock-ireps-server.mjs`): under
 Download ICs by IC Date, 27/10/2026 - 28/10/2026 gives 2 ICs of PO

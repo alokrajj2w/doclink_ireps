@@ -14,6 +14,9 @@
  *   5. Documents the invoice's ECM documents saved locally with the IREPS description to type,
  *                and the steps left in IREPS
  *
+ * When IREPS's answer to a write did not arrive, the step it belongs to shows what to check in
+ * IREPS and stays stopped until the user confirms they checked (BILL_UPLOAD_CONFIRM_CHECKED).
+ *
  * Built with textContent only; nothing from IREPS or ECM is inserted as HTML.
  */
 
@@ -92,10 +95,42 @@ function bindElements() {
     btnOpenIreps: $("btn-bill-open-ireps"),
     btnReset: $("btn-bill-reset")
   });
+  buildUnknownBox();
+}
+
+/**
+ * The "check IREPS first" box (review 3.1): what DocLink sent, why its answer is missing, what to
+ * check in IREPS, and the confirmation that lets the step be sent again. Built here (textContent
+ * only) and moved next to the step it stops.
+ */
+function buildUnknownBox() {
+  const box = node("div", "bill-forget");
+  box.hidden = true;
+  const text = node("p", "bill-check bill-check-error");
+  const label = node("label", "bill-confirm");
+  const confirm = node("input");
+  confirm.type = "checkbox";
+  const confirmText = node("span");
+  label.append(confirm, confirmText);
+  const button = node("button", "btn btn-secondary");
+  button.type = "button";
+  button.disabled = true;
+  box.append(text, label, button);
+  confirm.addEventListener("change", () => {
+    button.disabled = !state || state.busy || !confirm.checked;
+  });
+  button.addEventListener("click", confirmChecked);
+  Object.assign(el, { unknown: box, unknownText: text, unknownConfirm: confirm, unknownConfirmText: confirmText, btnUnknown: button });
 }
 
 /** The receipt the user picked (radio), kept across re-renders. */
 let selectedKey = null;
+/** The receipt the typed invoice fields belong to: another receipt starts with empty fields (review 3.4). */
+let manualFor = null;
+/** The last draft bill shown: once a bill is created, the typed invoice fields are emptied. */
+let shownBillRegNo = null;
+/** The unconfirmed write the box shows ("step|at"), so its tick is cleared when another one appears. */
+let shownUnknown = null;
 /** The picked invoice file, { name, records }; kept for the next receipt after "Start over". */
 let loadedFile = null;
 let fileProblem = null;
@@ -208,6 +243,8 @@ function renderReceipts(s) {
     radio.checked = r.key === (s.receiptKey || selectedKey);
     radio.addEventListener("change", () => {
       selectedKey = r.key;
+      // an invoice typed for one receipt is never sent for another (review 3.4)
+      if (manualFor !== null && manualFor !== r.key) clearManualInvoice();
       el.stepInvoice.hidden = false;
       renderFileStatus();
     });
@@ -249,18 +286,22 @@ function renderDocuments(s) {
   el.btnDocsFolder.hidden = folderDownloadId === null;
 }
 
+/** The write whose answer did not arrive ({ step, at, text, confirm, button }), or null. */
+const unknownOf = (s) => (s && s.bill && s.bill.unknown) || null;
+
 /* Upload one PDF to the draft bill (signed in the IREPS signer). */
 const UPLOAD_MAX_BYTES = 8388608;
 
 function updateUploadDocButton() {
   const s = state;
   const file = el.upDocFile.files && el.upDocFile.files[0];
-  el.btnUpDoc.disabled = !s || s.busy || !file || el.upDocDesc.value.trim().length < 5;
+  el.btnUpDoc.disabled = !s || s.busy || Boolean(unknownOf(s)) || !file || el.upDocDesc.value.trim().length < 5;
 }
 
 function renderUploadDoc(s) {
   const bill = s.bill;
-  const ready = Boolean(bill && bill.billRegNo && bill.dispatchNo);
+  const blocked = Boolean(unknownOf(s));
+  const ready = Boolean(bill && bill.billRegNo && bill.dispatchNo) && !blocked;
   el.upDoc.hidden = !(bill && bill.header && bill.billRegNo);
   if (el.upDoc.hidden) return;
   if (!el.upDocType.options.length) {
@@ -274,9 +315,11 @@ function renderUploadDoc(s) {
     el.upDocType.append(other);
     if (!el.upDocDesc.value) el.upDocDesc.value = el.upDocType.value;
   }
-  el.upDocHint.textContent = ready
-    ? `Adds the PDF to draft bill ${bill.billRegNo} (dispatch no. ${bill.dispatchNo}), like "Upload Document" on the IREPS bill page.`
-    : `Save the bill item first: IREPS takes documents once bill ${bill.billRegNo} has a dispatch no.`;
+  el.upDocHint.textContent = blocked
+    ? `IREPS's answer to an earlier step of bill ${bill.billRegNo} did not arrive. Check the bill in IREPS and confirm it below before you upload a document.`
+    : ready
+      ? `Adds the PDF to draft bill ${bill.billRegNo} (dispatch no. ${bill.dispatchNo}), like "Upload Document" on the IREPS bill page.`
+      : `Save the bill item first: IREPS takes documents once bill ${bill.billRegNo} has a dispatch no.`;
   for (const input of [el.upDocFile, el.upDocType, el.upDocDesc]) input.disabled = s.busy || !ready;
   setBusy(el.btnUpDoc, s.busy && /signer/i.test(s.message || ""));
   updateUploadDocButton();
@@ -393,7 +436,8 @@ export function startFreshText(bill) {
   if (!bill || !bill.receipt) return null;
   const r = bill.receipt;
   const findIt = `find it on the PO's Bills for Pay tab (or under ${receiptSearchIn(r)} for PO ${r.poNo}) and delete it there if you no longer need it`;
-  if (bill.existing) {
+  // a header whose creation IREPS has not confirmed has no number: the "check IREPS first" box handles it
+  if (bill.existing && bill.existing.billRegNo) {
     const no = bill.existing.billRegNo;
     return {
       offer: true,
@@ -423,7 +467,41 @@ function updateItemButton() {
   const s = state;
   const checks = (s && s.bill && s.bill.item && s.bill.item.checks) || [];
   const warnings = checks.some((c) => c.level === "warning");
-  el.btnSaveItem.disabled = !s || s.busy || (warnings && !el.itemAck.checked);
+  el.btnSaveItem.disabled = !s || s.busy || Boolean(unknownOf(s)) || (warnings && !el.itemAck.checked);
+}
+
+/** Next to the step it stops: the header's Create, the item's Save, the documents' Upload. */
+function unknownAnchor(u) {
+  if (u.step === "document" && !el.upDoc.hidden) return el.btnUpDoc;
+  if (u.step !== "header" && !el.stepResult.hidden) return el.itemAckRow;
+  if (!el.stepReview.hidden) return el.ackRow;
+  return el.progress;
+}
+
+function renderUnknown(s, failed) {
+  const u = unknownOf(s);
+  el.unknown.hidden = !u;
+  if (!u) {
+    shownUnknown = null;
+    el.unknownConfirm.checked = false;
+    return;
+  }
+  const anchor = unknownAnchor(u);
+  if (el.unknown.nextSibling !== anchor) anchor.parentElement.insertBefore(el.unknown, anchor);
+  const id = `${u.step}|${u.at}`;
+  if (shownUnknown !== id || failed) el.unknownConfirm.checked = false;
+  shownUnknown = id;
+  el.unknownText.textContent = u.text;
+  el.unknownConfirmText.textContent = u.confirm;
+  el.btnUnknown.textContent = u.button;
+  el.unknownConfirm.disabled = s.busy;
+  el.btnUnknown.disabled = s.busy || !el.unknownConfirm.checked;
+}
+
+function clearManualInvoice() {
+  for (const input of [el.invNumber, el.invDate, el.invAmount, el.invQty, el.invHsn, el.invPlace]) input.value = "";
+  el.invDivision.value = "";
+  manualFor = null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -433,6 +511,8 @@ function updateItemButton() {
 function render(s) {
   if (!s) return;
   const previousStep = state && state.step;
+  // a step that just failed: every tick is given again for what is shown now (review 3.1)
+  const failed = Boolean(state && state.busy && !s.busy && s.error);
   state = s;
   const steps = ["receipts", "review", "item-review", "item-blocked", "item-error", "done"];
   const at = (name) => steps.indexOf(s.step) >= steps.indexOf(name) && s.step !== "idle";
@@ -455,12 +535,16 @@ function render(s) {
 
   // 3. review
   const bill = s.bill;
+  // once a draft bill exists, the invoice typed for it is not offered for the next one (review 3.4)
+  const billRegNoShown = (bill && bill.billRegNo) || null;
+  if (billRegNoShown && billRegNoShown !== shownBillRegNo) clearManualInvoice();
+  shownBillRegNo = billRegNoShown;
   el.stepReview.hidden = !(bill && bill.header);
   if (bill && bill.header) {
     renderReview(el.review, bill.header.review, s.step === "review" && !s.busy);
     renderChecks(el.checks, bill.header.checks);
     el.ackRow.hidden = !bill.header.checks.some((c) => c.level === "warning") || s.step !== "review";
-    if (previousStep !== "review" || s.step !== "review") {
+    if (previousStep !== "review" || s.step !== "review" || failed) {
       el.confirm.checked = false;
       el.ack.checked = false;
     }
@@ -479,7 +563,7 @@ function render(s) {
     el.forgetText.textContent = fresh.text;
     el.forgetConfirm.parentElement.hidden = !fresh.offer;
     el.btnForget.hidden = !fresh.offer;
-    if (previousStep !== "review" || !fresh.offer) el.forgetConfirm.checked = false;
+    if (previousStep !== "review" || !fresh.offer || failed) el.forgetConfirm.checked = false;
     el.forgetConfirm.disabled = s.busy;
     el.btnForget.disabled = s.busy || !el.forgetConfirm.checked;
   } else {
@@ -502,6 +586,9 @@ function render(s) {
     } else if (s.step === "item-blocked") {
       el.resultTitle.textContent = `Draft bill ${billRegNo} created - item NOT saved`;
       el.resultText.textContent = "A check below stops DocLink from saving the item. Fill the item in IREPS yourself (open the draft bill), or delete the draft from the PO's Bills for Pay.";
+    } else if (unknownOf(s) && unknownOf(s).step === "item") {
+      el.resultTitle.textContent = `Draft bill ${billRegNo} created - item not confirmed`;
+      el.resultText.textContent = "DocLink sent the item, but IREPS's answer did not arrive, so DocLink does not know whether IREPS saved it. Check the bill in IREPS before you save the item again (see below).";
     } else {
       el.resultTitle.textContent = `Draft bill ${billRegNo} created - item NOT saved`;
       el.resultText.textContent = "Saving the item failed (see the message below). You can try again, or finish the item in IREPS.";
@@ -511,7 +598,7 @@ function render(s) {
     const canSave = s.step === "item-review" || s.step === "item-error";
     el.btnSaveItem.hidden = !canSave;
     el.itemAckRow.hidden = !(canSave && item && item.checks.some((c) => c.level === "warning"));
-    if (previousStep !== s.step) el.itemAck.checked = false;
+    if (previousStep !== s.step || failed) el.itemAck.checked = false;
     setBusy(el.btnSaveItem, s.busy && canSave);
     updateItemButton();
   }
@@ -523,6 +610,7 @@ function render(s) {
   renderDocuments(s);
   renderUploadDoc(s);
   renderNextSteps(s);
+  renderUnknown(s, failed);
 
   // progress / error
   el.progress.hidden = !s.busy;
@@ -623,6 +711,7 @@ async function prepare() {
     renderError(describeError("BILL_FILE_INVALID", { detail: fileProblem || "Choose the JSON file first" }));
     return;
   }
+  if (invoiceMode === "manual") manualFor = receiptKey;
   await request(MESSAGE_TYPES.BILL_UPLOAD_PREPARE, {
     receiptKey,
     invoiceMode,
@@ -660,6 +749,18 @@ async function forget() {
   }
 }
 
+/** The user checked the bill in IREPS after a write's answer did not arrive (review 3.1). */
+async function confirmChecked() {
+  renderError(null);
+  const u = unknownOf(state);
+  if (!u) return;
+  const response = await request(MESSAGE_TYPES.BILL_UPLOAD_CONFIRM_CHECKED, { step: u.step, at: u.at, checked: el.unknownConfirm.checked });
+  if (response && response.ok !== false) {
+    el.unknownConfirm.checked = false;
+    render(await ctx.send(MESSAGE_TYPES.BILL_UPLOAD_GET_STATE));
+  }
+}
+
 async function reset() {
   renderError(null);
   selectedKey = null;
@@ -688,6 +789,10 @@ export function initBillUpload(context) {
     if (event.key === "Enter") search();
   });
   for (const r of el.modeRadios) r.addEventListener("change", showModeFields);
+  // the typed invoice belongs to the receipt chosen while it was typed
+  el.manual.addEventListener("input", () => {
+    manualFor = selectedKey || (state && state.receiptKey) || manualFor;
+  });
   el.fileInput.addEventListener("change", loadInvoiceFile);
   el.btnPrepare.addEventListener("click", prepare);
   el.review.addEventListener("input", updateCreateButton);

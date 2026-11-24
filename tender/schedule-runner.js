@@ -3,14 +3,16 @@
 // DocLink claimed runs here instead of in the worker:
 //   READY -> the job (type, date range, verified IREPS account) -> the tender job, with the shared-run hooks
 //   installed (tender-shared-run.js: reserve before download, ECM only, report each save) -> DONE (outcome).
-// Every 20 s it asks the worker whether the claim is still live (the worker sends the heartbeats); a run
-// that lost its claim stops before its next upload. The worker closes this tab when the run ends.
+// Every 20 s, and before an upload whenever its last answer is older, it asks the worker whether the claim is
+// still live (the worker sends the heartbeats; tender-runner.js createClaimWatch, so Chrome throttling this hidden
+// tab's timers never stops a healthy run); a run that lost its claim stops before its next upload. The worker
+// closes this tab when the run ends.
 
 import { MESSAGE_TYPES } from '../utils/messages.js';
 import { createScheduleApi } from '../services/scheduler/schedule-api.js';
 import { createSharedRunHooks } from '../services/scheduler/shared-run-hooks.js';
-import { tenderRunOutcome, stoppedCode, RUNNER_PING_MS, RUNNER_LIVE_MS } from '../services/scheduler/tender-runner.js';
-import { scheduledSearch, failureEntry } from '../services/scheduler/run-details.js';
+import { tenderRunOutcome, stoppedCode, createClaimWatch, RUNNER_PING_MS } from '../services/scheduler/tender-runner.js';
+import { scheduledSearch } from '../services/scheduler/run-details.js';
 import { beginSharedRun, endSharedRun } from './tender-shared-run.js';
 import { TenderError, log } from './tender-core.js';
 import { runAutomatic, runLetterType } from './tender-auto.js';
@@ -46,28 +48,6 @@ const JOBS = {
   tenderCorrespondence: (r) => downloadPendingCorrespondence({ mode: 'all', onProgress: r.onProgress, onAccount: r.onAccount }),
 };
 
-const LIST_LABEL = { MyNegotiation: 'Negotiation letter list', MyCounterOffer: 'Counter Offer letter list', MyAdvanceAcceptanceLetter: 'LOA letter list' };
-
-/**
- * What a tender job could not do beyond single documents, for the run's report: whole tenders it could not
- * open (failures) and IREPS lists it could not read in full (warnings). Documents are reported by the hooks.
- */
-function jobProblems(result) {
-  const failures = [];
-  const warnings = [];
-  const r = result || {};
-  for (const part of [r, r.letters, r.tabulations].filter(Boolean)) {
-    for (const t of part.tenders || []) {
-      if (t && t.error && (t.status === 'FAILED' || t.status === 'NOT_FOUND')) failures.push(failureEntry({ doc: `Tender ${t.tenderNo}`, code: 'SCHEDULE_TENDER_FAILED', detail: t.error }));
-    }
-    for (const [status, message] of Object.entries(part.listErrors || {})) warnings.push(`${LIST_LABEL[status] || status}: ${message}`);
-    if (part.incomplete) warnings.push(String(part.incomplete));
-    if (part.messages && part.messages.incomplete) warnings.push(String(part.messages.incomplete));
-    if (Array.isArray(part.review) && part.review.length) warnings.push(`${part.review.length} IREPS message(s) could not be matched to a tender: open NIT Documents in the panel to review them.`);
-  }
-  return { failures, warnings: warnings.map((w) => w.slice(0, 200)).slice(0, 5) };
-}
-
 async function main() {
   const claimId = new URL(location.href).searchParams.get('claim') || '';
   const answer = await send(MESSAGE_TYPES.SCHEDULE_RUNNER_READY, { claimId }).catch(() => null);
@@ -77,20 +57,12 @@ async function main() {
   }
   const { job } = answer;
 
-  // the claim is live while the worker's heartbeat is fresh; it was live when the worker opened this tab
-  let live = { ok: true, at: Date.now() };
-  const ping = async () => {
-    try {
-      const r = await send(MESSAGE_TYPES.SCHEDULE_RUNNER_PING, { claimId });
-      live = { ok: Boolean(r && r.live), at: Date.now() };
-    } catch {
-      /* no answer: the last one ages out (RUNNER_LIVE_MS) */
-    }
-  };
-  const pinger = setInterval(ping, RUNNER_PING_MS);
-  const isClaimLive = () => live.ok && Date.now() - live.at < RUNNER_LIVE_MS;
+  // the claim is live while the worker's heartbeat is fresh; it was live when the worker opened this tab. The
+  // interval keeps the answer fresh; a check before an upload asks again when it is old (a throttled timer)
+  const watch = createClaimWatch({ ask: () => send(MESSAGE_TYPES.SCHEDULE_RUNNER_PING, { claimId }) });
+  const pinger = setInterval(watch.refresh, RUNNER_PING_MS);
 
-  const hooks = createSharedRunHooks({ api: createScheduleApi(), claimId, account: job.account, isClaimLive });
+  const hooks = createSharedRunHooks({ api: createScheduleApi(), claimId, account: job.account, isClaimLive: watch.isClaimLive });
   const from = dateOf(job.params.dateFrom);
   const to = dateOf(job.params.dateTo);
   const onProgress = (text) => show(String(text || ''));
@@ -119,14 +91,12 @@ async function main() {
     clearInterval(pinger);
   }
   const counts = await hooks.finishTenderRun({ stopped: stoppedCode(result, error) });
-  const problems = jobProblems(result);
-  const listed = hooks.details();
-  const details = { ...listed, failures: [...listed.failures, ...problems.failures] };
-  let outcome = error && error.code === 'SCHEDULE_TYPE_NOT_SUPPORTED'
+  // the documents the hooks name, and what the job itself could not do (tenders, lists, messages, records):
+  // tender-runner.js tenderRunOutcome decides done / partial / failed from both
+  const outcome = error && error.code === 'SCHEDULE_TYPE_NOT_SUPPORTED'
     ? { outcome: 'failed', code: 'SCHEDULE_TYPE_NOT_SUPPORTED', permanent: true }
-    : tenderRunOutcome({ result, error, counts, details, range: scheduledSearch(job.docType, job.params).text });
-  if (problems.warnings.length) outcome = { ...outcome, result: { ...(outcome.result || {}), warnings: problems.warnings } };
-  show(`Finished: ${counts.saved} saved, ${counts.skipped} already saved, ${counts.failed} failed.`);
+    : tenderRunOutcome({ result, error, counts, details: hooks.details(), range: scheduledSearch(job.docType, job.params).text });
+  show(`Finished: ${counts.saved} saved, ${counts.skipped} already saved, ${outcome.result?.failed ?? counts.failed} failed.`);
   await send(MESSAGE_TYPES.SCHEDULE_RUNNER_DONE, { claimId, outcome }).catch(() => {});
 }
 

@@ -11,7 +11,7 @@
  *   POST /epsn/ct/saveBillHeader.do       header fields             -> success^^<billRegNo>        WRITES: creates a draft bill
  *   POST /epsn/ct/fetchPOItemDetails.do   poSrNo, billRegNo ...     -> success@#$%<block>@#$%...   (fields ^^)
  *   POST /epsn/ct/populateROList.do       poSrNo                    -> success^^<count>^^<roNo>[^^...]
- *   POST /epsn/ct/populateRODetails.do    roNo                      -> success^^ + 15 fields
+ *   POST /epsn/ct/populateRODetails.do    roNo                      -> success^^ + 15 fields (or "duplicate" / "multi", RO_REFUSALS)
  *   POST /epsn/ct/saveBillDetails.do      item fields               -> success^^<dispatchNo>^^<amount>^^<rlyGSTIN>^^OK#<n><><docs>   WRITES
  *
  * The AJAX calls carry the headers the bill page's jQuery sends (Content-Type with charset,
@@ -19,11 +19,14 @@
  * runs the request inside the user's IREPS tab, see tab-transport.js).
  *
  * Anything that does not start with "success" is IREPS refusing the call; its text is the
- * reason the page would have shown in an alert, so it is kept as the error detail.
+ * reason the page would have shown in an alert, so it is kept as the error detail. A WRITE
+ * whose answer is missing (no answer, a server error, a page instead of the plain answer) is
+ * not a refusal: IREPS may have saved it (missingAnswerReason, review 3.1).
  */
 
-import { IrepsError, IREPS_ERROR, requestIreps } from "../ireps-api.js";
+import { IrepsError, IREPS_ERROR, IREPS_CONFIG, requestIreps } from "../ireps-api.js";
 import { isIrepsLoginPage } from "../session-service.js";
+import { withIrepsFormLock } from "../ireps-form-lock.js";
 
 export const BILL_ENDPOINTS = Object.freeze({
   FORM: "/epsn/ct/fetchPODetails.do",
@@ -69,7 +72,13 @@ export const BILL_ERROR = Object.freeze({
   NOT_PREPARED: "BILL_NOT_PREPARED",
   DOC_INVALID: "BILL_DOC_INVALID",
   SIGNER_UNAVAILABLE: "BILL_SIGNER_UNAVAILABLE",
-  SIGN_FAILED: "BILL_SIGN_FAILED"
+  SIGN_FAILED: "BILL_SIGN_FAILED",
+  /** A write was sent but its answer is missing: IREPS may have saved it (review 3.1). */
+  OUTCOME_UNKNOWN: "BILL_OUTCOME_UNKNOWN",
+  /** The ECM invoice names another PO, PO Sr or quantity than the receipt (review 3.3). */
+  ECM_MISMATCH: "BILL_ECM_MISMATCH",
+  /** populateRODetails.do refused the receipt the way the bill page knows: "duplicate" or "multi" (review 3.13). */
+  RECEIPT_REFUSED: "BILL_RECEIPT_REFUSED"
 });
 
 /** Separators of the bill responses. */
@@ -121,6 +130,37 @@ export function orderedBody(fields, values) {
 /* Transport                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/** The first error in a `cause` chain that has no cause itself (the transport's own error). */
+function rootCause(error) {
+  let e = error;
+  for (let i = 0; i < 6 && e && e.cause; i++) e = e.cause;
+  return e;
+}
+
+/** IREPS answered: a refusal in its own words, or its login page (the session had ended). */
+const ANSWERED = new Set([BILL_ERROR.IREPS_REJECTED, BILL_ERROR.SESSION_EXPIRED]);
+
+/**
+ * Why IREPS's answer to a request is missing, in words for the user; null when IREPS did answer
+ * and the request was not carried out (a refusal, the login page, an HTTP 4xx). For a WRITE a
+ * missing answer means IREPS may have saved it, so it must never invite a blind retry
+ * (review 3.1): the IREPS tab was reloaded, closed or left, the connection broke, the deadline
+ * passed, IREPS answered 5xx, or its answer could not be read.
+ * @param {unknown} error  what the request threw after it was sent
+ * @returns {string|null}
+ */
+export function missingAnswerReason(error) {
+  if (!(error instanceof IrepsError)) return "DocLink stopped before it could read IREPS's answer";
+  if (ANSWERED.has(error.code)) return null;
+  if (error.code === BILL_ERROR.RESPONSE_INVALID) return `IREPS's answer could not be read (${error.detail || "unexpected answer"})`;
+  if (error.code !== BILL_ERROR.REQUEST_FAILED && error.code !== IREPS_ERROR.REQUEST_FAILED) return `DocLink could not read IREPS's answer (${error.detail || error.code})`;
+  if (error.reason === "timeout") return `IREPS did not answer within ${Math.round(IREPS_CONFIG.timeoutMs / 1000)} seconds`;
+  if (error.reason === "http") return error.status >= 500 ? `IREPS answered with a server error (HTTP ${error.status})` : null;
+  const root = rootCause(error);
+  if (root && root.tabTransport === "tab") return "the IREPS tab was reloaded, closed or left before IREPS answered";
+  return "the connection to IREPS broke before IREPS answered";
+}
+
 /**
  * POST to a bill endpoint. Network / HTTP failures -> BILL_REQUEST_FAILED, a login page ->
  * IREPS_SESSION_EXPIRED. Returns the trimmed response text.
@@ -135,7 +175,8 @@ export async function postBill(path, body, deps = {}, { ajax = true } = {}) {
     response = await requestIreps({ path, method: "POST", body, headers: ajax ? AJAX_HEADERS : undefined }, { fetch: deps.fetch });
   } catch (error) {
     if (error instanceof IrepsError && error.code === IREPS_ERROR.REQUEST_FAILED) {
-      throw new IrepsError(BILL_ERROR.REQUEST_FAILED, error.message, { status: error.status, reason: error.reason, detail: `${error.detail || "request failed"} (${path.split("/").pop()})`, cause: error });
+      const why = missingAnswerReason(error) || error.detail || "request failed";
+      throw new IrepsError(BILL_ERROR.REQUEST_FAILED, error.message, { status: error.status, reason: error.reason, detail: `${path.split("/").pop()}: ${why}`, cause: error });
     }
     throw error;
   }
@@ -147,13 +188,27 @@ export async function postBill(path, body, deps = {}, { ajax = true } = {}) {
   return { text, response };
 }
 
+/** IREPS_REJECTED with IREPS's own words as `answer`, for a caller that shows them in a check. */
 function rejected(endpoint, text) {
   const reason = String(text || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300) || "empty answer";
-  return new IrepsError(BILL_ERROR.IREPS_REJECTED, `${endpoint} refused: ${reason}`, { detail: `${endpoint}: ${reason}` });
+  return Object.assign(new IrepsError(BILL_ERROR.IREPS_REJECTED, `${endpoint} refused: ${reason}`, { detail: `${endpoint}: ${reason}` }), { answer: reason });
 }
 
 function invalid(endpoint, text) {
   return new IrepsError(BILL_ERROR.RESPONSE_INVALID, `${endpoint}: unexpected answer`, { detail: `${endpoint} answered "${String(text).slice(0, 120)}"` });
+}
+
+/**
+ * The answer to a WRITE is IREPS's plain text ("success^^...", "OK#..." or the refusal the page
+ * would alert). A whole page instead (postBill has already told its login page apart) is an
+ * error page that may hide a saved write, so it is not read as a refusal (review 3.1).
+ * @returns {string} the text
+ */
+export function writeAnswer(endpoint, text) {
+  if (/<\s*(!doctype|html|body)\b/i.test(String(text || "").slice(0, 2000))) {
+    throw new IrepsError(BILL_ERROR.RESPONSE_INVALID, `${endpoint}: a page instead of the answer`, { detail: `${endpoint} answered with a page instead of its usual answer` });
+  }
+  return text;
 }
 
 /** Fields of a "success^^a^^b" answer (without the leading "success"); throws when IREPS refused. */
@@ -275,10 +330,35 @@ export function parseRoList(text) {
 }
 
 /**
+ * The two populateRODetails.do answers the bill page refuses a receipt with, and the alert it shows
+ * for each (billFunctions.js setRODetails). Not captured from IREPS: known from the page's script.
+ */
+export const RO_REFUSALS = Object.freeze({
+  duplicate: "This RO/CRN has already been submitted!",
+  multi: "1 CRN can be used only once in a bill. A separate bill should be submitted for balance claim."
+});
+
+/** BILL_RECEIPT_REFUSED for one of RO_REFUSALS: what IREPS means and what to do, in plain words (review 3.13). */
+function receiptRefused(answer, roNo) {
+  const receipt = roNo ? `receipt ${roNo}` : "this receipt";
+  const detail =
+    answer === "duplicate"
+      ? `IREPS answered "${RO_REFUSALS.duplicate}" for ${receipt}: it is already on another bill in IREPS, so it cannot be billed again. Look for that bill on the PO's Bills for Pay tab in IREPS. DocLink does not bill this receipt`
+      : `IREPS answered "${RO_REFUSALS.multi}" for ${receipt}: IREPS takes a CRN only once in a bill, and any balance of it only on a separate bill. Check which bill holds this CRN on the PO's Bills for Pay tab in IREPS, and claim a balance on a separate bill there. DocLink does not bill this receipt`;
+  return Object.assign(new IrepsError(BILL_ERROR.RECEIPT_REFUSED, `populateRODetails: ${answer}`, { detail }), { answer });
+}
+
+/**
  * populateRODetails.do: success^^14/10/2026^^87^^RT260464^^0^^4826100504^^14/10/2026^^0^^ 4826100504:87^^^^87.0^^^^812656.56^^0^^812656.56^^<url>
  * Index meanings from upload.md (step 7 table); "Not Applicable" / "NA" are kept as sent.
+ * "duplicate" and "multi" (RO_REFUSALS) throw BILL_RECEIPT_REFUSED; any other answer that is not
+ * "success" is a refusal in IREPS's words, as before.
+ * @param {string} text
+ * @param {string} [roNo]  the receipt asked for, named in the refusal's text
  */
-export function parseRoDetails(text) {
+export function parseRoDetails(text, roNo = "") {
+  const answer = String(text || "").trim().split(FIELD_SEP)[0].trim();
+  if (answer === "duplicate" || answer === "multi") throw receiptRefused(answer, roNo);
   const f = successFields("populateRODetails", text).map((s) => s.trim());
   if (f.length < 14) throw invalid("populateRODetails", text);
   return {
@@ -323,11 +403,15 @@ export function parseDocumentList(text) {
 /* Calls                                                                      */
 /* -------------------------------------------------------------------------- */
 
-/** The bill entry page of a PO (read-only; what "Bill Claim" opens). Returns its HTML. */
+/**
+ * The bill entry page of a PO (read-only; what "Bill Claim" opens). Returns its HTML.
+ * The page carries a Struts token, so loading it replaces the session's token: it runs under the
+ * IREPS form lock like every other form load (review 5.4), and waits for a running search instead
+ * of breaking it. Only the load is locked: the bill calls after it carry no token.
+ */
 export async function loadBillForm({ rly, poKey }, deps = {}) {
   const body = new URLSearchParams({ rly, poKey }).toString();
-  const { text } = await postBill(BILL_ENDPOINTS.FORM, body, deps, { ajax: false });
-  return text;
+  return withIrepsFormLock(async () => (await postBill(BILL_ENDPOINTS.FORM, body, deps, { ajax: false })).text);
 }
 
 export async function fetchPayAuthList({ payingRly, poKey }, deps = {}) {
@@ -349,7 +433,7 @@ export async function checkGstin(gstNo, deps = {}) {
 /** WRITES: creates the draft bill on IREPS. `values` must hold every SAVE_HEADER_FIELDS key. */
 export async function saveBillHeader(values, deps = {}) {
   const { text } = await postBill(BILL_ENDPOINTS.SAVE_HEADER, orderedBody(SAVE_HEADER_FIELDS, values), deps);
-  return parseSaveHeader(text);
+  return parseSaveHeader(writeAnswer("saveBillHeader", text));
 }
 
 export async function fetchItemDetails(values, deps = {}) {
@@ -367,11 +451,11 @@ export async function fetchRoList(values, deps = {}) {
 export async function fetchRoDetails(values, deps = {}) {
   const fields = ["rly", "poNumber", "poSrNo", "roNo", "billType", "paymentPercent", "payingRly"];
   const { text } = await postBill(BILL_ENDPOINTS.RO_DETAILS, orderedBody(fields, values), deps);
-  return parseRoDetails(text);
+  return parseRoDetails(text, values.roNo);
 }
 
 /** WRITES: saves the bill item; returns dispatchNo and the documents IREPS attached itself. */
 export async function saveBillDetails(values, deps = {}) {
   const { text } = await postBill(BILL_ENDPOINTS.SAVE_DETAILS, orderedBody(SAVE_DETAILS_FIELDS, values), deps);
-  return parseSaveDetails(text);
+  return parseSaveDetails(writeAnswer("saveBillDetails", text));
 }

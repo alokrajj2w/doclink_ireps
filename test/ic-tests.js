@@ -201,6 +201,30 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
     eq(empty.recordCount, 0);
   });
 
+  await test("IC search (6.6): a PO typed in another spelling compares as the PO search does, and its ICs are filed under the number IREPS shows", async () => {
+    const shown = "L3251421101345";
+    const page = resultsPage.split("27253922100240").join(shown);
+    for (const typed of ["l3251421101345", "L3251 421101345", shown]) {
+      const r = parseIcSearchResults(page, typed);
+      eq(r.recordCount, 4, `"${typed}": every IC of the PO is kept`);
+      eq(r.filteredCount, 0);
+    }
+    eq(parseIcSearchResults(page, "L3251421101346").filteredCount, 4, "another PO number is still filtered out");
+    const { fetchImpl } = fakeIc({ listPage, onSearch: (b, t, respond) => respond(page), onPdf: (url, respond) => respond(fakePdfBytes(), { contentType: "application/pdf" }) });
+    const filed = [];
+    const result = await downloadInspectionCertificates("l3251421101345", {
+      fetch: fetchImpl,
+      parseHtml: (html, o) => parseIcSearchResults(html, "l3251421101345", o),
+      saveFile: async (bytes, path, item) => (filed.push(item), { downloadId: filed.length, filename: path.split("/").pop() })
+    });
+    eq(result.count, 4);
+    eq(filed.length, 4);
+    for (const item of filed) {
+      eq(item.ecm.fields.customer_po_number, shown, "the ECM document names IREPS's PO number");
+      assert(item.log.key.startsWith(`ic:${shown}|`), item.log.key);
+    }
+  });
+
   /* --------------------------------------------------- search / download */
 
   await test("searchInspectionCertificates: finds all 4 issued ICs of the PO (session check -> token -> search -> parse)", async () => {
@@ -266,6 +290,21 @@ export async function runIcTests({ test, assert, eq, rejects, fixture }) {
     eq(found.count, 8, "every IC of the PO, not only page 1's");
     eq(new Set(found.certificates.map((c) => c.callId)).size, 8);
     eq(found.certificates.map((c) => c.index).join(","), "1,2,3,4,5,6,7,8", "numbered across pages");
+    eq(found.incomplete, null, "8 read of IREPS's 8: no warning");
+  });
+
+  await test("searchInspectionCertificates (4.3, 1.19): fewer ICs read than IREPS's Total Records is a warning, and it reaches the download's result", async () => {
+    // IREPS says 5 inspection calls; only the 4 rows on the page can be read
+    const short = resultsPage.replace('value="4" id="totalRecords"', 'value="5" id="totalRecords"').replace("Total Records: 4", "Total Records: 5");
+    const { fetchImpl: searchFetch } = fakeIc({ listPage, onSearch: (b, t, respond) => respond(short) });
+    const fetch = async (url, init) => ((init && init.method) === "POST" ? searchFetch(url, init) : new Response(fakePdfBytes(), { status: 200, headers: { "content-type": "application/pdf" } }));
+    const found = await searchInspectionCertificates("27253922100240", { fetch, parseHtml });
+    eq(found.count, 4, "what was read is kept");
+    eq(found.incomplete, "IREPS reported 5 inspection calls but 4 were read");
+    eq(found.listWarnings.join(), "PO 27253922100240: IREPS reported 5 inspection calls but 4 were read; some Inspection Certificates may be missing.");
+    const result = await downloadInspectionCertificates("27253922100240", { fetch, parseHtml, saveFile: async (bytes, path) => ({ downloadId: 1, filename: path.split("/").pop() }) });
+    eq(result.downloads.completed, 4);
+    eq(result.warnings.join(), found.listWarnings.join(), "the single-PO result carries the search's warning (it used to be dropped)");
   });
 
   await test("searchInspectionCertificates: login page, HTTP errors, missing token map to IC codes", async () => {

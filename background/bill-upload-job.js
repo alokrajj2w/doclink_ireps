@@ -12,6 +12,8 @@
  *   BILL_UPLOAD_DOCUMENTS  {}                                -> documents saved locally
  *   BILL_UPLOAD_ADD_DOCUMENT { file: { name, base64 }, fileDesc } -> signed in the IREPS signer, uploaded to the bill   WRITES
  *   BILL_UPLOAD_FORGET     {}                                -> review        (forgets DocLink's record of an earlier bill)
+ *   BILL_UPLOAD_CONFIRM_CHECKED { step, at, checked }        -> the user checked the bill in IREPS after a
+ *                          write's answer did not arrive; DocLink may send that step again (review 3.1)
  *   BILL_UPLOAD_GET_STATE / BILL_UPLOAD_RESET
  *
  * Each action answers { started: true } at once and finishes in the background; the panel
@@ -22,22 +24,78 @@ import { MESSAGE_TYPES, SESSION_KEYS, describeError } from "../utils/messages.js
 import { IrepsError } from "../services/ireps-api.js";
 import { logger } from "../utils/logger.js";
 import { BILL_ERROR } from "../services/bill-upload/bill-upload-api.js";
-import { findBillableReceipts, invoiceForReceipt, prepareBill, reviewBill, forgetBill, createDraftBill, saveItem, collectBillDocuments, billDocumentTypes } from "../services/bill-upload/bill-upload-service.js";
+import {
+  findBillableReceipts,
+  invoiceForReceipt,
+  prepareBill,
+  reviewBill,
+  forgetBill,
+  createDraftBill,
+  saveItem,
+  addDocumentToBill,
+  confirmCheckedInIreps,
+  withStoredBill,
+  unknownOutcome,
+  collectBillDocuments,
+  billDocumentTypes
+} from "../services/bill-upload/bill-upload-service.js";
 import { MAX_INVOICE_FILE_RECORDS } from "../services/bill-upload/invoice-file.js";
 import { createBillStore } from "../services/bill-upload/bill-upload-store.js";
 import { tabFetch, tabSignPdf, tabSaveFile, assertIrepsTab } from "../services/bill-upload/tab-transport.js";
-import { uploadBillDocument, MAX_SIGN_BYTES } from "../services/bill-upload/bill-document-upload.js";
+import { MAX_SIGN_BYTES } from "../services/bill-upload/bill-document-upload.js";
 import { searchRnote } from "../services/rnote/rnote-service.js";
 import { searchCrn } from "../services/crn/crn-service.js";
 import { downloadBytes } from "../services/download-service.js";
 import { holdWorker } from "./keep-alive.js";
 
-const IDLE = Object.freeze({ step: "idle", busy: false, message: "", poNo: "", receipts: [], warnings: [], receiptKey: null, invoiceMode: "ecm", invoice: null, context: null, documents: null, docUpload: null, error: null });
+const IDLE = Object.freeze({ step: "idle", busy: false, running: null, message: "", poNo: "", receipts: [], warnings: [], receiptKey: null, invoiceMode: "ecm", invoice: null, context: null, documents: null, docUpload: null, error: null });
+
+const lower = (text) => text.charAt(0).toLowerCase() + text.slice(1);
+
+/**
+ * What a step that Chrome cut off was doing, and what to check before it is repeated
+ * (BILL_INTERRUPTED, review 3.13a): a write may have reached IREPS, a read never wrote anything.
+ */
+function interruptedDetail(saved) {
+  const c = saved.context || {};
+  const bill = c.billRegNo || (c.existing && c.existing.billRegNo) || "?";
+  const invoice = (c.invoice && c.invoice.invoiceNumber) || (saved.invoice && saved.invoice.invoiceNumber) || "?";
+  const po = c.receipt ? ` (PO ${c.receipt.poNo}, PO Sr ${c.receipt.poSr})` : "";
+  switch (saved.running) {
+    case "create":
+      return `creating the draft bill for invoice ${invoice}${po}. IREPS may have created it: look for it on the PO's Bills for Pay tab in IREPS before you create it again`;
+    case "item":
+      return `saving the item of draft bill ${bill}. IREPS may have saved it: check bill ${bill} in IREPS (the PO's Bills for Pay tab) before you save the item again`;
+    case "add-document":
+      return `uploading a document to draft bill ${bill}. IREPS may have added it: check the bill's documents in IREPS before you upload it again`;
+    case "search":
+      return "searching the R-Notes and CRNs. That step only reads IREPS: search again";
+    case "prepare":
+      return "preparing the bill. That step only reads IREPS and ECM: prepare it again";
+    case "review":
+      return "checking your changes. That step only reads IREPS: apply them again";
+    case "documents":
+      return "getting the documents from ECM. Nothing was sent to IREPS: get them again";
+    default:
+      return `${lower(saved.message || "running a bill step")} Check the bill in IREPS (the PO's Bills for Pay tab) before you repeat it`;
+  }
+}
+
+/** The error's causes, for the log (logger.js redacts them): what the transport really said. */
+function causeChain(error) {
+  const parts = [];
+  for (let e = error && error.cause, i = 0; e && i < 5; e = e.cause, i++) parts.push(`${e.code || e.name || "Error"}: ${e.message || e}`);
+  return parts.length ? parts.join(" <- ") : null;
+}
 
 /**
  * @param {{ broadcast: (type: string, payload: object) => void, parseSearchPo: (html: string, options: object) => Promise<object> }} hooks
  */
-export function createBillUploadJob({ broadcast, parseSearchPo }) {
+/**
+ * @param {{ broadcast: Function, parseSearchPo: Function, onJobEnded?: () => void }} deps
+ *   onJobEnded: called when each step ends (done or failed), so that a scheduled download that waited for it may run
+ */
+export function createBillUploadJob({ broadcast, parseSearchPo, onJobEnded = () => {} }) {
   let state = { ...IDLE, updatedAt: Date.now() };
   let restored = false;
   const store = createBillStore();
@@ -48,12 +106,14 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
     try {
       const got = await chrome.storage.session.get(SESSION_KEYS.BILL_UPLOAD_STATE);
       const saved = got && got[SESSION_KEYS.BILL_UPLOAD_STATE];
-      // a worker that died mid-step is not busy any more; say which step was cut off (a draft bill may
-      // or may not exist in IREPS now, so the user checks there before doing it again)
+      // a worker that died mid-step is not busy any more; say which step was cut off (a write may
+      // or may not have reached IREPS, so the user checks there before doing it again)
       if (saved && state.step === "idle") {
         state = saved.busy
-          ? { ...saved, busy: false, message: "", error: describeError("BILL_INTERRUPTED", { detail: saved.message || "a bill step" }) }
-          : { ...saved, busy: false };
+          ? { ...saved, busy: false, running: null, message: "", error: describeError("BILL_INTERRUPTED", { detail: interruptedDetail(saved) }) }
+          : { ...saved, busy: false, running: null };
+        // a write that was under way is recorded in the bill store: show its stop at once
+        if (state.context && state.context.receipt) state = { ...state, context: await withStoredBill(state.context, { store }) };
       }
     } catch (error) {
       logger.debug("Could not restore the bill upload state", error);
@@ -91,6 +151,8 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
             billRegNo: c.billRegNo || (c.existing && c.existing.billRegNo) || null,
             dispatchNo: c.dispatchNo || (c.existing && c.existing.dispatchNo) || null,
             existing: c.existing || null,
+            // a write whose answer did not arrive: what to check in IREPS and confirm (review 3.1)
+            unknown: unknownOutcome(c.existing),
             documentsOnBill: c.documentsOnBill || null,
             forgottenBills: c.forgottenBills || []
           }
@@ -114,17 +176,25 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
     if (state.busy) return { started: false, error: describeError(BILL_ERROR.BUSY) };
     const before = state.step;
     holdWorker(async () => {
-      await set({ busy: true, message, error: null });
+      await set({ busy: true, running: step, message, error: null });
       try {
         const patch = await work();
-        await set({ busy: false, message: "", ...patch });
+        await set({ busy: false, running: null, message: "", ...patch });
       } catch (error) {
         const info = described(error);
         if (!(error instanceof IrepsError)) logger.error(`Bill upload step ${step} failed`, error);
-        else logger.warn(`Bill upload step ${step} stopped: ${info.title}`, { code: error.code, detail: error.detail });
-        // a failure after the draft bill was created keeps that bill on screen
-        if (error && error.billRegNo && error.context) await set({ busy: false, message: "", step: "item-error", context: error.context, error: info });
-        else await set({ busy: false, message: "", step: before, error: info });
+        else logger.warn(`Bill upload step ${step} stopped: ${info.title}`, { code: error.code, detail: error.detail, cause: causeChain(error) });
+        // a failure after the draft bill was created keeps that bill on screen; one that changed what
+        // is known about the bill (a write whose answer is missing) shows that
+        if (error && error.billRegNo && error.context) await set({ busy: false, running: null, message: "", step: "item-error", context: error.context, error: info });
+        else if (error && error.context) await set({ busy: false, running: null, message: "", step: before, context: error.context, error: info });
+        else await set({ busy: false, running: null, message: "", step: before, error: info });
+      } finally {
+        try {
+          onJobEnded();
+        } catch (error) {
+          logger.debug("Bill upload: the job-ended hook failed", error);
+        }
       }
     });
     return { started: true };
@@ -196,9 +266,32 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
       await restore();
       if (state.busy) return { ok: false, error: describeError(BILL_ERROR.BUSY) };
       if (!state.context || state.step !== "review") return { ok: false, error: describeError(BILL_ERROR.NOT_PREPARED, { detail: "Prepare the bill first" }) };
-      const { context } = await forgetBill(state.context, { store });
+      let context;
+      try {
+        ({ context } = await forgetBill(state.context, { store }));
+      } catch (error) {
+        // a header whose creation IREPS has not confirmed is cleared only by "I checked in IREPS"
+        if (error && error.context) await set({ context: error.context });
+        return { ok: false, error: described(error) };
+      }
       await set({ step: "review", context, documents: null, error: null });
       return { ok: true };
+    },
+
+    // After a write whose answer did not arrive: the user checked the bill in IREPS and confirms it,
+    // so DocLink may send that step again. Only DocLink's record changes; IREPS is not touched.
+    [MESSAGE_TYPES.BILL_UPLOAD_CONFIRM_CHECKED]: async (msg) => {
+      await restore();
+      if (state.busy) return { ok: false, error: describeError(BILL_ERROR.BUSY) };
+      if (!state.context || !state.context.receipt) return { ok: false, error: describeError(BILL_ERROR.NOT_PREPARED, { detail: "Prepare the bill first" }) };
+      if (msg.checked !== true) return { ok: false, error: describeError(BILL_ERROR.CHECKS_FAILED, { detail: "tick that you checked the bill in IREPS first" }) };
+      try {
+        const context = await confirmCheckedInIreps(state.context, { step: msg.step, at: msg.at }, { store });
+        await set({ context, error: null });
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: described(error) };
+      }
     },
 
     [MESSAGE_TYPES.BILL_UPLOAD_CREATE]: async (msg) => {
@@ -243,9 +336,10 @@ export function createBillUploadJob({ broadcast, parseSearchPo }) {
       return run("add-document", `Sign ${file.name} in the IREPS signer window (select your DSC, enter the PIN); DocLink then uploads it to bill ${billRegNo}...`, async () => {
         await assertIrepsTab(msg.panelTabId);
         const bill = { billRegNo, dispatchNo, vendorCode: c.form.literals.vendorCode, thumbprint: c.form.certThumbprint, spmBillRegNo: c.form.literals.spmBillRegNo };
-        const result = await uploadBillDocument(
+        const result = await addDocumentToBill(
+          state.context,
           { bill, file, fileDesc },
-          { fetch: tabFetch(msg.panelTabId), signPdf: tabSignPdf(msg.panelTabId), saveFile: tabSaveFile(msg.panelTabId) }
+          { store, fetch: tabFetch(msg.panelTabId), signPdf: tabSignPdf(msg.panelTabId), saveFile: tabSaveFile(msg.panelTabId) }
         );
         logger.info(`Bill upload: document uploaded to bill ${billRegNo}`, { file: result.fileName, desc: fileDesc, documents: result.documents.length });
         return { step, context: { ...state.context, documentsOnBill: result.documents }, docUpload: { fileName: result.fileName, fileDesc: fileDesc.trim(), billRegNo, at: new Date().toISOString() } };

@@ -146,10 +146,19 @@ function assertPage(page, notRecognisedCode) {
  */
 export function searchIrepsDocuments(options = {}, deps = {}) {
   // the form load, the search and the result pages share one Struts token: no other IREPS search in between (M2)
-  return withIrepsFormLock(() => searchIrepsDocumentsLocked(options, deps));
+  return withIrepsFormLock(async () => {
+    // result pages asked for ahead must all have ended before the lock is let go, also when the search fails:
+    // a request still under way would answer after the next form sequence got its token, and replace it
+    const ahead = { stop: async () => {} };
+    try {
+      return await searchIrepsDocumentsLocked(options, deps, ahead);
+    } finally {
+      await ahead.stop();
+    }
+  });
 }
 
-async function searchIrepsDocumentsLocked(options, deps) {
+async function searchIrepsDocumentsLocked(options, deps, ahead = { stop: async () => {} }) {
   if (typeof deps.parseHtml !== "function") throw new Error("searchIrepsDocuments requires deps.parseHtml");
   const { criteria, ...searchOptions } = options;
   const documentType = documentTypeFor(criteria);
@@ -221,6 +230,10 @@ async function searchIrepsDocumentsLocked(options, deps) {
       pending.catch(() => {}); // handled when awaited in order below
       prefetched.set(pageNo, pending);
     }
+    ahead.stop = async () => {
+      limit.cancel();
+      await Promise.allSettled(prefetched.values());
+    };
   }
 
   // Step 4: parse the first (possibly only) page.
@@ -294,8 +307,11 @@ async function searchIrepsDocumentsLocked(options, deps) {
     if (pagination.maxPage > pageCount) warnings.push(`Only the first ${pageCount} of ${pagination.maxPage} result pages were fetched (safety limit).`);
   }
   // IREPS's own count ("Total N result(s)", or count= in the page links): fewer records read than it
-  // reports is said out loud, never returned as a complete list without a word
-  let incomplete = null;
+  // reports is said out loud, never returned as a complete list without a word. A list DocLink's page
+  // limit cut is not read to its end either (a scheduled run then ends partial, not done)
+  let incomplete = prefetched.size > 0 && pagination.maxPage > pageCount
+    ? `IREPS listed ${pagination.maxPage} result pages; only the first ${pageCount} were read (DocLink's page limit)`
+    : null;
   const reported = pagination.reportedTotal ?? pagination.totalCount;
   if (reported !== null && reported !== undefined && records.length < reported && pagination.maxPage <= pageCount) {
     const missing = `IREPS reported ${reported} ${documentType.shortLabel} result(s) but ${records.length} were read`;
@@ -314,6 +330,12 @@ async function searchIrepsDocumentsLocked(options, deps) {
   })}`);
 
   if (records.length === 0) {
+    // IREPS's own total says there are results: reading none of them is a page DocLink could not read, never
+    // "nothing found" (PO by date would otherwise take the window as empty and miss those POs)
+    if (reported > 0) {
+      const detail = `IREPS reported ${reported} ${documentType.shortLabel} result(s) but none could be read`;
+      throw new IrepsError(CODES.RESULTS_INVALID, detail, { detail });
+    }
     throw new IrepsError(CODES.NOT_FOUND, `IREPS returned no ${documentType.shortLabel} records for the selected search`);
   }
   if (warnings.length) logger.info(`${criteria} parser warnings: ${warnings.length}`, warnings.slice(0, 5));

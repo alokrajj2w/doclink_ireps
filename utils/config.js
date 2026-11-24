@@ -30,6 +30,15 @@ function extensionUrl(name) {
   return typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL(name) : `./${name}`;
 }
 
+/** " (at position 123, line 5 column 10)" from a JSON SyntaxError, or "": the place only, never the quoted text. */
+export function jsonErrorPlace(error) {
+  const message = String((error && error.message) || "");
+  const position = /\bposition (\d+)/i.exec(message);
+  const line = /\bline (\d+) column (\d+)/i.exec(message);
+  if (!position && !line) return "";
+  return ` (at ${[position ? `position ${position[1]}` : "", line ? `line ${line[1]} column ${line[2]}` : ""].filter(Boolean).join(", ")})`;
+}
+
 async function readJson(name, { optional = false } = {}) {
   let response;
   try {
@@ -47,8 +56,9 @@ async function readJson(name, { optional = false } = {}) {
   try {
     parsed = await response.json();
   } catch (error) {
-    // the file is there but broken: say so (its settings, e.g. the real ECM credentials, are not applied)
-    logger.error(`${name} is not valid JSON, so it is ignored. Fix it and reload DocLink.`, error);
+    // the file is there but broken: say so (its settings, e.g. the real ECM credentials, are not applied).
+    // Never the parser's message: it quotes the text around the mistake, which can be part of a secret.
+    logger.error(`${name} is not valid JSON${jsonErrorPlace(error)}, so it is ignored. Fix it and reload DocLink.`);
     return null;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {

@@ -95,10 +95,29 @@ export function contentDispositionName(header) {
 /** The last path segment of a URL when it names a file ("viewNitPdf_5470263.pdf"); "" for a .do / .jsp / page URL. */
 export function urlFileName(url) {
   try {
-    const n = decodeURIComponent(new URL(url, "https://x.invalid/").pathname.split("/").pop() || "");
+    const n = safeDecodeURIComponent(new URL(url, "https://x.invalid/").pathname.split("/").pop() || "");
     return /\.[A-Za-z0-9]{2,5}$/.test(n) && !/\.(do|jsp|html?|php|aspx?)$/i.test(n) ? n : "";
   } catch {
     return "";
+  }
+}
+
+/**
+ * decodeURIComponent that never throws: the escapes it cannot read stay as written, so an IREPS file
+ * name with a lone "%" ("Rates 10%.pdf") keeps its name instead of losing it.
+ * @param {string} text
+ */
+export function safeDecodeURIComponent(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return String(text).replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+      try {
+        return decodeURIComponent(run);
+      } catch {
+        return run;
+      }
+    });
   }
 }
 

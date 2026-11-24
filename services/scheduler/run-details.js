@@ -185,19 +185,35 @@ export function fitResult(result) {
   return out;
 }
 
-/** Tender error codes (tender/tender-core.js TenderError) -> slot codes (utils/messages.js). */
+/**
+ * Tender error codes (tender/tender-core.js TenderError) -> slot codes (utils/messages.js). IREPS not answering
+ * is "IREPS not responding" and an IREPS error page an IREPS text, never the Bill Status or network text.
+ */
 const TENDER_CODES = Object.freeze({
   SESSION_EXPIRED: "IREPS_SESSION_EXPIRED",
   ACCOUNT_CHANGED: "SCHEDULE_ACCOUNT_MISMATCH",
   ACCOUNT_MISMATCH: "SCHEDULE_ACCOUNT_MISMATCH",
-  TIMEOUT: "IREPS_REQUEST_FAILED",
-  UNREACHABLE: "IREPS_REQUEST_FAILED"
+  ACCOUNT: "SCHEDULE_ACCOUNT_UNVERIFIED",
+  TIMEOUT: "IREPS_UNAVAILABLE",
+  UNREACHABLE: "IREPS_UNAVAILABLE",
+  HTTP: "SCHEDULE_IREPS_ERROR",
+  PAGE: "TENDER_PAGE_NOT_RECOGNISED",
+  PARSE: "TENDER_PAGE_NOT_RECOGNISED",
+  LIST: "TENDER_LIST_FAILED",
+  SEARCH_INCOMPLETE: "TENDER_SEARCH_INCOMPLETE",
+  BLOCKED: "TENDER_REQUEST_BLOCKED",
+  EXCLUDED: "TENDER_REQUEST_BLOCKED",
+  LOA_SCRIPT: "TENDER_LOA_SCRIPT_UNREADABLE"
 });
 
-/** The slot code of a tender job's error code (a SCHEDULE_* / ECM_* / RECON_* / IREPS_* code passes as it is). */
-export function tenderCode(code) {
+/**
+ * The slot code of a tender job's error code (a SCHEDULE_* / ECM_* / RECON_* / IREPS_* / TENDER_* code passes as
+ * it is). `fallback`: the code of anything else - a run that stopped (SCHEDULE_TENDER_FAILED), or one document
+ * that was not downloaded (SCHEDULE_DOWNLOAD_FAILED).
+ */
+export function tenderCode(code, fallback = "SCHEDULE_TENDER_FAILED") {
   const c = String(code || "");
   if (TENDER_CODES[c]) return TENDER_CODES[c];
-  if (/^(SCHEDULE|ECM|RECON|IREPS)_[A-Z0-9_]+$/.test(c)) return c;
-  return "SCHEDULE_TENDER_FAILED";
+  if (/^(SCHEDULE|ECM|RECON|IREPS|TENDER)_[A-Z0-9_]+$/.test(c)) return c;
+  return fallback;
 }

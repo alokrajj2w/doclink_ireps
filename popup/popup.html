@@ -56,6 +56,9 @@
         <label title="IC, PO, MA and tender documents: the ECM folder of your IREPS unit. Bill Status, CRN and R-NOTE: Recon Engine storage (S3)."><input type="radio" name="save-destination" value="recon" checked> ECM / S3</label>
       </div>
     </div>
+    <!-- Runs this panel did not start (a scheduled download, a run from another tab's panel): one line
+         each while they hold a job; their buttons wait meanwhile (popup-common.js noteBackgroundRun) -->
+    <p class="background-runs" id="background-runs" role="status" hidden></p>
     <!-- ===================== Not-on-IREPS gate =====================
          Shown instead of every other view (they keep their state) while the
          active tab is not the IREPS portal config.json targets. -->
@@ -220,6 +223,8 @@
         </label>
         <button id="btn-redownload-skip" class="btn btn-primary" type="button">Skip them, download only new files</button>
         <button id="btn-redownload-again" class="btn btn-secondary" type="button" disabled>Download selected again</button>
+        <!-- Only when the question's time ran out: the page then says what happened, and OK closes it -->
+        <button id="btn-redownload-ok" class="btn btn-primary" type="button" hidden>OK</button>
       </article>
     </section>
 
@@ -300,6 +305,7 @@
             <div>
               <div class="result-title" id="ma-results-title">MA Results</div>
               <p class="result-text result-muted" id="ma-results-filter"></p>
+              <p class="result-text result-warning" id="ma-results-warning" hidden></p>
             </div>
             <button id="btn-ma-new-search" class="btn btn-link" type="button">New search</button>
           </div>
@@ -864,9 +870,11 @@
     </section>
   </main>
 
-  <footer class="app-footer">
+  <!-- The last Bill Status run in this browser (the worker's doclink.lastDownload). It says so: every other
+       download shows its result in its own card or view, so the footer never stands for them (7.14). -->
+  <footer class="app-footer" title="The last Bill Status download in this browser (yours or a scheduled one). Every other download shows its result in its own card or view.">
     <div class="meta">
-      <span class="meta-label">Last download:</span>
+      <span class="meta-label" id="meta-last-download-label">Last Bill Status download:</span>
       <span id="meta-last-download" class="meta-value">-</span>
     </div>
     <div class="meta">
