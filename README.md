@@ -109,7 +109,7 @@ corrected, reconciled or inferred.
 
 | Layer | File | Responsibility |
 |---|---|---|
-| UI | `popup/popup.html`, `popup.css`, `popup.js` | Rendered in Chrome's side panel (docked right, full height; the toolbar icon toggles it). Each tab has its own DocLink panel: Chrome hides it when you switch to another tab and restores it, as it was, when you return; tabs where you never opened it show nothing. DocLink's tools appear only while the panel's tab is on the portal `config.json` targets (mock on `localhost:8765`, or `www.ireps.gov.in`). Opened on any other page, it shows a "Go to IREPS and log in" page (its Open IREPS button loads IREPS in that same tab), the other portal gets a "switch target" hint, and a config URL missing from `host_permissions` is reported as a configuration error. No IREPS request is made from a non-IREPS tab. Rule: `utils/url-scope.js`, view: `popup/popup-gate.js`. Download cards (Bill Status, CRN), connection indicator, progress, results, login-required view, the *Upload* card (Upload Bill to IREPS, section 20) |
+| UI | `popup/popup.html`, `popup.css`, `popup.js` | Rendered in Chrome's side panel (docked right, full height; the toolbar icon toggles it). Each tab has its own DocLink panel: Chrome hides it when you switch to another tab and restores it, as it was, when you return; tabs where you never opened it show nothing. DocLink's tools appear only while the panel's tab is on the portal `config.json` targets (mock on `localhost:8765`, or `www.ireps.gov.in`). Opened on any other page, it shows a "Go to IREPS and log in" page (its Open IREPS button loads IREPS in that same tab), the other portal gets a "switch target" hint, IREPS at its other address (`ireps.gov.in`, the same login) gets an "Open IREPS at www.ireps.gov.in" hint (section 5), and a config URL missing from `host_permissions` is reported as a configuration error. No IREPS request is made from a non-IREPS tab. Rule: `utils/url-scope.js`, view: `popup/popup-gate.js`. Download cards (Bill Status, CRN), connection indicator, progress, results, login-required view, the *Upload* card (Upload Bill to IREPS, section 20) |
 | Logging | `utils/logger.js` | Redacted, time-stamped log of every step, request, download and error from the service worker, panel and parser; last 1000 entries stored and mirrored into the side panel's console (Inspect). `doclinkLog.dump() / download() / clear()` in that console. See TESTING.md, "The DocLink log" |
 | UI (PO Search) | `popup/popup-documents.js` | CRN and R-NOTE cards on the main screen, each like the Bill Status card: Search options (Last 180 Days / Select Date / PO No., Railway, file format), Download, progress and errors in the card, result in the bottom panel |
 | Orchestration | `background/service-worker.js` | Runs the workflow, tracks job state, relays progress to the popup |
@@ -194,6 +194,7 @@ doclink/
 │   ├── ireps-form-lock.js     withIrepsFormLock: one IREPS form sequence (token) at a time
 │   ├── export-save-service.js export -> Downloads or Recon Engine, with the download-log check
 │   ├── ireps-api.js  ireps-form.js  session-service.js  bill-status-service.js  bill-parser.js  bill-status-export.js
+│   ├── ireps-account-service.js  the logged-in IREPS account (home page) for the scheduler and the ECM
 │   ├── recon-service.js  recon-auth.js   Recon Engine (S3) + sign-in (login 2)
 │   ├── ecm-service.js  ecm-direct.js  ecm-config.js  ecm-catalog.js   ECM (gateway or Nuxeo)
 │   ├── download-log.js        what was downloaded, per user and destination
@@ -273,6 +274,34 @@ that opening the popup and clicking Download does not hit IREPS twice; the
 page is handed to the download once and then discarded. Cookies are never
 read: Chrome attaches them because the extension has host permission for the
 IREPS origin and the requests use `credentials: "include"`.
+
+**The IREPS account check** (`GET /epsn/home/showHome.do`) reads which account
+is logged in. It serves the tender and correspondence views and runs
+(`tender/tender-account.js`, before a run and again before each tender and
+category), the scheduler, and the ECM unit of a document run
+(`services/ireps-account-service.js`).
+* Only IREPS's own login page means "not logged in" (`isIrepsLoginHtml` in
+  `utils/ireps-account.js`, or a page that asks for a password).
+* An answer of 502, 503 or 504 is asked for twice more, after 1 s and 3 s.
+* Any HTTP error, no answer within 45 seconds, or a page that is neither the
+  login page nor a logged-in page is `IREPS_UNAVAILABLE`. The panel says
+  "IREPS not responding (...). This is not a logout: try again in a minute."
+  * The tender views show "IREPS not responding" instead of "Not connected".
+  * In a run, only the part that needed the check fails.
+  * The scheduler gives the slot back and asks again at its next check,
+    instead of waiting for a new IREPS page load.
+
+A "login required" Bill Status error is not shown again when the panel is
+reopened. The user may have logged in since, so the live session check decides.
+
+**IREPS without www.** IREPS also answers at `https://ireps.gov.in`, and its
+login cookie (`JSESSIONID`, `Domain=.ireps.gov.in`) covers both addresses.
+* DocLink sends every request to `www.ireps.gov.in` only, the one in
+  `host_permissions`.
+* On a tab at `ireps.gov.in`, the panel says "Open IREPS at www.ireps.gov.in"
+  (header: "Other address"). Its Open IREPS button opens the same IREPS in that
+  tab, and the login carries over.
+* A page loaded there still counts as IREPS activity for the scheduler.
 
 ---
 
@@ -1860,7 +1889,9 @@ caught up by the next run.
 **Order of checks** (`services/scheduler/scheduler.js`): config on → Recon signed in with
 `doclink.schedule.run` → last verified IREPS account known → `GET /schedule/due` → no manual job running here →
 an IREPS page loaded in this browser in the last 4 minutes → claim → **one** IREPS check (the home page: logged
-in, same account) → run. Nothing is sent to IREPS before the claim is won, and never on a timer: twenty DocLinks
+in, same account) → run. Only IREPS's login page fails that check as "not logged in". When IREPS does not answer it
+(an HTTP error, a timeout, a busy page), the slot is given back as `IREPS_UNAVAILABLE` and asked again at the next
+check (section 5). Nothing is sent to IREPS before the claim is won, and never on a timer: twenty DocLinks
 waking at 09:00 send one IREPS request between them. A run starts at the alarm, when an IREPS page finishes
 loading (a user who logs in at 09:07 runs the 09:00 slot at once; without a page load the next check is 09:10), when the panel's IREPS check passes, after a
 Recon sign-in, or when a manual job ends.

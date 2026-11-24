@@ -197,6 +197,7 @@ These rules come from the November 2026 code review and the fixes that followed 
 
 **IREPS**
 - "Nothing found" only when IREPS says so. A page DocLink does not recognise is an error with a code, never zero results. New parsers report `structure`.
+- "Not logged in" only when IREPS shows its login page (`isIrepsLoginHtml` in `utils/ireps-account.js`). An HTTP error, a timeout or a page DocLink does not recognise is `IREPS_UNAVAILABLE` ("IREPS not responding"), never a logout.
 - Match document numbers exactly. Never use "the first row" or "the first PDF" without checking that it belongs to the document asked for.
 - Follow every result page, and compare the records read with IREPS's own total. A shortfall is a visible warning, never a silent partial list.
 - Run every form sequence under `withIrepsFormLock`. Never call a locked function from inside another one (Web Locks are not re-entrant).

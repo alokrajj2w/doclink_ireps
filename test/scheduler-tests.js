@@ -25,6 +25,8 @@ import { EcmError } from "../services/ecm-service.js";
 import { WorkflowError } from "../services/export-save-service.js";
 import { DOCUMENT_DOWNLOAD_STATUS } from "../services/search-po/document-downloader.js";
 import { describeError, MESSAGE_TYPES } from "../utils/messages.js";
+import { readIrepsAccount, ACCOUNT_READ_ERROR } from "../services/ireps-account-service.js";
+import { accountFromHomeDocument } from "../utils/ireps-account.js";
 
 const T0 = Date.parse("2026-11-17T03:30:00Z"); // 09:00 IST
 const ON = { enabled: true, types: [...SCHEDULE_TYPES], unknown: [], reason: null };
@@ -286,6 +288,107 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(h.calls.failedCheck, 1, "recorded, so this DocLink waits for a new IREPS page");
   });
 
+  /** A run log on fakes: what the scheduler wrote. */
+  const fakeRunLog = () => {
+    const log = { events: [], started: [], finished: [] };
+    return { log, event: (kind, text, types) => void log.events.push({ kind, text, types }), runStarted: (run) => void log.started.push(run), runFinished: (id, outcome) => void log.finished.push({ id, outcome }) };
+  };
+
+  await test("Scheduler: IREPS not responding to the winner's check -> given back, said so (never 'not logged in'), asked again at the next check", async () => {
+    const runLog = fakeRunLog();
+    const h = harness({ check: { ok: false, code: "IREPS_UNAVAILABLE", detail: "the home page answered HTTP 503" }, dues: [{ due: [slot(1, "billStatus")], running: null, next_check_at: null, slots: [] }], runLog });
+    await h.scheduler.wake("ireps page");
+    eq(h.calls.runs.length, 0);
+    eq(h.calls.finish[0].code, "IREPS_UNAVAILABLE");
+    eq(h.calls.finish[0].countsAsAttempt, false);
+    eq(h.calls.failedCheck, 0, "not recorded: the next alarm or page load asks IREPS again");
+    const text = runLog.log.events.at(-1).text;
+    assert(/^Bill Status: claimed, but IREPS could not be checked here: IREPS not responding \(the home page answered HTTP 503\); given back/.test(text), text);
+    assert(!/not logged in/.test(text), text);
+  });
+
+  await test("Scheduler: the winner's check meets IREPS's login page -> 'IREPS is not logged in here', recorded", async () => {
+    const runLog = fakeRunLog();
+    const h = harness({ check: { ok: false, code: "IREPS_SESSION_EXPIRED", detail: "IREPS answered with its login page" }, dues: [{ due: [slot(1, "billStatus")], running: null, next_check_at: null, slots: [] }], runLog });
+    await h.scheduler.wake("ireps page");
+    eq(h.calls.finish[0].code, "IREPS_SESSION_EXPIRED");
+    eq(h.calls.failedCheck, 1);
+    const text = runLog.log.events.at(-1).text;
+    assert(/^Bill Status: claimed, but IREPS is not logged in here; given back/.test(text), text);
+  });
+
+  await test("Scheduler: the first account read meets a busy IREPS -> waits for the account, the next check may try again", async () => {
+    const runLog = fakeRunLog();
+    const h = harness({ account: null, check: { ok: false, code: "IREPS_UNAVAILABLE", detail: "the home page answered HTTP 502" }, runLog });
+    await h.scheduler.wake("ireps page");
+    eq(h.scheduler.getState().waitingFor, "account");
+    eq(h.calls.failedCheck, 0);
+    eq(runLog.log.events.at(-1).text, "The IREPS account could not be read: IREPS not responding (the home page answered HTTP 502).");
+  });
+
+  /** IREPS home-page answers for readIrepsAccount, as fetch gives them. */
+  const HOME_833 = '<html><head><title>Bidder Home Page</title></head><body><table><tr><td class="welcomeLabel">A GIRIJA , FAIVELEY TRANSPORT RAIL TECHNOLOGIES INDIA PRIVATE LIMITED-HOSUR (IREPS ID- 833)</td></tr></table><a href="/epsn/home/logout.do">Log Out</a></body></html>';
+  const LOGIN_PAGE = '<html><head><title>Log into IREPS</title></head><body><form name="LogonForm" method="post" action="/epsn/home/userLoginAction.do"></form></body></html>';
+  const parseHome = async (html) => accountFromHomeDocument(new DOMParser().parseFromString(html, "text/html"), html);
+  /** A fake fetch answering from `list` in turn (the last one again after that); an Error is thrown. */
+  const answers = (...list) => {
+    const calls = [];
+    const fetch = async (url, init) => {
+      calls.push({ url, init });
+      const a = list[Math.min(calls.length - 1, list.length - 1)];
+      if (a instanceof Error) throw a;
+      const response = new Response(a.body ?? "", { status: a.status ?? 200 });
+      if (a.url) Object.defineProperty(response, "url", { value: a.url });
+      return response;
+    };
+    return { calls, fetch };
+  };
+  const readAccount = (fake, extra = {}) => readIrepsAccount({ baseUrl: "https://www.ireps.gov.in", parse: parseHome, fetch: fake.fetch, sleep: async () => {}, ...extra });
+
+  await test("IREPS account read: the home page -> the account; 502 / 503 / 504 asked again first; the same GET as before", async () => {
+    const busyThenHome = answers({ status: 503 }, { status: 502 }, { body: HOME_833 });
+    const r = await readAccount(busyThenHome);
+    eq(r.ok, true);
+    eq(r.account.irepsAccountId, "833");
+    eq(r.account.operatingUnit, "HOSUR");
+    eq(busyThenHome.calls.length, 3);
+    eq(busyThenHome.calls[0].url, "https://www.ireps.gov.in/epsn/home/showHome.do");
+    eq(busyThenHome.calls[0].init.credentials, "include");
+    eq(busyThenHome.calls[0].init.method, undefined, "a GET");
+  });
+
+  await test("IREPS account read: IREPS not answering is IREPS_UNAVAILABLE, never 'not logged in'", async () => {
+    const busy = answers({ status: 503 });
+    const r = await readAccount(busy);
+    eq(r.code, ACCOUNT_READ_ERROR.UNAVAILABLE);
+    eq(r.detail, "the home page answered HTTP 503");
+    eq(busy.calls.length, 3, "the first try and two more");
+    const serverError = answers({ status: 500 });
+    eq((await readAccount(serverError)).code, "IREPS_UNAVAILABLE");
+    eq(serverError.calls.length, 1, "a 500 is not asked again");
+    const offline = answers(new TypeError("Failed to fetch"));
+    eq((await readAccount(offline)).code, "IREPS_UNAVAILABLE");
+    eq(offline.calls.length, 3);
+    const busyPage = answers({ body: "<html><body><p>The server is busy. Please try after some time.</p></body></html>" });
+    eq((await readAccount(busyPage)).code, "IREPS_UNAVAILABLE", "a page that is neither the home page nor the login page");
+    const stalled = { fetch: (_url, init) => new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))) };
+    const late = await readAccount(stalled, { settings: { timeoutMs: 20, retryDelaysMs: [1, 1] } });
+    eq(late.code, "IREPS_UNAVAILABLE");
+    assert(/did not answer/.test(late.detail), late.detail);
+    eq(describeError("IREPS_UNAVAILABLE").title, "IREPS not responding");
+  });
+
+  await test("IREPS account read: only IREPS's login page (or a password form) is IREPS_SESSION_EXPIRED; no account line is unverified", async () => {
+    eq((await readAccount(answers({ body: LOGIN_PAGE }))).code, ACCOUNT_READ_ERROR.SESSION_EXPIRED);
+    eq((await readAccount(answers({ body: "<html><body>x</body></html>", url: "https://www.ireps.gov.in/epsn/home/userLogin.do" }))).code, "IREPS_SESSION_EXPIRED", "redirected to the login");
+    eq((await readAccount(answers({ status: 403, body: LOGIN_PAGE }))).code, "IREPS_SESSION_EXPIRED", "the login page, whatever its HTTP status");
+    eq((await readAccount(answers({ body: '<form action="/x.do"><input type="password" name="p"></form>' }))).code, "IREPS_SESSION_EXPIRED");
+    eq((await readAccount(answers({ body: '<html><body><p>Welcome</p><a href="/epsn/home/logout.do">Log Out</a></body></html>' }))).code, ACCOUNT_READ_ERROR.UNVERIFIED);
+    const unconfigured = answers({ body: HOME_833 });
+    eq((await readIrepsAccount({ baseUrl: "", parse: parseHome, fetch: unconfigured.fetch })).code, "IREPS_NOT_CONFIGURED");
+    eq(unconfigured.calls.length, 0, "nothing is sent without a portal");
+  });
+
   await test("Scheduler: logged in to another IREPS account -> SCHEDULE_ACCOUNT_MISMATCH, not run", async () => {
     const h = harness({ check: { ok: true, account: { irepsAccountId: "60828" } }, dues: [{ due: [slot(1, "ma")], running: null, next_check_at: null, slots: [] }] });
     await h.scheduler.wake("ireps page");
@@ -373,12 +476,6 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(h.calls.claim.length, 0, "an IC slot the backend returns anyway is not claimed");
     eq(h.calls.runs.length, 0);
   });
-
-  /** A run log on fakes: what the scheduler wrote. */
-  const fakeRunLog = () => {
-    const log = { events: [], started: [], finished: [] };
-    return { log, event: (kind, text, types) => void log.events.push({ kind, text, types }), runStarted: (run) => void log.started.push(run), runFinished: (id, outcome) => void log.finished.push({ id, outcome }) };
-  };
 
   await test("Scheduler: why a due download did not run here goes to the run log, in plain words, with its types", async () => {
     const due = { due: [slot(2, "crn"), slot(1, "billStatus")], running: null, next_check_at: null, slots: [] };
@@ -757,6 +854,10 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(isIrepsActivityUrl("https://www.ireps.gov.in/", base), false);
     eq(isIrepsActivityUrl("https://www.ireps.gov.in/epsn/login.do", base), false);
     eq(isIrepsActivityUrl("https://evil.example/epsn/home/showHome.do", base), false);
+    eq(isIrepsActivityUrl("https://ireps.gov.in/epsn/home/showHome.do", base), true, "the same IREPS without www (one domain-wide login)");
+    eq(isIrepsActivityUrl("https://ireps.gov.in/epsn/home/userLogin.do", base), false);
+    eq(isIrepsActivityUrl("http://ireps.gov.in/epsn/home/showHome.do", base), false, "another scheme is another site");
+    eq(isIrepsActivityUrl("https://evilireps.gov.in/epsn/home/showHome.do", base), false);
     eq(isIrepsActivityUrl("not a url", base), false);
     eq(isIrepsActivityUrl("https://www.ireps.gov.in/epsn/home/showHome.do", ""), false, "no configured portal: nothing counts");
   });

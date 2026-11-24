@@ -7,6 +7,7 @@ import { IREPS_CONFIG, loadIrepsConfig } from '../services/ireps-api.js';
 import { logger } from '../utils/logger.js';
 import { describeError } from '../utils/messages.js';
 import { sourceFileName } from '../utils/filename.js';
+import { isIrepsLoginHtml } from '../utils/ireps-account.js';
 import { sharedRun, LOCAL_SAVE_REFUSED } from './tender-shared-run.js';
 
 /** The panel-wide session-expired text (utils/messages.js), so every view says the same. */
@@ -220,7 +221,7 @@ export function assertAllowedRequest(request) {
 export const fetchSettings = { timeoutMs: 45000, waitMs: 180000, waitRetryMs: 5000, waitRetryMaxMs: 60000, netRetryMs: [1000, 3000] };
 
 /** IREPS answers these while a page is still coming up (gateway / overloaded); worth waiting out. */
-const STILL_OPENING = new Set([502, 503, 504]);
+export const STILL_OPENING = new Set([502, 503, 504]);
 
 /**
  * `wait` (Negotiation / Counter Offer): DocLink waits up to fetchSettings.waitMs (3 minutes) for IREPS to open
@@ -332,12 +333,8 @@ export function isLoginResponse(res) {
   if (/userLogin\.do/i.test(res.url)) return true;
   if (isPdfBytes(res.bytes)) return false;
   if (res.contentType && !/html|text|xml/i.test(res.contentType)) return false;
-  const t = res.text().slice(0, 300000);
-  if (/session\s*(has\s*)?(expired|timed\s*out)/i.test(t)) return true;
-  // the real IREPS login page: <title>Log into IREPS</title> + <form name="LogonForm" action=".../userLoginAction.do">
-  if (/<title>\s*(log\s*into\s*ireps|sign\s*in)/i.test(t)) return true;
-  if ((/<form[^>]+name=["']?LogonForm/i.test(t) || /<form[^>]+action=["'][^"']*userLogin(?:Action)?\.do/i.test(t)) && !/welcomeLabel/i.test(t)) return true;
-  return /userLogin\.do/i.test(t) && /sign\s*in/i.test(t) && !/log\s*out/i.test(t);
+  // the text rules are shared with the service worker's account check (utils/ireps-account.js)
+  return isIrepsLoginHtml(res.url, res.text());
 }
 
 export function assertSession(res) {

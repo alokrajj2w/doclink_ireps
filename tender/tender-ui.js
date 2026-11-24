@@ -1,6 +1,6 @@
 // "Download Tender Documents" view: account panel + automatic discovery from My Messages.
 import { runAutomatic, runLetterType, runTabulations } from './tender-auto.js';
-import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
+import { ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { SESSION_MSG, log } from './tender-core.js';
 import { renderAccountPanel, refreshAccountPanel, wireCopyDiagnostics, wireViewLifecycle, guardTabs } from './view-common.js';
 import { ECM_OUTCOME, describeEcmOutcome } from '../services/ecm-service.js';
@@ -270,7 +270,7 @@ async function run() {
   } catch (e) {
     $('tender-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('tender-error').hidden = false;
-    if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') renderAccount(await getActiveIrepsAccountContext().catch(() => null));
+    if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') await refreshAccountPanel('');
     log('Tender', `run failed: ${e.code || ''} ${e.message}`, 'error');
   } finally {
     stopGuard();

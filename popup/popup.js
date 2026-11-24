@@ -522,7 +522,9 @@ async function restoreJobState() {
     renderComplete(state.result);
     return true;
   }
-  if (state.status === "error" && state.error) {
+  // a "login required" error is not shown again: the user may have logged in since, so the live
+  // session check (onIrepsTabActive) decides what the panel says
+  if (state.status === "error" && state.error && !state.error.loginRequired) {
     renderError(state.error);
     return true;
   }
@@ -572,13 +574,7 @@ async function onIrepsTabActive() {
     const billRestored = restored || documentRestored || maRestored || poIcRestored || batchRestored ? false : await restoreBillUpload();
     if (!restored && !documentRestored && !maRestored && !poIcRestored && !batchRestored && !billRestored) showView("main");
     const state = await send(MESSAGE_TYPES.GET_JOB_STATE);
-    if (!state || state.status !== "running") {
-      if (restored && state && state.status === "error" && state.error && state.error.loginRequired) {
-        setConnection("login", "Login Required");
-      } else {
-        await checkSession(false);
-      }
-    }
+    if (!state || state.status !== "running") await checkSession(false);
     return;
   }
   const state = await send(MESSAGE_TYPES.GET_JOB_STATE);

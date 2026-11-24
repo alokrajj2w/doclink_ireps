@@ -24,6 +24,15 @@ const $ = (id) => document.getElementById(id);
 
 const PORTAL_NAMES = { mock: "mock IREPS portal", real: "real IREPS portal", custom: "configured IREPS portal" };
 
+/** "www.ireps.gov.in" for "https://www.ireps.gov.in" (the URL itself when it does not parse). */
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url || "");
+  }
+}
+
 /**
  * @param {{ send: Function, setConnection: Function, onActive: () => void|Promise<void> }} ctx
  *   onActive runs every time the panel's tab becomes the configured portal.
@@ -102,6 +111,14 @@ export async function initGate(ctx) {
         `Switch to a ${portalName} tab, or set "target": "${scope.otherPortal}" in config.json and reload DocLink.`;
       el.steps.hidden = true;
       el.btnOpen.textContent = `Open the ${portalName}`;
+    } else if (scope.scope === TAB_SCOPE.PORTAL_OTHER_HOST) {
+      // the same IREPS and the same login (the cookie is for the whole domain), at the address DocLink may call
+      const portalHost = hostOf(scope.portalUrl);
+      el.title.textContent = `Open IREPS at ${portalHost}`;
+      el.text.textContent =
+        `This tab is IREPS at ${scope.tabHost}, but DocLink works only at ${portalHost}. ` +
+        "Click Open IREPS: it opens the same IREPS in this tab, and you stay logged in.";
+      el.steps.hidden = true;
     } else if (scope.scope === TAB_SCOPE.MISCONFIGURED) {
       el.title.textContent = "DocLink configuration error";
       // no portal at all: config.json could not be read or has no valid "target" (DocLink fails closed, never guesses the mock)
@@ -121,6 +138,7 @@ export async function initGate(ctx) {
     el.view.hidden = false;
     el.body.dataset.gate = "on";
     if (scope.scope === TAB_SCOPE.MISCONFIGURED) ctx.setConnection("offline", "Config error", true);
+    else if (scope.scope === TAB_SCOPE.PORTAL_OTHER_HOST) ctx.setConnection("away", "Other address", true);
     else ctx.setConnection("away", "Not on IREPS", true);
   }
 

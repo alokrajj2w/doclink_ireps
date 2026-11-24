@@ -985,6 +985,13 @@ await test("url-scope: DocLink runs only on the config.json target portal; other
   eq(other.portalUrl, portals.mock, "the gate offers the configured portal");
   eq(scope("http://localhost:8765/", real), TAB_SCOPE.OTHER_PORTAL, "mock tab while target is real");
 
+  const otherHost = classifyTabUrl("https://ireps.gov.in/epsn/home/showHome.do", real, perms);
+  eq(otherHost.scope, TAB_SCOPE.PORTAL_OTHER_HOST, "IREPS without www: the same login, but DocLink calls www only");
+  eq(otherHost.tabHost, "ireps.gov.in");
+  eq(otherHost.portalUrl, portals.real, "the gate opens the configured portal");
+  eq(scope("http://ireps.gov.in/", real), TAB_SCOPE.NOT_IREPS, "another scheme");
+  eq(scope("https://evilireps.gov.in/", real), TAB_SCOPE.NOT_IREPS);
+
   for (const url of ["https://www.google.com/", "chrome://newtab/", "http://localhost:8766/", "https://localhost:8765/", "http://ireps.gov.in/", "about:blank", "", undefined, "not a url"]) {
     eq(scope(url, mock), TAB_SCOPE.NOT_IREPS, `not IREPS: ${url}`);
   }

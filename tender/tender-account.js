@@ -3,8 +3,8 @@
 // nothing is hardcoded and nothing is cached across runs, so switching IREPS accounts is picked
 // up the next time this is called. No cookie / token / credential is read or stored.
 
-import { TenderError, SESSION_MSG, log, getBaseUrl, irepsFetch, isLoginResponse, parseHtml } from './tender-core.js';
-import { HOME_PATH, accountFromHomeDocument } from '../utils/ireps-account.js';
+import { TenderError, SESSION_MSG, log, getBaseUrl, irepsFetch, isLoginResponse, parseHtml, fetchSettings, STILL_OPENING } from './tender-core.js';
+import { HOME_PATH, accountFromHomeDocument, asksForPassword } from '../utils/ireps-account.js';
 import { ensureDownloadSignIn } from './tender-ecm.js';
 
 // The parsing is shared with the service worker (MA / PO / IC uploads to the ECM need the unit too).
@@ -21,19 +21,46 @@ export function accountFromHomeHtml(html) {
  * Fetches the live IREPS home page with the user's existing browser session and returns:
  *   { irepsAccountId, companyName, operatingUnit, authenticated, verified, source }
  * Never throws for "not signed in" / "unreadable": it returns authenticated:false / verified:false
- * so the UI can say so. (Network failures still reject.)
+ * so the UI can say so. Only IREPS's login page is "not signed in". When IREPS does not answer with
+ * its home page (HTTP 502/503/504 after two more tries, another HTTP error, a busy or error page) it
+ * throws IREPS_UNAVAILABLE, and network failures throw TIMEOUT / UNREACHABLE: none of them is a logout.
  */
 export async function getActiveIrepsAccountContext({ base } = {}) {
   log('Account', 'Checking active IREPS account');
   const b = base || (await getBaseUrl());
-  const res = await irepsFetch(b, HOME_PATH);
-  if (isLoginResponse(res) || res.status !== 200) {
-    log('Account', `Not authenticated (HTTP ${res.status})`);
-    return { irepsAccountId: null, companyName: null, operatingUnit: null, authenticated: false, verified: false, source: 'ireps_home_page', note: SESSION_MSG };
+  const res = await fetchHomePage(b);
+  if (isLoginResponse(res)) return notSignedIn(`the login page, HTTP ${res.status}`);
+  if (res.status !== 200) throw irepsUnavailable(`its home page answered HTTP ${res.status}`);
+  const html = res.text();
+  const ctx = accountFromHomeHtml(html);
+  if (!ctx.authenticated) {
+    // no account line and no Log Out: a login form, or a busy / error page that says nothing about the login
+    if (asksForPassword(html)) return notSignedIn('a login form');
+    throw irepsUnavailable('it answered with a page that is not its home page');
   }
-  const ctx = accountFromHomeHtml(res.text());
   log('Account', ctx.verified ? `Account verified (id ${ctx.irepsAccountId}, unit ${ctx.operatingUnit || 'not stated'})` : `Account not verified: ${ctx.note}`);
   return ctx;
+}
+
+/** The home page, asked again (after fetchSettings.netRetryMs) while IREPS answers 502 / 503 / 504. */
+async function fetchHomePage(base) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await irepsFetch(base, HOME_PATH);
+    const delay = fetchSettings.netRetryMs[attempt];
+    if (!STILL_OPENING.has(res.status) || delay === undefined) return res;
+    log('Account', `IREPS answered HTTP ${res.status}; asking again in ${delay / 1000}s`, 'warn');
+    await new Promise((r) => setTimeout(r, delay));
+  }
+}
+
+function notSignedIn(what) {
+  log('Account', `Not authenticated (${what})`);
+  return { irepsAccountId: null, companyName: null, operatingUnit: null, authenticated: false, verified: false, source: 'ireps_home_page', note: SESSION_MSG };
+}
+
+function irepsUnavailable(why) {
+  log('Account', `IREPS not responding: ${why}`, 'warn');
+  return new TenderError('IREPS_UNAVAILABLE', `IREPS is not responding (${why}). This is not a logout: try again in a minute.`);
 }
 
 /** Folder label for downloads: the verified operating unit, else the account id. Never a guess. */

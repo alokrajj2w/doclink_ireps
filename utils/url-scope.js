@@ -25,6 +25,8 @@ export const TAB_SCOPE = Object.freeze({
   ACTIVE_PORTAL: "ACTIVE_PORTAL",
   /** The tab is on the other portal from config.json (mock vs real). */
   OTHER_PORTAL: "OTHER_PORTAL",
+  /** The tab is the configured portal under its other host name (ireps.gov.in for www.ireps.gov.in). */
+  PORTAL_OTHER_HOST: "PORTAL_OTHER_HOST",
   /** Any other page (or a tab with no URL yet). */
   NOT_IREPS: "NOT_IREPS",
   /** config.json points at an origin missing from manifest host_permissions. */
@@ -93,12 +95,34 @@ export function originOf(url) {
 }
 
 /**
+ * Is `url` on the portal's other host name: the same scheme and port, and the host with "www." added
+ * or removed? IREPS serves https://ireps.gov.in as well as https://www.ireps.gov.in, and its login
+ * cookie is set for the whole domain, so a tab there is logged in to the same session. DocLink still
+ * sends every request to the configured portal (the only one in host_permissions).
+ * @param {string|undefined|null} url
+ * @param {string} baseUrl   the configured portal
+ */
+export function isPortalOtherHost(url, baseUrl) {
+  let page;
+  let base;
+  try {
+    page = new URL(String(url));
+    base = new URL(String(baseUrl));
+  } catch {
+    return false;
+  }
+  const bare = (host) => host.toLowerCase().replace(/^www\./, "");
+  return page.protocol === base.protocol && page.port === base.port && page.hostname !== base.hostname && bare(page.hostname) === bare(base.hostname);
+}
+
+/**
  * Decide what the side panel shows for a tab.
  *
  * @param {string|undefined|null} tabUrl
  * @param {{ baseUrl: string, target: string, portals: { mock: string, real: string } }} config   IREPS_CONFIG
  * @param {readonly string[]} hostPermissions   manifest.json host_permissions
- * @returns {{ scope: string, target: string, portalUrl: string, otherPortal: ("mock"|"real"|null) }}
+ * @returns {{ scope: string, target: string, portalUrl: string, otherPortal: ("mock"|"real"|null), tabHost?: string }}
+ *          tabHost: the tab's host, for PORTAL_OTHER_HOST
  */
 export function classifyTabUrl(tabUrl, config, hostPermissions) {
   const result = { scope: TAB_SCOPE.NOT_IREPS, target: config.target, portalUrl: config.baseUrl, otherPortal: null };
@@ -110,6 +134,11 @@ export function classifyTabUrl(tabUrl, config, hostPermissions) {
   if (!tabOrigin) return result;
   if (tabOrigin === originOf(config.baseUrl)) {
     result.scope = TAB_SCOPE.ACTIVE_PORTAL;
+    return result;
+  }
+  if (isPortalOtherHost(tabUrl, config.baseUrl)) {
+    result.scope = TAB_SCOPE.PORTAL_OTHER_HOST;
+    result.tabHost = new URL(String(tabUrl)).host;
     return result;
   }
   for (const name of ["mock", "real"]) {

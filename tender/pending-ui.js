@@ -1,7 +1,7 @@
 // "Correspondence Downloads" view: account panel, one-click download of every pending letter,
 // live progress table, counts, retry. All values shown come from IREPS responses; text is set via textContent only.
 import { downloadPendingCorrespondence } from './tender-pending.js';
-import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
+import { ACCOUNT_UNVERIFIED_MSG } from './tender-account.js';
 import { SESSION_MSG, log } from './tender-core.js';
 import { renderAccountPanel, refreshAccountPanel, wireCopyDiagnostics, wireViewLifecycle } from './view-common.js';
 import { describeEcmOutcome } from '../services/ecm-service.js';
@@ -138,7 +138,7 @@ async function run(mode) {
   } catch (e) {
     $('pc-error-message').textContent = e.code === 'SESSION_EXPIRED' ? SESSION_MSG : e.code === 'ACCOUNT' ? ACCOUNT_UNVERIFIED_MSG : e.message || 'Something went wrong.';
     $('pc-error').hidden = false;
-    if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') renderAccount(await getActiveIrepsAccountContext().catch(() => null));
+    if (e.code === 'SESSION_EXPIRED' || e.code === 'ACCOUNT') await refreshAccountPanel('pc-');
     log('Pending', `run failed: ${e.code || ''} ${e.message}`, 'error');
   } finally {
     $('pc-progress').hidden = true;

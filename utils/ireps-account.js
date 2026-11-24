@@ -22,6 +22,31 @@ export const ACCOUNT_UNITS = Object.freeze({
   '60828': 'ROHTAK',
 });
 
+/**
+ * Is this answer IREPS's own login (or session-expired) page? Text rules only, so the service worker
+ * can ask it too. The real login page: <title>Log into IREPS</title> + <form name="LogonForm"
+ * action=".../userLoginAction.do">. Only this page means "not logged in": an HTTP error or a busy
+ * page is IREPS not responding, never a logout.
+ * @param {string} url    the final URL of the answer
+ * @param {string} text   its body
+ */
+export function isIrepsLoginHtml(url, text) {
+  if (/userLogin\.do/i.test(String(url || ''))) return true;
+  const t = String(text || '').slice(0, 300000);
+  if (/session\s*(has\s*)?(expired|timed\s*out)/i.test(t)) return true;
+  if (/<title>\s*(log\s*into\s*ireps|sign\s*in)/i.test(t)) return true;
+  if ((/<form[^>]+name=["']?LogonForm/i.test(t) || /<form[^>]+action=["'][^"']*userLogin(?:Action)?\.do/i.test(t)) && !/welcomeLabel/i.test(t)) return true;
+  return /userLogin\.do/i.test(t) && /sign\s*in/i.test(t) && !/log\s*out/i.test(t);
+}
+
+/**
+ * A page that asks for a password. For a home-page answer that is neither the home page nor the known
+ * login page: such a page is a login form, anything else is a busy / error page.
+ */
+export function asksForPassword(html) {
+  return /<input[^>]+type\s*=\s*["']?password/i.test(String(html || ''));
+}
+
 /** Pure parser for the welcome text. Returns null when it does not look like an account line. */
 export function parseWelcomeText(text) {
   const m = WELCOME_RE.exec(norm(text));

@@ -196,6 +196,11 @@ export const ERROR_CATALOG = Object.freeze({
     message: "DocLink could not complete the request to IREPS ({detail}). Check your network connection and try again.",
     connection: "offline"
   },
+  IREPS_UNAVAILABLE: {
+    title: "IREPS not responding",
+    message: "IREPS did not answer DocLink's check as expected ({detail}). This is not a logout: try again in a minute.",
+    connection: "offline"
+  },
   IREPS_TOKEN_NOT_FOUND: {
     title: "IREPS form token not found",
     message: "The IREPS page did not contain the expected form token. Reload IREPS, then try again.",

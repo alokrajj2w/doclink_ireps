@@ -62,7 +62,7 @@ import { downloadBytes } from "../services/download-service.js";
 import { WorkflowError, saveExportFile, sanitiseDestination, savedSummary, lastDownloadEntry } from "../services/export-save-service.js";
 import { saveToEcmOrLocally, canReplaceInEcm } from "../services/ecm-service.js";
 import { loadDownloadLogConfig, preflightDownloads, logDownload, flushDownloadLog, downloadRecord, runDestination } from "../services/download-log.js";
-import { HOME_PATH } from "../utils/ireps-account.js";
+import { readIrepsAccount } from "../services/ireps-account-service.js";
 import { downloadPo, PO_FLOW_STAGES } from "../services/po/po-service.js";
 import { downloadInspectionCertificates, IC_FLOW_STAGES } from "../services/inspection-certificate/ic-service.js";
 import { runPoDateDownload, retryPoDateFailures } from "../services/po/po-date-service.js";
@@ -299,28 +299,30 @@ const parseAccountInOffscreen = (html) => askOffscreen(MESSAGE_TYPES.PARSE_IREPS
  * reads it only for the download log (forEcm: false), where a missing account is no warning.
  */
 async function irepsAccountForEcm({ forEcm = true } = {}) {
-  const warn = (text, extra) => (forEcm ? logger.warn(`ECM: ${text}; documents will be saved locally`, extra) : logger.debug(`Download log: ${text}`, extra));
+  const read = await readActiveIrepsAccount();
+  if (read.ok) return read.account;
+  const text = `IREPS account not read (${read.detail})`;
+  if (forEcm) logger.warn(`ECM: ${text}; documents will be saved locally`, { code: read.code });
+  else logger.debug(`Download log: ${text}`, { code: read.code });
+  return null;
+}
+
+/**
+ * The logged-in IREPS account from the home page (services/ireps-account-service.js): { ok, account }, or
+ * { ok: false, code, detail } where only IREPS_SESSION_EXPIRED means "not logged in". Never rejects.
+ */
+async function readActiveIrepsAccount() {
+  await loadIrepsConfig();
+  const read = await readIrepsAccount({ baseUrl: IREPS_CONFIG.baseUrl, parse: parseAccountInOffscreen });
+  if (!read.ok) return read;
+  logger.info(`IREPS account ${read.account.irepsAccountId} (${read.account.operatingUnit || "unit not stated"})`);
   try {
-    await loadIrepsConfig();
-    const response = await fetch(`${IREPS_CONFIG.baseUrl}${HOME_PATH}`, { credentials: "include", redirect: "follow" });
-    if (!response.ok) {
-      warn("IREPS home page not available", { status: response.status });
-      return null;
-    }
-    // a login / session-expired page has no account line, so it comes back unverified
-    const account = await parseAccountInOffscreen(await response.text());
-    if (!account.verified) {
-      warn(`IREPS account not verified (${account.note})`);
-      return null;
-    }
-    logger.info(`${forEcm ? "ECM" : "Download log"}: IREPS account ${account.irepsAccountId} (${account.operatingUnit || "unit not stated"})`);
     // the scheduler asks the Recon Engine what is due for this account without loading IREPS
-    await schedulerJob.recordAccount(account.irepsAccountId);
-    return { irepsAccountId: account.irepsAccountId, operatingUnit: account.operatingUnit };
+    await schedulerJob.recordAccount(read.account.irepsAccountId);
   } catch (error) {
-    warn("could not read the IREPS account", error);
-    return null;
+    logger.warn("Scheduler: IREPS account not remembered", error);
   }
+  return read;
 }
 
 /** How long a run waits for the panel's "download again?" answer before skipping those files. */
@@ -1449,10 +1451,7 @@ const schedulerJob = createSchedulerJob({
   broadcast,
   launch: { billStatus: launchBillStatusJob, document: launchDocumentJob, maSearch: launchMaSearch, maDownload: launchMaDownload, batch: launchBatch },
   isBusy: () => jobRunning || Boolean(documentJobRunning) || maRunning || poRunning || icRunning || anyBatchRunning() || billUploadJob.isBusy(),
-  readIrepsAccount: async () => {
-    await loadIrepsConfig();
-    return irepsAccountForEcm({ forEcm: true });
-  },
+  readIrepsAccount: () => readActiveIrepsAccount(),
   irepsBaseUrl: () => IREPS_CONFIG.baseUrl
 });
 

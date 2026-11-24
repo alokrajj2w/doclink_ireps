@@ -55,14 +55,25 @@ const NO_RUN_LOG = Object.freeze({ event: () => {}, runStarted: () => {}, runFin
 const problemText = (code, detail) => `${describeError(code).title}${detail ? ` (${detail})` : ""}`;
 
 /**
+ * IREPS did not answer the account check (an HTTP error, a timeout, a busy page): that is no logout,
+ * so the next check (alarm or page load) tries again instead of waiting for a new IREPS page load.
+ */
+const irepsAnswersLater = (code) => code === "IREPS_UNAVAILABLE";
+
+/** Why the IREPS check failed, for the Schedule view: only IREPS's login page is "not logged in". */
+const irepsCheckProblem = (code, detail) =>
+  code === "IREPS_SESSION_EXPIRED" ? "IREPS is not logged in here" : `IREPS could not be checked here: ${problemText(code, detail)}`;
+
+/**
  * @param {object} deps
  * @param {() => Promise<{ enabled: boolean, types: string[], unknown: string[], reason: string|null }>} deps.loadConfig
  * @param {object} deps.api                 services/scheduler/schedule-api.js
  * @param {() => Promise<{ signedIn: boolean, user?: { name: string, permissions?: string[] } }>} deps.whoAmI
  * @param {object} deps.signals             services/scheduler/local-signals.js
  * @param {() => boolean} deps.isBusy       a manual job (or the bill upload) is running here
- * @param {() => Promise<{ ok: boolean, code?: string, account?: { irepsAccountId: string, operatingUnit?: string|null } }>} deps.checkIreps
- *        the IREPS session check + account (the only IREPS request the scheduler itself makes)
+ * @param {() => Promise<{ ok: boolean, code?: string, detail?: string|null, account?: { irepsAccountId: string, operatingUnit?: string|null } }>} deps.checkIreps
+ *        the IREPS session check + account (the only IREPS request the scheduler itself makes); code
+ *        IREPS_SESSION_EXPIRED = the login page, IREPS_UNAVAILABLE = no usable answer (tried again at the next check)
  * @param {Object<string, (ctx: object) => Promise<object>>} deps.runners   per schedule type
  * @param {{ set: (whenMs: number) => any, clear: () => any }} deps.alarms
  * @param {(state: object) => void} [deps.onState]
@@ -247,8 +258,8 @@ export function createScheduler(deps) {
       }
       const check = await deps.checkIreps();
       if (!check.ok || !check.account) {
-        await deps.signals.recordIrepsCheckFailed();
-        note("account", `The IREPS account could not be read: ${problemText(check.code || "SCHEDULE_ACCOUNT_UNVERIFIED")}.`);
+        if (!irepsAnswersLater(check.code)) await deps.signals.recordIrepsCheckFailed();
+        note("account", `The IREPS account could not be read: ${problemText(check.code || "SCHEDULE_ACCOUNT_UNVERIFIED", check.detail)}.`);
         return waitFor("account", { account: null, lastError: check.code ? { code: check.code, detail: null } : state.lastError });
       }
       account = String(check.account.irepsAccountId);
@@ -311,10 +322,10 @@ export function createScheduler(deps) {
         if (!sameAccount) {
           const code = check.ok ? "SCHEDULE_ACCOUNT_MISMATCH" : check.code || "IREPS_SESSION_EXPIRED";
           logger.info(`Scheduler: claim given back (${code}); another DocLink may run it`);
-          const why = check.ok ? `IREPS account ${check.account ? check.account.irepsAccountId : "?"} is logged in here, not ${account}` : `IREPS is not logged in here (${describeError(code).title})`;
+          const why = check.ok ? `IREPS account ${check.account ? check.account.irepsAccountId : "?"} is logged in here, not ${account}` : irepsCheckProblem(code, check.detail);
           note("ireps", `${labelOf(claimed.slot.doc_type)}: claimed, but ${why}; given back so that another DocLink can run it.`, [claimed.slot.doc_type]);
           await finish(claimed, { outcome: "failed", code, countsAsAttempt: false });
-          await deps.signals.recordIrepsCheckFailed();
+          if (!irepsAnswersLater(code)) await deps.signals.recordIrepsCheckFailed();
           if (check.ok && check.account) await deps.signals.recordAccount(check.account.irepsAccountId);
           return publish({ waitingFor: "ireps", running: null });
         }

@@ -7,17 +7,23 @@ import { getActiveIrepsAccountContext, ACCOUNT_UNVERIFIED_MSG } from './tender-a
 
 const $ = (id) => document.getElementById(id);
 
-/** Render a detected (or failed) account context into `<prefix>acc-*`. Every value shown is from IREPS. */
-export function renderAccountPanel(prefix, a) {
+/** Codes of a failed account check that mean IREPS did not answer (tender-account.js), not a logout. */
+const NOT_RESPONDING = new Set(['IREPS_UNAVAILABLE', 'TIMEOUT', 'UNREACHABLE']);
+
+/**
+ * Render a detected (or failed) account context into `<prefix>acc-*`. Every value shown is from IREPS.
+ * `error`: why the check itself failed (`a` is then null); its message is shown, never "log in".
+ */
+export function renderAccountPanel(prefix, a, error = null) {
   const ok = !!(a && a.authenticated && a.verified);
-  $(`${prefix}acc-connection`).textContent = a?.authenticated ? 'Connected' : 'Not connected';
+  $(`${prefix}acc-connection`).textContent = a?.authenticated ? 'Connected' : NOT_RESPONDING.has(error?.code) ? 'IREPS not responding' : 'Not connected';
   $(`${prefix}acc-company`).textContent = ok || a?.companyName ? a.companyName : '-';
   $(`${prefix}acc-unit`).textContent = ok ? a.operatingUnit || 'Not stated' : '-';
   $(`${prefix}acc-id`).textContent = ok || a?.irepsAccountId ? a.irepsAccountId : '-';
   $(`${prefix}acc-status`).textContent = ok ? 'Verified' : 'Account not verified';
   $(`${prefix}acc-status`).className = ok ? 'tender-ok' : 'tender-bad';
   const w = $(`${prefix}acc-warning`);
-  w.textContent = ok ? '' : a && !a.authenticated ? SESSION_MSG : ACCOUNT_UNVERIFIED_MSG;
+  w.textContent = ok ? '' : error?.message ? error.message : a && !a.authenticated ? SESSION_MSG : ACCOUNT_UNVERIFIED_MSG;
   w.hidden = ok;
 }
 
@@ -29,7 +35,7 @@ export async function refreshAccountPanel(prefix) {
     renderAccountPanel(prefix, await getActiveIrepsAccountContext());
   } catch (e) {
     log('Account', `check failed: ${e.message}`, 'error');
-    renderAccountPanel(prefix, null);
+    renderAccountPanel(prefix, null, e);
   }
 }
 

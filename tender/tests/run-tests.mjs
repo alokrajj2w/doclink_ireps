@@ -206,6 +206,53 @@ test('3c. Logged out => not authenticated (session error)', async () => {
   assert.deepEqual([a.authenticated, a.verified], [false, false]);
   await assert.rejects(() => run(), (e) => e.code === 'SESSION_EXPIRED');
 });
+/** The home page answers HTTP 503 `times` times (Infinity: always), then IREPS answers as usual. Counts home-page requests. */
+function homeBusy(times = Infinity) {
+  const orig = server.handle.bind(server);
+  const seen = { home: 0 };
+  server.handle = async (m, u, b) => {
+    if (!u.includes('showHome.do') || ++seen.home > times) return orig(m, u, b);
+    return { status: 503, type: 'text/html', bytes: new TextEncoder().encode('<html><body>Service Unavailable</body></html>') };
+  };
+  return seen;
+}
+const quickRetries = async (fn) => {
+  const before = core.fetchSettings.netRetryMs;
+  core.fetchSettings.netRetryMs = [5, 5];
+  try { return await fn(); } finally { core.fetchSettings.netRetryMs = before; }
+};
+test('3d. IREPS busy (HTTP 503 on the home page) => asked twice more, then IREPS_UNAVAILABLE: never "log in"', () => quickRetries(async () => {
+  const seen = homeBusy();
+  await assert.rejects(() => acct.getActiveIrepsAccountContext(), (e) => e.code === 'IREPS_UNAVAILABLE' && /HTTP 503/.test(e.message) && /not a logout/.test(e.message));
+  assert.equal(seen.home, 3, 'the first answer and two more tries');
+  await assert.rejects(() => run(), (e) => e.code === 'IREPS_UNAVAILABLE', 'the run does not start, and does not say the session expired');
+  assert.ok(!paths().includes('/epsn/search/advancedSearch.do'));
+}));
+test('3e. One busy answer, then the home page => the account is verified', () => quickRetries(async () => {
+  const seen = homeBusy(1);
+  const a = await acct.getActiveIrepsAccountContext();
+  assert.deepEqual([a.irepsAccountId, a.authenticated, a.verified, seen.home], ['833', true, true, 2]);
+}));
+test('3f. A page that is neither the home page nor the login page => IREPS_UNAVAILABLE; a password form => not signed in', async () => {
+  mk({ homeOverride: '<p>The server is busy. Please try after some time.</p>' });
+  await assert.rejects(() => acct.getActiveIrepsAccountContext(), (e) => e.code === 'IREPS_UNAVAILABLE');
+  mk({ homeOverride: '<form action="/epsn/x.do"><input name="u"><input type="password" name="p"></form>' });
+  const a = await acct.getActiveIrepsAccountContext();
+  assert.deepEqual([a.authenticated, a.verified], [false, false]);
+});
+test('3g. IREPS busy during a run => the parts it stops say "IREPS is not responding"; the run is not ended as an expired session', () => quickRetries(async () => {
+  mk({ tenders: [T({})] });
+  const orig = server.handle.bind(server);
+  let n = 0;
+  server.handle = async (m, u, b) => (u.includes('showHome.do') && ++n >= 2
+    ? { status: 503, type: 'text/html', bytes: new TextEncoder().encode('<html><body>Service Unavailable</body></html>') }
+    : orig(m, u, b));
+  const r = await run();
+  assert.notEqual(r.aborted?.code, 'SESSION_EXPIRED');
+  const failed = Object.values(r.categories).filter((c) => c.status === 'FAILED');
+  assert.ok(failed.length >= 1, JSON.stringify(r.categories));
+  assert.ok(failed.every((c) => /IREPS is not responding/.test(JSON.stringify(c)) && !/session expired/i.test(JSON.stringify(c))), JSON.stringify(failed));
+}));
 test('4. Switching accounts refreshes the context', async () => {
   assert.equal((await acct.getActiveIrepsAccountContext()).irepsAccountId, '833');
   server.s.account = { id: '55', company: 'OTHER CO LIMITED-DELHI' };

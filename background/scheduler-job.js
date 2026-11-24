@@ -25,6 +25,7 @@ import { scheduledSearch, FIXED_LOOKBACK } from "../services/scheduler/run-detai
 import { parseSchedulerConfig, TENDER_SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL } from "../services/scheduler/schedule-types.js";
 import { createTenderRunner } from "../services/scheduler/tender-runner.js";
 import { holdWorker } from "./keep-alive.js";
+import { isPortalOtherHost } from "../utils/url-scope.js";
 import { readConfigFiles } from "../utils/config.js";
 import { reconWhoAmI } from "../services/recon-auth.js";
 import { SAVE_DESTINATION } from "../services/recon-service.js";
@@ -73,7 +74,8 @@ export function isIrepsActivityUrl(url, irepsBaseUrl) {
   } catch {
     return false;
   }
-  if (page.origin !== base.origin) return false;
+  // the portal without / with "www." is the same IREPS session (one domain-wide login cookie)
+  if (page.origin !== base.origin && !isPortalOtherHost(url, irepsBaseUrl)) return false;
   return page.pathname !== "/" && !/log(in|out)/i.test(page.pathname);
 }
 
@@ -83,8 +85,8 @@ export function isIrepsActivityUrl(url, irepsBaseUrl) {
  * @param {{ billStatus: Function, document: Function, maSearch: Function, maDownload: Function, batch: Function }} deps.launch
  *        the worker's launchers (each answers { started, error?, done })
  * @param {() => boolean} deps.isBusy                  a manual job or the bill upload runs here
- * @param {() => Promise<{ irepsAccountId: string, operatingUnit?: string|null }|null>} deps.readIrepsAccount
- *        the verified IREPS account (the IREPS home page), or null
+ * @param {() => Promise<{ ok: true, account: { irepsAccountId: string, operatingUnit?: string|null } }|{ ok: false, code: string, detail?: string }>} deps.readIrepsAccount
+ *        the verified IREPS account (the IREPS home page; services/ireps-account-service.js), or why not
  * @param {() => string} deps.irepsBaseUrl
  */
 export function createSchedulerJob(deps) {
@@ -174,8 +176,8 @@ export function createSchedulerJob(deps) {
     signals,
     isBusy: deps.isBusy,
     checkIreps: async () => {
-      const account = await deps.readIrepsAccount();
-      return account ? { ok: true, account } : { ok: false, code: "SCHEDULE_ACCOUNT_UNVERIFIED" };
+      const read = await deps.readIrepsAccount();
+      return read && read.ok ? { ok: true, account: read.account } : { ok: false, code: (read && read.code) || "SCHEDULE_ACCOUNT_UNVERIFIED", detail: (read && read.detail) || null };
     },
     runners,
     alarms,
