@@ -28,6 +28,12 @@ export const EXPORT_LOOKBACK_DAYS = 90;
 export const FIXED_LOOKBACK = Object.freeze({ billStatus: EXPORT_LOOKBACK_DAYS, crn: EXPORT_LOOKBACK_DAYS, rnote: EXPORT_LOOKBACK_DAYS });
 /** Types whose run takes no date range: what IREPS lists now. */
 export const NO_RANGE_TYPES = Object.freeze(["icNotifications", "tenderCorrespondence"]);
+/**
+ * Types whose scheduled run searches at most this many days (today included), whatever the schedule's look-back
+ * (asked for on 25 Nov 2026): a tabulation run reads every closing day of its range from IREPS Search Tender, and a
+ * tabulation published later is followed by the waiting list (tender/tender-jobs.js WAITING).
+ */
+export const MAX_LOOKBACK = Object.freeze({ tenderTabulations: 7 });
 
 /** One line of text, cut to `max` characters. */
 function clip(value, max) {
@@ -48,6 +54,22 @@ const dmy = (date) => `${String(date.getUTCDate()).padStart(2, "0")}/${String(da
 /** Today in IST as DD/MM/YYYY. */
 export function istToday(now = Date.now()) {
   return dmy(new Date(now + 330 * 60000));
+}
+
+/**
+ * The claim's `params` with its range cut to MAX_LOOKBACK days ending on its dateTo, for a type that has a limit.
+ * Any other type, a range already within the limit, or params without a valid range: the params as they are.
+ * @param {string} docType
+ * @param {{ dateFrom?: string, dateTo?: string }} [params]
+ */
+export function limitedParams(docType, params = {}) {
+  const p = params || {};
+  const max = MAX_LOOKBACK[docType];
+  const from = max ? parseDmy(p.dateFrom) : null;
+  const to = max ? parseDmy(p.dateTo) : null;
+  if (!from || !to) return p;
+  const earliest = new Date(to.getTime() - (max - 1) * 86400000);
+  return from < earliest ? { ...p, dateFrom: dmy(earliest) } : p;
 }
 
 /**

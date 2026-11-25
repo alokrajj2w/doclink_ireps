@@ -3261,7 +3261,26 @@ test('Tabulation waiting list: the panel shows the tenders of earlier dates apar
   server.s.tenders[0].tab = true;
   await clickRun($, 'btn-tab-financial', { from: new Date(2026, 9, 25), to: new Date(2026, 9, 25) });
   const rows = panelRows($, 'tender-result-rows');
-  assert.deepEqual(rows.map((r) => r.slice(0, 2)), [['Financial Tabulation (by Closing Date)', 'none for these dates'], ['Earlier tenders waiting for a Financial Tabulation', '1 downloaded'], ['42263731', 'Financial Tabulation: 1 downloaded']], JSON.stringify(rows));
+  assert.deepEqual(rows.map((r) => r.slice(0, 2)), [['Financial Tabulation · closing in these dates', 'none for these dates'], ['Earlier tenders waiting for a Financial Tabulation', '1 downloaded'], ['42263731', 'Financial Tabulation: 1 downloaded']], JSON.stringify(rows));
+  assert.equal($('btn-tab-financial').closest('.tender-group').querySelector('.group-title').textContent, 'Tabulations · all published', 'the heading says every published tabulation, not only closed tenders');
   assert.match($('tender-result-totals').textContent, /^Downloaded: 1 /);
   assert.match($('tender-result-tender').textContent, /: 0 tender\(s\) of this vendor, 0 with a Financial Tabulation$/);
 }));
+test('Tabulation waiting list: a tabulation IREPS shows but that fails to download 3 times is no longer waited for; every failure is still reported by its run', async () => {
+  const closing = new Date(2026, 9, 20);
+  const t0 = atHour(closing, 18);
+  const fin = { pdfTypes: ['financialTabulation'] };
+  mk({ tenders: [bid('42263731')], tabulationAsHtml: true }); // IREPS answers the tabulation with a web page: it never downloads
+  for (let i = 0; i < 2; i++) {
+    const r = await tabsAt(closing, closing, t0 + i * HOUR, fin);
+    assert.equal(r.tenders[0].categories.financialTabulation.status, 'FAILED');
+  }
+  assert.deepEqual(waitingList(), [['42263731', 'financialTabulation']], 'two failed downloads: still waited for');
+  const third = await tabsAt(closing, closing, t0 + 2 * HOUR, fin);
+  assert.equal(third.tenders[0].categories.financialTabulation.status, 'FAILED', 'the third failure is reported as the others were');
+  assert.deepEqual(waitingList(), [], 'no longer waited for');
+  server.log.length = 0;
+  const later = new Date(2026, 9, 25);
+  await tabsAt(later, later, t0 + 10 * HOUR, fin);
+  assert.deepEqual(numberSearches(), [], 'not checked again by its number');
+});

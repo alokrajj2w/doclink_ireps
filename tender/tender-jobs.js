@@ -327,9 +327,11 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
  *   KEEP_DAYS   a tender that closed longer ago is no longer waited for
  *   MISSES      IREPS answers the tender's closing day this many times without it: it is no longer waited for
  *   MAX         tenders kept (the latest closing dates)
+ *   FAILS       a tabulation IREPS shows but whose download failed this many times (a file damaged in IREPS, a copy
+ *               the ECM keeps damaging or refusing) is no longer waited for; each failure was reported by its run
  * A tender whose row says it was cancelled, dropped or retendered is no longer waited for.
  */
-export const WAITING = Object.freeze({ META: 'tabulationsWaiting', RECHECK_MS: 6 * 3600000, PER_RUN: 25, KEEP_DAYS: 180, MISSES: 3, MAX: 500 });
+export const WAITING = Object.freeze({ META: 'tabulationsWaiting', RECHECK_MS: 6 * 3600000, PER_RUN: 25, KEEP_DAYS: 180, MISSES: 3, MAX: 500, FAILS: 3 });
 /** How the waiting tenders are named in a run's lists (the scheduled run's warnings, the panel). */
 export const WAITING_LABEL = 'Earlier tenders waiting for a tabulation';
 const NO_TABULATION_COMING = /cancel|drop|retender/i;
@@ -370,6 +372,7 @@ function keepWaiting(job, waiting) {
  * the tabulations this run set out to download from the row. For each tabulation:
  *   - downloaded by this run, or downloaded before: no longer waited for;
  *   - not shown by IREPS yet, or tried and not downloaded (failed, or the run stopped first): waited for, looked at now;
+ *     a download that failed (not one the run never reached) counts, and after FAILS of them it is no longer waited for;
  *   - shown and not tried (the other button's, or one downloaded by an earlier run): left as it was.
  * Only a tender this vendor bid on (My Offer) starts to be waited for, and one IREPS says was cancelled, dropped or
  * retendered is no longer. -> 'waiting' | 'done' | 'dropped' | null (not this vendor's, nothing to wait for)
@@ -379,14 +382,31 @@ function noteWaiting(waiting, row, rec, tried, now, key = waitKey(row)) {
   const known = waiting.get(key);
   const entry = known || (row.offer ? { tenderNo: row.tenderNo, nitId: row.nitId || '', closingDate: row.closingDate, dept: row.dept || '', title: row.title || '', since: at, types: {}, misses: 0 } : null);
   if (!entry) return null;
+  const fails = { ...(entry.fails || {}) };
+  const gaveUp = [];
   for (const t of Object.keys(TABULATIONS)) {
-    if (tabulationSaved(rec && rec.categories && rec.categories[TABULATIONS[t].key])) delete entry.types[t];
-    else if (!row.links[t] || tried.includes(t)) entry.types[t] = at;
+    const c = rec && rec.categories && rec.categories[TABULATIONS[t].key];
+    if (tabulationSaved(c)) {
+      delete entry.types[t];
+      delete fails[t];
+    } else if (!row.links[t]) {
+      entry.types[t] = at; // not published yet
+    } else if (tried.includes(t)) {
+      if (c && c.failed > 0) fails[t] = (Number(fails[t]) || 0) + 1;
+      if (fails[t] >= WAITING.FAILS) {
+        delete entry.types[t];
+        delete fails[t];
+        gaveUp.push(t);
+      } else {
+        entry.types[t] = at;
+      }
+    }
   }
-  Object.assign(entry, { nitId: entry.nitId || row.nitId || '', closingDate: row.closingDate || entry.closingDate, dept: row.dept || entry.dept, title: row.title || entry.title, misses: 0 });
+  for (const t of gaveUp) log('Tabulation', `${entry.tenderNo}: no longer waited for the ${TABULATIONS[t].label} (its download failed ${WAITING.FAILS} times; each run reported why)`);
+  Object.assign(entry, { nitId: entry.nitId || row.nitId || '', closingDate: row.closingDate || entry.closingDate, dept: row.dept || entry.dept, title: row.title || entry.title, misses: 0, fails });
   if (!Object.keys(entry.types).length) {
     waiting.delete(key);
-    return known ? 'done' : null;
+    return gaveUp.length ? 'dropped' : known ? 'done' : null;
   }
   if (NO_TABULATION_COMING.test(row.status || '')) {
     waiting.delete(key);

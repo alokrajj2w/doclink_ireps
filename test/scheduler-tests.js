@@ -9,12 +9,12 @@
 
 import { parseSchedulerConfig, SCHEDULE_TYPES, SCHEDULE_DEFAULT_TIMING, TENDER_SCHEDULE_TYPES } from "../services/scheduler/schedule-types.js";
 import { createTenderRunner, tenderRunOutcome, tenderJobProblems, cleanOutcome, tenderCode, stoppedCode, RUNNER_PAGE } from "../services/scheduler/tender-runner.js";
-import { createScheduler, LEASE_MS, HEARTBEAT_MS, RUNNING_POLL_MS, DEBOUNCE_MS, ACCOUNT_CHECK_MS } from "../services/scheduler/scheduler.js";
+import { createScheduler, LEASE_MS, HEARTBEAT_MS, RUNNING_POLL_MS, DEBOUNCE_MS, ACCOUNT_CHECK_MS, RUN_LAST } from "../services/scheduler/scheduler.js";
 import { createRunnerFactory, failedOutcome } from "../services/scheduler/runners.js";
 import { createSharedRunHooks, istParts, RESERVE_CHUNK } from "../services/scheduler/shared-run-hooks.js";
 import { createScheduleApi, ScheduleApiError } from "../services/scheduler/schedule-api.js";
-import { createLocalSignals, IREPS_ACTIVITY_MS } from "../services/scheduler/local-signals.js";
-import { scheduledSearch, labelFromKey, failureEntry, fitResult, RESULT_FAILURES_MAX, RESULT_MAX_CHARS, FIXED_LOOKBACK } from "../services/scheduler/run-details.js";
+import { createLocalSignals } from "../services/scheduler/local-signals.js";
+import { scheduledSearch, labelFromKey, failureEntry, fitResult, RESULT_FAILURES_MAX, RESULT_MAX_CHARS, FIXED_LOOKBACK, MAX_LOOKBACK, limitedParams } from "../services/scheduler/run-details.js";
 import { createRunLog, runLogText, MAX_RUNS } from "../services/scheduler/run-log.js";
 import { isIrepsActivityUrl, isUserIrepsActivity, exportLaunchOptions, batchRunEnd } from "../background/scheduler-job.js";
 import { icDateItems } from "../services/inspection-certificate/ic-date-service.js";
@@ -285,7 +285,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(long.calls.recordedAccount, "60828");
   });
 
-  await test("Scheduler (5.6): after a longer run with no IREPS page loaded since, the next slot waits for one; nothing is claimed or sent to IREPS", async () => {
+  await test("Scheduler (5.6): after a longer run, once IREPS is known to be logged out here, the next slot waits for the next login; nothing is claimed or sent to IREPS", async () => {
     const opts = {
       dues: [
         { due: [slot(2, "crn"), slot(1, "billStatus")], running: null, next_check_at: null, slots: [] },
@@ -294,7 +294,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
     };
     opts.during = async (ctx, { advance }) => {
       advance(40 * 60000);
-      opts.irepsReady = false; // the last IREPS page load is older than IREPS_ACTIVITY_MS now
+      opts.irepsReady = false; // a check found IREPS logged out here since the last login (local-signals.js irepsReady)
     };
     const h = harness(opts);
     await h.scheduler.wake("ireps page");
@@ -323,6 +323,46 @@ export async function runSchedulerTests({ test, assert, eq }) {
     });
     await h.scheduler.wake("ireps page");
     eq(h.calls.runs.map((r) => r.type).join(), "crn");
+  });
+
+  await test("Scheduler: Tabulations, the long run, goes after every other due slot, so Correspondence and Negotiation no longer wait behind it", async () => {
+    const at1030 = (id, type) => slot(id, type, { period: "10:30" });
+    const left = (...types) => ({ due: types.map((t) => at1030(["tenderNit", "tenderTabulations", "tenderCorrespondence", "tenderNegotiation"].indexOf(t) + 1, t)), running: null, next_check_at: null, slots: [] });
+    const h = harness({
+      dues: [
+        left("tenderTabulations", "tenderCorrespondence", "tenderNit", "tenderNegotiation"),
+        left("tenderTabulations", "tenderCorrespondence", "tenderNegotiation"),
+        left("tenderTabulations", "tenderNegotiation"),
+        left("tenderTabulations"),
+        { due: [], running: null, next_check_at: null, slots: [] }
+      ]
+    });
+    await h.scheduler.wake("ireps page");
+    eq(h.calls.runs.map((r) => r.type).join(), "tenderNit,tenderCorrespondence,tenderNegotiation,tenderTabulations");
+    eq(RUN_LAST.join(), "tenderTabulations");
+    eq(SCHEDULE_TYPES.indexOf("tenderTabulations") < SCHEDULE_TYPES.indexOf("tenderCorrespondence"), true, "the Schedule view keeps its order");
+  });
+
+  await test("Scheduler: a tabulation run searches 7 days at most, whatever its schedule's look-back; every other type keeps its range", async () => {
+    eq(MAX_LOOKBACK.tenderTabulations, 7);
+    eq(JSON.stringify(limitedParams("tenderTabulations", { dateFrom: "11/11/2026", dateTo: "25/11/2026" })), JSON.stringify({ dateFrom: "19/11/2026", dateTo: "25/11/2026" }), "15 days cut to the last 7");
+    const within = { dateFrom: "22/11/2026", dateTo: "25/11/2026" };
+    eq(limitedParams("tenderTabulations", within), within, "a shorter look-back stays as it is");
+    const nit = { dateFrom: "11/11/2026", dateTo: "25/11/2026" };
+    eq(limitedParams("tenderNit", nit), nit, "other types are untouched");
+    eq(JSON.stringify(limitedParams("tenderTabulations", {})), "{}", "no range: nothing to cut");
+    const at1030 = (id, type) => slot(id, type, { period: "10:30" });
+    const h = harness({
+      dues: [
+        { due: [at1030(1, "tenderTabulations"), at1030(2, "tenderNit")], running: null, next_check_at: null, slots: [] },
+        { due: [at1030(1, "tenderTabulations")], running: null, next_check_at: null, slots: [] },
+        { due: [], running: null, next_check_at: null, slots: [] }
+      ],
+      claim: () => ({ params: { lookbackDays: 15, dateFrom: "11/11/2026", dateTo: "25/11/2026" } })
+    });
+    await h.scheduler.wake("ireps page");
+    const ranges = Object.fromEntries(h.calls.runs.map((r) => [r.type, `${r.ctx.params.dateFrom} - ${r.ctx.params.dateTo}`]));
+    eq(JSON.stringify(ranges), JSON.stringify({ tenderNit: "11/11/2026 - 25/11/2026", tenderTabulations: "19/11/2026 - 25/11/2026" }));
   });
 
   await test("Scheduler: the winner's IREPS check fails -> slot given back without an attempt; no claim again until a new page load", async () => {
@@ -985,20 +1025,19 @@ export async function runSchedulerTests({ test, assert, eq }) {
 
   /* ------------------------------------------------- local signals, helpers */
 
-  await test("Local signals: IREPS counts as active for 4 minutes after a page load, and not after a failed check", async () => {
+  await test("Local signals: once IREPS was logged in here a slot may be tried at its time, without a recent page load, until a check finds IREPS logged out", async () => {
     let clock = T0;
     const signals = createLocalSignals({ session: memoryArea(), local: memoryArea(), now: () => clock });
-    eq(await signals.irepsReady(), false, "no page load yet");
+    eq(await signals.irepsReady(), false, "no IREPS page since Chrome started");
     await signals.recordIrepsActivity();
     eq(await signals.irepsReady(), true);
-    clock += 1000;
+    clock += 3 * 3600000;
+    eq(await signals.irepsReady(), true, "hours later, with no page load since: the scheduler does not wait for the user");
     await signals.recordIrepsCheckFailed();
-    eq(await signals.irepsReady(), false, "failed check after the last page load");
+    eq(await signals.irepsReady(), false, "a check found IREPS logged out: nothing more until the next login");
     clock += 1000;
     await signals.recordIrepsActivity();
-    eq(await signals.irepsReady(), true, "a new page load allows a claim again");
-    clock += IREPS_ACTIVITY_MS + 1;
-    eq(await signals.irepsReady(), false, "too long ago: IREPS logs out after about 5 idle minutes");
+    eq(await signals.irepsReady(), true, "a new login (page load) allows a claim again");
     await signals.recordAccount("833");
     eq(await signals.account(), "833");
   });
@@ -1245,7 +1284,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
       user: { name: "Priya", canRun: true, canManage: true },
       waitingFor: null,
       lastError: null,
-      version: "1.6.9",
+      version: "1.7.0",
       slots: [
         { id: 1, doc_type: "billStatus", period: "day", status: "missed", ...nineToTen },
         { id: 3, doc_type: "tenderNit", period: "10:30", status: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", attempts: 1, started_at: "2026-11-19T05:15:00+00:00", ended_at: "2026-11-19T05:22:00+00:00", window_start_at: "2026-11-19T05:00:00+00:00", window_end_at: "2026-11-19T06:00:00+00:00", next_try_at: "2026-11-19T05:45:00+00:00", result: { saved: 35, skipped: 18, failed: 2, range: "17/11/2026 - 18/11/2026", failures } }

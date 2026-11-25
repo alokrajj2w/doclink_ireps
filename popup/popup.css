@@ -365,10 +365,10 @@ body {
   border-top-color: var(--danger);
 }
 
-/* Buttons side by side: one column in a narrow panel, more as the panel is widened */
+/* A group of buttons: one below the other at any panel width, so widening the panel never rearranges them */
 .btn-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
 }
 
@@ -382,10 +382,11 @@ body {
   color: var(--text-muted);
 }
 
-/* Main view, Download: Bill Status, CRN and R-NOTE each with their search options */
+/* Main view, Download: Bill Status, CRN and R-NOTE each with their search options, one below the other at any
+   panel width (a wide panel used to put them side by side, each beside another one's options) */
 .dl-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   align-items: start;
   gap: 8px;
   margin-bottom: 12px;
@@ -1385,8 +1386,12 @@ body[data-redownload="on"] .app-main > .view:not(#view-redownload),
 body[data-redownload="on"] .app-main > .save-to {
   display: none !important;
 }
+/* "Select all" / "Select none": on a line of its own at the right, clear of the text above and the list below
+   (the card is not a flex column, so align-self never moved it) */
 .redownload-select-all {
-  align-self: flex-end;
+  display: flex;
+  width: fit-content;
+  margin: 10px 0 8px auto;
 }
 .redownload-list {
   list-style: none;

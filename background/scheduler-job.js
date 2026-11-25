@@ -21,7 +21,7 @@ import { createScheduleApi, ScheduleApiError } from "../services/scheduler/sched
 import { createLocalSignals } from "../services/scheduler/local-signals.js";
 import { createRunnerFactory } from "../services/scheduler/runners.js";
 import { createRunLog } from "../services/scheduler/run-log.js";
-import { scheduledSearch, FIXED_LOOKBACK } from "../services/scheduler/run-details.js";
+import { scheduledSearch, FIXED_LOOKBACK, MAX_LOOKBACK } from "../services/scheduler/run-details.js";
 import { parseSchedulerConfig, TENDER_SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL } from "../services/scheduler/schedule-types.js";
 import { createTenderRunner } from "../services/scheduler/tender-runner.js";
 import { holdWorker } from "./keep-alive.js";
@@ -292,6 +292,8 @@ export function createSchedulerJob(deps) {
         const changes = Object.fromEntries(EDITABLE.filter((k) => s[k] !== undefined).map((k) => [k, s[k]]));
         // Bill Status, CRN and R-NOTE always search 90 days: the stored look-back says so too
         if (FIXED_LOOKBACK[s.doc_type]) changes.lookback_days = FIXED_LOOKBACK[s.doc_type];
+        // Tabulations search 7 days at most: a longer look-back is stored as 7
+        if (MAX_LOOKBACK[s.doc_type] && !(changes.lookback_days <= MAX_LOOKBACK[s.doc_type])) changes.lookback_days = MAX_LOOKBACK[s.doc_type];
         const answer = s.id ? await api.updateSchedule(s.id, changes) : await api.createSchedule({ ...changes, ireps_account_id: account, doc_type: s.doc_type });
         const saved = answer.schedule || { ...changes, doc_type: s.doc_type };
         runLog.event("schedule", `Schedule ${s.id ? "changed" : "added"}: ${scheduleText(s.doc_type, saved)}.`, [s.doc_type]);

@@ -249,7 +249,7 @@ doclink/
 | `alarms` | Only for **scheduled downloads** (section 23): one alarm (`doclink.scheduler`) wakes the worker at the next check the Recon Engine names (09:00, 09:10, …). The alarm only asks the Recon Engine what is due; it never sends anything to IREPS |
 | `debugger` | Only for **published letters and corrigenda** (LOA, Negotiation, Counter Offer, Correspondence, Corrigendum - in Download Tender Documents and Correspondence): IREPS builds each one as a web page on every view (there is no file to download), so DocLink prints it to PDF with Chrome's own Ctrl+P engine (`Page.printToPDF`, `tender/tender-print.js`) in a background tab that is closed straight after. Chrome shows "DocLink started debugging this browser" while a letter prints. If the permission is blocked by policy, the letter is saved as before (text-only PDF + original `.html`) with a warning. Every request the letter page makes in that tab passes the write guard (body read as form/JSON/multipart; one Chrome does not hand over is read or refused), and the page cannot open a window. If Chrome cannot hand the page to the tab, the text PDF is kept |
 | host `https://www.ireps.gov.in/*` and `http://localhost:8765/*` (both in `manifest.json`; a production build keeps only the real portal, section 9) | Lets the extension `fetch()` IREPS (viewBills.do, searchPO.do, vendorInspectionCallList.do, same origin) with the user's cookies attached by Chrome. Which one is actually used is `config.json`'s `"target"` ("mock" or "real") - a plain hand-editable file, no manifest change or command needed to switch |
-| host `http://localhost:8000/*` and `https://wabtec.reconalpha-staging.joulestowatts.com/*` (the Recon Engine, local and staging; add the deployed Recon URL; a production build drops the localhost one) | The Recon Engine sign-in (section 17), the download log (section 18) and the **Save to: ECM / S3** uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
+| host `http://localhost:8000/*` and `https://wabtec.reconalpha.joulestowatts.com/*` (the Recon Engine, local and production; a production build drops the localhost one. To use the staging Recon Engine, put its host here and its URL in `config.json`) | The Recon Engine sign-in (section 17), the download log (section 18) and the **Save to: ECM / S3** uploads, with the Recon Engine's own sign-in cookie, without CORS. Must match `config.json` `reconBaseUrl` |
 | host `http://wctsrvecmtstsn1.wabtec.com:8080/*` (the ECM test server) | Only for **Save to: ECM / S3** with `"ecmBackendAws": false`: DocLink calls the ECM (Nuxeo) directly. Must match `config.json` `ecm.domain`. A production build keeps it and warns that it is plain HTTP |
 
 Not requested: `cookies`, `<all_urls>`, `history`, `bookmarks`, `webRequest`.
@@ -1656,14 +1656,19 @@ So:
   how many are left to a later run);
 * a tender is no longer waited for when it closed more than 180 days ago, when
   its row says it was cancelled, dropped or retendered, or when IREPS answers
-  its closing day 3 times without it;
+  its closing day 3 times without it; a tabulation IREPS shows but whose
+  download failed 3 times (a file damaged in IREPS, an ECM copy that keeps
+  failing) is no longer waited for either, each failure having been reported by
+  its run;
 * a search IREPS does not answer in full keeps the tender as it was (the next
   run asks again) and makes a scheduled run not "done" (`Earlier tenders
   waiting for a tabulation: ...`); IREPS not answering at all, or the session
   gone, stops the run as the range's search would.
 
 * **Panel.** "Download Tender Documents" › **Financial Tabulation** /
-  **Commercial Tabulation**: every tender of this vendor that closed between
+  **Commercial Tabulation** (the group "Tabulations · all published", with the
+  hint that the dates pick the tenders by closing date and that tenders of
+  earlier dates still waiting are checked again): every tender of this vendor that closed between
   From and To (the optional Tender Number narrows it) and shows the link is
   downloaded to `Downloads/DocLink/<unit>/Tender_<no>/Tabulation/`; one that
   shows My Offer but not the link yet reads "not available yet" and is waited
@@ -2013,8 +2018,8 @@ manual run, the Recon Engine) and its last failed check ("Last check failed: …
 * warnings of a tender run (an IREPS letter list it could not read, messages it could not match to a tender);
 * for an hourly type, the earlier runs of the day that did not end clean, each with its failed documents;
 * for a slot that did not run (missed, or due and waiting), what this browser's scheduler noted during its window,
-  for example "09:02-09:50 (6 checks): Due now: Bill Status, CRN, R-NOTE. Waiting for IREPS: no IREPS page has
-  loaded in this browser in the last 4 minutes".
+  for example "09:02-09:50 (6 checks): Due now: Bill Status, CRN, R-NOTE. Waiting for IREPS: log in to IREPS in
+  this browser (IREPS was logged out at the last check, or has not been opened since Chrome started)".
 
 **Run log of this browser** (a box under Today, `services/scheduler/run-log.js`, `chrome.storage.local`
 `doclink.scheduler.runLog`): every scheduled run this DocLink made (the last 60), each opening to the documents it
@@ -2032,22 +2037,28 @@ run, so the 18:00 run is the last one and may run until 19:00. A DocLink may run
 holds `doclink.schedule.run`, is signed in to the Recon Engine, and is logged in to IREPS on that account. The
 Recon Engine hands each slot to exactly one DocLink (an atomic claim with a 10-minute lease, renewed by a
 heartbeat every 2 minutes) and runs one slot per account at a time, so the hourly types run one after the
-other. When a slot is `done`, no DocLink triggers it again: a once-a-day type waits for tomorrow, an hourly type
-for the next hour. A slot not done by its end is `missed`. Each hourly run searches the look-back range and the
-reservations skip every document already saved, so a run downloads only what is new, and a missed hour is
+other, in the Schedule view's order except that Tabulations always runs last (`RUN_LAST` in
+`services/scheduler/scheduler.js`): one tabulation run reads every closing day of its look-back and took 43 minutes
+on 25 Nov 2026, so run earlier it held Correspondence and Negotiation past their window. When a slot is `done`,
+no DocLink triggers it again: a once-a-day type waits for tomorrow, an hourly type for the next hour. A slot not
+done by its end is `missed`. Each hourly run searches the look-back range and the reservations skip every
+document already saved, so a run downloads only what is new, and a missed hour is
 caught up by the next run.
 
 **Order of checks** (`services/scheduler/scheduler.js`): config on → Recon signed in with
 `doclink.schedule.run` → last verified IREPS account known → `GET /schedule/due` → no manual job running here →
-an IREPS page loaded in a tab of the user's in the last 4 minutes (a tab DocLink opened itself, such as a print
-tab or the tender runner tab, never counts) → claim → **one** IREPS check (the home page: logged
-in, same account) → run. That check covers the slots that follow it for 2 minutes; after a longer run the next
-slot needs an IREPS page load in the last 4 minutes and gets its own check after its claim. Only IREPS's login
-page fails that check as "not logged in". When IREPS does not answer it
+IREPS logged in here: an IREPS page has loaded in a tab of the user's since Chrome started (a tab DocLink opened
+itself, such as a print tab or the tender runner tab, never counts), and no check has found IREPS logged out since
+→ claim → **one** IREPS check (the home page: logged in, same account) → run. The user only logs in: nobody has to
+open or reload a page for a slot to run at its time (25 Nov 2026). That check covers the slots that follow it for
+2 minutes; after a longer run the next slot gets its own check after its claim, at once. IREPS ends an idle session
+by itself (about 5 minutes): the next slot's check then finds the login page, the slot is given back, and nothing
+more goes to IREPS from this browser until the user logs in again. DocLink never keeps the session alive. Only
+IREPS's login page fails that check as "not logged in". When IREPS does not answer it
 (an HTTP error, a timeout, a busy page), the slot is given back as `IREPS_UNAVAILABLE` and asked again at the next
 check (section 5). Nothing is sent to IREPS before the claim is won, and never on a timer: twenty DocLinks
 waking at 09:00 send one IREPS request between them. A run starts at the alarm, when an IREPS page finishes
-loading (a user who logs in at 09:07 runs the 09:00 slot at once; without a page load the next check is 09:10), when the panel's IREPS check passes, after a
+loading (a user who logs in at 09:07 runs the 09:00 slot at once; otherwise at the next check, 09:10), when the panel's IREPS check passes, after a
 Recon sign-in, or when a manual job ends.
 
 **Never twice, never local** (`services/scheduler/shared-run-hooks.js`):
@@ -2102,7 +2113,7 @@ ships it off.
 | `NIT` | `tenderNit` | "NIT Documents" (automatic mode): My Messages in the range → each tender's NIT, attachments and its corrigenda. My Offer is left out (the ECM has no document type for it; the run says so once): download it from the panel | hourly, 10:30 … 18:30 |
 | `CounterOffer` | `tenderCounterOffer` | Counter Offer letters by Letter Date | hourly, 10:30 … 18:30 |
 | `LOA` | `tenderLoa` | Advance Acceptance (LOA) letters by Letter Date. Sends IREPS's own "LOA viewed" request first, as a manual LOA download does, with nobody clicking | hourly, 10:30 … 18:30 |
-| `Tabulation` | `tenderTabulations` | Financial and Commercial Tabulation of tenders closing in the range, from IREPS Search Tender one closing day at a time, as the panel's buttons (section 19; look-back 15 days: a tabulation appears days after closing). First the tenders of earlier dates still waiting for a tabulation, each by its Tender Number (section 19, the waiting list) | hourly, 10:30 … 18:30 |
+| `Tabulation` | `tenderTabulations` | Financial and Commercial Tabulation of tenders closing in the range, from IREPS Search Tender one closing day at a time, as the panel's buttons (section 19; look-back 7 days at most, whatever the schedule says: `MAX_LOOKBACK` in `run-details.js`; a tabulation published later is caught by the waiting list). First the tenders of earlier dates still waiting for a tabulation, each by its Tender Number (section 19, the waiting list) | hourly, 10:30 … 18:30 |
 | `Correspondence` | `tenderCorrespondence` | Every letter IREPS lists as pending (no date range) | hourly, 10:30 … 18:30 |
 | `Negotiation` | `tenderNegotiation` | Negotiation letters by Letter Date. Its own schedule because IREPS opens these pages very slowly | 12:30, 15:30, 18:30 (retry every 30 min) |
 

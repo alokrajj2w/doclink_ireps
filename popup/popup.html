@@ -639,11 +639,13 @@
             </div>
           </div>
           <div class="tender-group">
-            <div class="group-title">Tabulations · by Closing Date</div>
+            <div class="group-title">Tabulations · all published</div>
             <div class="btn-grid">
               <button id="btn-tab-financial" class="btn btn-secondary" type="button" data-tabulation="financialTabulation"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">Financial Tabulation</span></button>
               <button id="btn-tab-commercial" class="btn btn-secondary" type="button" data-tabulation="commercialTabulation"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">Commercial Tabulation</span></button>
             </div>
+            <!-- the dates pick the tenders by their closing date; the waiting list (tender-jobs.js WAITING) adds earlier ones -->
+            <p class="field-hint">For tenders closing in these dates. Tenders of earlier dates still waiting for a tabulation are checked again.</p>
           </div>
         </div>
         <div class="tender-links">

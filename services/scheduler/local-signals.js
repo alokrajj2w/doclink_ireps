@@ -1,6 +1,6 @@
 /**
  * What this browser knows locally before the scheduler asks anyone (plan section 8.4):
- *   - when an IREPS page last finished loading here (the user is active on IREPS);
+ *   - when an IREPS page last finished loading here (the user logged in to IREPS in this browser);
  *   - when the winner's IREPS check last failed here (do not claim again until a new page loads);
  *   - the last verified IREPS account (833, 60828, ...), so the backend can be asked what is due
  *     without loading anything from IREPS;
@@ -14,8 +14,6 @@
 import { SESSION_KEYS, STORAGE_KEYS } from "../../utils/messages.js";
 import { logger } from "../../utils/logger.js";
 
-/** IREPS logs a user out after about 5 idle minutes: a page load older than this says nothing. */
-export const IREPS_ACTIVITY_MS = 4 * 60 * 1000;
 /** Own tabs remembered at most (each is forgotten when it closes; a long Chrome session never grows the list). */
 const OWN_TABS_MAX = 200;
 
@@ -79,13 +77,17 @@ export function createLocalSignals(deps = {}) {
       await write(session, SESSION_KEYS.SCHEDULER_SIGNALS, { ...(await signals()), irepsFailedAt: now() });
     },
     /**
-     * May this DocLink try a claim? Only right after IREPS activity, and not again after a
-     * failed IREPS check until a newer page load.
+     * May this DocLink try a claim? Once an IREPS page (not the login page) has loaded in this browser since
+     * Chrome started, that is, the user logged in to IREPS here, and not again after a failed IREPS check until a
+     * newer page load (the user logs in again). No time limit: a scheduled download runs at its time while the
+     * user's IREPS session lasts, without anyone loading a page. IREPS ends an idle session by itself; the slot's
+     * one IREPS check then finds the login page, is recorded as failed, and nothing more goes to IREPS until the
+     * next login. Nothing here asks IREPS anything, and DocLink never keeps the session alive.
      */
     async irepsReady() {
       const s = await signals();
       const at = Number(s.irepsActivityAt) || 0;
-      if (!at || now() - at > IREPS_ACTIVITY_MS) return false;
+      if (!at) return false;
       return !(Number(s.irepsFailedAt) >= at);
     },
     /**

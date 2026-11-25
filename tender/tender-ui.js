@@ -195,7 +195,7 @@ function renderTabulationResult(pdfType, r) {
   // a tabulation found but not downloaded is "failed" (red), never "nothing new"; one downloaded before says so (1.15)
   const f = found(inRange.filter((x) => !x.notAvailable));
   const text = foundText(n, f) || (t.summary.withTabulation ? 'nothing new' : 'none for these dates');
-  body.append(li(`${name} (by Closing Date)`, text, f.failed || t.incomplete ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', t.incomplete || ''));
+  body.append(li(`${name} · closing in these dates`, text, f.failed || t.incomplete ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', t.incomplete || ''));
   const tenderRow = (x) => {
     if (x.notAvailable) {
       body.append(li(`  ${x.tenderNo}`, 'not available yet', 'tender-muted', '', `${x.title || ''}${x.closingDate ? ` · closed ${x.closingDate}` : ''} · IREPS shows no ${name} yet`));

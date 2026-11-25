@@ -894,7 +894,7 @@ test('Worker: background/service-worker.js loads on a fake chrome and answers th
   globalThis.chrome = {
     runtime: {
       getURL: (p) => `${RECON}/__ext__/${p}`,
-      getManifest: () => ({ version: '1.6.9', host_permissions: [`${RECON}/*`, `${IREPS}/*`], side_panel: { default_path: 'popup/popup.html' } }),
+      getManifest: () => ({ version: '1.7.0', host_permissions: [`${RECON}/*`, `${IREPS}/*`], side_panel: { default_path: 'popup/popup.html' } }),
       onMessage: { addListener: (fn) => messageListeners.push(fn) },
       onInstalled: listen(), onStartup: listen(),
       getContexts: async () => [{}],

@@ -20,7 +20,7 @@
  */
 
 import { SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL } from "./schedule-types.js";
-import { scheduledSearch, fitResult } from "./run-details.js";
+import { scheduledSearch, fitResult, limitedParams, MAX_LOOKBACK } from "./run-details.js";
 import { describeError } from "../../utils/messages.js";
 import { logger } from "../../utils/logger.js";
 
@@ -39,10 +39,9 @@ const MAX_SLOTS_PER_WAKE = 10;
 /**
  * How long one IREPS account check covers the slots that follow it in a wake (5.6). A run can take an
  * hour, and an IREPS account switched in the meantime must never get another account's downloads: past
- * this, the next slot is checked again after its claim, and only right after an IREPS page load
- * (local-signals.js IREPS_ACTIVITY_MS), like the first one. Two minutes: slots that end at once (nothing
- * new to download) still share one check, and while the last IREPS page load is less than IREPS_ACTIVITY_MS
- * (4 minutes) old, the next slot is checked again at once, without waiting for a new page load.
+ * this, the next slot is checked again after its claim, like the first one. Two minutes: slots that end at
+ * once (nothing new to download) still share one check. The next slot needs no new page load: it is checked
+ * at once while IREPS was logged in here and no check found it logged out since (local-signals.js irepsReady).
  */
 export const ACCOUNT_CHECK_MS = 2 * 60000;
 
@@ -54,7 +53,15 @@ const NEXT_SLOT = new Set(["SCHEDULE_SLOT_DONE", "SCHEDULE_NOT_DUE", "SCHEDULE_S
 /** Backend answers that mean "another DocLink runs this account now". */
 const SOMEONE_ELSE = new Set(["SCHEDULE_ACCOUNT_BUSY", "SCHEDULE_SLOT_TAKEN"]);
 
-const order = (slot) => SCHEDULE_TYPES.indexOf(slot.doc_type);
+/**
+ * Types whose run takes long, run after every other due slot. The account runs one slot at a time, and a tabulation
+ * run reads every closing day of its look-back from IREPS Search Tender (25 Nov 2026: 43 minutes for 15 days), so
+ * run first it held back Correspondence and Negotiation past their window. The Schedule view keeps SCHEDULE_TYPES'
+ * order; only the run order changes.
+ */
+export const RUN_LAST = Object.freeze(["tenderTabulations"]);
+/** The order due slots run in: SCHEDULE_TYPES' order, RUN_LAST types after all the others. */
+const order = (slot) => (RUN_LAST.includes(slot.doc_type) ? SCHEDULE_TYPES.length : 0) + SCHEDULE_TYPES.indexOf(slot.doc_type);
 const labelOf = (type) => SCHEDULE_TYPE_LABEL[type] || type;
 /** Failed documents written one per line to the DocLink log for a run (the run log keeps them all). */
 const LOGGED_FAILURES_MAX = 50;
@@ -319,8 +326,10 @@ export function createScheduler(deps) {
         logger.debug(`Scheduler: the IREPS account check is ${Math.round((now() - verifiedAt) / 1000)} s old; checking it again for the next slot`);
         verified = null;
       }
+      // no page load is needed: only a browser where IREPS was never logged in since Chrome started, or whose
+      // last check found IREPS logged out (or another account), waits for the user to log in again
       if (!verified && !(await deps.signals.irepsReady())) {
-        note("ireps", `${dueText}. Waiting for IREPS: no IREPS page has loaded in this browser in the last 4 minutes (log in to IREPS and open any IREPS page).`, dueTypes);
+        note("ireps", `${dueText}. Waiting for IREPS: log in to IREPS in this browser (IREPS was logged out at the last check, or has not been opened since Chrome started).`, dueTypes);
         return publish({ waitingFor: "ireps" });
       }
 
@@ -371,7 +380,11 @@ export function createScheduler(deps) {
         const answer = await deps.api.claim({ slotId: slot.id, claimId, account });
         const period = slot.period && slot.period !== "day" ? ` ${slot.period}` : "";
         logger.info(`Scheduler: claimed ${slot.doc_type} for ${slot.slot_date}${period} (account ${account})`);
-        return { slot, claimId, params: answer.params || {} };
+        // Tabulations search 7 days at most, whatever the schedule's look-back (run-details.js MAX_LOOKBACK)
+        const asked = answer.params || {};
+        const params = limitedParams(slot.doc_type, asked);
+        if (params.dateFrom !== asked.dateFrom) logger.info(`Scheduler: ${slot.doc_type} searches ${MAX_LOOKBACK[slot.doc_type]} days at most: ${params.dateFrom} - ${params.dateTo} (the schedule's look-back gave ${asked.dateFrom})`);
+        return { slot, claimId, params };
       } catch (error) {
         const code = error && error.code;
         if (NEXT_SLOT.has(code)) continue;

@@ -18,7 +18,7 @@
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
 import { readConfigFiles } from "../utils/config.js";
 import { parseSchedulerConfig, SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL, SCHEDULE_DEFAULT_TIMING } from "../services/scheduler/schedule-types.js";
-import { FIXED_LOOKBACK, NO_RANGE_TYPES } from "../services/scheduler/run-details.js";
+import { FIXED_LOOKBACK, NO_RANGE_TYPES, MAX_LOOKBACK } from "../services/scheduler/run-details.js";
 import { runLogText, istDateTime, countsText } from "../services/scheduler/run-log.js";
 import { logger } from "../utils/logger.js";
 
@@ -36,11 +36,12 @@ const REPEATS = [
   [120, "every 2 hours"],
   [180, "every 3 hours"]
 ];
-// the Recon Engine's defaults (schedules.py LOOKBACK_DEFAULT); tabulations go by closing date and appear days later.
+// the Recon Engine's defaults (schedules.py LOOKBACK_DEFAULT); tabulations go by closing date and appear days later,
+// and search 7 days at most (run-details.js MAX_LOOKBACK: the field stops there, and a run never searches more).
 // Bill Status, CRN and R-NOTE always search 90 days (run-details.js FIXED_LOOKBACK): their look-back is not editable.
 const DEFAULT_LOOKBACK = {
   billStatus: 90, crn: 90, rnote: 90, ma: 2, poDate: 2, icDate: 2, icNotifications: 1,
-  tenderNit: 2, tenderCounterOffer: 2, tenderLoa: 2, tenderTabulations: 15, tenderCorrespondence: 1, tenderNegotiation: 2
+  tenderNit: 2, tenderCounterOffer: 2, tenderLoa: 2, tenderTabulations: 7, tenderCorrespondence: 1, tenderNegotiation: 2
 };
 /** Types whose run takes no date range (what IREPS lists now). */
 const NO_LOOKBACK = new Set(NO_RANGE_TYPES);
@@ -277,7 +278,7 @@ export function slotText(slot, schedule = null, now = Date.now()) {
 function waitingText(waitingFor) {
   switch (waitingFor) {
     case "ireps":
-      return "A download is due: open IREPS (logged in) and DocLink runs it.";
+      return "A download is due: log in to IREPS in this browser and DocLink runs it.";
     case "busy":
       return "A download is due: it starts when your current DocLink run ends.";
     case "backend":
@@ -593,7 +594,9 @@ function editor(type, schedule) {
   for (const [m, text] of REPEATS) runs.append(Object.assign(document.createElement("option"), { value: m === null ? "" : String(m), textContent: text, selected: m === repeat }));
   const every = document.createElement("select");
   for (const m of INTERVALS) every.append(Object.assign(document.createElement("option"), { value: String(m), textContent: `every ${m} min`, selected: m === s.check_every_minutes }));
-  const lookback = Object.assign(document.createElement("input"), { type: "number", min: "1", max: "180", value: String(s.lookback_days) });
+  // Tabulations: 7 days at most, so a longer stored look-back shows what a run really searches
+  const cap = MAX_LOOKBACK[type];
+  const lookback = Object.assign(document.createElement("input"), { type: "number", min: "1", max: String(cap || 180), value: String(cap ? Math.min(Number(s.lookback_days) || cap, cap) : s.lookback_days) });
   const fields = document.createElement("div");
   fields.className = "schedule-fields";
   fields.append(group("From", from.element), group("To", to.element), field("Runs", runs), field("Retry", every));
@@ -624,7 +627,7 @@ function editor(type, schedule) {
         check_every_minutes: Number(every.value),
         repeat_every_minutes: runs.value === "" ? null : Number(runs.value),
         days: dayBoxes.map((b, i) => (b.checked ? i : -1)).filter((i) => i >= 0),
-        lookback_days: FIXED_LOOKBACK[type] || Number(lookback.value) || DEFAULT_LOOKBACK[type]
+        lookback_days: FIXED_LOOKBACK[type] || Math.min(Number(lookback.value) || DEFAULT_LOOKBACK[type], cap || Infinity)
       })
     )
   );
