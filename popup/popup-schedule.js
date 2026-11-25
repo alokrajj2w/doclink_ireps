@@ -37,11 +37,11 @@ const REPEATS = [
   [180, "every 3 hours"]
 ];
 // the Recon Engine's defaults (schedules.py LOOKBACK_DEFAULT); tabulations go by closing date and appear days later,
-// and search 7 days at most (run-details.js MAX_LOOKBACK: the field stops there, and a run never searches more).
+// and search 5 days at most (run-details.js MAX_LOOKBACK: the field stops there, and a run never searches more).
 // Bill Status, CRN and R-NOTE always search 90 days (run-details.js FIXED_LOOKBACK): their look-back is not editable.
 const DEFAULT_LOOKBACK = {
   billStatus: 90, crn: 90, rnote: 90, ma: 2, poDate: 2, icDate: 2, icNotifications: 1,
-  tenderNit: 2, tenderCounterOffer: 2, tenderLoa: 2, tenderTabulations: 7, tenderCorrespondence: 1, tenderNegotiation: 2
+  tenderNit: 2, tenderCounterOffer: 2, tenderLoa: 2, tenderTabulations: 5, tenderCorrespondence: 1, tenderNegotiation: 2
 };
 /** Types whose run takes no date range (what IREPS lists now). */
 const NO_LOOKBACK = new Set(NO_RANGE_TYPES);
@@ -594,7 +594,7 @@ function editor(type, schedule) {
   for (const [m, text] of REPEATS) runs.append(Object.assign(document.createElement("option"), { value: m === null ? "" : String(m), textContent: text, selected: m === repeat }));
   const every = document.createElement("select");
   for (const m of INTERVALS) every.append(Object.assign(document.createElement("option"), { value: String(m), textContent: `every ${m} min`, selected: m === s.check_every_minutes }));
-  // Tabulations: 7 days at most, so a longer stored look-back shows what a run really searches
+  // Tabulations: 5 days at most, so a longer stored look-back shows what a run really searches
   const cap = MAX_LOOKBACK[type];
   const lookback = Object.assign(document.createElement("input"), { type: "number", min: "1", max: String(cap || 180), value: String(cap ? Math.min(Number(s.lookback_days) || cap, cap) : s.lookback_days) });
   const fields = document.createElement("div");

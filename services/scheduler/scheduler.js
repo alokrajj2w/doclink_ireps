@@ -380,7 +380,7 @@ export function createScheduler(deps) {
         const answer = await deps.api.claim({ slotId: slot.id, claimId, account });
         const period = slot.period && slot.period !== "day" ? ` ${slot.period}` : "";
         logger.info(`Scheduler: claimed ${slot.doc_type} for ${slot.slot_date}${period} (account ${account})`);
-        // Tabulations search 7 days at most, whatever the schedule's look-back (run-details.js MAX_LOOKBACK)
+        // Tabulations search 5 days at most, whatever the schedule's look-back (run-details.js MAX_LOOKBACK)
         const asked = answer.params || {};
         const params = limitedParams(slot.doc_type, asked);
         if (params.dateFrom !== asked.dateFrom) logger.info(`Scheduler: ${slot.doc_type} searches ${MAX_LOOKBACK[slot.doc_type]} days at most: ${params.dateFrom} - ${params.dateTo} (the schedule's look-back gave ${asked.dateFrom})`);

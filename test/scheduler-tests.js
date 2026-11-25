@@ -343,9 +343,9 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(SCHEDULE_TYPES.indexOf("tenderTabulations") < SCHEDULE_TYPES.indexOf("tenderCorrespondence"), true, "the Schedule view keeps its order");
   });
 
-  await test("Scheduler: a tabulation run searches 7 days at most, whatever its schedule's look-back; every other type keeps its range", async () => {
-    eq(MAX_LOOKBACK.tenderTabulations, 7);
-    eq(JSON.stringify(limitedParams("tenderTabulations", { dateFrom: "11/11/2026", dateTo: "25/11/2026" })), JSON.stringify({ dateFrom: "19/11/2026", dateTo: "25/11/2026" }), "15 days cut to the last 7");
+  await test("Scheduler: a tabulation run searches 5 days at most, whatever its schedule's look-back; every other type keeps its range", async () => {
+    eq(MAX_LOOKBACK.tenderTabulations, 5);
+    eq(JSON.stringify(limitedParams("tenderTabulations", { dateFrom: "11/11/2026", dateTo: "25/11/2026" })), JSON.stringify({ dateFrom: "21/11/2026", dateTo: "25/11/2026" }), "15 days cut to the last 5");
     const within = { dateFrom: "22/11/2026", dateTo: "25/11/2026" };
     eq(limitedParams("tenderTabulations", within), within, "a shorter look-back stays as it is");
     const nit = { dateFrom: "11/11/2026", dateTo: "25/11/2026" };
@@ -362,7 +362,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
     });
     await h.scheduler.wake("ireps page");
     const ranges = Object.fromEntries(h.calls.runs.map((r) => [r.type, `${r.ctx.params.dateFrom} - ${r.ctx.params.dateTo}`]));
-    eq(JSON.stringify(ranges), JSON.stringify({ tenderNit: "11/11/2026 - 25/11/2026", tenderTabulations: "19/11/2026 - 25/11/2026" }));
+    eq(JSON.stringify(ranges), JSON.stringify({ tenderNit: "11/11/2026 - 25/11/2026", tenderTabulations: "21/11/2026 - 25/11/2026" }));
   });
 
   await test("Scheduler: the winner's IREPS check fails -> slot given back without an attempt; no claim again until a new page load", async () => {

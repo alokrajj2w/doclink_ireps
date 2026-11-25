@@ -33,7 +33,7 @@ export const NO_RANGE_TYPES = Object.freeze(["icNotifications", "tenderCorrespon
  * (asked for on 25 Nov 2026): a tabulation run reads every closing day of its range from IREPS Search Tender, and a
  * tabulation published later is followed by the waiting list (tender/tender-jobs.js WAITING).
  */
-export const MAX_LOOKBACK = Object.freeze({ tenderTabulations: 7 });
+export const MAX_LOOKBACK = Object.freeze({ tenderTabulations: 5 });
 
 /** One line of text, cut to `max` characters. */
 function clip(value, max) {

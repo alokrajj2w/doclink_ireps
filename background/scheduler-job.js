@@ -292,7 +292,7 @@ export function createSchedulerJob(deps) {
         const changes = Object.fromEntries(EDITABLE.filter((k) => s[k] !== undefined).map((k) => [k, s[k]]));
         // Bill Status, CRN and R-NOTE always search 90 days: the stored look-back says so too
         if (FIXED_LOOKBACK[s.doc_type]) changes.lookback_days = FIXED_LOOKBACK[s.doc_type];
-        // Tabulations search 7 days at most: a longer look-back is stored as 7
+        // Tabulations search 5 days at most: a longer look-back is stored as 5
         if (MAX_LOOKBACK[s.doc_type] && !(changes.lookback_days <= MAX_LOOKBACK[s.doc_type])) changes.lookback_days = MAX_LOOKBACK[s.doc_type];
         const answer = s.id ? await api.updateSchedule(s.id, changes) : await api.createSchedule({ ...changes, ireps_account_id: account, doc_type: s.doc_type });
         const saved = answer.schedule || { ...changes, doc_type: s.doc_type };
