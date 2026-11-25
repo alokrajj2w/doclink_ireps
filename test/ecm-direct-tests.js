@@ -31,6 +31,8 @@ const IC = {
 const API = `${DOMAIN}/nuxeo/api/v1`;
 // a file read the ECM fails for a passing reason is made again at once (production waits 1 s, then 3 s)
 const NO_WAIT = { retryDelaysMs: [0, 0] };
+// every request of any test below that would go through the browser cache (none may: see the last test)
+const cachedRequests = [];
 
 function jsonResponse(status, body) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -85,8 +87,9 @@ function fakeNuxeo({ existing = [], folders = {}, respond, damaged = {}, damaged
   const json = (r) => ({ name: r.name, "mime-type": "application/pdf", length: String(r.length) });
   const fn = async (url, init = {}) => {
     const u = new URL(url);
-    const call = { method: init.method || "GET", url: String(url), path: u.pathname, query: u.searchParams.get("query"), headers: init.headers || {}, body: init.body, credentials: init.credentials, signal: init.signal };
+    const call = { method: init.method || "GET", url: String(url), path: u.pathname, query: u.searchParams.get("query"), headers: init.headers || {}, body: init.body, credentials: init.credentials, cache: init.cache, signal: init.signal };
     calls.push(call);
+    if (init.cache !== "no-store") cachedRequests.push(`${call.method} ${call.path}`);
     const own = respond && respond(call, calls);
     if (own) return own;
     if (call.path === "/nuxeo/oauth2/token") return jsonResponse(200, { access_token: `tok-${++tokens}`, expires_in: 3600, token_type: "bearer" });
@@ -201,6 +204,8 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     assert(fetch.calls.slice(1).every((c) => c.headers.Authorization === "Bearer tok-1"), "every API call carries the bearer token");
     assert(fetch.calls.every((c) => c.signal instanceof AbortSignal), "every request runs under a deadline");
     assert(fetch.calls.every((c) => c.credentials === "omit"), "no cookies are sent to the ECM");
+    // Chrome kept the TEST ECM's 200 to a byte range as a 1-byte file and answered later reads from it
+    assert(fetch.calls.every((c) => c.cache === "no-store"), "no ECM request goes through the browser cache");
     eq(search.headers.Properties, "*");
     eq(search.query, "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'inspectionCertificate' AND ecm:parentId = 'd440070d-3a60-4ad7-bf67-8efeb198e26b' AND dc:title = '3480517 - IC' AND file:content/name = 'IC_27253922100240_001_6038184070.pdf' AND InvoiceCertificateSchema:icNumber = '3480517' AND InvoiceCertificateSchema:customerPONumber = '27253922100240'", "dedup query: same kind, folder, title, file name and metadata, dates left out (the ECM answers 400 to icDate = '...')");
     eq(file.headers["X-File-Name"], IC.filename);
@@ -844,5 +849,10 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     eq(asked.join(), "100@0,100@1,50@0", "values 1-100 (two pages of results), then 101-150");
     eq(found.size, 150, "every one found");
     eq(JSON.stringify([found.get("PO-000").uid, found.get("PO-149").uid]), JSON.stringify(["u-PO-000", "u-PO-149"]));
+  });
+
+  await test("ECM direct: no request of any test above goes through the browser cache (token, searches, uploads, attachments, replacements, trash, file reads)", async () => {
+    // Chrome kept the TEST ECM's 200 to a byte range as a 1-byte file and answered later reads from it (25 Nov 2026)
+    eq(cachedRequests.join(", "), "", "every ECM request is sent with cache: no-store");
   });
 }

@@ -121,7 +121,7 @@ corrected, reconciled or inferred.
 | Layer | File | Responsibility |
 |---|---|---|
 | UI | `popup/popup.html`, `popup.css`, `popup.js` | Rendered in Chrome's side panel (docked right, full height; the toolbar icon toggles it). Each tab has its own DocLink panel: Chrome hides it when you switch to another tab and restores it, as it was, when you return; tabs where you never opened it show nothing. DocLink's tools appear only while the panel's tab is on the portal `config.json` targets (mock on `localhost:8765`, or `www.ireps.gov.in`). Opened on any other page, it shows a "Go to IREPS and log in" page (its Open IREPS button loads IREPS in that same tab), the other portal gets a "switch target" hint, IREPS at its other address (`ireps.gov.in`, the same login) gets an "Open IREPS at www.ireps.gov.in" hint (section 5), and a config URL missing from `host_permissions` is reported as a configuration error. No IREPS request is made from a non-IREPS tab. Rule: `utils/url-scope.js`, view: `popup/popup-gate.js`. Download cards (Bill Status, CRN), connection indicator, progress, results, login-required view, the *Upload* card (Upload Bill to IREPS, section 20) |
-| Logging | `utils/logger.js` | Redacted, time-stamped log of every step, request, download and error from the service worker, panel and parser; last 1000 entries stored and mirrored into the side panel's console (Inspect). `doclinkLog.dump() / download() / clear()` in that console. See TESTING.md, "The DocLink log" |
+| Logging | `utils/logger.js` | Redacted, time-stamped log of every step, request, download and error from the service worker, panel and parser; last 1000 entries stored (emptied when a build is loaded) and mirrored into the side panel's console (Inspect). `doclinkLog.dump() / download() / clear()` in that console. See TESTING.md, "The DocLink log" |
 | UI (PO Search) | `popup/popup-documents.js` | CRN and R-NOTE cards on the main screen, each like the Bill Status card: Search options (Last 180 Days / Select Date / PO No., Railway, file format), Download, progress and errors in the card, result in the bottom panel |
 | Orchestration | `background/service-worker.js` | Runs the workflow, tracks job state, relays progress to the popup |
 | DOM parsing | `background/offscreen.html`, `offscreen.js` | Offscreen document that owns `DOMParser` (service workers have none) |
@@ -1496,6 +1496,16 @@ the last byte of the stored file; a copy the ECM cannot serve in full is
 is saved locally, and an earlier damaged copy is not reported as "already in
 the ECM".
 
+**ECM requests skip the browser cache.** The TEST ECM answers a request for
+the last byte with 200 (not 206), and Chrome kept that answer as the whole
+file, 1 byte long. Later checks of the same file got a 416 (`Content-Range:
+bytes 0-0/1`) and a 1-byte file from Chrome's cache, so healthy copies were
+reported as damaged (25 Nov 2026). Every ECM request is now sent with
+`cache: "no-store"` (`send` in `services/ecm-direct.js`; through the Recon
+gateway, `gatewayRequest` in `services/ecm-service.js`), in every flow: manual
+and scheduled, IC / PO / MA and every tender document, uploads, the
+"already in the ECM" check, the read-back and the bill upload's file reads.
+
 | Flow | Checked first | Logged |
 |---|---|---|
 | MA, PO, IC (single) | yes (an IC Retry is not re-checked) | yes |
@@ -2028,6 +2038,9 @@ S3 path of an export), and the scheduler's decisions (the last 200: waiting for 
 Recon Engine; another DocLink running the account; a claim given back; a schedule changed). A decision repeated at
 every check is one line with its count. **Copy log** and **Save log** give the whole log as text (IST times) for
 support. The DocLink log (`doclinkLog.dump()`) has the same decisions and one line per document not saved.
+Both logs start afresh when a build is loaded or DocLink is reloaded in `chrome://extensions` (not when Chrome
+restarts or updates itself), so the last build's runs, maybe of another Recon server, are not shown: save the log
+first if you need it.
 Only document numbers, error codes and DocLink's own texts are kept, cut short and redacted: never a URL, an
 IREPS page, a token or a cookie.
 

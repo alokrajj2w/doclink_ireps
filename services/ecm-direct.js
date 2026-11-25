@@ -135,7 +135,9 @@ function jsonIn(buffer) {
  */
 async function send(conn, method, path, { headers = {}, body, read = "json" } = {}) {
   try {
-    return await fetchWithDeadline(`${ECM_CONFIG.domain}${path}`, { method, headers, body, credentials: "omit" }, { timeoutMs: ECM_CONFIG.timeoutMs, fetch: conn.fetch, read });
+    // never through the browser cache: the TEST ECM answers a byte range with 200 (not 206), which Chrome kept as
+    // the whole file, 1 byte long, and later reads of that file got a 416 "bytes 0-0/1" and 1 byte from it (25 Nov 2026)
+    return await fetchWithDeadline(`${ECM_CONFIG.domain}${path}`, { method, headers, body, credentials: "omit", cache: "no-store" }, { timeoutMs: ECM_CONFIG.timeoutMs, fetch: conn.fetch, read });
   } catch (error) {
     const timedOut = error instanceof DeadlineError || (error && error.name === "TimeoutError");
     // never log `path`: the token request carries the client secret in its URL

@@ -2952,7 +2952,9 @@ test('Scheduled run: a letter list read only in part, or one IREPS did not open,
   assert.match(notOpened.result.warnings[0], /^Negotiation letter list: Could not read the Negotiation page/);
 });
 test('Scheduled run: IREPS not answering its home page during a letters run stops the run; the tender is named, the rest skipped, never "done" (known issue 1)', () => quickRetries(async () => {
-  mk({ inbox: { MyNegotiation: [], MyCounterOffer: ['CO1', 'CO2', 'CO3'].map((no, i) => ({ no, oid: `90${i}`, letter: `91${i}`, date: new Date(NOW()) })), MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
+  // one time for all three letters: letters a millisecond apart were listed in another order (a flaky test)
+  const at = NOW();
+  mk({ inbox: { MyNegotiation: [], MyCounterOffer: ['CO1', 'CO2', 'CO3'].map((no, i) => ({ no, oid: `90${i}`, letter: `91${i}`, date: new Date(at) })), MyAdvanceAcceptanceLetter: [] }, letterAsPdf: true });
   const orig = server.handle.bind(server);
   let lettersServed = 0;
   server.handle = async (m, u, b) => {

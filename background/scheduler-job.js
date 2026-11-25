@@ -339,6 +339,8 @@ export function createSchedulerJob(deps) {
       await scheduler.wake("ireps session check", { quietable: true });
     },
     onBrowserStart: () => scheduler.wake("browser start", { force: true }),
+    /** A build was loaded: this browser's run log starts afresh (the last build's runs may be of another Recon server). */
+    clearRunLog: () => runLog.clear(),
     /** A tab closed: a tender runner tab closed before its run ended gives the slot back; an own tab is forgotten. */
     onTabRemoved: (tabId) => {
       tenderRunner.tabRemoved(tabId);

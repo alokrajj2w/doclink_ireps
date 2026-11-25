@@ -18,7 +18,8 @@
  * So that one console shows everything, every entry of level "info" and
  * above is also collected into one stored log (chrome.storage.local, last
  * MAX_ENTRIES entries, survives service-worker restarts and browser
- * restarts). The service worker is the only writer; the panel and parser
+ * restarts; a build loaded or reloaded starts it afresh: clearLogEntries).
+ * The service worker is the only writer; the panel and parser
  * send their entries to it. The side panel's console (right-click the
  * panel > Inspect) prints the recent history when it opens and then mirrors
  * every new entry from the worker and parser live.
@@ -293,6 +294,21 @@ export function appendLogEntries(entries) {
     })
     .catch(() => {
       /* the stored log is best effort; the console still has every line */
+    });
+  return flushChain;
+}
+
+/**
+ * Empty the stored log (service worker: a build was loaded), in turn with the batches already being
+ * written, so none of them writes the old entries back.
+ * @returns {Promise<void>}
+ */
+export function clearLogEntries() {
+  if (!HAS_STORAGE) return flushChain;
+  flushChain = flushChain
+    .then(() => chrome.storage.local.remove(LOG_STORE_KEY))
+    .catch(() => {
+      /* the stored log is best effort */
     });
   return flushChain;
 }

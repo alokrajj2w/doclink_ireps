@@ -1284,7 +1284,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
       user: { name: "Priya", canRun: true, canManage: true },
       waitingFor: null,
       lastError: null,
-      version: "1.7.0",
+      version: "1.7.1",
       slots: [
         { id: 1, doc_type: "billStatus", period: "day", status: "missed", ...nineToTen },
         { id: 3, doc_type: "tenderNit", period: "10:30", status: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", attempts: 1, started_at: "2026-11-19T05:15:00+00:00", ended_at: "2026-11-19T05:22:00+00:00", window_start_at: "2026-11-19T05:00:00+00:00", window_end_at: "2026-11-19T06:00:00+00:00", next_try_at: "2026-11-19T05:45:00+00:00", result: { saved: 35, skipped: 18, failed: 2, range: "17/11/2026 - 18/11/2026", failures } }

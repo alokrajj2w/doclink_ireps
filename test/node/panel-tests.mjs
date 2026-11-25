@@ -894,9 +894,9 @@ test('Worker: background/service-worker.js loads on a fake chrome and answers th
   globalThis.chrome = {
     runtime: {
       getURL: (p) => `${RECON}/__ext__/${p}`,
-      getManifest: () => ({ version: '1.7.0', host_permissions: [`${RECON}/*`, `${IREPS}/*`], side_panel: { default_path: 'popup/popup.html' } }),
+      getManifest: () => ({ version: '1.7.1', host_permissions: [`${RECON}/*`, `${IREPS}/*`], side_panel: { default_path: 'popup/popup.html' } }),
       onMessage: { addListener: (fn) => messageListeners.push(fn) },
-      onInstalled: listen(), onStartup: listen(),
+      onInstalled: { addListener: (fn) => (sw.installed = fn) }, onStartup: listen(),
       getContexts: async () => [{}],
       getPlatformInfo: async () => ({}),
       sendMessage: (m) => workerSends(m),
@@ -1144,6 +1144,32 @@ test('7.3 (worker): an IC Retry fetches only the failed ICs of the run, for its 
     sw.icSearch = null;
     sw.pdf = null;
     delete chrome.downloads;
+  }
+});
+
+test('Worker: a build loaded (installed, updated or reloaded) starts the run log afresh; Chrome updating itself does not; queued download-log records stay', async () => {
+  const RUN_LOG = 'doclink.scheduler.runLog';
+  const QUEUE = 'doclink.downloadLog.queue.sw';
+  const stored = async (key) => (await chrome.storage.local.get(key))[key];
+  // the last build's run and event, possibly of another Recon server, and a record still waiting to be sent
+  const lastBuild = () => chrome.storage.local.set({
+    [RUN_LOG]: { runs: [{ id: 'old-run', docType: 'billStatus', outcome: 'done' }], events: [{ first: 'x', at: 'x', kind: 'other', text: 'last build' }] },
+    [QUEUE]: [{ qid: 'q1', doc_type: 'po', key: 'po:1' }],
+  });
+  const leftOver = async () => {
+    const log = (await stored(RUN_LOG)) || { runs: [], events: [] };
+    return log.runs.filter((r) => r.id === 'old-run').length + log.events.filter((e) => e.text === 'last build').length;
+  };
+  await lastBuild();
+  sw.installed({ reason: 'chrome_update', previousVersion: '1.7.0' });
+  await settle();
+  assert.equal(await leftOver(), 2, 'Chrome updating itself keeps the log');
+  for (const reason of ['update', 'install']) {
+    await lastBuild();
+    sw.installed({ reason, previousVersion: '1.7.0' });
+    await until(async () => (await leftOver()) === 0);
+    assert.equal(await leftOver(), 0, `${reason}: the last build's runs and events are gone`);
+    assert.equal((await stored(QUEUE)).length, 1, `${reason}: a queued download-log record is data, not a log, and stays`);
   }
 });
 

@@ -73,7 +73,7 @@ import { isoToIrepsDate } from "../services/batch-utils.js";
 import { IC_DOWNLOAD_SUBFOLDER } from "../utils/filename.js";
 import { buildDocumentExportDownloadPath, buildDocumentExportFilename, buildBillStatusExportDownloadPath, buildBillStatusExportFilename } from "../utils/filename.js";
 import { MESSAGE_TYPES, TARGETS, STAGES, DOCUMENT_STAGES, MA_STAGES, PO_STAGES, IC_STAGES, documentStageLabel, describeError, STORAGE_KEYS, SESSION_KEYS, SCHEDULED_RUN } from "../utils/messages.js";
-import { logger, installLogCollector, installConsoleHelpers } from "../utils/logger.js";
+import { logger, installLogCollector, installConsoleHelpers, clearLogEntries } from "../utils/logger.js";
 import { holdWorker } from "./keep-alive.js";
 import { withIrepsFormLock } from "../services/ireps-form-lock.js";
 import { classifyTabUrl, compileMatchPatterns } from "../utils/url-scope.js";
@@ -1914,6 +1914,13 @@ chrome.tabs.onReplaced.addListener((addedTabId) => enableTabPanel(addedTabId));
 enableTabPanelsForAllTabs();
 
 chrome.runtime.onInstalled.addListener((details) => {
+  // a build loaded (or reloaded) starts both logs afresh: the last build's runs and lines, maybe of another Recon
+  // server, are not this one's. Queued download-log records are data, not a log: they stay. Chrome updating
+  // itself ("chrome_update") loads no new build.
+  if (details.reason === "install" || details.reason === "update") {
+    clearLogEntries();
+    schedulerJob.clearRunLog();
+  }
   logger.info(`DocLink installed (${details.reason})`);
   loadIrepsConfig().then(() => schedulerJob.onBrowserStart());
 });

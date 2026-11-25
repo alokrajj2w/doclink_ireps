@@ -212,7 +212,8 @@ export function uploadToEcm(doc, deps = {}) {
  */
 async function gatewayRequest(url, init, timeoutMs, deps) {
   try {
-    return await fetchWithDeadline(url, init, { timeoutMs, fetch: deps.fetch });
+    // never through the browser cache, as every direct ECM request (ecm-direct.js send)
+    return await fetchWithDeadline(url, { ...init, cache: "no-store" }, { timeoutMs, fetch: deps.fetch });
   } catch (error) {
     logger.warn("ECM gateway unreachable", error);
     throw new EcmError(ECM_ERROR.UNAVAILABLE, { detail: error instanceof DeadlineError ? error.message : `could not reach ${new URL(url).origin}` });
