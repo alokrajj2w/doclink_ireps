@@ -21,7 +21,7 @@ import { assertSameAccount, startTenderJob } from './tender-account.js';
 import { printPageToPdf } from './tender-print.js';
 import { sharedRun } from './tender-shared-run.js';
 import {
-  searchTender, findTenderRows, findTenderRowsLoose, fmtDate, railwayOf,
+  searchTender, findTenderRows, findTenderRowsLoose, fmtDate, railwayOf, tenderEquals,
   describeRow, loadForm, classifySearchResponse, closingDaySearchBody, nextResultPage, resultPageLink, resultPageLinks, searchResultsTotal,
 } from './tender-search.js';
 import { withIrepsFormLock } from '../services/ireps-form-lock.js';
@@ -1249,6 +1249,25 @@ export async function scanTenderSearch(run, { from, to, tenderNo = '' }) {
   log('Search', `${rows.length} tender(s) of this vendor closing ${fmtDate(from)}..${fmtDate(to)} in ${searched} result row(s) over ${pages} page(s), ${rows.filter((r) => r.links.financialTabulation || r.links.commercialTabulation).length} with a tabulation`);
   if (incomplete) log('Search', `Search Tender not fully read: ${incomplete}`, 'warn');
   return { rows, pages, searched, incomplete };
+}
+
+/**
+ * One tender of this vendor on IREPS Search Tender: the search of its closing day `day` with its Tender Number
+ * (closingDaySearchBody, the panel's optional Tender Number), read as any closing day is (readClosingDay). How a
+ * tender whose tabulation IREPS did not show yet is checked again once its closing day is no longer in the dates
+ * a run searches (tender-jobs.js, the tabulations waiting list). The search and its answer run under the IREPS form
+ * lock (the caller must not hold it). `forms` keeps the form for the next tender (a form with a Struts token is
+ * opened again for each search).
+ * -> { rows (this vendor's rows closing that day with exactly this number, + pageUrl), problem (the answer was not
+ * read in full, as readClosingDay says) }. Like the first day of scanTenderSearch, it throws when IREPS does not
+ * answer the search, the session is gone or the form does not open.
+ */
+export async function searchTenderOnClosingDay(run, tenderNo, day, forms = {}) {
+  const got = await withIrepsFormLock(async () => {
+    if (!forms.form || forms.form.hasToken) forms.form = await loadForm(run.base);
+    return readClosingDay(run, forms.form, day, { tenderNo });
+  });
+  return { rows: got.rows.filter((r) => tenderEquals(r.tenderNo, tenderNo)), problem: got.problem };
 }
 
 /** Download one tabulation from its request (a tender row or a Closed Tenders row): one category result. */

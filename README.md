@@ -1631,17 +1631,50 @@ On 19 Nov 2026 one closing day was 1214 tenders (Stores, all railways), 49
 result pages, and on 23 Nov 2026 1885 tenders, 76 pages, so a range costs
 about that many page requests per day.
 
+**Tabulations published after closing: the waiting list** (`WAITING` in
+`tender/tender-jobs.js`). The client wants every published Financial and
+Commercial Tabulation (25 Nov 2026), but IREPS cannot be searched by the date a
+tabulation is published, and the runs search by closing date. In a two-packet
+tender the price bids, and with them the Financial Tabulation, are opened weeks
+after closing, when the closing day is no longer in the dates a run searches.
+So:
+
+* a tender this vendor bid on (its row shows My Offer) whose Financial or
+  Commercial Tabulation IREPS does not show yet, or one a run found but could
+  not download, is kept in the ledger (`tabulationsWaiting`, per IREPS account;
+  a scheduled run keeps its own in its `#scheduled` ledger), with each
+  tabulation it waits for and when that one was last looked at;
+* every run (the panel's buttons and the scheduled run) first checks again the
+  waiting tenders whose closing day is not in its own dates: one Search Tender
+  search each, its Tender Number on its closing day
+  (`searchTenderOnClosingDay`, the same search and reading as a closing day's,
+  under the form lock). A tabulation IREPS shows by then is downloaded as the
+  range's are; a tabulation downloaded, or found downloaded before, is no longer
+  waited for. Then the run searches its own dates, as before;
+* a tabulation is looked at again at most every 6 hours (with the Tender Number
+  given, at once), 25 tenders a run, the longest unchecked first (the run says
+  how many are left to a later run);
+* a tender is no longer waited for when it closed more than 180 days ago, when
+  its row says it was cancelled, dropped or retendered, or when IREPS answers
+  its closing day 3 times without it;
+* a search IREPS does not answer in full keeps the tender as it was (the next
+  run asks again) and makes a scheduled run not "done" (`Earlier tenders
+  waiting for a tabulation: ...`); IREPS not answering at all, or the session
+  gone, stops the run as the range's search would.
+
 * **Panel.** "Download Tender Documents" › **Financial Tabulation** /
   **Commercial Tabulation**: every tender of this vendor that closed between
   From and To (the optional Tender Number narrows it) and shows the link is
   downloaded to `Downloads/DocLink/<unit>/Tender_<no>/Tabulation/`; one that
-  shows My Offer but not the link yet reads "not available yet" (re-run the
-  range later); a tabulation found but not downloaded reads "failed" (red), one
+  shows My Offer but not the link yet reads "not available yet" and is waited
+  for (above); a tabulation found but not downloaded reads "failed" (red), one
   downloaded before "already downloaded", and "none for these dates" only when
-  IREPS lists none (`downloadTabulationsByDate`, `tender/tender-jobs.js`;
-  `runTabulations`, `tender/tender-auto.js`).
+  IREPS lists none. The waiting tenders of earlier dates follow under "Earlier
+  tenders waiting for a ..." with what was downloaded for them, and the totals
+  add "Waiting from earlier dates" (`downloadTabulationsByDate`,
+  `tender/tender-jobs.js`; `runTabulations`, `tender/tender-auto.js`).
 * **Scheduled.** The `tenderTabulations` schedule (section 23) runs the same
-  `downloadTabulationsByDate`, for both tabulations.
+  `downloadTabulationsByDate`, for both tabulations, waiting list included.
 * **Single tender.** `downloadTenderDocuments` has the two categories
   `financialTabulation` / `commercialTabulation`: from the tender's search row,
   else from its Closed Tenders row (one scan, closing date ± 1 day;
@@ -2069,7 +2102,7 @@ ships it off.
 | `NIT` | `tenderNit` | "NIT Documents" (automatic mode): My Messages in the range → each tender's NIT, attachments and its corrigenda. My Offer is left out (the ECM has no document type for it; the run says so once): download it from the panel | hourly, 10:30 … 18:30 |
 | `CounterOffer` | `tenderCounterOffer` | Counter Offer letters by Letter Date | hourly, 10:30 … 18:30 |
 | `LOA` | `tenderLoa` | Advance Acceptance (LOA) letters by Letter Date. Sends IREPS's own "LOA viewed" request first, as a manual LOA download does, with nobody clicking | hourly, 10:30 … 18:30 |
-| `Tabulation` | `tenderTabulations` | Financial and Commercial Tabulation of tenders closing in the range, from IREPS Search Tender one closing day at a time, as the panel's buttons (section 19; look-back 15 days: a tabulation appears days after closing) | hourly, 10:30 … 18:30 |
+| `Tabulation` | `tenderTabulations` | Financial and Commercial Tabulation of tenders closing in the range, from IREPS Search Tender one closing day at a time, as the panel's buttons (section 19; look-back 15 days: a tabulation appears days after closing). First the tenders of earlier dates still waiting for a tabulation, each by its Tender Number (section 19, the waiting list) | hourly, 10:30 … 18:30 |
 | `Correspondence` | `tenderCorrespondence` | Every letter IREPS lists as pending (no date range) | hourly, 10:30 … 18:30 |
 | `Negotiation` | `tenderNegotiation` | Negotiation letters by Letter Date. Its own schedule because IREPS opens these pages very slowly | 12:30, 15:30, 18:30 (retry every 30 min) |
 

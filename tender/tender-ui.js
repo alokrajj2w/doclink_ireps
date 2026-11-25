@@ -187,27 +187,42 @@ function renderTabulationResult(pdfType, r) {
   const body = $('tender-result-rows');
   body.replaceChildren();
   const t = r.tabulations;
+  // the tenders of earlier dates still waiting for a tabulation, checked again by their Tender Number (tender-jobs.js WAITING)
+  const w = t.waiting || { checked: 0, downloaded: 0, dropped: 0, later: 0, still: 0, problem: '' };
+  const inRange = t.tenders.filter((x) => !x.rechecked);
+  const earlier = t.tenders.filter((x) => x.rechecked);
   const n = t.summary.downloaded;
   // a tabulation found but not downloaded is "failed" (red), never "nothing new"; one downloaded before says so (1.15)
-  const f = found(t.tenders.filter((x) => !x.notAvailable));
+  const f = found(inRange.filter((x) => !x.notAvailable));
   const text = foundText(n, f) || (t.summary.withTabulation ? 'nothing new' : 'none for these dates');
   body.append(li(`${name} (by Closing Date)`, text, f.failed || t.incomplete ? 'tender-bad' : n ? 'tender-ok' : 'tender-muted', '', t.incomplete || ''));
-  for (const x of t.tenders) {
+  const tenderRow = (x) => {
     if (x.notAvailable) {
       body.append(li(`  ${x.tenderNo}`, 'not available yet', 'tender-muted', '', `${x.title || ''}${x.closingDate ? ` · closed ${x.closingDate}` : ''} · IREPS shows no ${name} yet`));
-      continue;
+      return;
     }
     const parts = Object.entries(x.categories).map(([k, c]) => `${LABEL[k]}: ${catText(c)}`);
-    body.append(li(`  ${x.tenderNo}`, x.error ? 'failed' : parts.join(' · '), rowFailed(x) ? 'tender-bad' : 'tender-ok', '', [x.error, ...Object.values(x.categories).map(reasons)].filter(Boolean).join('\n')));
+    const closed = x.rechecked && x.closingDate ? `closed ${x.closingDate}` : '';
+    body.append(li(`  ${x.tenderNo}`, x.error ? 'failed' : parts.join(' · '), rowFailed(x) ? 'tender-bad' : 'tender-ok', '', [closed, x.error, ...Object.values(x.categories).map(reasons)].filter(Boolean).join('\n')));
+  };
+  for (const x of inRange) tenderRow(x);
+  if (w.checked || w.still || w.problem || earlier.length) {
+    const fe = found(earlier);
+    const wText = foundText(w.downloaded, fe) || (w.checked ? 'not published yet' : `${w.still} waiting`);
+    const why = [w.problem ? `Not all checked: ${w.problem}` : '', `${w.checked} checked again by Tender Number, ${w.still} still waiting. IREPS shows a tabulation once the bids are opened: the price bids of a two-packet tender weeks after closing.`].filter(Boolean).join('\n');
+    body.append(li(`Earlier tenders waiting for a ${name}`, wText, fe.failed || w.problem ? 'tender-bad' : w.downloaded ? 'tender-ok' : 'tender-muted', '', why));
+    for (const x of earlier) tenderRow(x);
   }
-  $('tender-result-tender').textContent = `${name} of tenders closing ${r.range.from} - ${r.range.to}: ${t.listed} closed tender(s), ${t.summary.withTabulation} with a ${name}`;
-  $('tender-result-totals').textContent = `Downloaded: ${n}${f.failed ? `   Failed: ${f.failed}` : ''}${f.already ? `   Already downloaded: ${f.already}` : ''}   Not available yet: ${t.summary.notAvailable}`;
+  $('tender-result-tender').textContent = `${name} of tenders closing ${r.range.from} - ${r.range.to}: ${t.listed} tender(s) of this vendor, ${t.summary.withTabulation} with a ${name}`;
+  const all = found(t.tenders.filter((x) => !x.notAvailable));
+  $('tender-result-totals').textContent = `Downloaded: ${n + (w.downloaded || 0)}${all.failed ? `   Failed: ${all.failed}` : ''}${all.already ? `   Already downloaded: ${all.already}` : ''}   Not available yet: ${t.summary.notAvailable}${w.still ? `   Waiting from earlier dates: ${w.still}` : ''}`;
   $('tender-result-folder').textContent = 'Downloads/DocLink/<unit>/Tender_<no>/Tabulation/';
   $('btn-tender-show').hidden = true;
   $('tender-result').hidden = false;
   $('btn-auto-retry').hidden = true;
   // the IREPS tender search not read to its end (H4): tenders on the part not read were not looked at
-  const problems = [t.aborted ? `Stopped early: ${t.aborted.message}` : '', t.incomplete ? `The IREPS tender search was not read to the end: ${t.incomplete}` : ''].filter(Boolean);
+  const problems = [t.aborted ? `Stopped early: ${t.aborted.message}` : '', t.incomplete ? `The IREPS tender search was not read to the end: ${t.incomplete}` : '',
+    w.problem ? `Tenders of earlier dates waiting for a ${name} were not all checked: ${w.problem}` : ''].filter(Boolean);
   if (problems.length) {
     $('tender-error-message').textContent = problems.join('\n');
     $('tender-error').hidden = false;

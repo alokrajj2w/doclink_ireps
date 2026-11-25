@@ -5,16 +5,17 @@
 //   downloadTodaysCorrigenda() once a day   - corrigendum published today (only that document)
 //   downloadLettersByDate()    3-4x a day   - negotiation / counter offer / LOA letters published on a date
 //   downloadTabulationsByDate()                - Financial / Commercial Tabulation of tenders CLOSING on the dates
-//                                            (IREPS Search Tender); a tabulation shows up some days after closing
+//                                            (IREPS Search Tender); a tabulation shows up some days after closing,
+//                                            and one still missing is checked again by Tender Number (WAITING)
 
 import { IREPS_DOWN_CODES, log, norm } from './tender-core.js';
 import { assertSameAccount, startTenderJob } from './tender-account.js';
-import { searchTender, fmtDate, railwayOf } from './tender-search.js';
+import { searchTender, fmtDate, railwayOf, tenderEquals } from './tender-search.js';
 import { openLedger } from './tender-ledger.js';
 import { ledgerIdFor } from './tender-shared-run.js';
 import {
   startTenderRun, runSteps, findNitNotices, findCorrigendumNotices, scanPostTenderList, LETTER_SPECS, LETTER_KINDS, downloadLetterItems, publicAccount, todayStr,
-  scanTenderSearch, downloadTabulation, TABULATIONS,
+  scanTenderSearch, searchTenderOnClosingDay, downloadTabulation, TABULATIONS,
 } from './tender-workflows.js';
 import { tenderEcmSink, ECM_TAKES_TENDER_DATE } from './tender-ecm.js';
 
@@ -308,6 +309,192 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
 }
 
 
+// ---------------------------------------------------------------- Tabulations (by closing date)
+
+/**
+ * The tabulations waiting list. IREPS shows a tender's tabulations on its Search Tender row once the bids are
+ * opened, but it cannot be searched by the date a tabulation is published: the runs search by closing date. A
+ * tabulation published after its tender's closing day has left the dates the runs search would so never be fetched:
+ * in a two-packet tender the price bids, and with them the Financial Tabulation, are opened weeks after closing.
+ * So a tender this vendor bid on (its row shows My Offer) whose Financial or Commercial Tabulation IREPS does not show
+ * yet, or one a run found but could not download, is kept in the ledger (meta META), with each tabulation it waits
+ * for and when that one was last looked at. Every run first checks again the waiting tenders whose closing day is
+ * not in its own dates (its own search reads those), each by its Tender Number on its closing day
+ * (searchTenderOnClosingDay): a tabulation IREPS shows by then is downloaded as the range's are, and a tabulation
+ * downloaded, or found downloaded before, is no longer waited for.
+ *   RECHECK_MS  a tabulation is looked at again at most this often (with the Tender Number given, at once)
+ *   PER_RUN     tenders one run checks again, the longest unchecked first (the others in a later run)
+ *   KEEP_DAYS   a tender that closed longer ago is no longer waited for
+ *   MISSES      IREPS answers the tender's closing day this many times without it: it is no longer waited for
+ *   MAX         tenders kept (the latest closing dates)
+ * A tender whose row says it was cancelled, dropped or retendered is no longer waited for.
+ */
+export const WAITING = Object.freeze({ META: 'tabulationsWaiting', RECHECK_MS: 6 * 3600000, PER_RUN: 25, KEEP_DAYS: 180, MISSES: 3, MAX: 500 });
+/** How the waiting tenders are named in a run's lists (the scheduled run's warnings, the panel). */
+export const WAITING_LABEL = 'Earlier tenders waiting for a tabulation';
+const NO_TABULATION_COMING = /cancel|drop|retender/i;
+
+/** "20/10/2026 11:30" or "20/10/2026" -> that day (local midnight), or null. */
+const dayOf = (text) => {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(norm(text));
+  return m ? new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1])) : null;
+};
+const waitKey = (x) => `${norm(x.tenderNo).toLowerCase()}|${x.nitId || ''}`;
+/** Whether a tabulation's category ends the wait: downloaded now, or downloaded before (skipped). */
+const tabulationSaved = (c) => Boolean(c) && (c.status === 'DOWNLOADED' || (c.status === 'NOT_AVAILABLE' && c.alreadyDownloaded > 0));
+
+/** The waiting list in the ledger: key -> { tenderNo, nitId, closingDate, dept, title, since, types: { pdfType: last looked at }, misses }. */
+function openWaiting(job, now) {
+  const list = job.ledger.meta(WAITING.META);
+  const waiting = new Map();
+  for (const e of Array.isArray(list) ? list : []) {
+    const day = e && dayOf(e.closingDate);
+    const types = Object.fromEntries(Object.entries((e && e.types) || {}).filter(([t]) => TABULATIONS[t]));
+    if (!e || !e.tenderNo || !day || !Object.keys(types).length) continue;
+    if (now - day.getTime() > WAITING.KEEP_DAYS * DAY) {
+      log('Tabulation', `${e.tenderNo}: no longer waited for (closed ${e.closingDate}, more than ${WAITING.KEEP_DAYS} days ago)`);
+      continue;
+    }
+    waiting.set(waitKey(e), { ...e, types });
+  }
+  return waiting;
+}
+
+/** Put the list in the ledger (saved with it): the tenders still waiting, the latest closing dates first, at most MAX. */
+function keepWaiting(job, waiting) {
+  job.ledger.setMeta(WAITING.META, [...waiting.values()].sort((a, b) => dayOf(b.closingDate) - dayOf(a.closingDate)).slice(0, WAITING.MAX));
+}
+
+/**
+ * What a tender's search row and this run's downloads (`rec`, or null) say about its waiting tabulations; `tried`:
+ * the tabulations this run set out to download from the row. For each tabulation:
+ *   - downloaded by this run, or downloaded before: no longer waited for;
+ *   - not shown by IREPS yet, or tried and not downloaded (failed, or the run stopped first): waited for, looked at now;
+ *   - shown and not tried (the other button's, or one downloaded by an earlier run): left as it was.
+ * Only a tender this vendor bid on (My Offer) starts to be waited for, and one IREPS says was cancelled, dropped or
+ * retendered is no longer. -> 'waiting' | 'done' | 'dropped' | null (not this vendor's, nothing to wait for)
+ */
+function noteWaiting(waiting, row, rec, tried, now, key = waitKey(row)) {
+  const at = new Date(now).toISOString();
+  const known = waiting.get(key);
+  const entry = known || (row.offer ? { tenderNo: row.tenderNo, nitId: row.nitId || '', closingDate: row.closingDate, dept: row.dept || '', title: row.title || '', since: at, types: {}, misses: 0 } : null);
+  if (!entry) return null;
+  for (const t of Object.keys(TABULATIONS)) {
+    if (tabulationSaved(rec && rec.categories && rec.categories[TABULATIONS[t].key])) delete entry.types[t];
+    else if (!row.links[t] || tried.includes(t)) entry.types[t] = at;
+  }
+  Object.assign(entry, { nitId: entry.nitId || row.nitId || '', closingDate: row.closingDate || entry.closingDate, dept: row.dept || entry.dept, title: row.title || entry.title, misses: 0 });
+  if (!Object.keys(entry.types).length) {
+    waiting.delete(key);
+    return known ? 'done' : null;
+  }
+  if (NO_TABULATION_COMING.test(row.status || '')) {
+    waiting.delete(key);
+    if (known) log('Tabulation', `${entry.tenderNo}: no longer waited for (IREPS says "${row.status}")`);
+    return known ? 'dropped' : null;
+  }
+  if (!known) log('Tabulation', `${entry.tenderNo}: waiting for the ${Object.keys(entry.types).map((t) => TABULATIONS[t].label).join(' and ')} (closed ${entry.closingDate})`);
+  waiting.set(key, entry);
+  return 'waiting';
+}
+
+/** Download `types` of one tender straight from its search row -> { rec, downloaded, aborted }. */
+async function downloadRowTabulations(job, row, types, { ecmSink, onProgress, range }) {
+  const rec = { tenderNo: row.tenderNo, title: row.title, closingDate: row.closingDate, categories: {}, folder: '' };
+  let downloaded = 0;
+  let aborted = null;
+  onProgress(`Tabulation for ${row.tenderNo}...`);
+  try {
+    const run = startLetterRun(job, row.tenderNo);
+    run.onProgress = onProgress;
+    Object.assign(run.ctx, { closingDate: row.closingDate, tenderTitle: row.title, railwayUnit: row.dept });
+    await assertSameAccount(job.account, { base: job.base });
+    run.ecm = await ecmSink();
+    for (const t of types) {
+      const r = await downloadTabulation(run, t, row.links[t], { relativeTo: row.pageUrl });
+      rec.categories[TABULATIONS[t].key] = r;
+      downloaded += r.downloaded;
+    }
+    await recordManifest(job, run, rec.categories, { range });
+    rec.folder = `Downloads/${run.saver.root}/`;
+  } catch (e) {
+    // the tender is failed and named (the scheduled run is partial); IREPS not answering stops the run
+    if (stopsRun(e)) aborted = { code: e.code, message: e.message };
+    Object.assign(rec, { status: 'FAILED', code: e.code || '', error: e.message });
+  }
+  return { rec, downloaded, aborted };
+}
+
+/**
+ * Check the waiting tenders again (WAITING): those waiting for a tabulation this run wants, whose closing day is not
+ * in the run's dates, each by its Tender Number on its closing day, the longest unchecked first and at most PER_RUN
+ * of those due. A tabulation IREPS shows now is downloaded; its tender's record (rechecked: true) goes to `earlier`.
+ * When IREPS stops answering or the session is gone before any tender was handled, it throws, as the range's search
+ * would; after that, the run stops there (`aborted`).
+ * -> { checked, downloaded, dropped, later (due, left to a later run), problems (tenders whose search was not answered in full), aborted }
+ */
+async function recheckWaiting(job, waiting, { from, to, pdfTypes, onlyTender, now, onProgress, earlier, download }) {
+  const lo = new Date(from.getFullYear(), from.getMonth(), from.getDate()).getTime();
+  const hi = new Date(to.getFullYear(), to.getMonth(), to.getDate()).getTime();
+  const wantedTypes = (e) => Object.keys(e.types).filter((t) => pdfTypes.includes(t));
+  const lastLook = (e) => Math.min(...wantedTypes(e).map((t) => Date.parse(e.types[t]) || 0));
+  const outside = [...waiting.entries()].filter(([, e]) => {
+    const day = dayOf(e.closingDate).getTime();
+    return (day < lo || day > hi) && wantedTypes(e).length > 0 && (!onlyTender || tenderEquals(e.tenderNo, onlyTender));
+  });
+  // the Tender Number asks for that tender at once; otherwise a tabulation is looked at again after RECHECK_MS
+  const due = outside.filter(([, e]) => onlyTender || now - lastLook(e) >= WAITING.RECHECK_MS)
+    .sort(([, a], [, b]) => lastLook(a) - lastLook(b) || dayOf(a.closingDate) - dayOf(b.closingDate));
+  const batch = due.slice(0, WAITING.PER_RUN);
+  const out = { checked: 0, downloaded: 0, dropped: 0, later: due.length - batch.length, problems: [], aborted: null };
+  if (batch.length) log('Tabulation', `${batch.length} earlier tender(s) waiting for a tabulation are checked again${out.later ? ` (${out.later} more in a later run)` : ''}`);
+  const forms = {};
+  for (const [i, [key, e]] of batch.entries()) {
+    const closed = e.closingDate.slice(0, 10);
+    onProgress(`Checking tenders of earlier dates still waiting for a tabulation: ${e.tenderNo} (closed ${closed}), ${i + 1} of ${batch.length}...`);
+    let got;
+    try {
+      got = await searchTenderOnClosingDay({ base: job.base, onProgress }, e.tenderNo, dayOf(e.closingDate), forms);
+    } catch (err) {
+      if (stopsRun(err)) {
+        if (!earlier.length && !out.checked) throw err; // nothing done yet: as when the range's search is not answered
+        out.aborted = { code: err.code, message: err.message };
+        break;
+      }
+      out.problems.push(`${e.tenderNo} (closed ${closed}): ${err.message}`);
+      if (err.code === 'SEARCH_FORM') break; // the next searches need the same form
+      continue;
+    }
+    if (got.problem) { out.problems.push(`${e.tenderNo} (closed ${closed}): ${got.problem}`); continue; }
+    out.checked++;
+    const row = got.rows.find((r) => !e.nitId || !r.nitId || r.nitId === e.nitId) || null;
+    if (!row) {
+      e.misses = (Number(e.misses) || 0) + 1;
+      for (const t of wantedTypes(e)) e.types[t] = new Date(now).toISOString();
+      if (e.misses >= WAITING.MISSES) {
+        waiting.delete(key);
+        out.dropped++;
+        log('Tabulation', `${e.tenderNo}: no longer waited for (IREPS did not list it on its closing day ${closed}, ${e.misses} times)`);
+      }
+    } else {
+      const types = wantedTypes(e).filter((t) => row.links[t]);
+      let rec = null;
+      if (types.length) {
+        const got2 = await download(row, types);
+        rec = { ...got2.rec, rechecked: true };
+        earlier.push(rec);
+        out.downloaded += got2.downloaded;
+        if (got2.aborted) out.aborted = got2.aborted;
+      }
+      if (noteWaiting(waiting, row, rec, types, now, key) === 'dropped') out.dropped++;
+    }
+    keepWaiting(job, waiting);
+    await job.ledger.save(); // after every tender (M21)
+    if (out.aborted) break;
+  }
+  return out;
+}
+
 /**
  * Financial / Commercial Tabulations of the tenders that CLOSED between `from` and `to` (Dates, both included),
  * optionally of one Tender Number: the panel's Financial / Commercial Tabulation buttons and the scheduled
@@ -316,52 +503,76 @@ export async function downloadLettersByDate({ onProgress = () => {}, onAccount =
  * from its row, with the row's closing date (Due Date/Time) as the ECM tender date. A tender of this vendor
  * without the link is reported as "not available yet" (IREPS adds it once the bids are opened), and what
  * was downloaded before is skipped (download log, or the ledger), so the same range can be re-run.
+ * Before the range, the tenders of earlier dates still waiting for a tabulation are checked again by their Tender
+ * Number (WAITING, recheckWaiting), so a tabulation IREPS publishes long after closing is still fetched; they are
+ * the records with `rechecked`, after the range's, and `waiting` says what was done with them.
  * @param pdfTypes  keys of TABULATIONS (default both)
+ * @param now       the time of the run (ms; the tests set it)
  */
-export async function downloadTabulationsByDate({ from, to, pdfTypes = Object.keys(TABULATIONS), tenderNo: onlyTender = '', onProgress = () => {}, onAccount = () => {}, job: sharedJob = null } = {}) {
+export async function downloadTabulationsByDate({ from, to, pdfTypes = Object.keys(TABULATIONS), tenderNo: onlyTender = '', onProgress = () => {}, onAccount = () => {}, job: sharedJob = null, now = Date.now() } = {}) {
   const job = sharedJob || (await beginJob({ onProgress, onAccount }));
   const range = { from: ddmmyyyy(from), to: ddmmyyyy(to) };
   const wantTender = norm(onlyTender);
-  onProgress(`Searching IREPS tenders closing ${range.from} - ${range.to}...`);
-  const { rows, pages, incomplete } = await scanTenderSearch({ base: job.base, onProgress }, { from, to, tenderNo: wantTender });
-  const listed = rows.filter((r) => !wantTender || norm(r.tenderNo).toLowerCase() === wantTender.toLowerCase());
-
   let ecm;
   const ecmSink = async () => (ecm === undefined ? (ecm = await tenderEcmSink(job.account)) : ecm);
+
+  // first the tenders of earlier dates still waiting for a tabulation: a long search of the range cannot crowd them out
+  const waiting = openWaiting(job, now);
+  const earlier = [];
+  const recheck = await recheckWaiting(job, waiting, {
+    from, to, pdfTypes, onlyTender: wantTender, now, onProgress, earlier,
+    download: (row, types) => downloadRowTabulations(job, row, types, { ecmSink, onProgress, range }),
+  });
+  let aborted = recheck.aborted;
+
+  let rows = [];
+  let pages = 0;
+  let incomplete = '';
+  if (!aborted) {
+    onProgress(`Searching IREPS tenders closing ${range.from} - ${range.to}...`);
+    ({ rows, pages, incomplete } = await scanTenderSearch({ base: job.base, onProgress }, { from, to, tenderNo: wantTender }));
+  }
+  const listed = rows.filter((r) => !wantTender || norm(r.tenderNo).toLowerCase() === wantTender.toLowerCase());
+
   const tenders = [];
-  let aborted = null;
   let downloaded = 0;
   for (const row of listed) {
-    const rec = { tenderNo: row.tenderNo, title: row.title, closingDate: row.closingDate, categories: {}, folder: '' };
-    tenders.push(rec);
     const wanted = pdfTypes.filter((t) => row.links[t]);
-    if (!wanted.length) { rec.notAvailable = true; continue; }
-    if (aborted) { Object.assign(rec, { status: 'SKIPPED', code: aborted.code, error: `Skipped: ${aborted.message}` }); continue; }
-    onProgress(`Tabulation for ${row.tenderNo}...`);
-    try {
-      const run = startLetterRun(job, row.tenderNo);
-      run.onProgress = onProgress;
-      Object.assign(run.ctx, { closingDate: row.closingDate, tenderTitle: row.title, railwayUnit: row.dept });
-      await assertSameAccount(job.account, { base: job.base });
-      run.ecm = await ecmSink();
-      for (const t of wanted) {
-        const r = await downloadTabulation(run, t, row.links[t], { relativeTo: row.pageUrl });
-        rec.categories[TABULATIONS[t].key] = r;
-        downloaded += r.downloaded;
-      }
-      await recordManifest(job, run, rec.categories, { range });
-      rec.folder = `Downloads/${run.saver.root}/`;
-    } catch (e) {
-      // the tender is failed and named (the scheduled run is partial); IREPS not answering stops the run
-      if (stopsRun(e)) aborted = { code: e.code, message: e.message };
-      Object.assign(rec, { status: 'FAILED', code: e.code || '', error: e.message });
+    let rec;
+    if (!wanted.length) rec = { tenderNo: row.tenderNo, title: row.title, closingDate: row.closingDate, categories: {}, folder: '', notAvailable: true };
+    else if (aborted) rec = { tenderNo: row.tenderNo, title: row.title, closingDate: row.closingDate, categories: {}, folder: '', status: 'SKIPPED', code: aborted.code, error: `Skipped: ${aborted.message}` };
+    else {
+      const got = await downloadRowTabulations(job, row, wanted, { ecmSink, onProgress, range });
+      rec = got.rec;
+      downloaded += got.downloaded;
+      if (got.aborted) aborted = got.aborted;
     }
-    await job.ledger.save(); // after every tender (M21): a run cut short keeps what it did
+    tenders.push(rec);
+    noteWaiting(waiting, row, rec, wanted, now);
+    if (wanted.length && rec.status !== 'SKIPPED') {
+      keepWaiting(job, waiting);
+      await job.ledger.save(); // after every tender (M21): a run cut short keeps what it did
+    }
   }
+  keepWaiting(job, waiting);
   if (!sharedJob) await job.ledger.save();
+
+  const lo = new Date(from.getFullYear(), from.getMonth(), from.getDate()).getTime();
+  const hi = new Date(to.getFullYear(), to.getMonth(), to.getDate()).getTime();
+  const still = [...waiting.values()].filter((e) => {
+    const day = dayOf(e.closingDate).getTime();
+    return (day < lo || day > hi) && Object.keys(e.types).some((t) => pdfTypes.includes(t)) && (!wantTender || tenderEquals(e.tenderNo, wantTender));
+  }).length;
+  const p = recheck.problems;
+  const problem = p.length ? `${p.length} not checked: ${p[0]}${p.length > 1 ? ` (and ${p.length - 1} more)` : ''}` : '';
   return {
-    account: publicAccount(job.account), range, pages, listed: listed.length, tenders, aborted, incomplete: incomplete || '',
+    account: publicAccount(job.account), range, pages, listed: listed.length, tenders: [...tenders, ...earlier], aborted, incomplete: incomplete || '',
     summary: { downloaded, withTabulation: tenders.filter((t) => !t.notAvailable).length, notAvailable: tenders.filter((t) => t.notAvailable).length },
+    // the tenders of earlier dates: checked again, their tabulations downloaded, no longer waited for, due but left to a
+    // later run, and still waiting after this run; a search IREPS did not answer in full means a scheduled run is not done
+    waiting: { checked: recheck.checked, downloaded: recheck.downloaded, dropped: recheck.dropped, later: recheck.later, still, problem },
+    listWarnings: problem ? { [WAITING_LABEL]: problem } : {},
+    notes: recheck.later ? [`${recheck.later} tender(s) of earlier dates waiting for a tabulation are checked again by a later run (${WAITING.PER_RUN} a run).`] : [],
   };
 }
 

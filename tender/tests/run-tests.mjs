@@ -3124,3 +3124,144 @@ test('Scheduled run: a manual run after it is unchanged (no hooks left installed
   await coRun();
   assert.equal(saved.length, 1, 'the manual run saves to Downloads as before');
 });
+
+// ---- tabulations IREPS publishes after closing: the waiting list (tender-jobs.js WAITING), checked by Tender Number
+const LEDGER_833 = 'doclink.tender.ledger.833';
+/** The waiting list in ledger `id`: [[tender number, the tabulations it waits for]]. */
+const waitingList = (id = LEDGER_833) => (store[id]?.meta?.[jobs.WAITING.META] || []).map((e) => [e.tenderNo, Object.keys(e.types).sort().join('+')]);
+const HOUR = 3600000;
+/** Day `d` at `h` o'clock (local), in ms: the runs' clock. */
+const atHour = (d, h = 12) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), h).getTime();
+const tabsAt = (from, to, now, o = {}) => jobs.downloadTabulationsByDate({ from, to, now, ...o });
+/** The Search Tender searches with a Tender Number: [number, closing day]. */
+const numberSearches = () => searchPosts().filter((l) => l.body.advancedSearch).map((l) => [l.body.advancedSearch, l.body.dateFrom]);
+test('Tabulation waiting list: a Financial Tabulation IREPS shows only weeks after closing (two-packet tender) is found by the Tender Number on its closing day and downloaded; the tender then leaves the list', async () => {
+  const closing = new Date(2026, 9, 20);
+  mk({ tenders: [bid('42263731', { tab: ['commercialTabulation'] }), other('51111111')] });
+  const first = await tabsAt(closing, closing, atHour(closing, 18));
+  assert.deepEqual(first.tenders.map((x) => [x.tenderNo, Object.keys(x.categories).join()]), [['42263731', 'commercialTabulation']], 'the Commercial Tabulation IREPS shows is downloaded');
+  assert.deepEqual(waitingList(), [['42263731', 'financialTabulation']], 'the Financial one is waited for');
+  // weeks later the price bids are opened: IREPS shows the Financial Tabulation on the tender's row
+  server.s.tenders[0].tab = true;
+  server.log.length = 0;
+  const later = new Date(2026, 10, 25);
+  const r = await tabsAt(later, later, atHour(later));
+  assert.deepEqual(searchPosts().map((l) => [l.body.advancedSearch, l.body.dateFrom, l.body.dateTo]), [['42263731', '20/10/2026', '20/10/2026'], ['', '25/11/2026', '25/11/2026']],
+    'first the waiting tender, by its number on its closing day; then the run\'s own dates');
+  const rec = r.tenders.find((x) => x.tenderNo === '42263731');
+  assert.deepEqual([rec.rechecked, Object.keys(rec.categories).join(), rec.categories.financialTabulation.status], [true, 'financialTabulation', 'DOWNLOADED'], 'only the tabulation it waited for');
+  assert.deepEqual([r.waiting.checked, r.waiting.downloaded, r.waiting.still, r.waiting.problem], [1, 1, 0, '']);
+  assert.deepEqual([r.listed, r.summary], [0, { downloaded: 0, withTabulation: 0, notAvailable: 0 }], 'the run\'s own dates are counted apart');
+  assert.ok(savedNames().includes('DocLink/HOSUR/Tender_42263731/Tabulation/Financial_Tabulation_42263731.pdf'), savedNames().join('\n'));
+  assert.deepEqual(waitingList(), [], 'no longer waited for');
+  server.log.length = 0;
+  await tabsAt(later, later, atHour(later, 20));
+  assert.deepEqual(numberSearches(), [], 'nothing is searched again');
+});
+test('Tabulation waiting list: a tender is looked at again at most every 6 hours, at once with its Tender Number; a run for one tabulation leaves the other one IREPS shows to a run for it', async () => {
+  const closing = new Date(2026, 9, 20);
+  const later = new Date(2026, 9, 22);
+  const t0 = atHour(closing, 18);
+  const fin = { pdfTypes: ['financialTabulation'] };
+  mk({ tenders: [bid('24261658', { tab: false })] });
+  const first = await tabsAt(closing, closing, t0, fin);
+  assert.equal(first.tenders[0].notAvailable, true, 'not available yet, as before');
+  assert.deepEqual(waitingList(), [['24261658', 'commercialTabulation+financialTabulation']], 'a Financial run notes both tabulations IREPS does not show yet');
+  server.log.length = 0;
+  await tabsAt(later, later, t0 + 2 * HOUR, fin);
+  assert.deepEqual(numberSearches(), [], 'looked at 2 hours ago: not yet');
+  const asked = await tabsAt(later, later, t0 + 2 * HOUR, { ...fin, tenderNo: '24261658' });
+  assert.deepEqual(numberSearches(), [['24261658', '20/10/2026'], ['24261658', '22/10/2026']], 'with its Tender Number: at once (the run\'s own dates are narrowed to it too)');
+  assert.deepEqual([asked.waiting.checked, asked.waiting.downloaded, asked.waiting.still], [1, 0, 1], 'not published yet');
+  // IREPS shows the Commercial Tabulation now: the Financial run that looks first leaves it to a Commercial run
+  server.s.tenders[0].tab = ['commercialTabulation'];
+  server.log.length = 0;
+  const finRun = await tabsAt(later, later, t0 + 9 * HOUR, fin);
+  assert.deepEqual([finRun.waiting.checked, finRun.waiting.downloaded, tabRequests().length], [1, 0, 0]);
+  const comRun = await tabsAt(later, later, t0 + 10 * HOUR, { pdfTypes: ['commercialTabulation'] });
+  assert.equal(comRun.tenders.find((x) => x.rechecked).categories.commercialTabulation.status, 'DOWNLOADED', 'an hour later the Commercial run fetches it');
+  assert.deepEqual(waitingList(), [['24261658', 'financialTabulation']], 'the Financial one is still waited for');
+});
+test('Tabulation waiting list: a tender IREPS says was cancelled, one IREPS no longer lists on its closing day (3 times) and one that closed over 180 days ago are no longer waited for', async () => {
+  const closing = new Date(2026, 9, 20);
+  const april = new Date(2026, 3, 1);
+  const later = new Date(2026, 9, 25);
+  const t0 = atHour(closing, 18);
+  mk({ tenders: [bid('11111111', { tab: false }), bid('22222222', { tab: false }), bid('33333333', { tab: false, closing: april })] });
+  await tabsAt(april, april, atHour(april, 18));
+  assert.deepEqual(waitingList().map(([no]) => no), ['33333333']);
+  await tabsAt(closing, closing, t0);
+  assert.deepEqual(waitingList().map(([no]) => no).sort(), ['11111111', '22222222'], 'the tender that closed on 01/04/2026 is no longer waited for');
+  server.s.tenders.find((t) => t.no === '11111111').status = 'Cancelled';
+  server.s.tenders = server.s.tenders.filter((t) => t.no !== '22222222');
+  const r1 = await tabsAt(later, later, t0 + 7 * HOUR);
+  assert.deepEqual([r1.waiting.checked, r1.waiting.dropped], [2, 1], 'the cancelled tender goes at once');
+  assert.deepEqual(waitingList().map(([no]) => no), ['22222222']);
+  await tabsAt(later, later, t0 + 14 * HOUR);
+  assert.deepEqual(waitingList().map(([no]) => no), ['22222222'], 'not listed twice: still waited for');
+  const r3 = await tabsAt(later, later, t0 + 21 * HOUR);
+  assert.deepEqual([r3.waiting.dropped, waitingList()], [1, []], 'not listed a third time: no longer waited for');
+});
+test('Tabulation waiting list: one run checks at most 25 tenders again, the longest unchecked first; the others are left to a later run, and the run says so', async () => {
+  const closing = new Date(2026, 9, 20);
+  const later = new Date(2026, 9, 25);
+  const t0 = atHour(closing, 18);
+  const nos = Array.from({ length: 27 }, (_, i) => `7726${String(i).padStart(4, '0')}`);
+  mk({ tenders: nos.map((no) => bid(no, { tab: false })) });
+  await tabsAt(closing, closing, t0);
+  assert.equal(waitingList().length, 27);
+  server.log.length = 0;
+  const r = await tabsAt(later, later, t0 + 7 * HOUR);
+  assert.deepEqual([r.waiting.checked, r.waiting.later, r.waiting.still, numberSearches().length], [jobs.WAITING.PER_RUN, 2, 27, 25]);
+  assert.match(r.notes[0], /^2 tender\(s\) of earlier dates waiting for a tabulation are checked again by a later run/);
+  assert.equal(server.log.filter((l) => l.body.searchParam === 'showPage').length, 2, 'the form (no Struts token) is opened once for the 25 searches, once for the run\'s own dates');
+  server.log.length = 0;
+  await tabsAt(later, later, t0 + 8 * HOUR);
+  assert.deepEqual(numberSearches().map(([no]) => no), nos.slice(25), 'the next run takes the two left out');
+});
+test('Tabulation waiting list: a search IREPS does not answer in full keeps the tender waiting and asks again next time; the scheduled run is not "done" and says why; IREPS not answering at all stops the run', () => quickRetries(async () => {
+  const closing = new Date(2026, 9, 20);
+  const later = new Date(2026, 9, 25);
+  const t0 = atHour(closing, 18);
+  // as tender/schedule-runner.js runs it: the job, then its ledger saved
+  const scheduledTabs = (from, to, now) => scheduledOutcome(async () => {
+    const job = await jobs.beginJob({});
+    const tabulations = await jobs.downloadTabulationsByDate({ from, to, now, job });
+    await job.ledger.save();
+    return { tabulations };
+  });
+  mk({ tenders: [bid('42263731', { tab: ['commercialTabulation'] })] });
+  const first = await scheduledTabs(closing, closing, t0);
+  assert.equal(first.outcome.outcome, 'done', JSON.stringify(first.outcome));
+  assert.deepEqual(waitingList(`${LEDGER_833}#scheduled`), [['42263731', 'financialTabulation']], 'a scheduled run keeps its own list, in its own ledger');
+  const handle = server.handle;
+  intercept((m, u, b) => b.get('advancedSearch') === '42263731', () => ({ status: 500, type: 'text/html', bytes: enc8('<html><body>boom</body></html>') }));
+  const second = await scheduledTabs(later, later, t0 + 7 * HOUR);
+  assert.deepEqual([second.outcome.outcome, second.outcome.code], ['failed', 'SCHEDULE_LIST_INCOMPLETE'], JSON.stringify(second.outcome));
+  assert.match(second.outcome.result.warnings[0], /^Earlier tenders waiting for a tabulation: 1 not checked: 42263731 \(closed 20\/10\/2026\): .*HTTP 500/);
+  assert.deepEqual(waitingList(`${LEDGER_833}#scheduled`), [['42263731', 'financialTabulation']], 'still waited for');
+  server.handle = handle;
+  server.s.tenders[0].tab = true;
+  server.log.length = 0;
+  const third = await scheduledTabs(later, later, t0 + 7 * HOUR + 60000);
+  assert.deepEqual(numberSearches(), [['42263731', '20/10/2026']], 'asked again at once: its last look did not count');
+  assert.deepEqual([third.outcome.outcome, third.outcome.result.saved], ['done', 1], JSON.stringify(third.outcome));
+  assert.deepEqual(waitingList(`${LEDGER_833}#scheduled`), []);
+  // a manual run: IREPS cannot be reached for the first search, before anything was done -> the run stops, as when the range's search is not answered
+  mk({ tenders: [bid('42263731', { tab: ['commercialTabulation'] })] });
+  await tabsAt(closing, closing, t0);
+  unreachable((m, u, b) => b.get('advancedSearch') === '42263731');
+  await assert.rejects(() => tabsAt(later, later, t0 + 7 * HOUR), (e) => e.code === 'UNREACHABLE');
+  assert.deepEqual(waitingList(), [['42263731', 'financialTabulation']], 'still waited for');
+}));
+test('Tabulation waiting list: the panel shows the tenders of earlier dates apart, after the dates the run searched', () => withTenderPanel(async ($) => {
+  const closing = new Date(2026, 9, 20);
+  mk({ tenders: [bid('42263731', { tab: ['commercialTabulation'] })] });
+  await tabsAt(closing, closing, Date.now() - 7 * HOUR, { pdfTypes: ['commercialTabulation'] });
+  server.s.tenders[0].tab = true;
+  await clickRun($, 'btn-tab-financial', { from: new Date(2026, 9, 25), to: new Date(2026, 9, 25) });
+  const rows = panelRows($, 'tender-result-rows');
+  assert.deepEqual(rows.map((r) => r.slice(0, 2)), [['Financial Tabulation (by Closing Date)', 'none for these dates'], ['Earlier tenders waiting for a Financial Tabulation', '1 downloaded'], ['42263731', 'Financial Tabulation: 1 downloaded']], JSON.stringify(rows));
+  assert.match($('tender-result-totals').textContent, /^Downloaded: 1 /);
+  assert.match($('tender-result-tender').textContent, /: 0 tender\(s\) of this vendor, 0 with a Financial Tabulation$/);
+}));

@@ -53,14 +53,20 @@ const TH = `<tr class="table_head"><td class="formLabel">Deptt./Rly. Unit&nbsp;<
 
 /**
  * A Search Tender result row. t.offer: this vendor bid (My Offer), and then the tabulation links and Bill
- * Tracking follow unless t.tab === false (bids not opened yet), as on the 20 Nov 2026 capture.
+ * Tracking follow unless t.tab === false (bids not opened yet), as on the 20 Nov 2026 capture. t.tab as a list
+ * shows only those tabulations (a two-packet tender: the Commercial one once the technical bids are opened, the
+ * Financial one only after the price bids are opened, weeks later).
  */
 export function resultRow(t) {
+  const shows = (type) => t.tab !== false && (!Array.isArray(t.tab) || t.tab.includes(type));
+  const fin = shows('financialTabulation') ? `<a title="Financial Tabulation" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=${t.oid}', '', 'toolbar=0')">f</a>` : '';
+  const com = shows('commercialTabulation') ? `<a title="View Commercial Tabulation" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=${t.oid}', '', 'toolbar=0')">c</a>` : '';
+  const bill = fin || com ? `&nbsp;<a title="Bill Tracking" class=linkStyle href=/epsn/works/bills/billSubmission.do?activity=display&oid=${t.oid}><img src="/ireps/images/common/Submit Pending Bill Details.png"></a>` : '';
   return `<tr><td>${t.dept}&nbsp;</td>
 <td><a title="View Tender Document / Corrigendum" class="linkStyle" href=# onclick="window.open('/epsn/supply/rfq/nitPublish.do?nitId=${t.nitId}&activity=viewNIT', '', 'toolbar=0,titlebar=0,scrollbars=1,location=1,resizable=1,width=950,height=600')">${t.no}</a>&nbsp;</td>
 <td><span class="dataText">${t.title}</span></td><td>${t.status}&nbsp;</td><td>NOT OPENED</td><td>${fmt(t.closing)}&nbsp;</td><td>34&nbsp;</td>
 <td>&nbsp;<a title="View Tender Document / Corrigendum" href="#" onclick="window.open('/ireps/supply/pdfdocs/112026/${t.oid}/viewNitPdf_${t.nitId}.pdf', '', 'toolbar=0')"><img src="/x.gif"></a>&nbsp;<a title="View Published Corrigendum" class=linkStyle href=/epsn/works/rfq/viewCorrigendum.do?nitId=${t.nitId}><img src="/y.gif"></a>&nbsp;${
-  t.offer ? `<a title="My Offer" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=${t.oid}&accountID=${t.offerAcct || '833'}', '', 'toolbar=0')">o</a>${t.tab === false ? '' : `<a title="Financial Tabulation" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=financialTabulation&tenderOID=${t.oid}', '', 'toolbar=0')">f</a><a title="View Commercial Tabulation" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=commercialTabulation&tenderOID=${t.oid}', '', 'toolbar=0')">c</a>&nbsp;<a title="Bill Tracking" class=linkStyle href=/epsn/works/bills/billSubmission.do?activity=display&oid=${t.oid}><img src="/ireps/images/common/Submit Pending Bill Details.png"></a>`}` : ''
+  t.offer ? `<a title="My Offer" href=# onclick="window.open('/epsn/tbo/commTboPdfAction.do?pdfType=offer&tenderOID=${t.oid}&accountID=${t.offerAcct || '833'}', '', 'toolbar=0')">o</a>${fin}${com}${bill}` : ''
 }<a title="Bid Process" class=linkStyle href=/epsn/supply/bid/bidProcess.do?oid=${t.oid}&bidStartDate=>b</a></td></tr>`;
 }
 
