@@ -13,6 +13,8 @@ import { railwayOf } from './tender-search.js';
 import { sharedRun } from './tender-shared-run.js';
 
 const DAY = 86400000;
+/** "25/11/2026" -> "20261125": IREPS's dd/mm/yyyy dates in day order. */
+const dayKey = (dmy) => String(dmy || '').split('/').reverse().join('');
 
 /** What a NIT message brings: the tender PDF, its attached documents and My Offer. */
 const NIT_STEPS = ['tenderPdf', 'attachments', 'myOffer'];
@@ -101,6 +103,8 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
     t.dueDate = t.dueDate || d.dueDate;
     t.railwayUnit = t.railwayUnit || (railwayOf(d.railwayUnit) ? d.railwayUnit : '');
     t.messages.push({ oid: row.oid, sentAt: d.sentAt || `${row.sentDate} ${row.sentTime}`, subject: d.subject, kind: d.kind });
+    // the NIT's published date in the ECM: the day IREPS sent its NIT message (the first, when it sent one twice)
+    if (d.kind === 'NIT' && (!t.nitSentDate || dayKey(row.sentDate) < dayKey(t.nitSentDate))) t.nitSentDate = row.sentDate;
     tenders.set(k, t);
   }
   onEvent({ type: 'discovered', tenders: [...tenders.values()].map((t) => ({ key: t.key, tenderNo: t.tenderNo, title: t.title, railwayUnit: t.railwayUnit, due: t.dueDate, sentAt: t.messages[0].sentAt, kinds: [...t.kinds] })), review, failedMessages });
@@ -124,6 +128,7 @@ export async function runAutomatic({ from, to, onProgress = () => {}, onAccount 
       // the message's railway and due date pick this tender when another railway uses the same tender number
       const run = await openTender(job, t.tenderNo, windowsFor(t.dueDate), onProgress, { railway: t.railwayUnit, dueDate: t.dueDate || null });
       run.ctx.dueDate = t.dueDate ? t.dueDate.toISOString() : '';
+      run.ctx.nitSentDate = t.nitSentDate || '';
       run.dateRange = rangeSet;
       const { categories, aborted: ab } = await runSteps(run, steps, onProgress);
       if (ab) aborted = ab;

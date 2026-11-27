@@ -13,7 +13,7 @@ import { uploadToNuxeo, buildEcmQuery, existingDocumentQuery, groupDocumentQuery
 import { applyEcmConfig, ECM_CONFIG, isDirectEcm } from "../services/ecm-config.js";
 import { mergeConfig } from "../utils/config.js";
 import { DeadlineError } from "../utils/http.js";
-import { ECM_KINDS, ECM_SITES, PROD_CREATION_FOLDER, routeSite } from "../services/ecm-catalog.js";
+import { ECM_KINDS, ECM_SITES, PROD_CREATION_FOLDER, routeSite, matchFields } from "../services/ecm-catalog.js";
 import { applyReconConfig } from "../services/recon-service.js";
 
 const DOMAIN = "http://ecm.test:8080";
@@ -474,6 +474,10 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     const lookup = empty.calls.find((c) => c.query && c.query.includes("dc:title"));
     eq(lookup.query, groupDocumentQuery({ kind: "nit", folderUid: ECM_SITES.TEST.hosur.folderIds.tenders, title: "T-1 - NIT", values: { tender_number: "T-1", tender_date: "2026-11-09" } }));
     assert(!lookup.query.includes("file:content/name") && !lookup.query.includes("tenderDate") && lookup.query.endsWith("ORDER BY dc:created ASC"), `found by type, folder, title and tender number, oldest first: ${lookup.query}`);
+    // an NIT's published date describes it without identifying it: never looked up, so an NIT stored before the ECM had it still matches
+    const dated = { tender_number: "T-1", tender_date: "2026-11-09", published_date: "2026-11-25" };
+    assert(!groupDocumentQuery({ kind: "nit", folderUid: "f", title: "T-1 - NIT", values: dated }).includes("publishedDate"), "the published date is not in the lookup");
+    eq(JSON.stringify(matchFields("nit", dated)), JSON.stringify({ tender_number: "T-1", tender_date: "2026-11-09" }));
 
     fresh();
     const fetch = fakeNuxeo({ existing: [groupDoc()] });

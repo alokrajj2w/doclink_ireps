@@ -41,6 +41,10 @@ export const ECM_FIELDS = Object.freeze({
   modification_advise_number: "InvoiceCertificateSchema:modificationAdviseNumber",
   tender_number: "InvoiceCertificateSchema:tenderNumber",
   tender_date: "InvoiceCertificateSchema:tenderDate",
+  // An NIT's published date: the day IREPS sent its NIT message (Wabtec, 27/11/2026: the publish date is the
+  // message's sent date). The ECM team is adding the property (26/11/2026 meeting); publishedDate is the name
+  // DocLink expects until they confirm it: node scripts/check-ecm-schema.mjs must show it before a build sends it.
+  published_date: "InvoiceCertificateSchema:publishedDate",
   loi_number: "InvoiceCertificateSchema:loiNumber",
   loi_date: "InvoiceCertificateSchema:loiDate"
 });
@@ -75,7 +79,9 @@ export const ECM_KINDS = Object.freeze({
   modificationAdvise: { fields: ["customer_po_number", "modification_advise_number", "tender_number"], required: ["customer_po_number", "modification_advise_number"], location: "inputs", code: "MA", title: "{modification_advise_number} - MA" },
   // grouped (group: true, see groupKind): "<T> - NIT" (tender PDF + its attached documents),
   // "<T> - LOA" (every Advance Acceptance Letter), "<T> - Result" (Financial Tabulation)
-  nit: groupKind("NIT"),
+  // an NIT also carries its published date when the run knows it (tender/tender-ecm.js); it describes the NIT
+  // without identifying it, so an NIT stored before the ECM had the property is still found
+  nit: groupKind("NIT", { fields: ["tender_number", "tender_date", "published_date"], details: ["published_date"] }),
   loi: groupKind("LOA", { fields: ["tender_number", "tender_date", "loi_number", "loi_date"] }),
   tenderResult: groupKind("Result"), // the ECM's type "Tender Result" (vocabulary invoice_certificate_document_types)
   nbsp: tenderKind("NBSP"),

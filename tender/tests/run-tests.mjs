@@ -1216,6 +1216,11 @@ test('ECM: each tender category maps to its ECM kind with the tender number and 
   assert.deepEqual(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T', dueDate: new Date(2026, 10, 9).toISOString() }).fields, { tender_number: 'T', tender_date: '2026-11-09' }, 'without a closing date, the due date\'s local day');
   assert.deepEqual(tecm.ecmDocumentFor('TENDER_PDF', {}, { tenderNo: 'T' }).fields, { tender_number: 'T', tender_date: '' }, 'no date known: blank, which ecmFields() drops');
   assert.equal(tecm.ECM_TAKES_TENDER_DATE, true);
+  // an NIT's published date: the day IREPS sent its NIT message (NIT Documents sets ctx.nitSentDate); NIT documents only
+  const sent = { ...ctx, nitSentDate: '25/11/2026' };
+  assert.deepEqual(tecm.ecmDocumentFor('TENDER_PDF', { id: '1' }, sent).fields, { tender_number: '29263265', tender_date: '09/11/2026 15:00', published_date: '25/11/2026' }, 'as IREPS shows it; ecmFields() makes it YYYY-MM-DD');
+  assert.equal(tecm.ecmDocumentFor('ATTACHMENTS', { id: 'x', meta: {} }, sent).fields.published_date, '25/11/2026', 'an attachment carries it too: it fills in an NIT document that lacks it');
+  assert.deepEqual(['CORRIGENDA', 'NEGOTIATION', 'COUNTER_OFFER', 'LOA', 'CORRESPONDENCE', 'FINANCIAL_TABULATION', 'COMMERCIAL_TABULATION'].filter((c) => 'published_date' in tecm.ecmDocumentFor(c, { id: '1', meta: { title: '1' } }, sent).fields), [], 'only NIT documents get it');
 });
 test('ECM: Save to Local (the default) never calls the ECM', async () => {
   mk({ tenders: [FULL()] });
@@ -1325,6 +1330,39 @@ test('ECM direct: with ecmBackendAws false every tender document goes straight t
   });
   const asked = await withDirectEcm(async (seen) => seen.asked);
   assert.equal(asked, 0, 'no Recon sign-in asked in direct mode');
+});
+test('ECM direct, NIT Documents: the NIT document carries its published date, the day IREPS sent the NIT message (the first of two; never a corrigendum message\'s day)', async () => {
+  const day = (back) => new Date(TODAY().getFullYear(), TODAY().getMonth(), TODAY().getDate() - back);
+  const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  mk({ tenders: [futureT({ no: 'P7', nitId: '7', oid: '70', attachments: att('p7') })], messages: [
+    nitMsg('P7', dmy(day(0).getTime())),
+    { date: dmy(day(2).getTime()), subject: 'Issue of Corrigendum towards STORES-PCMM/SOUTH EASTERN RLY, Tender no: P7' },
+    nitMsg('P7', dmy(day(1).getTime())),
+  ] });
+  store['doclink.saveDestination'] = 'recon';
+  await withDirectEcm(async ({ creates, attaches, puts }) => {
+    const r = await autoRun({ from: day(2) });
+    assert.equal(r.tenders.length, 1, 'one tender: its NIT and corrigendum messages');
+    assert.equal(r.tenders[0].categories.tenderPdf.status, 'DOWNLOADED');
+    const nits = creates.filter((p) => p['InvoiceCertificateSchema:type'] === 'nit');
+    assert.deepEqual(nits.map((p) => [p['dc:title'], p['InvoiceCertificateSchema:publishedDate']]), [['P7 - NIT', iso(day(1))]], 'IREPS sent the NIT message twice: the day it first did, not the earlier corrigendum message\'s');
+    assert.deepEqual(Object.keys(nits[0]).filter((k) => k !== 'folder').sort(), ['InvoiceCertificateSchema:publishedDate', 'InvoiceCertificateSchema:tenderDate', 'InvoiceCertificateSchema:tenderNumber', 'InvoiceCertificateSchema:type', 'dc:title', 'file:content']);
+    assert.deepEqual(attaches.map(([title]) => title), ['P7 - NIT'], 'the attachment goes into it');
+    assert.equal(puts.length, 0, 'the document has the date from its first PDF');
+  });
+});
+test('ECM direct, NIT Documents: an NIT document stored before the ECM had the published date is still found, and the next PDF fills the date in', async () => {
+  mk({ tenders: [futureT({ no: 'P8', nitId: '8', oid: '80', attachments: att('p8') })], messages: [nitMsg('P8')] });
+  store['doclink.saveDestination'] = 'recon';
+  await withDirectEcm(async ({ creates, attaches, puts, docs }) => {
+    docs.set('old-1', { props: { 'dc:title': 'P8 - NIT', 'InvoiceCertificateSchema:type': 'nit', 'InvoiceCertificateSchema:tenderNumber': 'P8', 'InvoiceCertificateSchema:tenderDate': '2026-01-05' }, main: { name: 'older.pdf', length: 10 }, files: [] });
+    const r = await autoRun();
+    assert.equal(r.tenders[0].status, 'DOWNLOADED');
+    assert.equal(creates.length, 0, 'no second "P8 - NIT" document');
+    assert.deepEqual(attaches.map(([title]) => title), ['P8 - NIT', 'P8 - NIT']);
+    const t = TODAY();
+    assert.deepEqual(puts, [{ uid: 'old-1', 'InvoiceCertificateSchema:publishedDate': `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}` }], 'only what it lacked: the tender date it has stays');
+  });
 });
 test('ECM direct: when IREPS serves the tender PDF last, it is still the main file of "<T> - NIT" (the attachments wait for it)', async () => {
   mk({ tenders: [FULL()] });

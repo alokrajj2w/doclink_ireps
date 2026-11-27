@@ -136,6 +136,7 @@ After code changes, reload DocLink in `chrome://extensions`.
   - **Grouped kinds are direct-ECM only.** The gateway can't add attachments, so with `ecmBackendAws: true` they're refused and saved locally.
   - Corrigenda, NBSP, CO, CRP and the Commercial Tabulation (`vct`) stay one document per PDF.
   - Every tender document carries `tender_date` (the IREPS closing date). `vft` remains in the catalog, in step with the gateway, but is unused.
+  - An NIT also carries `published_date`, the day IREPS sent its NIT message (My Messages "Sent Date/Time"; `nitSentDate` in `tender/tender-auto.js`), as Wabtec asked on 27 Nov 2026 (the publish date is the sent date). It is a `details` field. `InvoiceCertificateSchema:publishedDate` is the expected name until the ECM team confirms it: `check-ecm-schema.mjs` must show it on TEST and PROD before a build ships it.
   - The client asked for the LOA fields and the correspondence tender date on 13 Nov 2026. The tech lead decided on 15 Nov 2026 that they ship without a setting. An LOA also carries:
     - `loi_number`, the number printed on the letter: `<Dept> / <Tender No> / <LetterId>`, e.g. `DAHOD / 61265711C / 1503282`;
     - `loi_date`, the LOA list row's Letter Date.

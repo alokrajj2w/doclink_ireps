@@ -1153,7 +1153,7 @@ settings, sign-in cookie and host permission as section 15:
 | Inspection Certificate | `inspectionCertificate` | `ic_number` (the IC PDF's file name, e.g. `3480517`), `customer_po_number`, `ic_date`, `customer_po_serial_number` (the row's "PO Sr.", e.g. `001`), `passed_quantity` (its "Passed Qty.") | `3480517 - IC` |
 | PO | `poCopy` | `customer_po_number` | `<PO no> - PO` |
 | Modification Advice | `modificationAdvise` | `customer_po_number`, `modification_advise_number` | `<MA no> - MA` |
-| NIT + attached documents | `nit` | `tender_number`, `tender_date` | **one document per tender**, `<tender no> - NIT`: the tender PDF is its main file, each attached document an attachment |
+| NIT + attached documents | `nit` | `tender_number`, `tender_date`, `published_date` (the day IREPS sent the NIT message) | **one document per tender**, `<tender no> - NIT`: the tender PDF is its main file, each attached document an attachment |
 | Corrigendum | `extension` | same | `<tender no> - Extension - <corrigendum no>`; a document attached to it `<tender no> - Extension - <corrigendum no> - Attachment <n>` |
 | Negotiation letter | `nbsp` | same | `<tender no> - NBSP - <letter id>` |
 | Counter offer | `co` | same | `<tender no> - CO - <letter id>` |
@@ -1226,6 +1226,19 @@ no setting to switch them.
     its old metadata: DocLink does not add the two fields to it.
   - The Recon gateway's `document_kinds.toml` needs the same two fields before
     `ecmBackendAws: true`.
+
+**The NIT's published date (asked for on 27/11/2026).** Wabtec checks which NITs reached the ECM
+by the day IREPS published them, and the publish date is the NIT message's sent date (Girija,
+27/11/2026). So an NIT carries `published_date`: the day of its NIT message's "Sent Date/Time"
+in My Messages (the earliest, when IREPS sent the message twice), as YYYY-MM-DD.
+- NIT Documents and the scheduled NIT run start from that message, so every NIT they save has it.
+  No other document carries it.
+- It describes the NIT without identifying it (`details` in `ecm-catalog.js`), so an NIT stored
+  before the ECM had the property is still found. It gets the date when a later PDF of its tender
+  is added to it (DocLink fills in what a document lacks); otherwise it keeps none.
+- The ECM property is `InvoiceCertificateSchema:publishedDate`, the name DocLink expects until the
+  ECM team confirms it. Run `node scripts/check-ecm-schema.mjs` on TEST and PROD before a build that
+  sends it: the ECM refuses every NIT that names a property it lacks ("No such property").
 
 **Where the tender date comes from.**
 

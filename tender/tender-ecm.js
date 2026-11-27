@@ -80,7 +80,9 @@ export async function savedDestination() {
  * tells them apart: "29263265 - Extension - 1", "29263265 - NBSP - 1204920".
  * Only the fields the ECM has for the kind are sent (services/ecm-catalog.js): the tender
  * number, and the tender date (IREPS closing date) when the run knows it. An LOA also carries its
- * LOA number and LOA date (loaFields below), as the client asked on 13 Nov 2026.
+ * LOA number and LOA date (loaFields below), as the client asked on 13 Nov 2026. An NIT carries its
+ * published date, the day IREPS sent its NIT message (ctx.nitSentDate, set by NIT Documents and the
+ * scheduled NIT run in tender-auto.js), as Wabtec asked on 27 Nov 2026.
  *   action = the download action ({ id, unit, meta: { title, docDate } }), ctx = run.ctx
  */
 export function ecmDocumentFor(category, action, ctx) {
@@ -98,6 +100,7 @@ export function ecmDocumentFor(category, action, ctx) {
   }[category];
   const known = { tender_number: tenderNo, tender_date: ctx.closingDate || localDay(ctx.dueDate) };
   if (category === 'LOA') Object.assign(known, loaFields(action.unit, tenderNo, id, meta.docDate));
+  if (ctx.nitSentDate) known.published_date = ctx.nitSentDate; // only the NIT kind lists it
   const fields = Object.fromEntries(ECM_KINDS[kind].fields.filter((key) => key in known).map((key) => [key, known[key]]));
   const title = [tenderNo, ECM_KINDS[kind].code, detail].filter(Boolean).join(' - ');
   return { kind, title: title.replace(/\s+/g, ' ').trim().slice(0, TITLE_MAX), fields };

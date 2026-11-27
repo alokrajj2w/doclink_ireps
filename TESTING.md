@@ -668,18 +668,22 @@ node test/mock/switch-target.mjs status
     built zip has no `config.local.json`, so it saves locally). The TEST
     ECM's Tenders folder must exist.
     0. Run `node scripts/check-ecm-schema.mjs`. Every line must say `ok`,
-       `customer_po_serial_number` and `passed_quantity` included. A
+       `customer_po_serial_number`, `passed_quantity` and `published_date`
+       included. A
        `MISSING` line means the ECM names that property differently: find
        its name under "Its other properties", and change it in
        `services/ecm-catalog.js` `ECM_FIELDS` before you go on.
-    1. Download one tender's NIT, an LOA, a Negotiation or Counter Offer
-       letter, a Pending Correspondence letter, and the ICs of one PO.
+    1. Download one tender's NIT with NIT Documents (on the day of its NIT
+       message), an LOA, a Negotiation or Counter Offer letter, a Pending
+       Correspondence letter, and the ICs of one PO.
     2. In the ECM, check the documents:
        - each one shows **Tender Number** and **Tender Date**. The date is the
          tender's closing date, the "Due Date/Time" of IREPS's Search Tender;
        - the `<tender> - LOA` document also shows **LOI Number** as printed on
          the letter ("Letter No: DAHOD / 61265711C / 1503282"), and **LOI
          Date** as the letter's "Dated";
+       - the `<tender> - NIT` document also shows the **Published Date**: the
+         day in its NIT message's "Sent Date/Time" in IREPS's My Messages;
        - a correspondence document's Tender Date is the "Closing Date" next to
          the tender number on its Tender Related Correspondence page, not the
          reply deadline;
