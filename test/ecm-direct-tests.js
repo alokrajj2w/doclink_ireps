@@ -3,7 +3,7 @@
  * ECM (Nuxeo) REST API itself (services/ecm-direct.js) with the folders of
  * services/ecm-catalog.js. A fake Nuxeo answers the token, NXQL search, batch upload and
  * create calls and records them - request shapes, the spec's queries, token reuse and
- * refresh, deduplication, folder routing for every kind and site, the PROD creation folder, every
+ * refresh, deduplication, folder routing for every kind and site, the PROD TST site, every
  * error path, the config.local.json merge and the gateway / direct switch. No extension
  * APIs are used. Invoked from run-tests.js.
  */
@@ -13,7 +13,7 @@ import { uploadToNuxeo, buildEcmQuery, existingDocumentQuery, groupDocumentQuery
 import { applyEcmConfig, ECM_CONFIG, isDirectEcm } from "../services/ecm-config.js";
 import { mergeConfig } from "../utils/config.js";
 import { DeadlineError } from "../utils/http.js";
-import { ECM_KINDS, ECM_SITES, PROD_CREATION_FOLDER, routeSite } from "../services/ecm-catalog.js";
+import { ECM_KINDS, ECM_SITES, PROD_TST_SITE, routeSite } from "../services/ecm-catalog.js";
 import { applyReconConfig } from "../services/recon-service.js";
 
 const DOMAIN = "http://ecm.test:8080";
@@ -514,24 +514,28 @@ export async function runEcmDirectTests({ test, assert, eq }) {
     eq(gateway.calls.length, 0, "nothing sent");
   });
 
-  await test("ECM direct: on PROD every kind of both sites goes to the one creation folder, opened once", async () => {
+  await test("ECM direct: on PROD both accounts go to the TST site, Inputs and Tenders folders, each opened once", async () => {
     const prod = { ...CONFIG, ecm: { ...CONFIG.ecm, env: "PROD" } };
-    const folder = PROD_CREATION_FOLDER.uid;
+    const inputs = PROD_TST_SITE.inputs.uid;
+    const tenders = PROD_TST_SITE.tenders.uid;
     fresh(prod);
     const fetch = fakeNuxeo();
     const deps = { fetch, hostPermissions: HOSTS };
-    await uploadToNuxeo(IC, deps);
+    const ic = await uploadToNuxeo(IC, deps);
     await uploadToNuxeo({ ...IC, account: ROHTAK, filename: "second.pdf" }, deps);
     await uploadToNuxeo({ ...IC, kind: ECM_KIND.NIT, fields: { tender_number: "T-1" }, filename: "nit.pdf" }, deps);
     await uploadToNuxeo({ ...IC, kind: ECM_KIND.COUNTER_OFFER, account: ROHTAK, fields: { tender_number: "T-2" }, filename: "co.pdf" }, deps);
-    eq(fetch.creates().map((c) => c.path).join(" | "), Array(4).fill(`/nuxeo/api/v1/id/${folder}`).join(" | "), "Hosur and Rohtak, inputs and tenders");
-    eq(fetch.calls.filter((c) => c.method === "GET" && c.path === `/nuxeo/api/v1/id/${folder}`).length, 1, "the folder is opened once per session");
+    eq(fetch.creates().map((c) => c.path).join(" | "), [inputs, inputs, tenders, tenders].map((uid) => `/nuxeo/api/v1/id/${uid}`).join(" | "), "Hosur and Rohtak: IC to Inputs, tenders to Tenders");
+    eq(ic.site, "tst");
+    for (const uid of [inputs, tenders]) eq(fetch.calls.filter((c) => c.method === "GET" && c.path === `/nuxeo/api/v1/id/${uid}`).length, 1, `folder ${uid} is opened once per session`);
     eq(fetch.calls.filter((c) => c.query && c.query.includes("ecm:path =")).length, 0, "no path lookup");
+    eq(routeSite("PROD", { irepsAccountId: "833", operatingUnit: "ROHTAK" }), "tst", "both accounts and units are the one PROD site");
+    eq((await rejectsEcm(uploadToNuxeo({ ...IC, account: { irepsAccountId: "999" } }, deps), ECM_ERROR.REJECTED)).detail, "no ECM site for IREPS account 999", "any other account is still refused");
 
     fresh(prod);
-    const gone = fakeNuxeo({ respond: (call) => (call.method === "GET" && call.path === `/nuxeo/api/v1/id/${folder}` ? jsonResponse(404, { "entity-type": "exception", status: 404, message: folder }) : undefined) });
-    const error = await rejectsEcm(uploadToNuxeo(IC, { fetch: gone, hostPermissions: HOSTS }), ECM_ERROR.REJECTED, "a folder the ECM cannot open");
-    assert(error.detail.includes(folder), error.detail);
+    const gone = fakeNuxeo({ respond: (call) => (call.method === "GET" && call.path === `/nuxeo/api/v1/id/${tenders}` ? jsonResponse(404, { "entity-type": "exception", status: 404, message: tenders }) : undefined) });
+    const error = await rejectsEcm(uploadToNuxeo({ ...IC, kind: ECM_KIND.NIT, fields: { tender_number: "T-1" } }, { fetch: gone, hostPermissions: HOSTS }), ECM_ERROR.REJECTED, "a folder the ECM cannot open");
+    eq(error.detail, `the TST tenders folder ${PROD_TST_SITE.tenders.path} (uid ${tenders}) cannot be opened on the ECM: HTTP 404 - ${tenders}`);
     eq(gone.creates().length, 0, "nothing created");
   });
 
@@ -583,10 +587,10 @@ export async function runEcmDirectTests({ test, assert, eq }) {
       "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'inspectionCertificate' AND ecm:ancestorId = 'ad5090e5-648d-4f75-8c14-7052e8ac3b72' ORDER BY dc:created DESC");
     eq(buildEcmQuery({ env: "TEST", site: "rohtak", kind: "nit" }),
       "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'nit' AND ecm:ancestorId = '34a61f51-10fe-44ce-a669-2ea14dc86ff4' ORDER BY dc:created DESC");
-    eq(buildEcmQuery({ env: "PROD", site: "hosur", kind: "poCopy", filters: { customer_po_number: "PO-1", ic_number: "" } }),
-      "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'poCopy' AND ecm:ancestorId = '7dfe3fc0-3157-489d-826a-9435e65631fc' AND InvoiceCertificateSchema:customerPONumber = 'PO-1' ORDER BY dc:created DESC");
+    eq(buildEcmQuery({ env: "PROD", site: "tst", kind: "poCopy", filters: { customer_po_number: "PO-1", ic_number: "" } }),
+      "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0 AND InvoiceCertificateSchema:type = 'poCopy' AND ecm:ancestorId = '05d52729-d82c-4f76-a530-dc915b83660c' AND InvoiceCertificateSchema:customerPONumber = 'PO-1' ORDER BY dc:created DESC");
     eq(buildEcmQuery({ site: "hosur", kind: "inspectionCertificate", filters: { ic_date: "09/11/2026" } }).includes("(InvoiceCertificateSchema:icDate >= TIMESTAMP '2026-11-08T18:30:00.000Z' AND InvoiceCertificateSchema:icDate < TIMESTAMP '2026-11-09T18:30:00.000Z')"), true, "a date filter is the IST day as a timestamp range (a plain string is an invalid query)");
-    eq(buildEcmQuery({ env: "PROD", site: "rohtak", kind: "modificationAdvise" }).includes("ecm:ancestorId = 'f2a5bf87-877b-4e4c-b4fc-7301cabfd236'"), true);
+    eq(buildEcmQuery({ env: "PROD", site: "tst", kind: "modificationAdvise" }).includes("ecm:ancestorId = '05d52729-d82c-4f76-a530-dc915b83660c'"), true, "PROD searches are scoped to the TST site");
     eq(nxqlLiteral("O'Brien \\ x"), "'O\\'Brien \\\\ x'", "quotes and backslashes escaped");
     eq(nxqlLiteral(true), "1");
     eq(existingDocumentQuery({ kind: "co", folderUid: "f-1", title: "T - CO 1", filename: "a.pdf", values: { tender_number: "T" } }),

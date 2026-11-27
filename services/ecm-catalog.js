@@ -82,11 +82,18 @@ export const ECM_KINDS = Object.freeze({
 export const isGroupedKind = (kind) => Boolean(ECM_KINDS[kind] && ECM_KINDS[kind].group);
 
 /**
- * The PROD folder DocLink's PROD client may create documents in (16/11/2026), used for every
- * kind of both sites until the per-site folders are supplied. Its path is not confirmed yet:
- * the first upload of a session logs the real one ("ECM folder ... is at ...").
+ * The PROD site DocLink's PROD client can write to: the TEST space ("TST") on the PROD ECM,
+ * supplied by the ECM team on 18/11/2026. Until the client has access to the Hosur (HSR) and
+ * Rohtak (HPD) sites, the documents of both IREPS accounts go here. When it does, replace the
+ * PROD entry of ECM_SITES below with one site per account (as TEST has), and keep the Recon
+ * gateway's sites.prod.toml in step. The paths are for messages only: uploads use the uids, and
+ * the first upload of a session logs the real path when it differs ("ECM folder ... is at ...").
  */
-export const PROD_CREATION_FOLDER = Object.freeze({ uid: "99e2faf3-7f92-4d5b-af65-6f90eeb48a53", path: "(PROD creation folder, path to confirm)" });
+export const PROD_TST_SITE = Object.freeze({
+  siteId: "05d52729-d82c-4f76-a530-dc915b83660c",
+  inputs: Object.freeze({ uid: "99e2faf3-7f92-4d5b-af65-6f90eeb48a53", path: "/FT/workspaces/Sites/TST/Invoice Certificate/Inputs" }),
+  tenders: Object.freeze({ uid: "a1060813-c249-4874-999d-24b0d2431d20", path: "/FT/workspaces/Sites/TST/Invoice Certificate/Tenders" })
+});
 
 /**
  * Sites by environment.
@@ -122,28 +129,21 @@ export const ECM_SITES = Object.freeze({
       folderIds: { inputs: "93a37d6e-f3e1-499b-9f10-6ba52f1262bb", tenders: "a6594520-2d2b-4a33-b344-47426e116389" }
     }
   },
-  // Site ids from "Download and Upload v1.xlsx"; confirm before first PROD use. Until the ECM
-  // team supplies each site's Inputs and Tenders folders, every PROD document of both sites,
-  // tenders included, goes to the one creation folder DocLink's PROD client can write to
-  // (PROD_CREATION_FOLDER). The spreadsheet's Inputs paths, for when they do:
-  //   Hosur  /FT/workspaces/Sites/HSR/Invoice Certificate/Inputs
-  //   Rohtak /FT/workspaces/Sites/HPD/Invoice Certificate/Input   ("Input", singular)
+  // One site for both accounts until the client has access to Hosur and Rohtak (PROD_TST_SITE).
+  // What "TSG India Doculink ECM specifications.xlsx" gives for those sites, for when it does:
+  //   Hosur  (833)   ecm:ancestorId 7dfe3fc0-3157-489d-826a-9435e65631fc
+  //                  Inputs /FT/workspaces/Sites/HSR/Invoice Certificate/Inputs
+  //   Rohtak (60828) ecm:ancestorId f2a5bf87-877b-4e4c-b4fc-7301cabfd236
+  //                  Inputs /FT/workspaces/Sites/HPD/Invoice Certificate/Input   ("Input", singular)
+  //   No PROD Tenders paths and no folder uids yet.
   [ECM_ENV.PROD]: {
-    hosur: {
-      name: "Hosur",
-      siteId: "7dfe3fc0-3157-489d-826a-9435e65631fc",
-      vendorCodes: ["833"],
-      operatingUnits: ["HOSUR", "HSR"],
-      locations: { inputs: PROD_CREATION_FOLDER.path, tenders: PROD_CREATION_FOLDER.path },
-      folderIds: { inputs: PROD_CREATION_FOLDER.uid, tenders: PROD_CREATION_FOLDER.uid }
-    },
-    rohtak: {
-      name: "Rohtak",
-      siteId: "f2a5bf87-877b-4e4c-b4fc-7301cabfd236",
-      vendorCodes: ["60828"],
-      operatingUnits: ["ROHTAK", "BRH"],
-      locations: { inputs: PROD_CREATION_FOLDER.path, tenders: PROD_CREATION_FOLDER.path },
-      folderIds: { inputs: PROD_CREATION_FOLDER.uid, tenders: PROD_CREATION_FOLDER.uid }
+    tst: {
+      name: "TST",
+      siteId: PROD_TST_SITE.siteId,
+      vendorCodes: ["833", "60828"],
+      operatingUnits: ["HOSUR", "HSR", "ROHTAK", "BRH"],
+      locations: { inputs: PROD_TST_SITE.inputs.path, tenders: PROD_TST_SITE.tenders.path },
+      folderIds: { inputs: PROD_TST_SITE.inputs.uid, tenders: PROD_TST_SITE.tenders.uid }
     }
   }
 });
