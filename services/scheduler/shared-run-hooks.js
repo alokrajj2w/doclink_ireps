@@ -19,7 +19,9 @@
  * document that could not be saved, with its reason.
  *
  * `details()` lists what the run saved, skipped and could not save (with the code and reason of each),
- * for the slot's result and this browser's run log (run-details.js, run-log.js).
+ * for the slot's result and this browser's run log (run-details.js, run-log.js), and `seen`: every document the
+ * run's IREPS lists named, once, with what helps find it in IREPS and what became of it (document-ledger.js,
+ * My Downloads > Missed documents). `seen` never goes to the Recon Engine.
  */
 
 import { downloadKey, exportFingerprint, downloadRecord, logDownload, describeSkip, SKIP_REASON, LOG_DESTINATION } from "../download-log.js";
@@ -27,7 +29,7 @@ import { uploadToEcm, ECM_OUTCOME, EcmError } from "../ecm-service.js";
 import { saveExportFileTo, WorkflowError } from "../export-save-service.js";
 import { SAVE_DESTINATION } from "../recon-service.js";
 import { DOCUMENT_DOWNLOAD_STATUS } from "../search-po/document-downloader.js";
-import { failureEntry, docEntry, labelFromKey, tenderCode, LOG_DOCS_MAX } from "./run-details.js";
+import { failureEntry, docEntry, withKey, labelFromKey, tenderCode, docInfo, seenList, LOG_DOCS_MAX, SEEN_MAX, SEEN_STATUS } from "./run-details.js";
 import { logger } from "../../utils/logger.js";
 
 /** Keys per reserve request (the backend takes up to 100). */
@@ -43,6 +45,16 @@ export class SharedRunError extends Error {
     this.code = code;
     this.detail = detail;
   }
+}
+
+/**
+ * A reservation's "already saved" as `seen` keeps it: by whom and when (IST). A document another run holds right now
+ * is not saved yet: whichever run saves it, the next one finds it saved.
+ */
+function seenTaken(skip) {
+  if (skip && skip.inProgress) return { status: SEEN_STATUS.UNREAD, code: "SCHEDULE_NOT_RESERVED", detail: `being saved by ${skip.by || "another DocLink run"}` };
+  const when = skip && skip.date ? `${skip.date}${skip.time ? ` ${String(skip.time).slice(0, 5)}` : ""}` : "";
+  return { status: SEEN_STATUS.ALREADY, by: (skip && skip.by) || "", when };
 }
 
 /** "2026-11-16T04:38:00+00:00" -> { date: "2026-11-16", time: "10:08:00" } in IST. */
@@ -102,6 +114,15 @@ export function createSharedRunHooks(deps) {
   /** what the run did, document by document (details()) */
   const lists = { failures: [], saved: [], skipped: [] };
   const more = { failures: 0, saved: 0, skipped: 0 };
+  /** every document the run's lists named ("item:<id>" in a PDF run, "key:<key>" in a tender run) -> what became of it */
+  const seen = new Map();
+
+  /** Note a document IREPS listed, or what became of it: the entry is made the first time, then updated. */
+  function see(id, entry) {
+    const known = seen.get(id);
+    if (known) Object.assign(known, entry);
+    else if (seen.size < SEEN_MAX) seen.set(id, { ...entry });
+  }
 
   /** Add an entry to one of the run's lists, counting what does not fit. */
   function note(list, entry) {
@@ -165,9 +186,12 @@ export function createSharedRunHooks(deps) {
     for (const item of items) {
       const key = item.log && item.log.key;
       labels.set(item.id, item.label || labelFromKey(key) || String(item.id));
+      // listed by IREPS: named by its key when it has one (its numbers; an IC's with its PO)
+      see(`item:${item.id}`, { key, doc: labelFromKey(key) || labels.get(item.id), info: docInfo(item), status: SEEN_STATUS.UNREAD });
       if (!key) {
         skip.set(item.id, { reason: SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT, by: "", note: "no document key" });
         note("skipped", docEntry(labels.get(item.id), "not downloaded: no document number to reserve it by"));
+        see(`item:${item.id}`, { status: SEEN_STATUS.FAILED, code: "SCHEDULE_NOT_RESERVED", detail: "not downloaded: no document number to reserve it by" });
       } else byKey.set(item.id, key);
     }
     let alreadySaved = 0;
@@ -180,7 +204,8 @@ export function createSharedRunHooks(deps) {
           const taken = takenSkip(answer.taken.get(key));
           skip.set(id, taken);
           alreadySaved++;
-          note("skipped", docEntry(labels.get(id), describeSkip(taken)));
+          note("skipped", withKey(docEntry(labels.get(id), describeSkip(taken)), key));
+          see(`item:${id}`, seenTaken(taken));
         }
       }
     } catch (error) {
@@ -218,8 +243,35 @@ export function createSharedRunHooks(deps) {
     if (!item.log || !granted.has(item.id)) return;
     pendingDone.push(downloadRecord(item.log, { filename: done.filename, ecm: done.ecm, account }));
     stats.saved++;
-    note("saved", docEntry(labels.get(item.id) || item.label, ecmNote(done.filename, done.ecm)));
+    note("saved", withKey(docEntry(labels.get(item.id) || item.label, ecmNote(done.filename, done.ecm)), granted.get(item.id)));
+    see(`item:${item.id}`, { status: SEEN_STATUS.SAVED });
     if (pendingDone.length >= COMPLETE_BATCH) await flushDone();
+  }
+
+  /**
+   * A PDF run's final row: what it adds about the document (a batch row carries the PO's or IC's date and railway),
+   * and a row never offered to the reservation (no PDF link: skipped with the link error) as a document not saved.
+   */
+  function seeFinal(item) {
+    const id = `item:${item.id}`;
+    const known = seen.get(id);
+    if (known) {
+      known.info = { ...docInfo(item), ...(known.info || {}) };
+      return;
+    }
+    const error = item.error || {};
+    if (item.status === DOCUMENT_DOWNLOAD_STATUS.COMPLETED || !error.code) return;
+    const key = item.log && item.log.key;
+    see(id, { key, doc: labelFromKey(key) || item.label || String(item.id), info: docInfo(item), status: SEEN_STATUS.FAILED, code: error.code, detail: error.detail || null });
+  }
+
+  /** Documents listed but never reached (the reservation failed, the run stopped): with the code the run stopped with. */
+  function seeUnread() {
+    for (const entry of seen.values()) {
+      if (entry.status !== SEEN_STATUS.UNREAD || entry.code) continue;
+      entry.code = aborted || "SCHEDULE_DOWNLOAD_FAILED";
+      entry.detail = "not downloaded: the run stopped before it";
+    }
   }
 
   /**
@@ -230,14 +282,18 @@ export function createSharedRunHooks(deps) {
   async function finishDocuments(items) {
     const failed = [];
     for (const item of items || []) {
+      seeFinal(item);
       const key = granted.get(item.id);
       if (!key || item.status === DOCUMENT_DOWNLOAD_STATUS.COMPLETED) continue;
       const info = failureInfo.get(item.id) || {};
       const error = item.error || {};
       const code = info.code || error.code || "SCHEDULE_DOWNLOAD_FAILED";
       failed.push({ doc_key: key, destination: LOG_DESTINATION.ECM, code });
-      note("failures", failureEntry({ doc: labels.get(item.id) || item.label, key, code, detail: info.detail || error.detail || (error.status ? `HTTP ${error.status}` : null) }));
+      const detail = info.detail || error.detail || (error.status ? `HTTP ${error.status}` : null);
+      note("failures", withKey(failureEntry({ doc: labels.get(item.id) || item.label, key, code, detail }), key));
+      see(`item:${item.id}`, { status: SEEN_STATUS.FAILED, code, detail });
     }
+    seeUnread();
     stats.failed += failed.length;
     const done = pendingDone;
     pendingDone = [];
@@ -312,7 +368,9 @@ export function createSharedRunHooks(deps) {
     for (const k of answer.granted) grantedKeys.add(k);
     const taken = new Map([...answer.taken].map(([k, v]) => [k, takenSkip(v)]));
     stats.skipped += taken.size;
-    for (const [k, skip] of taken) note("skipped", docEntry(labelFromKey(k), describeSkip(skip)));
+    for (const [k, skip] of taken) note("skipped", withKey(docEntry(labelFromKey(k), describeSkip(skip)), k));
+    for (const k of new Set(keys)) if (!seen.has(`key:${k}`)) see(`key:${k}`, { key: k, doc: labelFromKey(k), status: SEEN_STATUS.UNREAD });
+    for (const [k, skip] of taken) see(`key:${k}`, seenTaken(skip));
     return { granted: answer.granted, taken };
   }
 
@@ -337,7 +395,8 @@ export function createSharedRunHooks(deps) {
     savedKeys.add(record.doc_key);
     stats.saved++;
     const ecm = record.ecm || null;
-    note("saved", docEntry(labelFromKey(record.doc_key), ecmNote(record.filename, ecm && { status: ecm.status, path: ecm.path })));
+    note("saved", withKey(docEntry(labelFromKey(record.doc_key), ecmNote(record.filename, ecm && { status: ecm.status, path: ecm.path })), record.doc_key));
+    see(`key:${record.doc_key}`, { key: record.doc_key, doc: labelFromKey(record.doc_key), status: SEEN_STATUS.SAVED });
     await flushDone();
   }
 
@@ -366,14 +425,18 @@ export function createSharedRunHooks(deps) {
       const entry = tenderFailures.get(key)
         || failureEntry({ key, code: stopped ? tenderCode(stopped) : "SCHEDULE_DOWNLOAD_FAILED", detail: stopped ? "not downloaded: the run stopped before it" : "reserved, but no file was saved and no error was reported" });
       failed.push({ doc_key: key, destination: LOG_DESTINATION.ECM, code: entry.code });
-      note("failures", entry);
+      note("failures", withKey(entry, key));
+      see(`key:${key}`, { key, doc: entry.doc, status: SEEN_STATUS.FAILED, code: entry.code, detail: entry.detail });
     }
     // the reported failures that are not a reservation to release: still documents that were not saved
     let unreserved = 0;
     for (const [key, entry] of tenderFailures) {
       if (grantedKeys.has(key) && !savedKeys.has(key)) continue;
-      note("failures", entry);
+      note("failures", withKey(entry, key));
       unreserved++;
+      // a document saved only in part (an attachment missing) is not saved; one without a key keeps the tender code's name
+      const keyless = key.startsWith("#");
+      see(keyless ? key : `key:${key}`, { key: keyless ? undefined : key, doc: entry.doc, status: SEEN_STATUS.FAILED, code: entry.code, detail: entry.detail });
     }
     stats.failed += failed.length + unreserved;
     const done = pendingDone;
@@ -384,7 +447,7 @@ export function createSharedRunHooks(deps) {
 
   /** What the run did, document by document: { failures, saved, skipped } (and how many more did not fit). */
   function details() {
-    return { failures: [...lists.failures], saved: [...lists.saved], skipped: [...lists.skipped], more: Object.fromEntries(Object.entries(more).filter(([, n]) => n > 0)) };
+    return { failures: [...lists.failures], saved: [...lists.saved], skipped: [...lists.skipped], more: Object.fromEntries(Object.entries(more).filter(([, n]) => n > 0)), seen: seenList([...seen.values()]) };
   }
 
   return {

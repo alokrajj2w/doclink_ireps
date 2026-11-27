@@ -27,7 +27,7 @@
  */
 
 import { createSharedRunHooks } from "./shared-run-hooks.js";
-import { scheduledSearch, resultFailures, failureEntry, shortText } from "./run-details.js";
+import { withKey, scheduledSearch, resultFailures, failureEntry, shortText } from "./run-details.js";
 
 /** A manual run of the same kind holds the job: the slot is given back without counting an attempt. */
 const BUSY_CODES = new Set(["BUSY", "DOCUMENT_BUSY", "MA_BUSY", "BATCH_BUSY"]);
@@ -81,7 +81,7 @@ const withWarnings = (result, warnings) => (warnings.length ? { ...result, warni
 function rowsNotFetched(items) {
   return (Array.isArray(items) ? items : [])
     .filter((i) => i && i.status === "skipped" && !i.skip && i.error && i.error.code)
-    .map((i) => failureEntry({ doc: i.label || String(i.id || ""), code: i.error.code, detail: i.error.detail || null }));
+    .map((i) => withKey(failureEntry({ doc: i.label || String(i.id || ""), code: i.error.code, detail: i.error.detail || null }), i.log && i.log.key));
 }
 
 /** done when nothing went wrong; partial when something was saved; failed (retried) when nothing was. */
@@ -135,7 +135,10 @@ export function createRunnerFactory(deps) {
       const failures = [...details.failures, ...unread];
       const warnings = listWarnings(res.warnings);
       const result = withWarnings({ found: (res.items || []).length, saved: counts.saved, skipped: counts.skipped, failed: counts.failed + unread.length, notReported: counts.notReported, ...resultBase(ctx, failures) }, warnings);
-      const withLog = (outcome) => ({ ...outcome, log: { ...details, failures } });
+      // every IREPS list of the range was read to its end, whatever became of its documents: the run can count as
+      // this type's last successful run (run-details.js lastSuccessAfter)
+      const searchedAll = res.ok && !counts.aborted && !res.sessionExpired && warnings.length === 0 && !(Array.isArray(res.problems) && res.problems.length > 0);
+      const withLog = (outcome) => ({ ...outcome, ...(searchedAll ? { searchedAll: true } : {}), log: { ...details, failures } });
       if (!res.ok) return withLog(failedOutcome(res.code, withDetail(result, res.detail)));
       if (counts.aborted) return withLog(failedOutcome(counts.aborted, result));
       if (res.sessionExpired) return withLog(failedOutcome("IREPS_SESSION_EXPIRED", result));

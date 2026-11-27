@@ -257,8 +257,13 @@ test('7.5: the download-again question, the Recon sign-in page and the gate neve
 });
 
 // ------------------------------------------------ L10: "My downloads" (popup-downloads.js)
-const { initDownloads } = await import('../../popup/popup-downloads.js');
+const { initDownloads, allDownloads, savedFilesSheet } = await import('../../popup/popup-downloads.js');
+const { XLSX_MIME_TYPE } = await import('../../utils/xlsx-writer.js');
+const { describeError: describeErr } = await import('../../utils/messages.js');
 const { localIsoDate } = await import('../../utils/dates.js');
+const { dayLabel } = await import('../../services/scheduler/run-log.js');
+/** The local day `back` days before today, as the view asks for it. */
+const dayBack = (back) => localIsoDate(new Date(Date.now() - back * 86400000));
 const who = { user: { name: 'A', email: 'a@b.test', isAdmin: false }, signedIn: true, unreachable: false };
 initDownloads({
   showView: (name) => { $('view-downloads').hidden = name !== 'downloads'; },
@@ -278,19 +283,24 @@ async function openDownloads() {
   await settle();
 }
 
-test('My downloads (L10): the signed-in user\'s downloads of the last 7 days, 50 at a time, each with where it went', async () => {
+test('My downloads (L10): a button for each of the last 3 days with downloads; the newest is shown, 50 at a time, each with where it went', async () => {
   recon.mode = 'signedIn';
   recon.listed.length = 0;
   const first = Array.from({ length: 50 }, (_, i) => record(i + 1));
   first[0] = record(1, { filename: '3480517.pdf', destination: 'ecm', ecm: { site: 'hosur', status: 'stored', uid: 'u-1', path: '/FT/workspaces/Sites/HSR/Invoice Certificate/Inputs/3480517 - IC' } });
   first[1] = record(2, { doc_type: 'bill_status', filename: 'IREPS_Bill_Status.xlsx', destination: 's3' });
-  recon.downloads = (q) => [200, q.get('offset') === '50' ? { count: 53, downloads: [record(51), record(52), record(53)] } : { count: 53, downloads: first }];
+  recon.downloads = (q) => [200, q.get('offset') === '50' ? { count: 53, downloads: [record(51), record(52), record(53)] } : { count: 53, downloads: q.get('limit') === '1' ? first.slice(0, 1) : first }];
   await openDownloads();
   assert.equal($('view-downloads').hidden, false);
   assert.equal($('downloads-who').textContent, 'Signed in as A (a@b.test)');
-  assert.deepEqual([recon.listed[0].get('to'), recon.listed[0].get('limit'), recon.listed[0].get('offset'), recon.listed[0].get('all')], [localIsoDate(new Date()), '50', null, null], 'today back to 7 days ago, 50 rows, only this user');
+  const counts = recon.listed.filter((q) => q.get('limit') === '1');
+  assert.deepEqual(counts.map((q) => `${q.get('from')}|${q.get('to')}`), [0, 1, 2].map((b) => `${dayBack(b)}|${dayBack(b)}`), 'one count per day back from today, until 3 days had downloads');
+  const page = recon.listed.find((q) => q.get('limit') === '50');
+  assert.deepEqual([page.get('from'), page.get('to'), page.get('offset'), page.get('all')], [dayBack(0), dayBack(0), null, null], 'the newest day, 50 rows, only this user');
+  assert.deepEqual([...$('downloads-days').options].map((o) => `${o.textContent}|${o.selected}|${o.disabled}`), [...[0, 1, 2].map((b) => `${dayLabel(dayBack(b))} · 53 downloads|${b === 0}|false`), 'Other dates|false|false', 'Only the last 3 days with downloads are listed here.|false|true'], 'a Day dropdown, its note at the foot');
+  assert.equal($('downloads-range').hidden, true, 'the From - To row only for other dates');
   assert.equal(rowsShown().length, 50);
-  assert.equal($('downloads-summary').textContent, '50 downloads so far, newest first.');
+  assert.equal($('downloads-summary').textContent, `50 downloads on ${dayLabel(dayBack(0))} so far, newest first.`);
   const ecmCells = rowsShown()[0].querySelectorAll('td');
   assert.deepEqual([ecmCells[0].querySelector('.downloads-date').textContent, ecmCells[1].textContent, ecmCells[2].querySelector('.downloads-file').textContent], ['14/11/2026', 'Inspection Certificate', '3480517.pdf']);
   assert.equal(ecmCells[3].querySelector('.chip').textContent, 'ECM · Hosur');
@@ -300,9 +310,9 @@ test('My downloads (L10): the signed-in user\'s downloads of the last 7 days, 50
   assert.equal($('btn-downloads-more').hidden, false);
   $('btn-downloads-more').click();
   await settle();
-  assert.equal(recon.listed[1].get('offset'), '50');
+  assert.equal(recon.listed.at(-1).get('offset'), '50');
   assert.equal(rowsShown().length, 53);
-  assert.equal($('downloads-summary').textContent, '53 downloads, newest first.');
+  assert.equal($('downloads-summary').textContent, `53 downloads on ${dayLabel(dayBack(0))}, newest first.`);
   assert.equal($('btn-downloads-more').hidden, true, 'a short page is the last one');
 });
 
@@ -324,7 +334,9 @@ test('My downloads (L10): the filters go to the Recon Engine, and an admin may s
     const cells = rowsShown()[0].querySelectorAll('td');
     assert.equal(cells[2].querySelector('.downloads-user').textContent, 'someone@b.test');
     assert.match(cells[3].textContent, /already there/);
-    assert.equal($('downloads-summary').textContent, '1 download by all users, newest first.');
+    assert.equal($('downloads-summary').textContent, `1 download on ${dayLabel(dayBack(0))} by all users, newest first.`);
+    assert.deepEqual([q.get('from'), q.get('to')], [dayBack(0), dayBack(0)], 'the day shown');
+    assert.equal(recon.listed.filter((x) => x.get('limit') === '1').every((x) => x.get('doc_type') === 'ic' || x.get('doc_type') === null), true, 'the days are counted with the filters');
   } finally {
     who.user = { name: 'A', email: 'a@b.test', isAdmin: false };
     $('downloads-destination').value = '';
@@ -391,7 +403,7 @@ test('7.9: My downloads: a filter changed while a page is being read is never dr
     $('view-downloads').hidden = true;
     $('btn-downloads-open').click();
     for (let i = 0; i < 50 && recon.listed.length === 0; i++) await tick();
-    assert.equal(recon.listed.length, 1, 'the first page is being read');
+    assert.equal(recon.listed.length, 1, 'the first request (today\'s count) is being read');
     $('downloads-type').value = 'ic';
     $('downloads-type').dispatchEvent(new Event('change'));
     await settle();
@@ -399,12 +411,134 @@ test('7.9: My downloads: a filter changed while a page is being read is never dr
     await settle();
     assert.equal(recon.listed.at(-1).get('doc_type'), 'ic', 'the new filter is asked for');
     assert.deepEqual(rowsShown().map((tr) => tr.querySelector('.downloads-file').textContent), ['IC_new.pdf'], 'and only its downloads are listed');
-    assert.equal($('downloads-summary').textContent, '1 download, newest first.');
+    assert.equal($('downloads-summary').textContent, `1 download on ${dayLabel(dayBack(0))}, newest first.`);
     assert.equal($('btn-downloads-refresh').disabled, false);
   } finally {
     $('downloads-type').value = '';
     recon.hold = null;
   }
+});
+
+test('My downloads: days without downloads (a weekend) are skipped; a day button shows that day, "Other dates" the From - To range', async () => {
+  recon.mode = 'signedIn';
+  recon.listed.length = 0;
+  // downloads today, none on the 2 days before, then 4 and 2 (a Monday after a weekend)
+  const perDay = { [dayBack(0)]: 5, [dayBack(3)]: 4, [dayBack(4)]: 2 };
+  recon.downloads = (q) => {
+    const n = q.get('from') === q.get('to') ? perDay[q.get('from')] || 0 : 11;
+    return [200, { count: n, downloads: Array.from({ length: Math.min(n, Number(q.get('limit'))) }, (_, i) => record(i + 1)) }];
+  };
+  const choices = () => [...$('downloads-days').options].filter((o) => !o.disabled);
+  const choose = (option) => {
+    $('downloads-days').value = option.value;
+    $('downloads-days').dispatchEvent(new Event('change'));
+  };
+  await openDownloads();
+  assert.deepEqual(choices().map((o) => o.textContent), [`${dayLabel(dayBack(0))} · 5 downloads`, `${dayLabel(dayBack(3))} · 4 downloads`, `${dayLabel(dayBack(4))} · 2 downloads`, 'Other dates']);
+  assert.equal(recon.listed.filter((q) => q.get('limit') === '1').length, 5, 'asked day by day until 3 days had downloads');
+  choose(choices()[1]);
+  await settle();
+  const day = recon.listed.at(-1);
+  assert.deepEqual([day.get('from'), day.get('to'), day.get('limit')], [dayBack(3), dayBack(3), '50']);
+  assert.equal(rowsShown().length, 4);
+  assert.equal(choices()[1].selected, true);
+  // other dates: the From - To row, starting on the oldest day offered
+  choose(choices().at(-1));
+  await settle();
+  assert.equal($('downloads-range').hidden, false);
+  assert.deepEqual([$('downloads-from').value, $('downloads-to').value], [dayBack(4), dayBack(0)]);
+  const range = recon.listed.at(-1);
+  assert.deepEqual([range.get('from'), range.get('to')], [dayBack(4), dayBack(0)]);
+  assert.equal($('downloads-summary').textContent, '11 downloads, newest first.');
+});
+/** Catch the files the panel saves (URL.createObjectURL + a link clicked) while `run` runs: [{ blob, name }]. */
+async function filesSaved(run) {
+  const files = [];
+  const { createObjectURL, revokeObjectURL } = URL;
+  const click = dom.window.HTMLAnchorElement.prototype.click;
+  URL.createObjectURL = (blob) => (files.push({ blob }), `blob:test/${files.length}`);
+  URL.revokeObjectURL = () => {};
+  dom.window.HTMLAnchorElement.prototype.click = function () { files.at(-1).name = this.download; };
+  try {
+    await run();
+  } finally {
+    Object.assign(URL, { createObjectURL, revokeObjectURL });
+    dom.window.HTMLAnchorElement.prototype.click = click;
+  }
+  return files;
+}
+
+test('My downloads: Download Excel saves every download of the day shown (every page, the same filters) as one .xlsx; the button says how many', async () => {
+  recon.mode = 'signedIn';
+  recon.listed.length = 0;
+  const all = Array.from({ length: 120 }, (_, i) => record(i + 1));
+  all[0] = record(1, { destination: 'ecm', ecm: { site: 'hosur', status: 'stored', path: '/FT/workspaces/Sites/HSR/Invoice Certificate/Inputs/IC_1 - IC' } });
+  recon.downloads = (q) => {
+    const offset = Number(q.get('offset') || 0);
+    return [200, { count: all.length, downloads: all.slice(offset, offset + Number(q.get('limit'))) }];
+  };
+  await openDownloads();
+  assert.equal($('downloads-export').hidden, false, 'shown with rows');
+  const table = recon.listed.find((q) => q.get('limit') === '50');
+  const before = recon.listed.length;
+  const files = await filesSaved(async () => {
+    $('btn-downloads-excel').click();
+    await settle();
+  });
+  const reads = recon.listed.slice(before);
+  assert.deepEqual(reads.map((q) => q.get('offset')), [null, '50', '100'], 'page by page to the end');
+  const keys = ['from', 'to', 'doc_type', 'destination', 'site', 'all', 'limit'];
+  for (const q of reads) assert.deepEqual(keys.map((k) => q.get(k)), keys.map((k) => table.get(k)), 'the selection the table shows');
+  assert.deepEqual(files.map((f) => [f.name, f.blob.type]), [[`DocLink_saved_files_${dayBack(0)}.xlsx`, XLSX_MIME_TYPE]]);
+  const xml = Buffer.from(await files[0].blob.arrayBuffer()).toString('utf8');
+  assert.ok(xml.startsWith('PK'), 'an .xlsx (a zip)');
+  for (const cell of ['IREPS account', 'ECM folder', 'IC_1.pdf', 'IC_120.pdf', '/FT/workspaces/Sites/HSR/Invoice Certificate/Inputs/IC_1 - IC']) assert.ok(xml.includes(`>${cell}<`), cell);
+  assert.equal($('btn-downloads-excel').textContent, 'Saved 120 rows');
+  assert.equal($('btn-downloads-excel').disabled, false);
+});
+
+test('My downloads: the Excel sheet keeps each row as the log gives it, where it went, and the user when an admin shows everyone\x27s', () => {
+  const ecm = record(7, { time: '09:41:18', destination: 'ecm', ecm: { site: 'rohtak', status: 'already_stored', path: '/FT/x/Inputs/7 - IC' }, user_email: 's@b.test' });
+  const sheet = savedFilesSheet([ecm, record(8, { doc_type: 'bill_status', filename: 'IREPS_Bill_Status.xlsx', destination: 's3' })], true);
+  assert.deepEqual(sheet.headers, ['Date', 'Time', 'Type', 'File', 'IREPS account', 'Location', 'ECM site', 'ECM folder', 'Note', 'User']);
+  assert.deepEqual(sheet.rows, [
+    ['14/11/2026', '09:41:18', 'Inspection Certificate', 'IC_7.pdf', '833', 'ECM', 'Rohtak', '/FT/x/Inputs/7 - IC', 'already in the ECM, not stored twice', 's@b.test'],
+    ['14/11/2026', '10:05:30', 'Bill Status', 'IREPS_Bill_Status.xlsx', '833', 'S3', '', '', '', '']
+  ]);
+  assert.deepEqual(savedFilesSheet([record(9)]).rows[0].slice(5), ['Local', '', '', ''], 'no user column for your own');
+});
+
+test('My downloads: Download Excel reads 5,000 rows at most and says when there were more; exactly 5,000 are all of them', async () => {
+  recon.mode = 'signedIn';
+  for (const [count, cut] of [[5000, false], [5060, true]]) {
+    recon.downloads = (q) => {
+      const offset = Number(q.get('offset') || 0);
+      const n = Math.max(0, Math.min(Number(q.get('limit')), count - offset));
+      return [200, { count, downloads: Array.from({ length: n }, (_, i) => record(offset + i + 1)) }];
+    };
+    recon.listed.length = 0;
+    const got = await allDownloads({ from: dayBack(0), to: dayBack(0) });
+    assert.deepEqual([got.rows.length, got.cut, recon.listed.length], [5000, cut, 100], `${count} in the log`);
+  }
+});
+
+test('My downloads: no rows, no Download Excel; an export the download log does not answer is said in the view, and nothing is saved', async () => {
+  recon.mode = 'signedIn';
+  recon.downloads = () => [200, { count: 0, downloads: [] }];
+  await openDownloads();
+  assert.equal($('downloads-export').hidden, true, 'nothing to export');
+  recon.downloads = (q) => [200, { count: 2, downloads: [record(1), record(2)].slice(0, Number(q.get('limit'))) }];
+  await openDownloads();
+  assert.equal($('downloads-export').hidden, false);
+  recon.downloads = () => [503, { detail: 'down' }];
+  const files = await filesSaved(async () => {
+    $('btn-downloads-excel').click();
+    await settle();
+  });
+  assert.equal(files.length, 0);
+  assert.deepEqual([$('downloads-error').hidden, $('downloads-error-title').textContent], [false, describeErr('DOWNLOAD_LOG_LIST_UNAVAILABLE').title]);
+  assert.equal($('btn-downloads-excel').textContent, 'Download Excel', 'back to its label at once');
+  assert.equal(rowsShown().length, 2, 'the rows shown stay');
 });
 
 // ------------------------------------------------ the whole panel (popup.js) on a fake worker: whose runs it shows (7.1),
@@ -1147,28 +1281,42 @@ test('7.3 (worker): an IC Retry fetches only the failed ICs of the run, for its 
   }
 });
 
-test('Worker: a build loaded (installed, updated or reloaded) starts the run log afresh; Chrome updating itself does not; queued download-log records stay', async () => {
+test('Worker: a build loaded (installed, updated or reloaded) keeps the run log of this Recon server and drops the rest; Chrome updating itself changes nothing; queued download-log records stay', async () => {
   const RUN_LOG = 'doclink.scheduler.runLog';
   const QUEUE = 'doclink.downloadLog.queue.sw';
   const stored = async (key) => (await chrome.storage.local.get(key))[key];
-  // the last build's run and event, possibly of another Recon server, and a record still waiting to be sent
+  const here = new URL(RECON).origin;
+  const other = 'https://recon-test.example';
+  const at = '2026-11-27T04:00:00Z';
+  // a run and an event of this Recon server, of another one, and of a build that did not record its server
   const lastBuild = () => chrome.storage.local.set({
-    [RUN_LOG]: { runs: [{ id: 'old-run', docType: 'billStatus', outcome: 'done' }], events: [{ first: 'x', at: 'x', kind: 'other', text: 'last build' }] },
+    [RUN_LOG]: {
+      runs: [
+        { id: 'this-run', docType: 'ma', outcome: 'done', day: '2026-11-27', startedAt: at, recon: here },
+        { id: 'other-run', docType: 'ma', outcome: 'done', day: '2026-11-27', startedAt: at, recon: other },
+        { id: 'old-run', docType: 'billStatus', outcome: 'done', day: '2026-11-27', startedAt: at },
+      ],
+      events: [
+        { first: at, at, day: '2026-11-27', recon: here, kind: 'other', text: 'this server' },
+        { first: at, at, day: '2026-11-27', recon: other, kind: 'other', text: 'other server' },
+        { first: at, at, kind: 'other', text: 'last build' },
+      ],
+    },
     [QUEUE]: [{ qid: 'q1', doc_type: 'po', key: 'po:1' }],
   });
-  const leftOver = async () => {
+  const kept = async () => {
     const log = (await stored(RUN_LOG)) || { runs: [], events: [] };
-    return log.runs.filter((r) => r.id === 'old-run').length + log.events.filter((e) => e.text === 'last build').length;
+    return [...log.runs.map((r) => r.id), ...log.events.map((e) => e.text)].join();
   };
   await lastBuild();
   sw.installed({ reason: 'chrome_update', previousVersion: '1.7.0' });
   await settle();
-  assert.equal(await leftOver(), 2, 'Chrome updating itself keeps the log');
+  assert.equal(await kept(), 'this-run,other-run,old-run,this server,other server,last build', 'Chrome updating itself keeps the log as it is');
   for (const reason of ['update', 'install']) {
     await lastBuild();
     sw.installed({ reason, previousVersion: '1.7.0' });
-    await until(async () => (await leftOver()) === 0);
-    assert.equal(await leftOver(), 0, `${reason}: the last build's runs and events are gone`);
+    await until(async () => (await kept()) === 'this-run,this server');
+    assert.equal(await kept(), 'this-run,this server', `${reason}: this Recon server's runs and events stay (3 days of history); another server's, and a build's that did not record its server, go`);
     assert.equal((await stored(QUEUE)).length, 1, `${reason}: a queued download-log record is data, not a log, and stays`);
   }
 });

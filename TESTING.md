@@ -909,8 +909,9 @@ End to end, with the mock portal and a local Recon Engine:
 6. Make the mock ECM refuse one IC: it is saved nowhere, the slot shows "Partly done", and the next check fetches
    only that IC. Open the row (▸): "Not saved (1)" names the IC ("IC … (PO … Sr. …)") with the ECM's own reason, not
    "Chrome could not save the file". In the other profile the same row lists it too (from the slot's result). In
-   A's **Run log of this browser** the run opens to the same IC, the ICs already saved ("Already saved by …") and the
-   ones saved ("… in ECM /…"); **Save log** writes `DocLink_scheduler_log_<time>.txt` with all of it.
+   A's **My Downloads > Scheduled runs** the run opens to the same IC, the ICs already saved ("Already saved by …") and
+   the ones saved ("… in ECM /…"); **Download Excel** saves `DocLink_scheduled_runs_<first day>_to_<last day>.xlsx` with
+   the IC under Documents.
 6a. 90 days: let a CRN and an R-NOTE slot run. Their rows say "Searched: <today - 89 days> - <today>", and the mock
    server's request log shows that `dateFrom` / `dateTo` in the searchPO request. Bill Status says "Searched: Last
    90 Days" and sends IREPS's own "Last 90 Days" search. Each `.xlsx` goes to the Recon Engine's

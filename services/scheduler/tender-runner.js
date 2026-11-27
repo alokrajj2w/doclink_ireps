@@ -17,7 +17,7 @@
  */
 
 import { failedOutcome } from "./runners.js";
-import { failureEntry, docEntry, resultFailures, capped, shortText, tenderCode, RESULT_FAILURES_MAX } from "./run-details.js";
+import { failureEntry, docEntry, withKey, resultFailures, capped, shortText, tenderCode, seenList, RESULT_FAILURES_MAX } from "./run-details.js";
 
 export { tenderCode };
 
@@ -74,15 +74,19 @@ const OUTCOMES = new Set(["done", "partial", "failed"]);
 const RESULT_KEYS = ["found", "saved", "skipped", "failed", "notReported", "tenders", "failuresMore"];
 const WARNINGS_MAX = 5;
 
-/** The run log's lists from a runner tab, each entry rebuilt by run-details.js (short, redacted). */
+/**
+ * The run log's lists from a runner tab, each entry rebuilt by run-details.js (short, redacted, with its document key),
+ * and what IREPS listed to the run (`seen`, for document-ledger.js), rebuilt the same way.
+ */
 function cleanLog(log) {
   const l = log && typeof log === "object" ? log : {};
   const list = (items, clean) => capped(Array.isArray(items) ? items.filter((x) => x && typeof x === "object") : []).map(clean);
   return {
-    failures: list(l.failures, failureEntry),
-    saved: list(l.saved, (d) => docEntry(d.doc, d.note)),
-    skipped: list(l.skipped, (d) => docEntry(d.doc, d.note)),
-    more: Object.fromEntries(["failures", "saved", "skipped"].filter((k) => l.more && Number.isFinite(l.more[k]) && l.more[k] > 0).map((k) => [k, l.more[k]]))
+    failures: list(l.failures, (f) => withKey(failureEntry(f), f.key)),
+    saved: list(l.saved, (d) => withKey(docEntry(d.doc, d.note), d.key)),
+    skipped: list(l.skipped, (d) => withKey(docEntry(d.doc, d.note), d.key)),
+    more: Object.fromEntries(["failures", "saved", "skipped"].filter((k) => l.more && Number.isFinite(l.more[k]) && l.more[k] > 0).map((k) => [k, l.more[k]])),
+    seen: seenList(l.seen)
   };
 }
 
@@ -110,6 +114,7 @@ export function cleanOutcome(reported) {
     permanent: r.permanent === true,
     sessionExpired: r.sessionExpired === true,
     stopWake: r.stopWake === true,
+    ...(r.searchedAll === true ? { searchedAll: true } : {}),
     result,
     ...(r.log ? { log: cleanLog(r.log) } : {})
   };
@@ -243,7 +248,8 @@ export function tenderJobProblems(result, known = []) {
  * Every failure is named in `failures` (documents, tenders, messages, records) or `warnings` (lists not read
  * in full, notes), so "Partly done" always says why. The slot's result carries the searched `range`, the
  * stop reason (`detail`) and the first failures; the outcome's `log` carries the full lists for this
- * browser's run log.
+ * browser's run log. `searchedAll` (a run that did not stop, read every list to its end and named every
+ * document it did not save) lets the run count as the type's last successful run (run-details.js lastSuccessAfter).
  * @param {{ result?: object, error?: { code?: string, message?: string }|null, range?: string,
  *           counts: { saved: number, skipped: number, failed: number, notReported: number, aborted: string|null },
  *           details?: { failures: object[], saved: object[], skipped: object[], more?: object } }} run
@@ -274,10 +280,13 @@ export function tenderRunOutcome({ result = null, error = null, counts, range = 
   if (stopped) return stoppedWith(tenderCode(stopped), detail ? { ...summary, detail } : summary);
   const docsFailed = counts.failed > 0 || problems.failures.some((f) => f.code !== NEEDS_REVIEW) || failedTenders(result) > 0;
   const code = docsFailed ? "SCHEDULE_DOWNLOAD_FAILED" : problems.lists > 0 ? "SCHEDULE_LIST_INCOMPLETE" : problems.review > 0 ? NEEDS_REVIEW : null;
-  if (!code) return withLog({ outcome: "done", result: summary });
+  // every IREPS list of the range was read to its end, and every document not saved is named: the run can count
+  // as this type's last successful run (run-details.js lastSuccessAfter)
+  const searched = (outcome) => (problems.lists === 0 && !(docsFailed && !summary.failures) ? { ...outcome, searchedAll: true } : outcome);
+  if (!code) return withLog(searched({ outcome: "done", result: summary }));
   // never "Partly done" without a reason: a failure the job counted but did not name is said in a line
   const said = summary.failures || summary.warnings ? summary : { ...summary, warnings: ["Some documents of this download were not saved, and DocLink could not tell which: run it from the DocLink panel to see them."] };
-  return counts.saved > 0 ? withLog({ outcome: "partial", code, result: said }) : withLog(failedOutcome(code, said));
+  return counts.saved > 0 ? withLog(searched({ outcome: "partial", code, result: said })) : withLog(searched(failedOutcome(code, said)));
 }
 
 /**

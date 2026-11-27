@@ -12,14 +12,15 @@
  * documents it could not save, each with its reason (the slot's result, kept by the Recon Engine for
  * every user; this browser's own runs in full). A slot that did not run shows what this browser's
  * scheduler noted during its window. "Run log of this browser" lists every run and decision of this
- * DocLink's scheduler, and copies or saves it as text.
+ * DocLink's scheduler and each type's last successful run here (which the first run after a gap searches
+ * from), and copies or saves it as text.
  */
 
 import { MESSAGE_TYPES, describeError } from "../utils/messages.js";
 import { readConfigFiles } from "../utils/config.js";
 import { parseSchedulerConfig, SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL, SCHEDULE_DEFAULT_TIMING } from "../services/scheduler/schedule-types.js";
 import { FIXED_LOOKBACK, NO_RANGE_TYPES, MAX_LOOKBACK } from "../services/scheduler/run-details.js";
-import { runLogText, istDateTime, countsText } from "../services/scheduler/run-log.js";
+import { lastSuccessLines, istDateTime, countsText } from "../services/scheduler/run-log.js";
 import { logger } from "../utils/logger.js";
 
 const $ = (id) => document.getElementById(id);
@@ -47,17 +48,12 @@ const DEFAULT_LOOKBACK = {
 const NO_LOOKBACK = new Set(NO_RANGE_TYPES);
 /** Failed documents shown under a row (the run log's text has them all). */
 const SHOWN_FAILURES = 50;
-/** Runs and events shown in "Run log of this browser" (Copy / Save give all of them). */
-const SHOWN_RUNS = 30;
-const SHOWN_EVENTS = 60;
 /** Saved / skipped documents shown per run in the run log. */
 const SHOWN_DOCS = 25;
 
 let el = null;
 let ctx = null;
 let loading = false;
-/** The last view drawn: what Copy / Save write. */
-let lastView = null;
 /** Types whose schedule box the admin opened: kept open when the list is drawn again (after a save). */
 const openEditors = new Set();
 /** Today rows and run-log runs the user opened: kept open when the view is drawn again. */
@@ -76,7 +72,7 @@ export function istTime(iso) {
   return Number.isFinite(ms) ? new Date(ms + 330 * 60000).toISOString().slice(11, 16) : "";
 }
 
-const typeLabel = (type) => SCHEDULE_TYPE_LABEL[type] || type;
+export const typeLabel = (type) => SCHEDULE_TYPE_LABEL[type] || type;
 const who = (person) => (person && person.name ? person.name : "another DocLink user");
 
 /** The result line of a finished slot, e.g. "2 saved, 5 already saved". */
@@ -305,7 +301,7 @@ function statusLine(view) {
   return [`IREPS account ${account}. This DocLink runs: ${runs}.${unknown}`, waitingText(view.waitingFor), lastErrorText(view.lastError)].filter(Boolean).join(" ");
 }
 
-const node = (tag, className, text) => Object.assign(document.createElement(tag), { className, ...(text !== undefined ? { textContent: text } : {}) });
+export const node = (tag, className, text) => Object.assign(document.createElement(tag), { className, ...(text !== undefined ? { textContent: text } : {}) });
 
 /** A list of documents under a row: "doc: reason", the first `max` of them, then how many more (and where they are). */
 function docList(items, text, max, more = 0, where = "") {
@@ -316,12 +312,13 @@ function docList(items, text, max, more = 0, where = "") {
   return ul;
 }
 
-/** Where the documents a list leaves out can be read. */
-const SAVE_LOG_HAS_ALL = "Save log lists them all";
+/** Where the documents a list leaves out can be read: the Scheduled runs tab (and its Download Excel) has this browser's. */
+const EXCEL_HAS_THEM = "Download Excel lists them";
+const RUNS_TAB_HAS_ALL = "My Downloads > Scheduled runs has them all";
 const OTHER_LOG_HAS_ALL = "the run log of the browser that ran it lists them all";
 
 /** One failed document as the panel shows it: its name, then why. */
-function failureLine(f) {
+export function failureLine(f) {
   return `${f.doc}: ${describeError(f.code).title}${f.detail ? ` (${f.detail})` : ""}`;
 }
 
@@ -335,7 +332,7 @@ function detailsBody(details) {
   }
   if (details.failures.length) {
     body.append(node("div", "schedule-docs-title schedule-docs-failed", `Not saved (${details.failures.length + details.failuresMore})`));
-    body.append(docList(details.failures, failureLine, SHOWN_FAILURES, details.failuresMore, details.fromLog ? SAVE_LOG_HAS_ALL : OTHER_LOG_HAS_ALL));
+    body.append(docList(details.failures, failureLine, SHOWN_FAILURES, details.failuresMore, details.fromLog ? RUNS_TAB_HAS_ALL : OTHER_LOG_HAS_ALL));
   }
   if (details.warnings.length) {
     body.append(node("div", "schedule-docs-title", "Warnings"));
@@ -387,12 +384,13 @@ function renderToday(view) {
 
 const RUN_CHIP = { running: STATUS_CHIP.in_progress, done: STATUS_CHIP.done, partial: STATUS_CHIP.partial, failed: ["Failed", "chip-failed"] };
 
-/** One run of this browser's run log, as a row that opens to its document lists. */
-function runRow(run) {
+/** One run of this browser's run log, as a row that opens to its document lists (My Downloads > Scheduled runs). */
+export function runRow(run) {
   const li = document.createElement("li");
   li.className = "schedule-row";
   const period = run.period && run.period !== "day" ? ` (${run.period} run)` : "";
-  const name = node("span", "schedule-type", `${whenText(run.startedAt)} ${typeLabel(run.docType)}${period}`);
+  // the day is the button picked above the runs: the time is enough
+  const name = node("span", "schedule-type", `${istTime(run.startedAt)} ${typeLabel(run.docType)}${period}`);
   const [chipText, chipClass] = RUN_CHIP[run.outcome] || [run.outcome, ""];
   const chip = node("span", `chip ${chipClass}`, chipText);
   const why = run.code && run.outcome !== "done" && run.outcome !== "partial" ? describeError(run.code).title : "";
@@ -405,57 +403,30 @@ function runRow(run) {
   if (run.file) facts.append(node("li", "", `Saved to: ${run.file}`));
   body.append(facts);
   const more = run.more || {};
-  const section = (title, items, count, text, className = "") => {
+  // the workbook lists the documents saved and not saved, not the ones found already saved
+  const section = (title, items, count, text, className = "", where = EXCEL_HAS_THEM) => {
     if (!items || items.length === 0) return;
     body.append(node("div", `schedule-docs-title ${className}`.trim(), `${title} (${items.length + Number(count || 0)})`));
-    body.append(docList(items, text, title === "Not saved" ? SHOWN_FAILURES : SHOWN_DOCS, count, SAVE_LOG_HAS_ALL));
+    body.append(docList(items, text, title === "Not saved" ? SHOWN_FAILURES : SHOWN_DOCS, count, where));
   };
   for (const w of run.warnings || []) facts.append(node("li", "", `Warning: ${w}`));
   section("Not saved", run.failures, more.failures, failureLine, "schedule-docs-failed");
-  section("Already saved, skipped", run.skipped, more.skipped, (d) => `${d.doc}${d.note ? `: ${d.note}` : ""}`);
+  section("Already saved, skipped", run.skipped, more.skipped, (d) => `${d.doc}${d.note ? `: ${d.note}` : ""}`, "", "");
   section("Saved", run.saved, more.saved, (d) => `${d.doc}${d.note ? `: ${d.note}` : ""}`);
   openableRow(li, `run:${run.id}`, [name, chip, text], body);
   return li;
 }
 
-/** "Run log of this browser": its runs and the scheduler's events, newest first. */
-function renderLog(view) {
-  if (!el.logRuns) return;
-  const log = view.log && typeof view.log === "object" ? view.log : { runs: [], events: [] };
-  const runs = Array.isArray(log.runs) ? log.runs : [];
-  const events = Array.isArray(log.events) ? log.events : [];
-  el.logSummary.textContent = `${runs.length} run${runs.length === 1 ? "" : "s"} · ${events.length} event${events.length === 1 ? "" : "s"}`;
-  el.logRuns.replaceChildren(...runs.slice(0, SHOWN_RUNS).map(runRow));
-  el.logRunsEmpty.hidden = runs.length > 0;
-  el.logEvents.replaceChildren(...events.slice(0, SHOWN_EVENTS).map((e) => node("li", `schedule-event schedule-event-${e.kind}`, `${eventTime(e)}: ${e.text}`)));
-  el.logEventsEmpty.hidden = events.length > 0;
-}
-
-/** The run log as a text file's content (Copy / Save). */
-function logText() {
-  const view = lastView || {};
-  return runLogText(view.log, { account: view.account, version: view.version, savedAt: new Date().toISOString() });
-}
-
-/** Copy the run log; the button says whether it worked. */
-async function copyLog() {
-  const label = el.btnLogCopy.textContent;
-  try {
-    await navigator.clipboard.writeText(logText());
-    el.btnLogCopy.textContent = "Copied";
-  } catch (error) {
-    logger.warn("Scheduler run log not copied", error);
-    el.btnLogCopy.textContent = "Not copied: use Save log";
-  }
-  setTimeout(() => (el.btnLogCopy.textContent = label), 2500);
-}
-
-/** Save the run log as a .txt file in Downloads. */
-function saveLog() {
-  const url = URL.createObjectURL(new Blob([logText()], { type: "text/plain" }));
-  const a = Object.assign(document.createElement("a"), { href: url, download: `DocLink_scheduler_log_${new Date().toISOString().replace(/[:.]/g, "-")}.txt` });
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+/**
+ * "Last successful run": each type's day in this browser, which the first run after a gap searches from. The runs
+ * themselves (the last 3 days) are in My Downloads > Scheduled runs (popup-run-history.js).
+ */
+function renderLastSuccess(view) {
+  if (!el.logLast) return;
+  const last = lastSuccessLines(view.lastSuccess);
+  el.logLast.replaceChildren(...last.map((line) => node("li", "schedule-event", line)));
+  el.logLastEmpty.hidden = last.length > 0;
+  if (el.logSummary) el.logSummary.textContent = last.length ? `${last.length} type${last.length === 1 ? "" : "s"}` : "";
 }
 
 function field(labelText, input) {
@@ -711,11 +682,10 @@ export function savedNotice(schedule, view) {
 }
 
 function render(view) {
-  lastView = view;
   el.status.textContent = statusLine(view);
   showError(view.error || null);
   renderToday(view);
-  renderLog(view);
+  renderLastSuccess(view);
   renderManage(view);
 }
 
@@ -798,20 +768,14 @@ export async function initSchedule(context) {
     todayEmpty: $("schedule-today-empty"),
     notice: $("schedule-notice"),
     logSummary: $("schedule-log-summary"),
-    logRuns: $("schedule-log-runs"),
-    logRunsEmpty: $("schedule-log-runs-empty"),
-    logEvents: $("schedule-log-events"),
-    logEventsEmpty: $("schedule-log-events-empty"),
-    btnLogCopy: $("btn-schedule-log-copy"),
-    btnLogSave: $("btn-schedule-log-save"),
+    logLast: $("schedule-log-last"),
+    logLastEmpty: $("schedule-log-last-empty"),
     manage: $("schedule-manage"),
     editors: $("schedule-editors")
   };
   el.btnOpen.addEventListener("click", () => (el.view.hidden ? open() : ctx.showView("main")));
   el.btnBack.addEventListener("click", () => ctx.showView("main"));
   el.btnRefresh.addEventListener("click", () => load());
-  if (el.btnLogCopy) el.btnLogCopy.addEventListener("click", () => copyLog());
-  if (el.btnLogSave) el.btnLogSave.addEventListener("click", () => saveLog());
   const files = await readConfigFiles();
   el.btnOpen.hidden = !parseSchedulerConfig(files && files.config).enabled;
 }

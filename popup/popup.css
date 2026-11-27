@@ -644,6 +644,15 @@ input[type="radio"] {
     color: var(--text-muted);
     cursor: default;
   }
+  /* the Day dropdown's foot: how many days are kept, small, under a line */
+  option.day-note {
+    margin-top: 4px;
+    padding-top: 7px;
+    border-top: 1px solid var(--border);
+    border-radius: 0;
+    font-size: 11px;
+    white-space: normal;
+  }
 }
 
 .form-message {
@@ -1260,11 +1269,20 @@ body[data-recon-login="on"] .app-main > .save-to {
   display: flex;
   gap: 8px;
   align-items: center;
-  margin: 4px 0 10px;
+  margin: 8px 0 0 20px;
   font-size: 13px;
 }
 .downloads-all[hidden] {
   display: none;
+}
+/* Refresh lines up with the day buttons and filters above it (.date-row), with room above */
+.downloads-refresh {
+  margin: 12px 0 0 20px;
+  width: calc(100% - 20px);
+}
+/* Download Excel, under the summary of the downloads shown */
+.downloads-export {
+  margin: 0 0 6px;
 }
 .downloads-summary {
   margin: 10px 0 6px;
@@ -1741,6 +1759,245 @@ body[data-redownload="on"] .app-main > .save-to {
 .schedule-event-error,
 .schedule-event-backend {
   color: var(--danger);
+}
+/* "Not saved": a document a later run saved */
+.schedule-saved-later {
+  color: var(--success);
+}
+/* My Downloads: the Saved files and Scheduled runs tabs */
+.downloads-tabs {
+  display: flex;
+  margin: 0 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+.downloads-tab {
+  flex: 1 1 0;
+  padding: 8px 6px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.downloads-tab:hover {
+  color: var(--primary);
+}
+.downloads-tab[aria-selected="true"] {
+  color: var(--primary-hover);
+  border-bottom-color: var(--primary);
+}
+.downloads-runs .result-actions {
+  margin-bottom: 4px;
+}
+/* My Downloads > Missed documents: the day in tiles, a row per type with a bar, then the documents to download.
+   One colour per end: Auto (the schedule), Manual (a DocLink user), Missed, Pending. */
+.downloads-missed {
+  --missed-auto: var(--primary);
+  --missed-manual: #5b84c4;
+  --missed-missed: var(--danger);
+  --missed-pending: #d99a1e;
+}
+.missed-tiles {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0 0 12px;
+}
+.missed-tile {
+  padding: 8px 4px 7px;
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  text-align: center;
+}
+.missed-tile-value {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.missed-tile-label {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+.missed-tile-auto {
+  border-top-color: var(--missed-auto);
+}
+.missed-tile-auto .missed-tile-value {
+  color: var(--missed-auto);
+}
+.missed-tile-manual {
+  border-top-color: var(--missed-manual);
+}
+.missed-tile-manual .missed-tile-value {
+  color: var(--missed-manual);
+}
+.missed-tile-missed {
+  border-top-color: var(--missed-missed);
+}
+.missed-tile-missed .missed-tile-value {
+  color: var(--missed-missed);
+}
+.missed-tile-pending {
+  border-top-color: var(--missed-pending);
+}
+.missed-tile-pending .missed-tile-value {
+  color: var(--warning);
+}
+.missed-tile-zero .missed-tile-value {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.missed-types {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.missed-type-row {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.missed-type-row:last-child {
+  border-bottom: 0;
+}
+.missed-type-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.missed-type-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.missed-type-count {
+  flex: none;
+  color: var(--text-muted);
+}
+.missed-bar {
+  display: flex;
+  height: 6px;
+  margin: 6px 0 4px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--surface-muted);
+}
+.missed-bar-auto {
+  background: var(--missed-auto);
+}
+.missed-bar-manual {
+  background: var(--missed-manual);
+}
+.missed-bar-missed {
+  background: var(--missed-missed);
+}
+.missed-bar-pending {
+  background: var(--missed-pending);
+}
+.missed-type-line {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.missed-part-missed {
+  color: var(--danger);
+  font-weight: 600;
+}
+.missed-part-pending {
+  color: var(--warning);
+  font-weight: 600;
+}
+.missed-legend {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.missed-legend li {
+  margin: 2px 0;
+  padding-left: 14px;
+  position: relative;
+}
+.missed-legend li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.45em;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+.missed-key-auto::before {
+  background: var(--missed-auto);
+}
+.missed-key-manual::before {
+  background: var(--missed-manual);
+}
+.missed-key-missed::before {
+  background: var(--missed-missed);
+}
+.missed-key-pending::before {
+  background: var(--missed-pending);
+}
+.missed-note {
+  margin: 0 0 8px;
+}
+.missed-docs {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  font-size: 12px;
+}
+.missed-doc {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-left: 3px solid var(--danger);
+  border-radius: 4px;
+  background: var(--danger-soft);
+  overflow-wrap: anywhere;
+}
+.missed-doc-pending {
+  border-left-color: var(--warning);
+  background: var(--warning-soft);
+}
+.missed-doc-byHand,
+.missed-doc-already,
+.missed-doc-scheduled {
+  border-left-color: var(--success);
+  background: var(--success-soft);
+}
+.missed-doc-name {
+  font-weight: 600;
+}
+.missed-doc-info,
+.missed-doc-where {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+.missed-doc-why {
+  font-size: 11.5px;
+}
+/* My Downloads: the Day dropdown of Scheduled runs and Missed documents (Saved files has it in a .date-row) */
+.day-field {
+  margin: 10px 0 8px;
+}
+/* the Day dropdown never grows past its row (an older Chrome sizes a select to its longest line: the note) */
+#downloads-day-field .field {
+  min-width: 0;
+}
+.day-field select,
+#downloads-day-field select {
+  width: 100%;
+  min-width: 0;
 }
 /* Date range of Bill Status, CRN and R-NOTE: fixed at 90 days, shown in place of the look-back */
 .schedule-fixed {

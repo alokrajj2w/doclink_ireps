@@ -23,6 +23,8 @@ import { initGate, currentPanelTabId, panelOwnTabId, tabExists, isOwnRun, rememb
 import { initReconAuth, ensureReconSignedIn, onReconDestinationChange, openReconSignIn, refreshReconStatus, currentReconUser, reconUnreachable, RECON_OFFLINE } from "./popup-recon-auth.js";
 import { initDownloads } from "./popup-downloads.js";
 import { initSchedule, handleScheduleMessage } from "./popup-schedule.js";
+import { initRunHistory, handleRunHistoryMessage } from "./popup-run-history.js";
+import { initMissed, handleMissedMessage } from "./popup-missed.js";
 import { initBillUpload, handleBillUploadMessage, restoreBillUpload } from "./popup-bill-upload.js";
 import { logger, mirrorLogToConsole, installConsoleHelpers } from "../utils/logger.js";
 
@@ -200,6 +202,9 @@ chrome.runtime.onMessage.addListener((message) => {
   if (handlePoIcMessage(message)) return false;
   if (handleBatchMessage(message)) return false;
   if (handleBillUploadMessage(message)) return false;
+  // the Scheduled runs tab of My Downloads reads the run log again too (it never takes the message)
+  handleRunHistoryMessage(message);
+  handleMissedMessage(message);
   if (handleScheduleMessage(message)) return false;
   // a Bill Status run this panel did not start (a scheduled one, another tab's) never takes this panel over
   const own = isOwnRun(message.startedBy);
@@ -682,6 +687,8 @@ async function onIrepsTabActive() {
   initBillUpload({ send, showView, setConnection, setConnectionForError, currentPanelTabId });
   initDownloads({ showView, ensureSignedIn: () => ensureReconSignedIn({ always: true }), currentUser: currentReconUser, openSignIn: openReconSignIn, reconUnreachable });
   initSchedule({ send, showView }).catch((error) => logger.warn("Scheduled downloads view not set up", error));
+  initMissed({ send });
+  initRunHistory({ send }).catch((error) => logger.warn("Scheduled runs tab not set up", error));
   // Nothing talks to IREPS until the active tab is the configured portal.
   await initGate({ send, setConnection, onActive: onIrepsTabActive });
 })();

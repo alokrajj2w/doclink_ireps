@@ -491,56 +491,124 @@
           <h2>My Downloads</h2>
           <button id="btn-downloads-back" class="btn btn-secondary btn-back" type="button">Back</button>
         </div>
-        <p class="card-text downloads-who" id="downloads-who"></p>
-        <div class="date-row">
-          <label class="field"><span class="field-label">From</span><input type="date" id="downloads-from"></label>
-          <label class="field"><span class="field-label">To</span><input type="date" id="downloads-to"></label>
+        <!-- Saved files: the download log (popup-downloads.js). Scheduled runs: this browser's scheduled downloads of the last
+             3 days with runs (popup-run-history.js), shown only when scheduling is on -->
+        <div class="downloads-tabs" id="downloads-tabs" role="tablist" aria-label="My Downloads" hidden>
+          <button class="downloads-tab" id="downloads-tab-files" type="button" role="tab" aria-selected="true" aria-controls="downloads-files">Saved files</button>
+          <button class="downloads-tab" id="downloads-tab-runs" type="button" role="tab" aria-selected="false" aria-controls="downloads-runs">Scheduled runs</button>
+          <button class="downloads-tab" id="downloads-tab-missed" type="button" role="tab" aria-selected="false" aria-controls="downloads-missed">Missed documents</button>
         </div>
-        <div class="date-row">
-          <label class="field">
-            <span class="field-label">Location</span>
-            <select id="downloads-destination">
-              <option value="">All</option>
-              <option value="local">Local</option>
-              <option value="ecm">ECM (all sites)</option>
-              <option value="ecm:hosur">ECM - Hosur</option>
-              <option value="ecm:rohtak">ECM - Rohtak</option>
-              <option value="s3">S3</option>
-            </select>
+        <div id="downloads-files" role="tabpanel" aria-labelledby="downloads-tab-files">
+          <p class="card-text downloads-who" id="downloads-who"></p>
+          <!-- the last 3 days with downloads, a button each, and "Other dates" (the From - To row below) -->
+          <div class="date-row" id="downloads-day-field" hidden>
+            <label class="field"><span class="field-label">Day</span><select id="downloads-days"></select></label>
+          </div>
+          <div class="date-row" id="downloads-range" hidden>
+            <label class="field"><span class="field-label">From</span><input type="date" id="downloads-from"></label>
+            <label class="field"><span class="field-label">To</span><input type="date" id="downloads-to"></label>
+          </div>
+          <div class="date-row">
+            <label class="field">
+              <span class="field-label">Location</span>
+              <select id="downloads-destination">
+                <option value="">All</option>
+                <option value="local">Local</option>
+                <option value="ecm">ECM (all sites)</option>
+                <option value="ecm:hosur">ECM - Hosur</option>
+                <option value="ecm:rohtak">ECM - Rohtak</option>
+                <option value="s3">S3</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Document type</span>
+              <select id="downloads-type"><option value="">All</option></select>
+            </label>
+          </div>
+          <label class="downloads-all" id="downloads-all-wrap" hidden>
+            <input type="checkbox" id="downloads-all">
+            <span>All users (admin)</span>
           </label>
-          <label class="field">
-            <span class="field-label">Document type</span>
-            <select id="downloads-type"><option value="">All</option></select>
-          </label>
+          <button id="btn-downloads-refresh" class="btn btn-primary downloads-refresh" type="button">Refresh</button>
+          <div id="downloads-error" class="result result-error" hidden>
+            <div class="result-title" id="downloads-error-title"></div>
+            <p id="downloads-error-message" class="result-text"></p>
+            <div class="result-actions"><button id="btn-downloads-sign-in" class="btn btn-link" type="button" hidden>Sign in to Recon</button></div>
+          </div>
+          <p class="downloads-summary" id="downloads-summary"></p>
+          <div class="result-actions downloads-export" id="downloads-export" hidden>
+            <button id="btn-downloads-excel" class="btn btn-link" type="button">Download Excel</button>
+          </div>
+          <div class="downloads-table-wrap" id="downloads-table-wrap" hidden>
+            <table class="downloads-table">
+              <colgroup>
+                <col class="downloads-col-date"><col class="downloads-col-type"><col class="downloads-col-file"><col class="downloads-col-location">
+              </colgroup>
+              <thead>
+                <tr>
+                  <th scope="col">Date</th>
+                  <th scope="col" title="Document type">Type</th>
+                  <th scope="col">File</th>
+                  <th scope="col">Location</th>
+                </tr>
+              </thead>
+              <tbody id="downloads-list"></tbody>
+            </table>
+          </div>
+          <button id="btn-downloads-more" class="btn btn-link" type="button" hidden>Load more</button>
         </div>
-        <label class="downloads-all" id="downloads-all-wrap" hidden>
-          <input type="checkbox" id="downloads-all">
-          <span>All users (admin)</span>
-        </label>
-        <button id="btn-downloads-refresh" class="btn btn-primary" type="button">Refresh</button>
-        <div id="downloads-error" class="result result-error" hidden>
-          <div class="result-title" id="downloads-error-title"></div>
-          <p id="downloads-error-message" class="result-text"></p>
-          <div class="result-actions"><button id="btn-downloads-sign-in" class="btn btn-link" type="button" hidden>Sign in to Recon</button></div>
+        <div id="downloads-runs" class="downloads-runs" role="tabpanel" aria-labelledby="downloads-tab-runs" hidden>
+          <p class="schedule-hint">What the scheduled downloads of this browser did on the last 3 days with runs (kept when DocLink is reloaded): the documents they downloaded, the ones they could not save, the runs, and why a due download did not run. Times are IST. Downloads you start yourself are under Saved files.</p>
+          <p class="downloads-summary" id="history-summary"></p>
+          <div class="result-actions">
+            <button id="btn-history-excel" class="btn btn-link" type="button">Download Excel</button>
+            <button id="btn-history-refresh" class="btn btn-link" type="button">Refresh</button>
+          </div>
+          <label class="field day-field" id="history-day-field" hidden><span class="field-label">Day</span><select id="history-days"></select></label>
+          <div class="group-title" id="history-downloaded-title">Downloaded</div>
+          <ul class="schedule-events history-docs" id="history-downloaded"></ul>
+          <p class="schedule-empty" id="history-downloaded-empty" hidden>Nothing downloaded on this day.</p>
+          <div class="group-title" id="history-not-saved-title">Not saved</div>
+          <ul class="schedule-events" id="history-not-saved"></ul>
+          <p class="schedule-empty" id="history-not-saved-empty" hidden>Nothing: every document of this day was saved.</p>
+          <div class="group-title" id="history-runs-title">Runs</div>
+          <ul class="schedule-list schedule-log-runs" id="history-runs"></ul>
+          <p class="schedule-empty" id="history-runs-empty" hidden>No scheduled download ran in this browser yet.</p>
+          <div class="group-title" id="history-events-title">Scheduler events</div>
+          <ul class="schedule-events" id="history-events"></ul>
+          <p class="schedule-empty" id="history-events-empty" hidden>Nothing noted yet.</p>
+          <div id="history-error" class="result result-error" hidden><div class="result-title" id="history-error-title"></div><p id="history-error-message" class="result-text"></p></div>
         </div>
-        <p class="downloads-summary" id="downloads-summary"></p>
-        <div class="downloads-table-wrap" id="downloads-table-wrap" hidden>
-          <table class="downloads-table">
-            <colgroup>
-              <col class="downloads-col-date"><col class="downloads-col-type"><col class="downloads-col-file"><col class="downloads-col-location">
-            </colgroup>
-            <thead>
-              <tr>
-                <th scope="col">Date</th>
-                <th scope="col" title="Document type">Type</th>
-                <th scope="col">File</th>
-                <th scope="col">Location</th>
-              </tr>
-            </thead>
-            <tbody id="downloads-list"></tbody>
-          </table>
+        <div id="downloads-missed" class="downloads-runs downloads-missed" role="tabpanel" aria-labelledby="downloads-tab-missed" hidden>
+          <p class="schedule-hint">What IREPS listed to the scheduled downloads of this browser, by the day DocLink first found each document, and what became of it. Download a missed document in IREPS: what finds it there is below. Times are IST. The Bill Status, CRN and R-NOTE exports are under Scheduled runs.</p>
+          <p class="downloads-summary" id="missed-summary"></p>
+          <div class="result-actions">
+            <button id="btn-missed-excel" class="btn btn-link" type="button">Download Excel</button>
+            <button id="btn-missed-refresh" class="btn btn-link" type="button">Refresh</button>
+          </div>
+          <label class="field day-field" id="missed-day-field" hidden><span class="field-label">Day found</span><select id="missed-days"></select></label>
+          <div id="missed-day" hidden>
+            <div class="group-title" id="missed-types-title">Found in IREPS</div>
+            <div class="missed-tiles" id="missed-tiles"></div>
+            <div class="group-title">By document type</div>
+            <ul class="missed-types" id="missed-types"></ul>
+            <ul class="missed-legend" id="missed-legend">
+              <li class="missed-key-auto"><b>Auto</b>: downloaded by this browser's schedule</li>
+              <li class="missed-key-manual"><b>Manual</b>: saved with DocLink by a user (before the run, or by you since)</li>
+              <li class="missed-key-missed"><b>Missed</b>: no run tries it again; download it in IREPS</li>
+              <li class="missed-key-pending"><b>Pending</b>: not saved yet; the next run tries again</li>
+            </ul>
+            <div class="group-title" id="missed-list-title">Missed</div>
+            <ul class="missed-docs" id="missed-list"></ul>
+            <p class="schedule-empty" id="missed-list-empty" hidden>None: every document IREPS listed was downloaded.</p>
+            <div id="missed-pending-box" hidden>
+              <div class="group-title" id="missed-pending-title">Not saved yet</div>
+              <ul class="missed-docs" id="missed-pending"></ul>
+            </div>
+            <p class="downloads-muted missed-note" id="missed-check" hidden></p>
+          </div>
+          <div id="missed-error" class="result result-error" hidden><div class="result-title" id="missed-error-title"></div><p id="missed-error-message" class="result-text"></p></div>
         </div>
-        <button id="btn-downloads-more" class="btn btn-link" type="button" hidden>Load more</button>
       </article>
     </section>
 
@@ -564,19 +632,11 @@
         <ul class="schedule-list" id="schedule-today"></ul>
         <p class="schedule-empty" id="schedule-today-empty" hidden>No scheduled download for this IREPS account today.</p>
         <details class="options schedule-log" id="schedule-log">
-          <summary><span>Run log of this browser</span><span class="options-summary" id="schedule-log-summary"></span></summary>
+          <summary><span>Last successful run</span><span class="options-summary" id="schedule-log-summary"></span></summary>
           <div class="options-body">
-            <p class="schedule-hint">Every scheduled download this DocLink ran, with the documents it saved, skipped and could not save (and why), and why a due download did not run here. Times are IST. Copy or save it to send it to support.</p>
-            <div class="result-actions">
-              <button id="btn-schedule-log-copy" class="btn btn-link" type="button">Copy log</button>
-              <button id="btn-schedule-log-save" class="btn btn-link" type="button">Save log</button>
-            </div>
-            <div class="group-title">Runs</div>
-            <ul class="schedule-list schedule-log-runs" id="schedule-log-runs"></ul>
-            <p class="schedule-empty" id="schedule-log-runs-empty" hidden>No scheduled download has run in this browser yet.</p>
-            <div class="group-title">Scheduler events</div>
-            <ul class="schedule-events" id="schedule-log-events"></ul>
-            <p class="schedule-empty" id="schedule-log-events-empty" hidden>Nothing noted yet.</p>
+            <p class="schedule-hint">After a gap (a weekend, a holiday, IREPS logged out overnight), the next run of a type searches from this day when its look-back starts later. What the scheduled downloads did on the last 3 days is in My Downloads, under Scheduled runs.</p>
+            <ul class="schedule-events" id="schedule-log-last"></ul>
+            <p class="schedule-empty" id="schedule-log-last-empty" hidden>None yet: a type's next successful run in this browser stores its day.</p>
           </div>
         </details>
         <div id="schedule-manage" hidden>

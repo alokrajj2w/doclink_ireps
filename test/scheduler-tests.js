@@ -14,8 +14,13 @@ import { createRunnerFactory, failedOutcome } from "../services/scheduler/runner
 import { createSharedRunHooks, istParts, RESERVE_CHUNK } from "../services/scheduler/shared-run-hooks.js";
 import { createScheduleApi, ScheduleApiError } from "../services/scheduler/schedule-api.js";
 import { createLocalSignals } from "../services/scheduler/local-signals.js";
-import { scheduledSearch, labelFromKey, failureEntry, fitResult, RESULT_FAILURES_MAX, RESULT_MAX_CHARS, FIXED_LOOKBACK, MAX_LOOKBACK, limitedParams } from "../services/scheduler/run-details.js";
-import { createRunLog, runLogText, MAX_RUNS } from "../services/scheduler/run-log.js";
+import { scheduledSearch, labelFromKey, failureEntry, fitResult, RESULT_FAILURES_MAX, RESULT_MAX_CHARS, FIXED_LOOKBACK, MAX_LOOKBACK, limitedParams, caughtUpParams, lastSuccessAfter, catchesUp, logKey, withKey, CATCH_UP_DAYS, CATCH_UP_RETRIES } from "../services/scheduler/run-details.js";
+import { createRunLog, runLogText, runLogSheets, lastSuccessLines, keptLog, logDays, notSavedList, notSavedText, downloadedOn, dayLabel, runDay, eventDay, istDateTime, MAX_RUNS, RUN_DAYS, MAX_LOG_CHARS } from "../services/scheduler/run-log.js";
+import { createLastSuccess } from "../services/scheduler/last-success.js";
+import { createDocumentLedger, keptLedger, documentDays, ledgerSheets, stateText, LEDGER_DAYS } from "../services/scheduler/document-ledger.js";
+import { initMissed, loadMissed } from "../popup/popup-missed.js";
+import { initRunHistory, handleRunHistoryMessage } from "../popup/popup-run-history.js";
+import { buildWorkbook, XLSX_MIME_TYPE } from "../utils/xlsx-writer.js";
 import { isIrepsActivityUrl, isUserIrepsActivity, exportLaunchOptions, batchRunEnd } from "../background/scheduler-job.js";
 import { icDateItems } from "../services/inspection-certificate/ic-date-service.js";
 import { icFiling } from "../services/inspection-certificate/ic-service.js";
@@ -24,7 +29,7 @@ import { describeSkip, SKIP_REASON } from "../services/download-log.js";
 import { EcmError } from "../services/ecm-service.js";
 import { WorkflowError } from "../services/export-save-service.js";
 import { DOCUMENT_DOWNLOAD_STATUS } from "../services/search-po/document-downloader.js";
-import { describeError, MESSAGE_TYPES } from "../utils/messages.js";
+import { describeError, MESSAGE_TYPES, STORAGE_KEYS } from "../utils/messages.js";
 import { readIrepsAccount, ACCOUNT_READ_ERROR } from "../services/ireps-account-service.js";
 import { accountFromHomeDocument } from "../utils/ireps-account.js";
 
@@ -86,7 +91,9 @@ function harness(options = {}) {
   const runnerFor = (type) => async (ctx) => {
     calls.runs.push({ type, ctx });
     if (options.during) await options.during(ctx, { intervals, advance: (ms) => (clock += ms) });
-    return (options.outcomes && options.outcomes[type]) || { outcome: "done", result: { saved: 1 } };
+    // outcomeFor: an outcome per run (the nth run of the type), for runs that end differently one after the other
+    const nth = calls.runs.filter((r) => r.type === type).length;
+    return (options.outcomeFor && options.outcomeFor(type, nth, ctx)) || (options.outcomes && options.outcomes[type]) || { outcome: "done", result: { saved: 1 } };
   };
   const scheduler = createScheduler({
     loadConfig: async () => options.config || ON,
@@ -104,6 +111,8 @@ function harness(options = {}) {
     runners: Object.fromEntries(SCHEDULE_TYPES.map((t) => [t, runnerFor(t)])),
     alarms: { set: async (when) => void calls.alarmsSet.push(when), clear: async () => void calls.alarmsCleared++ },
     ...(options.runLog ? { runLog: options.runLog } : {}),
+    ...(options.lastSuccess ? { lastSuccess: options.lastSuccess } : {}),
+    ...(options.documents ? { documents: options.documents } : {}),
     now: () => clock,
     random: () => 0,
     uuid: (() => {
@@ -872,12 +881,14 @@ export async function runSchedulerTests({ test, assert, eq }) {
       { id: "it-4", label: items[3].label, status: DOCUMENT_DOWNLOAD_STATUS.SKIPPED }
     ]);
     const d = hooks.details();
+    // the run log keeps each document's key, so a later run that saved it is found ("saved later")
     eq(JSON.stringify(d.failures), JSON.stringify([
-      { doc: "IC C1 (PO PO1 Sr. 1)", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time" },
-      { doc: "IC C2 (PO PO2 Sr. 1)", code: "IREPS_IC_DOWNLOAD_FAILED", detail: "IREPS returned HTTP 500" }
+      { doc: "IC C1 (PO PO1 Sr. 1)", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time", key: "ic:PO1|1|C1" },
+      { doc: "IC C2 (PO PO2 Sr. 1)", code: "IREPS_IC_DOWNLOAD_FAILED", detail: "IREPS returned HTTP 500", key: "ic:PO2|1|C2" }
     ]));
-    eq(JSON.stringify(d.skipped), JSON.stringify([{ doc: "IC C4 (PO PO4 Sr. 1)", note: "Already saved by Rahul on 2026-11-16 at 15:02" }]));
-    eq(JSON.stringify(d.saved), JSON.stringify([{ doc: "IC C3 (PO PO3 Sr. 1)", note: "IC_C3.pdf in ECM /ECM/Hosur/IC" }]));
+    eq(JSON.stringify(d.skipped), JSON.stringify([{ doc: "IC C4 (PO PO4 Sr. 1)", note: "Already saved by Rahul on 2026-11-16 at 15:02", key: "ic:PO4|1|C4" }]));
+    eq(JSON.stringify(d.saved), JSON.stringify([{ doc: "IC C3 (PO PO3 Sr. 1)", note: "IC_C3.pdf in ECM /ECM/Hosur/IC", key: "ic:PO3|1|C3" }]));
+    eq(d.failures.map(failureEntry).some((f) => "key" in f), false, "what a slot's result names (failureEntry) never carries the key");
     eq(api.calls.complete.at(-1).failed.map((f) => f.code).join(), "ECM_UNAVAILABLE,IREPS_IC_DOWNLOAD_FAILED", "the Recon Engine gets the same codes");
 
     const exportApi = hooksApi();
@@ -1294,6 +1305,7 @@ export async function runSchedulerTests({ test, assert, eq }) {
         runs: [{ id: "c7", docType: "tenderNit", slotId: 9, period: "09:30", account: "833", range: "17/11/2026 - 18/11/2026", startedAt: "2026-11-19T04:00:00Z", endedAt: "2026-11-19T04:06:00Z", outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", counts: { saved: 3, failed: 5 }, failures: new Array(5).fill(failures[0]), saved: [{ doc: "Tender 1 tender PDF", note: "T1.pdf in the ECM" }], skipped: [], more: {} }],
         events: [{ kind: "ireps", first: "2026-11-19T03:32:00Z", at: "2026-11-19T04:20:00Z", count: 6, text: "Due now: Bill Status, CRN, R-NOTE. Waiting for IREPS: no IREPS page has loaded in this browser in the last 4 minutes.", types: ["billStatus", "crn", "rnote"] }]
       },
+      lastSuccess: { tenderNit: "18/11/2026" },
       error: null
     };
     const sent = [];
@@ -1327,15 +1339,12 @@ export async function runSchedulerTests({ test, assert, eq }) {
       const missed = rows[0].querySelector("details.schedule-run");
       missed.open = true;
       assert(missed.textContent.includes("09:02-09:50 (6 checks): Due now: Bill Status"), missed.textContent);
-      // the run log: the run opens to its five documents; the event is listed
-      const log = host.querySelector("#schedule-log");
-      log.open = true;
-      const run = host.querySelector("#schedule-log-runs details.schedule-run");
-      run.open = true;
-      assert(run.textContent.includes("Not saved (5)") && run.textContent.includes("Saved (1)"), run.textContent);
-      eq(getComputedStyle(run.querySelector("summary"), "::before").content, "none", "a run of the run log has its own marker only, not the option box's too");
-      assert(host.querySelector("#schedule-log-events").textContent.includes("Waiting for IREPS"), "the scheduler's events are listed");
-      eq(host.querySelector("#schedule-log-summary").textContent, "1 run · 1 event");
+      // the clock view keeps each type's last successful run; the runs themselves are in My Downloads > Scheduled runs
+      host.querySelector("#schedule-log").open = true;
+      eq(host.querySelector("#schedule-log-last").textContent, "Tender NIT documents: 18/11/2026", "each type's last successful run here");
+      eq(host.querySelector("#schedule-log-last-empty").hidden, true);
+      eq(host.querySelector("#schedule-log-summary").textContent, "1 type");
+      eq(host.querySelector("#schedule-log-runs"), null, "no run history in the clock view");
       await tick();
       const card = host.querySelector(".card");
       const style = getComputedStyle(card);
@@ -1747,10 +1756,15 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(sent.map((f) => `${f.doc_key}|${f.code}`).join(), `${keys[1]}|SCHEDULE_DOWNLOAD_FAILED,${keys[2]}|IREPS_SESSION_EXPIRED`);
     const d = hooks.details();
     eq(JSON.stringify(d.failures), JSON.stringify([
-      { doc: "Tender T7 - Annexure A", code: "SCHEDULE_DOWNLOAD_FAILED", detail: "The file was not a valid PDF." },
-      { doc: "Tender T7 corrigendum c1", code: "IREPS_SESSION_EXPIRED", detail: "not downloaded: the run stopped before it" }
+      { doc: "Tender T7 - Annexure A", code: "SCHEDULE_DOWNLOAD_FAILED", detail: "The file was not a valid PDF.", key: keys[1] },
+      { doc: "Tender T7 corrigendum c1", code: "IREPS_SESSION_EXPIRED", detail: "not downloaded: the run stopped before it", key: keys[2] }
     ]));
-    eq(JSON.stringify(d.saved), JSON.stringify([{ doc: "Tender T7 tender PDF", note: "T7.pdf in ECM /ECM/Hosur/Tenders" }]));
+    eq(JSON.stringify(d.saved), JSON.stringify([{ doc: "Tender T7 tender PDF", note: "T7.pdf in ECM /ECM/Hosur/Tenders", key: keys[0] }]));
+    // the runner tab's answer keeps the keys for this browser's run log; the slot's result never has them
+    const cleaned = cleanOutcome(tenderRunOutcome({ result: {}, counts: { saved: 1, skipped: 0, failed: 2, notReported: 0, aborted: null }, details: d }));
+    eq(cleaned.log.failures.map((f) => f.key).join(), `${keys[1]},${keys[2]}`);
+    eq(cleaned.log.saved[0].key, keys[0]);
+    eq(cleaned.result.failures.some((f) => "key" in f), false);
   });
 
   await test("Shared hooks (tender): a failure reported for a document without a reservation of its own, or saved only in part, is named and counted; only reservations are released", async () => {
@@ -2020,5 +2034,967 @@ export async function runSchedulerTests({ test, assert, eq }) {
     eq(savedNotice(schedule, { slots: [slotAt("pending", ...moved)] }), "", "the slot took the new time: nothing to say");
     eq(savedNotice(schedule, { slots: [] }), "", "no slot today yet");
     eq(savedNotice({ ...schedule, doc_type: "ma", repeat_every_minutes: 60 }, { slots: [slotAt("missed", ...old)] }), "", "hourly types make the right slot at the next look");
+  });
+
+  /* ------------------------------------------------ catch-up after a gap */
+
+  const searchedDone = (o = {}) => ({ outcome: "done", searchedAll: true, result: { saved: 3 }, log: { failures: [], saved: [], skipped: [], more: {} }, ...o });
+  /** One due slot per round of a wake, then nothing. */
+  const wakesOnce = (...slots) => [...slots.map((s) => ({ due: [s], running: null, next_check_at: null, slots: [] })), { due: [], running: null, next_check_at: null, slots: [] }];
+  const claimRange = (dateFrom, dateTo, lookbackDays = 2) => () => ({ params: { lookbackDays, dateFrom, dateTo } });
+  const rangesRun = (h) => h.calls.runs.map((r) => `${r.ctx.params.dateFrom} - ${r.ctx.params.dateTo}`).join(" | ");
+  const onDay = (id, type, day, period) => slot(id, type, { slot_date: day, period });
+  /** The stored day of a type (null: none). */
+  const dayIn = async (store, account, type) => ((await store.get(account, type)) || {}).day || null;
+
+  await test("Catch-up: after a gap a range starts at the last successful run; a normal day keeps the look-back; 7 days back at most", () => {
+    eq(CATCH_UP_DAYS, 7);
+    // logged out Friday 27/11 at 6 PM, logged in Monday 30/11 at 9 AM: the look-back gives Sunday and Monday
+    const monday = caughtUpParams("ma", { lookbackDays: 2, dateFrom: "29/11/2026", dateTo: "30/11/2026" }, "27/11/2026");
+    eq(JSON.stringify([monday.dateFrom, monday.dateTo, monday.lookbackDays]), JSON.stringify(["27/11/2026", "30/11/2026", 2]));
+    eq(JSON.stringify(monday.catchUp), JSON.stringify({ last: "27/11/2026", lookback: "29/11/2026", widened: true }));
+    eq(scheduledSearch("ma", monday).text, "27/11/2026 - 30/11/2026 (from the last successful run; the look-back gave 29/11/2026)");
+    // logged out at 6 PM, logged in at 9 AM the next day: a 2-day look-back already holds the evening
+    const nextDay = { dateFrom: "23/11/2026", dateTo: "24/11/2026" };
+    eq(caughtUpParams("tenderNit", nextDay, "23/11/2026"), nextDay, "the look-back reaches the last successful run: unchanged");
+    eq(caughtUpParams("tenderNit", { dateFrom: "24/11/2026", dateTo: "24/11/2026" }, "23/11/2026").dateFrom, "23/11/2026", "a 1-day look-back still gets the evening");
+    // a normal day: the last successful run is today
+    const today = { dateFrom: "29/11/2026", dateTo: "30/11/2026" };
+    eq(caughtUpParams("poDate", today, "30/11/2026"), today, "the look-back stays the least a run searches");
+    eq(caughtUpParams("poDate", today, null), today, "nothing stored: the look-back alone, as before");
+    for (const bad of ["", "31/11/2026", "2026-11-27", 42, {}]) eq(caughtUpParams("poDate", today, bad), today, `an unreadable day (${JSON.stringify(bad)}) changes nothing`);
+    eq(caughtUpParams("poDate", {}, "27/11/2026").dateFrom, undefined, "no range in the claim: nothing to widen");
+    eq(scheduledSearch("poDate", today).text, "29/11/2026 - 30/11/2026", "a range without a catch-up reads as before");
+    // more than 7 days without a successful run: back to the Monday before, and the days left out are named
+    const week = caughtUpParams("icDate", today, "18/11/2026");
+    eq(JSON.stringify([week.dateFrom, week.catchUp.notSearched]), JSON.stringify(["23/11/2026", "18/11/2026 - 22/11/2026"]));
+    eq(scheduledSearch("icDate", week).text, "23/11/2026 - 30/11/2026 (the last successful run was on 18/11/2026: 18/11/2026 - 22/11/2026 not searched)");
+    // a look-back longer than the catch-up is never cut
+    const long = caughtUpParams("ma", { dateFrom: "21/11/2026", dateTo: "30/11/2026" }, "18/11/2026");
+    eq(JSON.stringify([long.dateFrom, long.catchUp.widened, long.catchUp.notSearched]), JSON.stringify(["21/11/2026", false, "18/11/2026 - 20/11/2026"]));
+    // Tabulations: never more than their 5 days
+    eq(caughtUpParams("tenderTabulations", today, "27/11/2026").dateFrom, "27/11/2026");
+    const tab = caughtUpParams("tenderTabulations", { dateFrom: "26/11/2026", dateTo: "30/11/2026" }, "20/11/2026");
+    eq(JSON.stringify([tab.dateFrom, tab.catchUp.notSearched]), JSON.stringify(["26/11/2026", "20/11/2026 - 25/11/2026"]));
+    // across the end of a month and a year
+    eq(caughtUpParams("tenderLoa", { dateFrom: "01/01/2027", dateTo: "02/01/2027" }, "30/12/2026").dateFrom, "30/12/2026");
+    for (const type of ["billStatus", "crn", "rnote", "icNotifications", "tenderCorrespondence"]) eq(caughtUpParams(type, today, "20/11/2026"), today, `${type} keeps its own range`);
+  });
+
+  await test("Catch-up: a run that read every list to its end moves the day on; a catch-up that left documents not saved keeps it for 3 more runs, whatever the reason; a stop or a short list keeps it", () => {
+    eq(CATCH_UP_RETRIES, 3);
+    const friday = { day: "27/11/2026", held: 0 };
+    const look = { dateFrom: "29/11/2026", dateTo: "30/11/2026" };
+    const caught = caughtUpParams("poDate", look, friday.day);
+    const text = (entry) => (entry ? `${entry.day} ${entry.held}` : "kept");
+    eq(text(lastSuccessAfter("poDate", caught, searchedDone(), friday)), "30/11/2026 0", "a clean catch-up moves the day on");
+    // documents of the catch-up not saved, whatever their code: the next run searches the gap again
+    const timeout = { doc: "PO 27253922000301", code: "IREPS_PO_DOWNLOAD_FAILED", detail: "IREPS did not respond in time" };
+    const refused = { doc: "PO 2", code: "ECM_REJECTED", detail: "HTTP 401" };
+    const broken = { doc: "Tender 31265690 - NIT attachments", code: "SCHEDULE_DOWNLOAD_FAILED", detail: "IREPS returned an unrecognised file type (application/pdf)." };
+    for (const [why, end] of [
+      ["an IREPS PDF that timed out", searchedDone({ outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", log: { failures: [timeout], more: {} } })],
+      ["the ECM refusing", searchedDone({ outcome: "failed", code: "SCHEDULE_DOWNLOAD_FAILED", log: { failures: [refused], more: {} } })],
+      ["a file broken in IREPS", searchedDone({ outcome: "partial", log: { failures: [broken], more: {} } })],
+      ["failures only counted", searchedDone({ outcome: "partial", log: undefined, result: { saved: 1, failed: 2 } })],
+      ["failures in the result beyond its list", { outcome: "partial", searchedAll: true, result: { failures: [broken], failuresMore: 4 } }]
+    ]) eq(text(lastSuccessAfter("poDate", caught, end, friday)), "27/11/2026 1", why);
+    const left = searchedDone({ outcome: "partial", log: { failures: [broken], more: {} } });
+    eq(text(lastSuccessAfter("poDate", caught, left, { day: "27/11/2026", held: 2 })), "27/11/2026 3", "the third try");
+    eq(text(lastSuccessAfter("poDate", caught, left, { day: "27/11/2026", held: 3 })), "30/11/2026 0", "after 3 tries the day moves on: a file that never downloads cannot hold the range back");
+    // a run within its look-back: its own failures are searched again by the next run's look-back anyway
+    eq(text(lastSuccessAfter("poDate", look, left, { day: "30/11/2026", held: 0 })), "30/11/2026 0", "a normal day");
+    eq(text(lastSuccessAfter("poDate", look, left, null)), "30/11/2026 0", "the first run ever starts the memory");
+    for (const [why, end] of [
+      ["IREPS logged out mid-run", { outcome: "failed", code: "IREPS_SESSION_EXPIRED", sessionExpired: true, result: { saved: 2 } }],
+      ["a list read short", { outcome: "partial", code: "SCHEDULE_LIST_INCOMPLETE", result: { saved: 2, warnings: ["MA search: IREPS reported 9 but 7 were read"] } }],
+      ["a run that never said it read its lists", { outcome: "done", result: { saved: 1 } }],
+      ["no outcome", null]
+    ]) eq(lastSuccessAfter("ma", caught, end, friday), null, `${why}: the stored day stays`);
+    eq(text(lastSuccessAfter("ma", look, searchedDone(), { day: "02/12/2026", held: 0 })), "02/12/2026 0", "a stored day is never moved back");
+    eq(text(lastSuccessAfter("ma", look, searchedDone(), { day: "bad", held: 5 })), "30/11/2026 0", "an unreadable stored day counts as none");
+    for (const type of ["billStatus", "crn", "rnote", "icNotifications", "tenderCorrespondence"]) {
+      eq(catchesUp(type), false, `${type} takes no range from the claim`);
+      eq(lastSuccessAfter(type, look, searchedDone(), friday), null, `${type} stores nothing`);
+    }
+    for (const type of ["ma", "poDate", "icDate", "tenderNit", "tenderCounterOffer", "tenderLoa", "tenderNegotiation", "tenderTabulations"]) eq(catchesUp(type), true, type);
+    eq(lastSuccessAfter("ma", { dateTo: "30/11/2026" }, searchedDone(), friday), null, "no valid range");
+  });
+
+  await test("Catch-up: the runners say when a run read every IREPS list of its range to its end", async () => {
+    let counts = { saved: 2, skipped: 0, failed: 0, notReported: 0, aborted: null };
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ documentHooks: {}, finishDocuments: async () => counts, details: noDetails }) });
+    const run = (end) => factory.documentRunner(async () => ({ started: true, done: Promise.resolve(end) }))({ slot: { doc_type: "poDate" }, params: { dateFrom: "29/11/2026", dateTo: "30/11/2026" } });
+    eq((await run({ ok: true, items: [{}, {}] })).searchedAll, true, "done");
+    counts = { ...counts, failed: 1 };
+    const failed = await run({ ok: true, items: [{}, {}, {}] });
+    eq(JSON.stringify([failed.outcome, failed.searchedAll]), JSON.stringify(["partial", true]), "documents failed, the lists were read");
+    counts = { ...counts, failed: 0 };
+    eq((await run({ ok: true, items: [{}], warnings: ["PO dates 29/11/2026 to 30/11/2026: IREPS reported 5 POs but 3 were read; some POs may be missing."] })).searchedAll, undefined, "a list read short");
+    eq((await run({ ok: true, items: [{}], sessionExpired: true })).searchedAll, undefined, "IREPS logged out");
+    eq((await run({ ok: false, code: "IREPS_REQUEST_FAILED", items: [] })).searchedAll, undefined, "the search failed");
+    eq((await run({ ok: true, items: [], problems: [{ doc: "Notification 1", code: "IREPS_IC_SEARCH_FAILED" }] })).searchedAll, undefined, "a search it could not read");
+    counts = { ...counts, aborted: "SCHEDULE_CLAIM_LOST" };
+    eq((await run({ ok: true, items: [{}] })).searchedAll, undefined, "the run stopped");
+
+    const tc = (o = {}) => ({ saved: 0, skipped: 0, failed: 0, notReported: 0, aborted: null, ...o });
+    const letters = (o) => ({ letters: { tenders: [], listErrors: {}, listWarnings: {}, aborted: null, summary: { newLetters: 0 }, ...o } });
+    eq(tenderRunOutcome({ result: letters({}), counts: tc({ saved: 1 }), details: noDetails() }).searchedAll, true, "a tender run that read everything");
+    const named = { failures: [{ doc: "Tender 1 LOA 2", code: "SCHEDULE_DOWNLOAD_FAILED", detail: "not a PDF" }], saved: [], skipped: [], more: {} };
+    const partial = tenderRunOutcome({ result: letters({}), counts: tc({ saved: 1, failed: 1 }), details: named });
+    eq(JSON.stringify([partial.outcome, partial.searchedAll]), JSON.stringify(["partial", true]), "a named document failed");
+    eq(tenderRunOutcome({ result: letters({ listErrors: { MyAdvanceAcceptanceLetter: "IREPS is not responding." } }), counts: tc({ saved: 1 }), details: noDetails() }).searchedAll, undefined, "a letter list not read");
+    eq(tenderRunOutcome({ result: { letters: { aborted: { code: "SESSION_EXPIRED" } } }, counts: tc({ saved: 1 }), details: noDetails() }).searchedAll, undefined, "stopped");
+    eq(tenderRunOutcome({ result: { summary: { failed: 1 } }, counts: tc({ saved: 1 }), details: noDetails() }).searchedAll, undefined, "a failure the job counted but did not name");
+    eq(cleanOutcome({ outcome: "done", searchedAll: true }).searchedAll, true, "the runner tab's answer keeps it");
+    eq(cleanOutcome({ outcome: "done", searchedAll: "yes" }).searchedAll, undefined, "only true counts");
+  });
+
+  await test("Catch-up: the last successful runs are kept per IREPS account and type, apart from the run log; a storage that cannot be read is never written over", async () => {
+    const area = memoryArea();
+    const store = createLastSuccess({ storage: area });
+    eq(await store.get("833", "ma"), null, "nothing stored yet");
+    await store.set("833", "ma", { day: "27/11/2026", held: 0 });
+    await store.set("833", "tenderNit", { day: "27/11/2026", held: 2 });
+    await store.set("60828", "ma", { day: "20/11/2026", held: 0 });
+    await store.set("833", "ma", { day: "30/11/2026", held: 0 });
+    eq(JSON.stringify(await store.get("833", "ma")), JSON.stringify({ day: "30/11/2026", held: 0 }), "the newest success");
+    eq((await store.get("60828", "ma")).day, "20/11/2026", "each account its own");
+    eq(JSON.stringify(await store.read("833")), JSON.stringify({ ma: { day: "30/11/2026", held: 0 }, tenderNit: { day: "27/11/2026", held: 2 } }));
+    eq(JSON.stringify(area.data.get(STORAGE_KEYS.SCHEDULER_LAST_SUCCESS)), JSON.stringify({ 833: { ma: { day: "30/11/2026", held: 0 }, tenderNit: { day: "27/11/2026", held: 2 } }, 60828: { ma: { day: "20/11/2026", held: 0 } } }), "days, counts and type names only");
+    await store.set("833", "ma", { day: "not a day", held: 0 });
+    await store.set("833", "ma", "never");
+    await store.set("", "ma", { day: "01/12/2026", held: 0 });
+    await store.set("833", "../x", { day: "01/12/2026", held: 0 });
+    eq((await store.get("833", "ma")).day, "30/11/2026", "only a day, an account and a type name are stored");
+    eq(Object.keys(await store.read("833")).join(), "ma,tenderNit");
+    area.data.set(STORAGE_KEYS.SCHEDULER_LAST_SUCCESS, { 833: { ma: "<b>", poDate: "29/11/2026", icDate: { day: "28/11/2026", held: -4 }, tenderLoa: { held: 1 } }, 60828: "x" });
+    eq(JSON.stringify(await store.read("833")), JSON.stringify({ poDate: { day: "29/11/2026", held: 0 }, icDate: { day: "28/11/2026", held: 0 } }), "a plain day reads as that day; what is no day is ignored");
+    eq(JSON.stringify(await store.read("60828")), "{}");
+
+    // clearing the run log leaves the last successful runs alone
+    const runLog = createRunLog({ storage: area });
+    await runLog.runStarted({ id: "r1", docType: "ma" });
+    await runLog.clear();
+    eq((await store.get("833", "poDate")).day, "29/11/2026", "loading a build keeps them");
+
+    let reads = 0;
+    const writes = [];
+    const broken = createLastSuccess({ storage: { get: async () => { reads++; throw new Error("storage unreadable"); }, set: async (items) => void writes.push(items) } });
+    eq(await broken.get("833", "ma"), null, "a store that cannot be read gives no day");
+    await broken.set("833", "ma", "30/11/2026");
+    eq(JSON.stringify([reads, writes.length]), "[2,0]", "and is never written over: the other types' days would be lost");
+    const full = createLastSuccess({ storage: { get: async () => ({}), set: async () => { throw new Error("QUOTA_BYTES quota exceeded"); } } });
+    await full.set("833", "ma", "30/11/2026");
+    eq(await full.get("833", "ma"), null, "a write that fails never throws");
+  });
+
+  await test("Catch-up (logged out Friday 6 PM, logged in Monday 9 AM): Monday's first run searches from Friday, the next one the look-back again", async () => {
+    const store = createLastSuccess({ storage: memoryArea() });
+    const runLog = createRunLog({ storage: memoryArea() });
+    // Friday 27/11: the 17:00 MA run succeeds; IREPS is logged out at 18:00
+    const friday = harness({ lastSuccess: store, dues: wakesOnce(onDay(1, "ma", "2026-11-27", "17:00")), claim: claimRange("26/11/2026", "27/11/2026"), outcomes: { ma: searchedDone() } });
+    await friday.scheduler.wake("alarm");
+    eq(rangesRun(friday), "26/11/2026 - 27/11/2026", "Friday: the look-back");
+    eq(await dayIn(store, "833", "ma"), "27/11/2026");
+    // nobody logs in on Saturday and Sunday: nothing runs. Monday 30/11, a new worker: only the stored day is left
+    const monday = harness({ lastSuccess: store, runLog, dues: wakesOnce(onDay(2, "ma", "2026-11-30", "09:00"), onDay(3, "ma", "2026-11-30", "10:00")), claim: claimRange("29/11/2026", "30/11/2026"), outcomes: { ma: searchedDone() } });
+    await monday.scheduler.wake("alarm");
+    eq(rangesRun(monday), "27/11/2026 - 30/11/2026 | 29/11/2026 - 30/11/2026", "the first run from Friday, the next one the look-back again");
+    eq(await dayIn(store, "833", "ma"), "30/11/2026");
+    const runs = (await runLog.read()).runs;
+    eq(runs[1].range, "27/11/2026 - 30/11/2026 (from the last successful run; the look-back gave 29/11/2026)", "the run log says why");
+    eq(runs[0].range, "29/11/2026 - 30/11/2026");
+    eq(monday.calls.finish.length, 2, "both runs reported how they ended");
+  });
+
+  await test("Catch-up: a first run after the gap that IREPS cuts off, or that leaves documents not saved (an IREPS PDF timing out, the ECM not responding), keeps Friday; the next run searches from Friday again", async () => {
+    for (const [why, firstEnd] of [
+      ["IREPS logged out mid-run", { outcome: "failed", code: "IREPS_SESSION_EXPIRED", countsAsAttempt: false, sessionExpired: true, result: { saved: 4 } }],
+      ["an IREPS PDF timed out", searchedDone({ outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result: { saved: 3, failed: 1 }, log: { failures: [{ doc: "MA 7 (PO 1)", code: "IREPS_MA_DOWNLOAD_FAILED", detail: "IREPS did not respond in time" }], saved: [], skipped: [], more: {} } })],
+      ["the ECM did not respond", searchedDone({ outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", log: { failures: [{ doc: "MA 7 (PO 1)", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time" }], saved: [], skipped: [], more: {} } })]
+    ]) {
+      const store = createLastSuccess({ storage: memoryArea() });
+      await store.set("833", "ma", "27/11/2026");
+      const h = harness({ lastSuccess: store, dues: wakesOnce(onDay(2, "ma", "2026-11-30", "09:00"), onDay(3, "ma", "2026-11-30", "10:00")), claim: claimRange("29/11/2026", "30/11/2026"), outcomeFor: (type, nth) => (nth === 1 ? firstEnd : searchedDone()) });
+      await h.scheduler.wake("alarm");
+      // an expired IREPS session ends the wake: the next login starts the next one
+      if (h.calls.runs.length < 2) await h.scheduler.wake("ireps page", { force: true });
+      eq(rangesRun(h), "27/11/2026 - 30/11/2026 | 27/11/2026 - 30/11/2026", why);
+      eq(await dayIn(store, "833", "ma"), "30/11/2026", `${why}: the run that then succeeds moves it on`);
+    }
+  });
+
+  await test("Catch-up (logged out 6 PM, logged in 9 AM the next day): the evening is searched whatever the look-back; no stored day, or none readable, changes nothing", async () => {
+    const store = createLastSuccess({ storage: memoryArea() });
+    await store.set("833", "tenderNit", "23/11/2026");
+    const oneDay = harness({ lastSuccess: store, dues: wakesOnce(onDay(1, "tenderNit", "2026-11-24", "10:30")), claim: claimRange("24/11/2026", "24/11/2026", 1), outcomes: { tenderNit: searchedDone() } });
+    await oneDay.scheduler.wake("alarm");
+    eq(rangesRun(oneDay), "23/11/2026 - 24/11/2026", "a 1-day look-back still gets the evening of the 23rd");
+    await store.set("833", "tenderNit", "23/11/2026");
+    const twoDays = harness({ lastSuccess: store, dues: wakesOnce(onDay(1, "tenderNit", "2026-11-24", "10:30")), claim: claimRange("23/11/2026", "24/11/2026"), outcomes: { tenderNit: searchedDone() } });
+    await twoDays.scheduler.wake("alarm");
+    eq(rangesRun(twoDays), "23/11/2026 - 24/11/2026", "the 2-day look-back already reaches it");
+    eq(twoDays.calls.runs[0].ctx.params.catchUp, undefined, "nothing changed, nothing to say");
+    const unreadable = createLastSuccess({ storage: { get: async () => { throw new Error("unreadable"); }, set: async () => {} } });
+    for (const lastSuccess of [createLastSuccess({ storage: memoryArea() }), unreadable, undefined]) {
+      const h = harness({ ...(lastSuccess ? { lastSuccess } : {}), dues: wakesOnce(onDay(1, "tenderNit", "2026-11-30", "10:30")), claim: claimRange("29/11/2026", "30/11/2026"), outcomes: { tenderNit: searchedDone() } });
+      await h.scheduler.wake("alarm");
+      eq(rangesRun(h), "29/11/2026 - 30/11/2026", "the look-back alone, as before");
+      eq(h.calls.finish.length, 1, "the run ran and ended");
+    }
+  });
+
+  await test("Catch-up: Bill Status, CRN, R-NOTE, ICs from notifications and Correspondence keep their own ranges; another IREPS account's day is never used", async () => {
+    const store = createLastSuccess({ storage: memoryArea() });
+    const own = ["billStatus", "crn", "rnote", "icNotifications", "tenderCorrespondence"];
+    for (const type of own) await store.set("833", type, "20/11/2026");
+    await store.set("60828", "poDate", "20/11/2026");
+    const h = harness({ lastSuccess: store, dues: wakesOnce(...[...own, "poDate"].map((type, i) => onDay(i + 1, type, "2026-11-30", "09:00"))), claim: claimRange("29/11/2026", "30/11/2026"), outcomeFor: () => searchedDone() });
+    await h.scheduler.wake("alarm");
+    eq(h.calls.runs.map((r) => r.type).join(), [...own, "poDate"].join());
+    for (const r of h.calls.runs) eq(`${r.ctx.params.dateFrom} - ${r.ctx.params.dateTo}`, "29/11/2026 - 30/11/2026", `${r.type}: the claim's range`);
+    for (const type of own) eq(await dayIn(store, "833", type), "20/11/2026", `${type}: nothing stored`);
+    eq(await dayIn(store, "833", "poDate"), "30/11/2026", "this account's PO run is stored");
+    eq(await dayIn(store, "60828", "poDate"), "20/11/2026", "the other account's day is untouched");
+  });
+
+  await test("Catch-up: more than 7 days since the last successful run: the run goes back 7 days, and the days it leaves out are noted, to download by hand", async () => {
+    const store = createLastSuccess({ storage: memoryArea() });
+    await store.set("833", "icDate", "18/11/2026");
+    const runLog = createRunLog({ storage: memoryArea() });
+    const h = harness({ lastSuccess: store, runLog, dues: wakesOnce(onDay(1, "icDate", "2026-11-30", "09:00")), claim: claimRange("29/11/2026", "30/11/2026"), outcomes: { icDate: searchedDone() } });
+    await h.scheduler.wake("alarm");
+    eq(rangesRun(h), "23/11/2026 - 30/11/2026");
+    const log = await runLog.read();
+    eq(log.runs[0].range, "23/11/2026 - 30/11/2026 (the last successful run was on 18/11/2026: 18/11/2026 - 22/11/2026 not searched)");
+    const noted = log.events.find((e) => e.text.includes("not searched"));
+    assert(noted && noted.kind === "error" && noted.types.join() === "icDate", JSON.stringify(log.events));
+    assert(noted.text.startsWith("ICs by IC date: 18/11/2026 - 22/11/2026 not searched."), noted.text);
+    assert(!/[\u2013\u2014]/.test(noted.text + log.runs[0].range), "no en or em dash");
+    eq(await dayIn(store, "833", "icDate"), "30/11/2026", "once it succeeds, the next run is back to the look-back");
+  });
+
+  await test("Catch-up: a document that never downloads holds the gap back for 3 more runs at most, then the look-back is back", async () => {
+    const store = createLastSuccess({ storage: memoryArea() });
+    await store.set("833", "tenderNit", { day: "27/11/2026", held: 0 });
+    const broken = searchedDone({ outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", result: { saved: 2, failed: 1 }, log: { failures: [{ doc: "Tender 31265690 - NIT attachments", code: "SCHEDULE_DOWNLOAD_FAILED", detail: "IREPS returned an unrecognised file type (application/pdf)." }], saved: [], skipped: [], more: {} } });
+    const periods = ["10:30", "11:30", "12:30", "13:30", "14:30"];
+    const h = harness({ lastSuccess: store, dues: wakesOnce(...periods.map((p, i) => onDay(i + 1, "tenderNit", "2026-11-30", p))), claim: claimRange("29/11/2026", "30/11/2026"), outcomes: { tenderNit: broken } });
+    await h.scheduler.wake("alarm");
+    const gap = "27/11/2026 - 30/11/2026";
+    eq(rangesRun(h), [gap, gap, gap, gap, "29/11/2026 - 30/11/2026"].join(" | "), "the catch-up, 3 more tries, then the look-back again");
+    eq(JSON.stringify(await store.get("833", "tenderNit")), JSON.stringify({ day: "30/11/2026", held: 0 }));
+  });
+
+  await test("Catch-up: Tabulations catch up within their 5 days; a 5-day look-back already reaches Friday", async () => {
+    const store = createLastSuccess({ storage: memoryArea() });
+    const tabRun = (dateFrom, lookbackDays) => harness({ lastSuccess: store, dues: wakesOnce(onDay(1, "tenderTabulations", "2026-11-30", "10:30")), claim: claimRange(dateFrom, "30/11/2026", lookbackDays), outcomes: { tenderTabulations: searchedDone() } });
+    await store.set("833", "tenderTabulations", { day: "27/11/2026", held: 0 });
+    const short = tabRun("29/11/2026", 2);
+    await short.scheduler.wake("alarm");
+    eq(rangesRun(short), "27/11/2026 - 30/11/2026", "a 2-day look-back catches up to Friday");
+    for (const [dateFrom, lookback] of [["26/11/2026", 5], ["16/11/2026", 15]]) {
+      await store.set("833", "tenderTabulations", { day: "20/11/2026", held: 0 });
+      const h = tabRun(dateFrom, lookback);
+      await h.scheduler.wake("alarm");
+      eq(rangesRun(h), "26/11/2026 - 30/11/2026", `a ${lookback}-day look-back: never more than 5 days, whatever the stored day`);
+    }
+  });
+
+  await test("Catch-up: the tender runner tab gets the caught-up range, and its outcome keeps searchedAll", async () => {
+    const runner = createTenderRunner({ openTab: async () => 41, closeTab: async () => {}, holdWorker: (task) => task(), timers: { setTimeout: () => 0, clearTimeout: () => {} } });
+    const params = caughtUpParams("tenderNit", { lookbackDays: 2, dateFrom: "29/11/2026", dateTo: "30/11/2026" }, "27/11/2026");
+    const ended = runner.run({ slot: { id: 5, doc_type: "tenderNit" }, claimId: "claim-9", params, account: ACCOUNT, isClaimLive: () => true });
+    const ready = await runner.ready("claim-9", 41);
+    // as the message to the tab carries it
+    const job = JSON.parse(JSON.stringify(ready.job));
+    eq(`${job.params.dateFrom} - ${job.params.dateTo}`, "27/11/2026 - 30/11/2026");
+    eq(scheduledSearch(job.docType, job.params).text, "27/11/2026 - 30/11/2026 (from the last successful run; the look-back gave 29/11/2026)");
+    eq(runner.done("claim-9", { outcome: "done", searchedAll: true, result: { saved: 1 } }, 41).ok, true);
+    eq((await ended).searchedAll, true);
+  });
+
+  await test("Catch-up: the days a catch-up cannot reach are noted when its run starts, never for a claim given back", async () => {
+    const store = createLastSuccess({ storage: memoryArea() });
+    await store.set("833", "icDate", { day: "18/11/2026", held: 0 });
+    const runLog = createRunLog({ storage: memoryArea() });
+    const h = harness({ lastSuccess: store, runLog, check: { ok: false, code: "IREPS_SESSION_EXPIRED" }, dues: wakesOnce(onDay(1, "icDate", "2026-11-30", "09:00")), claim: claimRange("29/11/2026", "30/11/2026") });
+    await h.scheduler.wake("alarm");
+    eq(h.calls.runs.length, 0, "IREPS was logged out: the claim was given back");
+    assert(!(await runLog.read()).events.some((e) => e.text.includes("not searched")), "nothing noted for a run that did not start");
+    eq(await dayIn(store, "833", "icDate"), "18/11/2026", "the stored day stays");
+  });
+
+  await test("Catch-up: a run whose claim was lost is never a success", async () => {
+    const store = createLastSuccess({ storage: memoryArea() });
+    await store.set("833", "icDate", "27/11/2026");
+    const h = harness({
+      lastSuccess: store,
+      heartbeatError: conflict("SCHEDULE_CLAIM_LOST"),
+      dues: wakesOnce(onDay(1, "icDate", "2026-11-30", "09:00")),
+      claim: claimRange("29/11/2026", "30/11/2026"),
+      outcomes: { icDate: searchedDone() },
+      during: async (ctx, { intervals }) => {
+        await intervals[0].fn();
+      }
+    });
+    await h.scheduler.wake("alarm");
+    eq(rangesRun(h), "27/11/2026 - 30/11/2026");
+    eq(await dayIn(store, "833", "icDate"), "27/11/2026", "Friday is kept: the next run searches from it again");
+  });
+
+  /* ------------------------------------------------- missed documents: what IREPS listed */
+
+  const maItem = (n, extra = {}) => ({ id: `m${n}`, label: `MA M${n} (PO P${n})`, meta: { maNo: `M${n}`, poNo: `P${n}`, maDate: "27/11/2026", railwayUnit: "S W RLY" }, log: { docType: "ma", key: `ma:P${n}|M${n}` }, ecm: { kind: "modificationAdvise", fields: {} }, ...extra });
+  const seenText = (seen) => seen.map((s) => [s.doc, s.status, s.code || s.by || "", s.when || (s.info && [s.info.date, s.info.unit].filter(Boolean).join(" ")) || ""].join("|"));
+
+  await test("Missed documents: a PDF run names every document IREPS listed, once, with its IREPS date and railway and what became of it; a row without a PDF link and a run that could not reserve are named too", async () => {
+    const api = hooksApi({ taken: { "ma:P2|M2": { status: "done", by: { name: "Rahul" }, at: "2026-11-27T04:35:00+00:00" } } });
+    const hooks = createSharedRunHooks({ api, claimId: "c1", account: ACCOUNT, isClaimLive: () => true, uploadEcm: async () => ({ uid: "u", site: "hosur", path: "/x", deduplicated: false }) });
+    const items = [maItem(1), maItem(2), maItem(3)];
+    await hooks.documentHooks.preflight(items);
+    await hooks.documentHooks.onSaved(items[0], { filename: "MA_M1.pdf", ecm: { status: "stored", path: "/ECM/MA" } });
+    await hooks.finishDocuments([
+      { id: "m1", status: DOCUMENT_DOWNLOAD_STATUS.COMPLETED },
+      { id: "m2", status: DOCUMENT_DOWNLOAD_STATUS.SKIPPED, skip: { reason: SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT } },
+      { id: "m3", status: DOCUMENT_DOWNLOAD_STATUS.FAILED, error: { code: "IREPS_MA_DOWNLOAD_FAILED", detail: "IREPS did not respond in time" } },
+      // a PO-by-date row IREPS gave no PDF link for: never offered to the reservation
+      { id: "po-9", label: "PO 9", status: "skipped", poDate: "26/11/2026", railwayUnit: "N RLY", error: { code: "IREPS_PO_PDF_NOT_FOUND", detail: "the row has no PO PDF link" } }
+    ]);
+    eq(JSON.stringify(seenText(hooks.details().seen)), JSON.stringify([
+      "MA M1 (PO P1)|saved||27/11/2026 S W RLY",
+      "MA M2 (PO P2)|already|Rahul|2026-11-27 10:05",
+      "MA M3 (PO P3)|failed|IREPS_MA_DOWNLOAD_FAILED|27/11/2026 S W RLY",
+      "PO 9|failed|IREPS_PO_PDF_NOT_FOUND|26/11/2026 N RLY"
+    ]));
+    eq(hooks.details().seen[0].key, "ma:P1|M1", "named by its key");
+    // a run that could not reserve: its documents were listed but not reached, with the code it stopped with
+    const down = createSharedRunHooks({ api: hooksApi({ reserveError: new ScheduleApiError("SCHEDULE_BACKEND_UNAVAILABLE") }), claimId: "c2", account: ACCOUNT, isClaimLive: () => true });
+    await down.documentHooks.preflight([maItem(4)]);
+    await down.finishDocuments([{ id: "m4", status: DOCUMENT_DOWNLOAD_STATUS.SKIPPED, skip: { reason: SKIP_REASON.ALREADY_SAVED_FOR_ACCOUNT } }]);
+    eq(JSON.stringify(down.details().seen.map((s) => [s.doc, s.status, s.code, s.detail])), JSON.stringify([["MA M4 (PO P4)", "unread", "SCHEDULE_BACKEND_UNAVAILABLE", "not downloaded: the run stopped before it"]]));
+  });
+
+  await test("Missed documents: a tender run names each document it reserved (saved, already saved, not saved, being saved by another run) and the runner tab's list reaches the worker cleaned", async () => {
+    const api = hooksApi({ taken: { "tender:LOA|T1|2": { status: "done", by: { name: "Rahul" }, at: "2026-11-16T09:32:00+00:00" }, "tender:LOA|T1|4": { status: "in_progress", by: { name: "Asha" } } } });
+    const hooks = createSharedRunHooks({ api, claimId: "c1", account: ACCOUNT, isClaimLive: () => true });
+    const t = hooks.tenderHooks;
+    await t.reserveDocuments(["tender:LOA|T1|1", "tender:LOA|T1|2", "tender:LOA|T1|3", "tender:LOA|T1|4"]);
+    await t.documentSaved({ doc_type: "loa", doc_key: "tender:LOA|T1|1", filename: "LOA_T1.pdf", destination: "ecm" });
+    t.documentFailed({ key: "tender:LOA|T1|3", code: "SCHEDULE_TENDER_FAILED", detail: "IREPS answered with an error page" });
+    await hooks.finishTenderRun();
+    const seen = hooks.details().seen;
+    eq(JSON.stringify(seen.map((s) => `${s.key}|${s.status}|${s.code || s.by || ""}`)), JSON.stringify([
+      "tender:LOA|T1|1|saved|", "tender:LOA|T1|2|already|Rahul", "tender:LOA|T1|3|failed|SCHEDULE_TENDER_FAILED", "tender:LOA|T1|4|unread|SCHEDULE_NOT_RESERVED"
+    ]));
+    eq(seen[3].detail, "being saved by Asha", "another run holds it: not saved yet, whichever run saves it");
+    // the runner tab's outcome: only what a document is, cleaned (no URL as a key, no unknown field, no bad code, redacted)
+    const out = cleanOutcome({ outcome: "done", log: { failures: [], saved: [], skipped: [], more: {}, seen: [
+      { key: "tender:TENDER_PDF|7|-", doc: "Tender 7 tender PDF", status: "saved", url: "https://ireps.example/doc?id=1" },
+      { doc: "Tender 8 corrigendum 1", status: "failed", key: "https://ireps.example/x", code: "not a code", detail: "refused, JSESSIONID=ABCDEF0123456789ABCDEF" },
+      { doc: "Tender 9", status: "lost" },
+      "not an entry"
+    ] } });
+    eq(JSON.stringify(out.log.seen.map((s) => Object.keys(s).join(","))), JSON.stringify(["key,doc,status", "doc,status,detail"]));
+    assert(!out.log.seen[1].detail.includes("ABCDEF0123456789"), out.log.seen[1].detail);
+  });
+
+  const ledgerAt = (hhmm, day = "2026-11-27") => new Date(Date.parse(`${day}T${hhmm}:00+05:30`)).toISOString();
+  const statesOf = (days) => days.map((d) => `${d.day}: ${d.docs.map((x) => `${x.doc.split(" ")[1]}=${x.state}`).sort().join(" ")}`).join(" / ");
+
+  await test("Missed documents: each document is kept once per IREPS account under the day it was first found; saved once stays saved; one not saved is missed only once a later complete search of its type no longer lists it", async () => {
+    const ledger = createDocumentLedger({ storage: memoryArea(), recon: () => "http://recon.test" });
+    const a = { key: "ma:P1|M1", doc: "MA M1 (PO P1)", info: { date: "27/11/2026", unit: "S W RLY" } };
+    const b = { key: "ma:P2|M2", doc: "MA M2 (PO P2)" };
+    const c = { key: "ma:P3|M3", doc: "MA M3 (PO P3)" };
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-27", at: ledgerAt("10:00"), full: true, seen: [{ ...a, status: "saved" }, { ...b, status: "failed", code: "IREPS_MA_DOWNLOAD_FAILED", detail: "IREPS did not respond in time" }, { ...c, status: "failed", code: "ECM_UNAVAILABLE" }] });
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-27", at: ledgerAt("11:00"), full: true, seen: [{ ...a, status: "already", by: "Priya" }, { ...b, status: "saved" }, { ...c, status: "failed", code: "ECM_UNAVAILABLE" }] });
+    let read = await ledger.read("833");
+    eq(statesOf(documentDays(read)), "2026-11-27: M1=scheduled M2=scheduled M3=pending", "the 11:00 run still listed M3: the next run tries again");
+    const m3 = read.docs.find((d) => d.key === c.key);
+    eq(JSON.stringify([m3.tries, m3.first, m3.last, m3.day]), JSON.stringify([2, ledgerAt("10:00"), ledgerAt("11:00"), "2026-11-27"]));
+    eq(read.docs.find((d) => d.key === a.key).status, "saved", "found already saved later: still saved by the schedule");
+    eq(read.docs.find((d) => d.key === b.key).tries, 1, "saved after one run could not");
+    // a run that did not read every list (IREPS logged out mid-run) never makes a document missed
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-28", at: ledgerAt("09:00", "2026-11-28"), full: false, seen: [] });
+    eq(statesOf(documentDays(await ledger.read("833"))), "2026-11-27: M1=scheduled M2=scheduled M3=pending");
+    // Monday: a complete search no longer lists M3 (its date left the look-back): missed; M4 is Monday's
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-30", at: ledgerAt("09:00", "2026-11-30"), full: true, seen: [{ key: "ma:P4|M4", doc: "MA M4 (PO P4)", status: "saved" }] });
+    read = await ledger.read("833");
+    eq(statesOf(documentDays(read)), "2026-11-30: M4=scheduled / 2026-11-27: M1=scheduled M2=scheduled M3=missed");
+    // a complete search of another type says nothing about MAs
+    await ledger.recordRun({ account: "833", type: "poDate", day: "2026-11-30", at: ledgerAt("12:00", "2026-11-30"), full: true, seen: [{ key: "po:7", doc: "PO 7", status: "failed", code: "IREPS_PO_DOWNLOAD_FAILED" }] });
+    eq(statesOf(documentDays(await ledger.read("833"))).split(" / ")[0], "2026-11-30: 7=pending M4=scheduled");
+    // a document you downloaded with DocLink since (the download log's answer) is downloaded, not missed
+    const days = documentDays(await ledger.read("833"), { byHand: { "ma:P3|M3": { date: "2026-11-30", time: "12:10:00" } } });
+    const friday = days.find((d) => d.day === "2026-11-27");
+    eq(JSON.stringify(friday.totals), JSON.stringify({ listed: 3, downloaded: 3, scheduled: 2, already: 0, byHand: 1, missed: 0, pending: 0 }));
+    eq(stateText(friday.docs.find((d) => d.key === c.key), { "ma:P3|M3": { date: "2026-11-30", time: "12:10:00" } }), "Manual: downloaded by you with DocLink on 30/11/2026 12:10");
+    // another IREPS account's documents are its own
+    await ledger.recordRun({ account: "60828", type: "ma", day: "2026-11-30", at: ledgerAt("13:00", "2026-11-30"), full: true, seen: [{ key: "ma:P1|M1", doc: "MA M1 (PO P1)", status: "failed", code: "ECM_UNAVAILABLE" }] });
+    eq((await ledger.read("60828")).docs.length, 1);
+    eq((await ledger.read("833")).docs.find((d) => d.key === a.key).status, "saved", "the other account's failure is not this one's");
+    // the Bill Status, CRN and R-NOTE exports are no documents IREPS lists
+    await ledger.recordRun({ account: "833", type: "billStatus", day: "2026-11-30", at: ledgerAt("09:05", "2026-11-30"), full: false, seen: [{ doc: "Bill Status export (12 records)", status: "failed", code: "IREPS_UNAVAILABLE" }] });
+    eq((await ledger.read("833")).runs.some((r) => r.type === "billStatus"), false);
+  });
+
+  await test("Missed documents: the ledger keeps the last 3 days with documents (and each type's newest complete search), starts afresh for another Recon Engine server, and is never written over when it cannot be read", async () => {
+    eq(LEDGER_DAYS, 3);
+    const doc = (day, n, extra = {}) => ({ account: "833", type: "ma", id: `ma:P${n}|M${n}`, key: `ma:P${n}|M${n}`, doc: `MA M${n}`, day, first: `${day}T04:00:00.000Z`, last: `${day}T04:00:00.000Z`, status: "saved", tries: 0, ...extra });
+    const kept = keptLedger({
+      recon: "http://recon.test",
+      docs: [doc("2026-11-30", 1), doc("2026-11-27", 2), doc("2026-11-26", 3), doc("2026-11-25", 4)],
+      runs: [
+        { account: "833", type: "ma", day: "2026-11-30", at: "2026-11-30T04:00:00.000Z", full: false },
+        { account: "833", type: "poDate", day: "2026-11-20", at: "2026-11-20T04:00:00.000Z", full: true },
+        { account: "833", type: "poDate", day: "2026-11-19", at: "2026-11-19T04:00:00.000Z", full: true },
+        { account: "833", type: "ma", day: "2026-11-24", at: "2026-11-24T04:00:00.000Z", full: false }
+      ]
+    });
+    eq(kept.docs.map((d) => d.day).join(), "2026-11-30,2026-11-27,2026-11-26", "a Monday keeps Friday and Thursday");
+    eq(kept.runs.map((r) => `${r.type} ${r.day}`).join(), "ma 2026-11-30,poDate 2026-11-20", "older runs go, apart from a type's newest complete search");
+    // another Recon Engine server: its documents are not this one's
+    const area = memoryArea();
+    const ledger = createDocumentLedger({ storage: area, recon: () => "http://other.test" });
+    await area.set({ [STORAGE_KEYS.SCHEDULER_DOCUMENTS]: { recon: "http://recon.test", docs: [doc("2026-11-30", 1)], runs: [] } });
+    await ledger.keepServer("http://recon.test");
+    eq((await ledger.read("833")).docs.length, 1, "the same server: kept when a build is loaded");
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-30", at: ledgerAt("10:00", "2026-11-30"), full: true, seen: [{ key: "ma:P9|M9", doc: "MA M9", status: "saved" }] });
+    eq((await ledger.read("833")).docs.map((d) => d.key).join(), "ma:P9|M9", "recorded against another server: started afresh");
+    await ledger.keepServer("http://third.test");
+    eq((await ledger.read("833")).docs.length, 0, "a build for another server drops it");
+    // a ledger that cannot be read is never written over
+    let writes = 0;
+    const broken = createDocumentLedger({ storage: { get: async () => { throw new Error("quota"); }, set: async () => void writes++ } });
+    await broken.recordRun({ account: "833", type: "ma", day: "2026-11-30", at: ledgerAt("10:00", "2026-11-30"), full: true, seen: [{ key: "ma:P9|M9", doc: "MA M9", status: "saved" }] });
+    eq(writes, 0);
+  });
+
+  await test("Missed documents: the scheduler hands each run's list to the ledger with its account, day and start; a short read or a lost claim is no complete search; a run without lists records nothing", async () => {
+    const recorded = [];
+    const documents = { recordRun: async (r) => void recorded.push(r) };
+    const lists = (seen) => ({ failures: [], saved: [], skipped: [], more: {}, seen });
+    const seen = [{ key: "ma:P1|M1", doc: "MA M1 (PO P1)", status: "saved" }];
+    const h = harness({
+      documents,
+      dues: wakesOnce(onDay(1, "ma", "2026-11-30", "09:00"), onDay(2, "ma", "2026-11-30", "10:00"), onDay(3, "ma", "2026-11-30", "11:00")),
+      claim: claimRange("29/11/2026", "30/11/2026"),
+      outcomeFor: (type, nth) => (nth === 1 ? searchedDone({ log: lists(seen) }) : nth === 2 ? { outcome: "partial", code: "SCHEDULE_LIST_INCOMPLETE", result: { saved: 1 }, log: lists(seen) } : { outcome: "failed", code: "UNKNOWN", result: {} })
+    });
+    await h.scheduler.wake("alarm");
+    eq(recorded.map((r) => `${r.account}|${r.type}|${r.day}|${r.full}|${r.seen.length}`).join(" / "), "833|ma|2026-11-30|true|1 / 833|ma|2026-11-30|false|1", "the third run had no lists");
+    eq(recorded[0].at, new Date(T0).toISOString(), "when the run started");
+    const lost = [];
+    const l = harness({
+      documents: { recordRun: async (r) => void lost.push(r) },
+      heartbeatError: conflict("SCHEDULE_CLAIM_LOST"),
+      dues: wakesOnce(onDay(1, "icDate", "2026-11-30", "09:00")),
+      claim: claimRange("29/11/2026", "30/11/2026"),
+      outcomes: { icDate: searchedDone({ log: lists([{ key: "ic:P1|1|C1", doc: "IC C1 (PO P1 Sr. 1)", status: "saved" }]) }) },
+      during: async (ctx, { intervals }) => {
+        await intervals[0].fn();
+      }
+    });
+    await l.scheduler.wake("alarm");
+    eq(lost.map((r) => `${r.type}|${r.full}|${r.seen.length}`).join(), "icDate|false|1", "a lost claim: its documents count, its search is not complete");
+  });
+
+  await test("Missed documents: Download Excel gives the missed documents (with what finds each in IREPS), a line per day and type, and every document IREPS listed", async () => {
+    const ledger = createDocumentLedger({ storage: memoryArea() });
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-27", at: ledgerAt("10:00"), full: true, seen: [{ key: "ma:P3|M3", doc: "MA M3 (PO P3)", info: { date: "27/11/2026", unit: "S W RLY" }, status: "failed", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer" }, { key: "ma:P1|M1", doc: "MA M1 (PO P1)", status: "saved" }] });
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-30", at: ledgerAt("09:00", "2026-11-30"), full: true, seen: [{ key: "ma:P4|M4", doc: "MA M4 (PO P4)", status: "already", by: "Priya", when: "2026-11-30 08:40" }] });
+    const sheets = ledgerSheets(await ledger.read("833"));
+    eq(sheets.map((s) => `${s.name}:${s.headers.length}:${s.rows.length}`).join(), "Missed documents:13:1,By day:9:2,All documents:11:3");
+    eq(JSON.stringify(sheets[0].rows[0]), JSON.stringify(["27/11/2026", "MA copies", "MA M3 (PO P3)", "27/11/2026", "S W RLY", "", "Missed: download it in IREPS", `${describeError("ECM_UNAVAILABLE").title} (the ECM did not answer)`, "ECM_UNAVAILABLE", "1", "27/11/2026 10:00", "27/11/2026 10:00", "the MAs of its PO"]));
+    eq(JSON.stringify(sheets[1].headers), JSON.stringify(["Day found", "Type", "In IREPS", "Downloaded", "Auto (scheduler)", "Manual", "Missed", "Pending", "Lists read in full"]));
+    eq(JSON.stringify(sheets[1].rows), JSON.stringify([["30/11/2026", "MA copies", "1", "1", "0", "1", "0", "0", "yes"], ["27/11/2026", "MA copies", "2", "1", "1", "0", "1", "0", "yes"]]));
+    eq(sheets[2].rows[0][6], "Manual: already saved by Priya on 30/11/2026 08:40");
+  });
+
+  /* ------------------------------------------------- run history: 3 days */
+
+  const DASHES = new RegExp(`[${String.fromCharCode(0x2013, 0x2014)}]`);
+
+  await test("Run history: the last 3 days with runs are kept, so a Monday still shows Friday and Thursday; the events of the days between stay", async () => {
+    let clock = 0;
+    const at = (iso) => (clock = Date.parse(iso));
+    const runLog = createRunLog({ storage: memoryArea(), now: () => clock, recon: () => "http://recon.test" });
+    const runOn = async (id, slotDate, iso) => {
+      at(iso);
+      await runLog.runStarted({ id, docType: "ma", slotId: id, slotDate, period: "09:00" });
+      await runLog.runFinished(id, searchedDone());
+    };
+    eq(RUN_DAYS, 3);
+    await runOn("wed", "2026-11-25", "2026-11-25T04:00:00Z");
+    await runLog.event("ireps", "Wednesday: waiting for IREPS");
+    await runOn("thu", "2026-11-26", "2026-11-26T04:00:00Z");
+    await runOn("fri", "2026-11-27", "2026-11-27T11:00:00Z");
+    at("2026-11-28T05:00:00Z");
+    await runLog.event("ireps", "Saturday: waiting for IREPS");
+    at("2026-11-29T05:00:00Z");
+    await runLog.event("ireps", "Sunday: waiting for IREPS");
+    eq((await runLog.read()).runs.map((r) => r.id).join(), "fri,thu,wed", "three days with runs: all kept");
+    await runOn("mon", "2026-11-30", "2026-11-30T03:35:00Z");
+    const log = await runLog.read();
+    eq(log.runs.map((r) => `${r.id}:${r.day}`).join(), "mon:2026-11-30,fri:2026-11-27,thu:2026-11-26", "Monday keeps Friday and Thursday; Wednesday goes");
+    eq(log.events.map((e) => e.text).join(" | "), "Sunday: waiting for IREPS | Saturday: waiting for IREPS", "the weekend's events stay, Wednesday's go");
+    eq(JSON.stringify(logDays(log).map((d) => [dayLabel(d.day), d.runs.length, d.events.length])), JSON.stringify([["Mon 30/11/2026", 1, 0], ["Sun 29/11/2026", 0, 1], ["Sat 28/11/2026", 0, 1], ["Fri 27/11/2026", 1, 0], ["Thu 26/11/2026", 1, 0]]));
+    eq(log.runs[0].recon, "http://recon.test", "each run says which Recon server it ran against");
+  });
+
+  await test("Run history: a day is the slot's date (the Recon Engine's), else the IST day a run started; an event repeated on the next day is a new line", async () => {
+    eq(runDay({ slotDate: "2026-11-30", startedAt: "2026-11-29T20:00:00Z" }), "2026-11-30");
+    eq(runDay({ startedAt: "2026-11-29T20:00:00Z" }), "2026-11-30", "01:30 IST on the 30th");
+    eq(runDay({ startedAt: "2026-11-29T18:00:00Z" }), "2026-11-29", "23:30 IST on the 29th");
+    eq(runDay({}), "");
+    eq(eventDay({ first: "2026-11-29T18:40:00Z", at: "2026-11-29T20:00:00Z" }), "2026-11-30");
+    let clock = Date.parse("2026-11-29T16:00:00Z"); // 21:30 IST
+    const runLog = createRunLog({ storage: memoryArea(), now: () => clock });
+    await runLog.event("ireps", "Waiting for IREPS");
+    clock = Date.parse("2026-11-29T18:00:00Z"); // 23:30 IST, the same day: one line
+    await runLog.event("ireps", "Waiting for IREPS");
+    clock = Date.parse("2026-11-30T03:00:00Z"); // 08:30 IST the next day: a new line
+    await runLog.event("ireps", "Waiting for IREPS");
+    eq(JSON.stringify((await runLog.read()).events.map((e) => [e.day, e.count || 1])), JSON.stringify([["2026-11-30", 1], ["2026-11-29", 2]]));
+  });
+
+  await test("Run history: a build loaded keeps what ran against this Recon server and drops the rest; nothing changes while the server is not known", async () => {
+    const area = memoryArea();
+    let server = "http://recon.test";
+    const runLog = createRunLog({ storage: area, now: () => Date.parse("2026-11-30T04:00:00Z"), recon: () => server });
+    await runLog.runStarted({ id: "here", docType: "ma", slotDate: "2026-11-30" });
+    await runLog.event("other", "here");
+    server = "https://recon-test.example";
+    await runLog.runStarted({ id: "there", docType: "ma", slotDate: "2026-11-30" });
+    await runLog.event("other", "there");
+    const log = await runLog.read();
+    await area.set({ [STORAGE_KEYS.SCHEDULER_RUN_LOG]: { ...log, runs: [...log.runs, { id: "untagged", docType: "ma", slotDate: "2026-11-30", startedAt: "2026-11-30T03:00:00Z" }] } });
+    await runLog.keepServer("");
+    eq((await runLog.read()).runs.length, 3, "an unknown server changes nothing");
+    await runLog.keepServer("http://recon.test");
+    const kept = await runLog.read();
+    eq([...kept.runs.map((r) => r.id), ...kept.events.map((e) => e.text)].join(), "here,here");
+  });
+
+  await test("Run history: past MAX_LOG_CHARS the oldest runs' saved and skipped lists go first (their counts stay), then the oldest runs", () => {
+    const docs = (n, tag) => Array.from({ length: 200 }, (_, i) => ({ doc: `PO ${tag}-${n}-${i} ${"x".repeat(90)}`, note: `PO_${n}_${i}.pdf in ECM /ECM/Hosur/PO ${"y".repeat(150)}`, key: `po:${tag}${n}-${i}` }));
+    const started = (n) => new Date(Date.parse("2026-11-30T12:00:00Z") - n * 60000).toISOString();
+    const runs = Array.from({ length: 20 }, (_, n) => ({ id: `r${n}`, docType: "poDate", day: "2026-11-30", startedAt: started(n), failures: [{ doc: `PO F${n}`, code: "ECM_UNAVAILABLE", detail: null, key: `po:F${n}` }], saved: docs(n, "s"), skipped: docs(n, "k"), more: {} }));
+    const big = { runs, events: [] };
+    assert(JSON.stringify(big).length > MAX_LOG_CHARS, "the test log is over the limit");
+    const kept = keptLog(big);
+    assert(JSON.stringify(kept).length <= MAX_LOG_CHARS, "the kept log is within it");
+    eq(kept.runs.length, 20, "no run had to go");
+    eq(kept.runs[0].saved.length, 200, "the newest run keeps its lists");
+    const oldest = kept.runs[19];
+    eq(JSON.stringify([oldest.saved.length, oldest.skipped.length, oldest.more.saved, oldest.more.skipped, oldest.failures.length]), JSON.stringify([0, 0, 200, 200, 1]), "the oldest run's lists are counted instead; its failure stays");
+    const failing = (n) => Array.from({ length: 200 }, (_, i) => ({ doc: `PO ${n}-${i} ${"z".repeat(110)}`, code: "ECM_UNAVAILABLE", detail: "d".repeat(150) }));
+    // 60 runs of 200 failures each are over the limit even without their saved and skipped lists
+    const huge = { runs: Array.from({ length: 60 }, (_, n) => ({ ...runs[0], id: `h${n}`, startedAt: started(n), failures: failing(n) })), events: [] };
+    const cut = keptLog(huge);
+    assert(JSON.stringify(cut).length <= MAX_LOG_CHARS, "within the limit");
+    assert(cut.runs.length > 0 && cut.runs.length < 60 && cut.runs[0].id === "h0" && cut.runs.at(-1).id === `h${cut.runs.length - 1}`, `then the oldest runs go, the newest kept (${cut.runs.length} kept)`);
+  });
+
+  await test("Run history: each document not saved is listed once, with how often and whether a later run saved it (by its key; without a key only a save counts)", () => {
+    const run = (id, startedAt, lists) => ({ id, docType: "poDate", day: istDateTime(startedAt).slice(0, 10), startedAt, failures: [], saved: [], skipped: [], ...lists });
+    const fail = (doc, key) => ({ doc, code: "IREPS_PO_DOWNLOAD_FAILED", detail: "IREPS did not respond in time", ...(key ? { key } : {}) });
+    const log = { events: [], runs: [
+      run("r4", "2026-11-30T05:30:00Z", { skipped: [{ doc: "PO 3", note: "Already saved by Rahul", key: "po:3" }, { doc: "PO 5", note: "not downloaded: no document number to reserve it by" }] }),
+      run("r3", "2026-11-30T04:30:00Z", { saved: [{ doc: "PO 1", note: "PO_1.pdf in ECM", key: "po:1" }] }),
+      run("r2", "2026-11-30T03:30:00Z", { failures: [fail("PO 1", "po:1"), fail("PO 5", null), fail("PO 2", "po:2")] }),
+      run("r1", "2026-11-27T11:30:00Z", { failures: [fail("PO 1", "po:1"), fail("PO 3", "po:3"), fail("PO 5", null)] })
+    ] };
+    const list = notSavedList(log);
+    eq(JSON.stringify(list.map((n) => [n.doc, n.times, n.savedAt ? istDateTime(n.savedAt) : null])), JSON.stringify([
+      ["PO 2", 1, null],
+      ["PO 5", 2, null],
+      ["PO 1", 2, "2026-11-30 10:00"],
+      ["PO 3", 1, "2026-11-30 11:00"]
+    ]), "the ones still not saved first, each part newest first; PO 3 was found already saved later; PO 5 has no key, so a skip does not count");
+    const po1 = list.find((n) => n.doc === "PO 1");
+    eq(notSavedText(po1), `2026-11-30 09:00  POs by PO date  PO 1: ${describeError("IREPS_PO_DOWNLOAD_FAILED").title} (IREPS did not respond in time) [IREPS_PO_DOWNLOAD_FAILED] (2 times)  saved later 2026-11-30 10:00`);
+    assert(notSavedText(list[0]).endsWith("  not saved since"), notSavedText(list[0]));
+    // one day: only that day's failures, still marked by a later day's save
+    eq(JSON.stringify(notSavedList(log, { day: "2026-11-27" }).map((n) => [n.doc, n.times, Boolean(n.savedAt)])), JSON.stringify([["PO 5", 1, false], ["PO 1", 1, true], ["PO 3", 1, true]]));
+  });
+
+  await test("Run history: a failure without a key is cleared by a later save of the same document by its name; a later run marks the failures it saved, so they stay saved when lists are cut", async () => {
+    // a PO row without a PDF link at 09:00 (no key on the failure), saved at 10:00
+    const noKey = { events: [], runs: [
+      { id: "b", docType: "poDate", day: "2026-11-30", startedAt: "2026-11-30T04:30:00Z", failures: [], saved: [{ doc: "PO 123", note: "PO_123.pdf in ECM", key: "po:123" }], skipped: [] },
+      { id: "a", docType: "poDate", day: "2026-11-30", startedAt: "2026-11-30T03:30:00Z", failures: [{ doc: "PO 123", code: "IREPS_PO_LINK_NOT_FOUND", detail: null }], saved: [], skipped: [] }
+    ] };
+    eq(istDateTime(notSavedList(noKey)[0].savedAt), "2026-11-30 10:00");
+    // Friday's failure, saved on Monday: marked when Monday's run ends
+    let clock = Date.parse("2026-11-27T11:00:00Z");
+    const runLog = createRunLog({ storage: memoryArea(), now: () => clock });
+    await runLog.runStarted({ id: "fri", docType: "poDate", slotDate: "2026-11-27" });
+    await runLog.runFinished("fri", { outcome: "partial", result: { saved: 1, failed: 1 }, log: { failures: [{ doc: "PO 7", code: "ECM_UNAVAILABLE", key: "po:7" }], saved: [{ doc: "PO 6", note: "PO_6.pdf", key: "po:6" }], skipped: [{ doc: "PO 5", note: "Already saved by Rahul", key: "po:5" }], more: {} } });
+    clock = Date.parse("2026-11-30T03:35:00Z");
+    await runLog.runStarted({ id: "mon", docType: "poDate", slotDate: "2026-11-30" });
+    await runLog.runFinished("mon", { outcome: "done", result: { saved: 1 }, log: { failures: [], saved: [{ doc: "PO 7", note: "PO_7.pdf", key: "po:7" }], skipped: [], more: {} } });
+    const log = await runLog.read();
+    const fri = log.runs.find((r) => r.id === "fri");
+    eq(fri.failures[0].savedAt, "2026-11-30T03:35:00.000Z", "Friday's failure knows Monday saved it");
+    eq(JSON.stringify([fri.saved.length, fri.skipped.length, fri.more.skipped]), JSON.stringify([1, 0, 1]), "an older day keeps what it downloaded, and counts what it found already saved");
+    const cut = { ...log, runs: log.runs.map((r) => ({ ...r, saved: [], skipped: [] })) };
+    eq(istDateTime(notSavedList(cut)[0].savedAt), "2026-11-30 09:05", "still saved later when every list is cut");
+    eq(JSON.stringify(downloadedOn(log, "2026-11-27")), JSON.stringify({ entries: [{ doc: "PO 6", note: "PO_6.pdf", key: "po:6", at: "2026-11-27T11:00:00.000Z", docType: "poDate" }], total: 1 }));
+  });
+
+  await test("Run history: a log that cannot be read is never written over; a run still running when the worker starts is marked cut off; a browser with few run days keeps 7 days of events", async () => {
+    const area = memoryArea();
+    let clock = Date.parse("2026-11-30T03:35:00Z");
+    const runLog = createRunLog({ storage: area, now: () => clock });
+    await runLog.runStarted({ id: "r1", docType: "ma", slotDate: "2026-11-30" });
+    let sets = 0;
+    let fail = true;
+    const flaky = { get: async (key) => {
+      if (fail) {
+        fail = false;
+        throw new Error("storage busy");
+      }
+      return area.get(key);
+    }, set: async (items) => {
+      sets++;
+      return area.set(items);
+    } };
+    const other = createRunLog({ storage: flaky, now: () => clock });
+    await other.event("ireps", "Waiting for IREPS");
+    eq(sets, 0, "the read failed: nothing written, the stored log is untouched");
+    eq((await runLog.read()).runs.length, 1);
+    await other.markInterrupted();
+    const r1 = (await runLog.read()).runs[0];
+    eq(JSON.stringify([r1.outcome, r1.code]), JSON.stringify(["failed", "SCHEDULE_RUN_INTERRUPTED"]), "a run that was running when the worker started was cut off");
+    eq(describeError("SCHEDULE_RUN_INTERRUPTED").title, "Scheduled download cut off");
+    const before = sets;
+    await other.markInterrupted();
+    eq(sets, before, "nothing running: nothing written");
+    // one day with a run, then events on 9 more days: only the last 7 days of events stay
+    for (let d = 1; d <= 9; d++) {
+      clock = Date.parse("2026-11-30T05:00:00Z") + d * 86400000;
+      await runLog.event("other", `day ${d}`);
+    }
+    const events = (await runLog.read()).events.map((e) => e.text);
+    eq(events.join(), "day 9,day 8,day 7,day 6,day 5,day 4,day 3", "7 days of events");
+  });
+
+  await test("Runners: a row IREPS lists without a PDF link keeps its document key in the run log", async () => {
+    const factory = createRunnerFactory({ api: {}, makeHooks: () => ({ documentHooks: {}, finishDocuments: async () => ({ saved: 0, skipped: 0, failed: 0, notReported: 0, aborted: null }), details: noDetails }) });
+    const noLink = { id: "po-3", label: "PO 27253922000301", status: "skipped", log: { docType: "po", key: "po:27253922000301" }, error: { code: "IREPS_PO_LINK_NOT_FOUND", detail: "IREPS did not provide a PO PDF link for this row" } };
+    const end = await factory.documentRunner(async () => ({ started: true, done: Promise.resolve({ ok: true, items: [noLink] }) }))({ slot: { doc_type: "poDate" }, params: { dateFrom: "29/11/2026", dateTo: "30/11/2026" } });
+    eq(end.log.failures[0].key, "po:27253922000301");
+    eq("key" in end.result.failures[0], false, "never in the slot's result");
+  });
+
+  await test("Run history: a run keeps each document's key, so a later save of it is found; anything that is no document key is left out", async () => {
+    eq(logKey("po:27253922000301"), "po:27253922000301");
+    eq(logKey("tender:LOA|10263703|1503282"), "tender:LOA|10263703|1503282");
+    eq(logKey("pending:833|1|2|3|Annexure 1.pdf"), "pending:833|1|2|3|Annexure 1.pdf", "an attachment's name may have spaces");
+    for (const bad of ["", "https://www.ireps.gov.in/x", "po", "PO:1", 42, null, `po:${"9".repeat(400)}`, `po:1${String.fromCharCode(10)}x`]) eq(logKey(bad), "", JSON.stringify(bad));
+    eq(JSON.stringify(withKey({ doc: "PO 1" }, "po:1")), JSON.stringify({ doc: "PO 1", key: "po:1" }));
+    eq(JSON.stringify(withKey({ doc: "PO 1" }, "cookie=abc")), JSON.stringify({ doc: "PO 1" }));
+    const runLog = createRunLog({ storage: memoryArea(), now: () => Date.parse("2026-11-30T04:00:00Z") });
+    await runLog.runStarted({ id: "k", docType: "poDate", slotDate: "2026-11-30" });
+    await runLog.runFinished("k", { outcome: "partial", result: { saved: 1, failed: 1 }, log: { failures: [{ doc: "PO 2", code: "ECM_UNAVAILABLE", key: "po:2" }], saved: [{ doc: "PO 1", note: "PO_1.pdf", key: "po:1" }], skipped: [{ doc: "PO 3", note: "x", key: "javascript:alert(1)" }], more: {} } });
+    const r = (await runLog.read()).runs[0];
+    eq(JSON.stringify([r.failures[0].key, r.saved[0].key, "key" in r.skipped[0]]), JSON.stringify(["po:2", "po:1", false]));
+  });
+
+  await test("Run history: the saved text keeps every day, newest first, after the documents not saved", () => {
+    const log = {
+      runs: [
+        { id: "m", docType: "ma", day: "2026-11-30", startedAt: "2026-11-30T03:35:00Z", outcome: "done", range: "27/11/2026 - 30/11/2026 (from the last successful run; the look-back gave 29/11/2026)", counts: { saved: 2 }, failures: [], saved: [], skipped: [], more: {} },
+        { id: "f", docType: "ma", day: "2026-11-27", startedAt: "2026-11-27T11:30:00Z", outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", counts: { saved: 1, failed: 1 }, failures: [{ doc: "MA 7 (PO 1)", code: "ECM_UNAVAILABLE", detail: null, key: "ma:1|7" }], saved: [], skipped: [], more: {} }
+      ],
+      events: [{ first: "2026-11-28T05:00:00Z", at: "2026-11-28T05:00:00Z", day: "2026-11-28", kind: "ireps", text: "Saturday: waiting for IREPS" }]
+    };
+    const text = runLogText(log, { account: "833", version: "1.7.2", savedAt: "2026-11-30T06:00:00Z" });
+    let from = 0;
+    for (const part of ["Kept: the last 3 days with runs and the days between (Mon 30/11/2026, Sat 28/11/2026, Fri 27/11/2026)", "STILL NOT SAVED (1;", "MON 30/11/2026", "DOWNLOADED (2)", "... and 2 more (counted by their runs, not listed)", "Searched: 27/11/2026 - 30/11/2026 (from the last successful run", "SAT 28/11/2026", "Saturday: waiting for IREPS", "FRI 27/11/2026", "NOT SAVED (1)", "MA copies"]) {
+      const i = text.indexOf(part, from);
+      assert(i >= 0, `"${part}" after position ${from} in:\n${text}`);
+      from = i;
+    }
+    assert(!DASHES.test(text), "no en or em dash");
+  });
+
+  await test("Run history: Download Excel gives a Documents sheet (downloaded, then not saved, day by day), a Runs sheet and the scheduler's events", () => {
+    const log = {
+      runs: [
+        { id: "m", docType: "ma", day: "2026-11-30", period: "09:00", startedAt: "2026-11-30T03:35:00Z", endedAt: "2026-11-30T03:36:00Z", outcome: "done", range: "27/11/2026 - 30/11/2026", counts: { found: 1, saved: 1 }, failures: [], saved: [{ doc: "MA 9 (PO 9)", note: "MA_9.pdf in ECM /ECM/Hosur/MA", key: "ma:9|9" }], skipped: [], more: {} },
+        { id: "f", docType: "poDate", day: "2026-11-27", period: "17:00", startedAt: "2026-11-27T11:30:00Z", endedAt: "2026-11-27T11:31:00Z", outcome: "failed", code: "SCHEDULE_DOWNLOAD_FAILED", range: "26/11/2026 - 27/11/2026", counts: { found: 1, saved: 0, failed: 1, notReported: 0 }, failures: [{ doc: "PO 7", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time", key: "po:7" }], saved: [], skipped: [], more: {} }
+      ],
+      events: [{ kind: "ireps", first: "2026-11-28T04:30:00Z", at: "2026-11-28T12:15:00Z", count: 32, day: "2026-11-28", text: "Saturday: waiting for IREPS" }]
+    };
+    const sheets = runLogSheets(log);
+    eq(sheets.map((s) => `${s.name}:${s.headers.length}`).join(), "Documents:7,Runs:14,Scheduler events:5");
+    eq(JSON.stringify(sheets[0].rows), JSON.stringify([
+      ["30/11/2026", "09:05", "MA copies", "MA 9 (PO 9)", "Downloaded", "MA_9.pdf in ECM /ECM/Hosur/MA", ""],
+      ["27/11/2026", "17:00", "POs by PO date", "PO 7", "Not saved", `${describeError("ECM_UNAVAILABLE").title} (the ECM did not answer in time)`, "ECM_UNAVAILABLE"]
+    ]));
+    eq(JSON.stringify(sheets[1].rows), JSON.stringify([
+      ["30/11/2026", "09:05", "09:06", "MA copies", "09:00 run", "Done", "27/11/2026 - 30/11/2026", "1", "1", "", "", "", "", ""],
+      ["27/11/2026", "17:00", "17:01", "POs by PO date", "17:00 run", "Failed", "26/11/2026 - 27/11/2026", "1", "0", "", "1", "0", "", describeError("SCHEDULE_DOWNLOAD_FAILED").title]
+    ]), "a count IREPS did not give stays empty, never 0");
+    eq(sheets[2].rows[0].join("|"), "28/11/2026|10:00|17:45|32|Saturday: waiting for IREPS");
+    const bytes = buildWorkbook({ sheets });
+    eq(String.fromCharCode(bytes[0], bytes[1]), "PK", "an .xlsx (a zip)");
+  });
+
+  // My Downloads' layout is checked with the panel's stylesheet too: loaded again here (outside the timed test),
+  // removed after it
+  const downloadsCss = Object.assign(document.createElement("link"), { rel: "stylesheet", href: panelCss.href });
+  await new Promise((resolve) => {
+    downloadsCss.onload = downloadsCss.onerror = resolve;
+    document.head.append(downloadsCss);
+  });
+  await test("My Downloads > Scheduled runs: a Day dropdown; the day shows what was downloaded, what was not saved, its runs and events; the newest day follows new runs until one is picked", async () => {
+    const host = document.createElement("div");
+    host.className = "app-main";
+    host.style.cssText = "position: absolute; left: -10000px; top: 0; width: 320px";
+    host.innerHTML = `<button id="btn-downloads-open" type="button"></button>${panelHtml.querySelector("#view-downloads").outerHTML}`;
+    document.body.append(host);
+    host.querySelector("#view-downloads").hidden = false;
+    const run = (o) => ({ account: "833", recon: "http://recon.test", failures: [], saved: [], skipped: [], more: {}, warnings: [], ...o });
+    const broken = { doc: "Tender 31265690 - IRS_Conditions.pdf", code: "SCHEDULE_TENDER_FAILED", detail: "IREPS returned an unrecognised file type (application/pdf).", key: "tender:ATTACHMENTS|31265690|irs" };
+    const ma = { doc: "MA 4411 (PO 27253922000301)", code: "IREPS_MA_DOWNLOAD_FAILED", detail: "IREPS did not respond in time", key: "ma:27253922000301|4411" };
+    let log = {
+      runs: [
+        run({ id: "m2", docType: "ma", day: "2026-11-30", startedAt: "2026-11-30T04:30:00Z", outcome: "done", counts: { saved: 1 }, saved: [{ doc: ma.doc, note: "MA_4411.pdf in ECM /ECM/Hosur/MA", key: ma.key }] }),
+        run({ id: "m1", docType: "ma", day: "2026-11-30", startedAt: "2026-11-30T03:35:00Z", outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", counts: { saved: 2, failed: 1 }, failures: [ma], saved: [{ doc: "MA 4402 (PO 1)", note: "MA_4402.pdf in ECM /ECM/Hosur/MA", key: "ma:1|4402" }], more: { saved: 1 } }),
+        run({ id: "f1", docType: "tenderNit", day: "2026-11-27", startedAt: "2026-11-27T11:00:00Z", outcome: "partial", code: "SCHEDULE_DOWNLOAD_FAILED", counts: { saved: 3, failed: 1 }, failures: [broken], saved: [{ doc: "Tender 1 tender PDF", note: "1.pdf in ECM /ECM/Hosur/Tenders", key: "tender:TENDER_PDF|1|-" }], more: { saved: 2 } })
+      ],
+      events: [{ kind: "ireps", first: "2026-11-28T04:30:00Z", at: "2026-11-28T12:15:00Z", count: 32, day: "2026-11-28", text: "Waiting for IREPS: log in to IREPS in this browser." }]
+    };
+    const asked = [];
+    const state = () => ({ config: { enabled: true, types: ["ma", "tenderNit"], unknown: [], reason: null }, account: "833", version: "1.7.2", log: JSON.parse(JSON.stringify(log)), lastSuccess: { ma: { day: "30/11/2026", held: 0 } } });
+    const settle = async (check) => {
+      for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 0));
+    };
+    const lines = (id) => [...host.querySelectorAll(`#${id} li`)].map((li) => li.textContent);
+    const days = () => [...host.querySelectorAll("#history-days option:not(.day-note)")].map((o) => `${o.textContent}|${o.selected}`).join(", ");
+    const pick = (label) => {
+      const select = host.querySelector("#history-days");
+      select.value = [...select.options].find((o) => o.textContent.startsWith(label)).value;
+      select.dispatchEvent(new Event("change"));
+    };
+    try {
+      await initRunHistory({ send: async (type) => (asked.push(type), state()) });
+      host.querySelector("#downloads-tab-runs").click();
+      await settle(() => host.querySelector("#history-days option"));
+      eq(asked[0], MESSAGE_TYPES.SCHEDULE_GET_STATE);
+      eq(JSON.stringify([...host.querySelectorAll("#downloads-runs .result-actions button")].map((b) => b.textContent)), JSON.stringify(["Download Excel", "Refresh"]), "My Downloads exports with Download Excel only: no Copy / Save log");
+      eq(JSON.stringify([host.querySelector("#downloads-files").hidden, host.querySelector("#downloads-runs").hidden, host.querySelector("#downloads-tab-runs").getAttribute("aria-selected")]), JSON.stringify([true, false, "true"]), "the tab shows instead of the saved files");
+      eq(host.querySelector("#history-summary").textContent, "2 days · 3 runs · 6 downloaded · 1 not saved", "days with runs (Saturday had only notes)");
+      eq(days(), "Mon 30/11/2026 · 3 downloaded|true, Sat 28/11/2026 · no runs|false, Fri 27/11/2026 · 3 downloaded|false");
+      // the foot of the list: how many days are kept, a line that cannot be picked
+      const note = host.querySelector("#history-days").lastElementChild;
+      eq(JSON.stringify([note.textContent, note.disabled, note.className]), JSON.stringify(["Only the last 3 days with runs are kept.", true, "day-note"]));
+      eq(host.querySelector("#history-downloaded-title").textContent, "Downloaded on Mon 30/11/2026 (3)");
+      eq(JSON.stringify(lines("history-downloaded")), JSON.stringify(["10:00 · MA copies: MA 4411 (PO 27253922000301) · MA_4411.pdf in ECM /ECM/Hosur/MA", "09:05 · MA copies: MA 4402 (PO 1) · MA_4402.pdf in ECM /ECM/Hosur/MA", "... and 1 more"]));
+      const monday = lines("history-not-saved");
+      assert(monday.length === 1 && monday[0].startsWith(`09:05 · MA copies: MA 4411 (PO 27253922000301): ${describeError("IREPS_MA_DOWNLOAD_FAILED").title}`) && monday[0].includes(" · saved later, ") && monday[0].endsWith("10:00"), monday.join());
+      eq(host.querySelector("#history-not-saved li").className, "schedule-event schedule-saved-later");
+      eq(host.querySelector("#history-runs-title").textContent, "Runs (2)");
+
+      // nothing picked: a new day's run makes it the day shown
+      log = { ...log, runs: [run({ id: "t1", docType: "ma", day: "2026-12-01", startedAt: "2026-12-01T03:31:00Z", outcome: "done", counts: { saved: 1 }, saved: [{ doc: "MA 9 (PO 9)", note: "MA_9.pdf in ECM", key: "ma:9|9" }] }), ...log.runs] };
+      handleRunHistoryMessage({ type: MESSAGE_TYPES.SCHEDULE_STATE });
+      await settle(() => host.querySelectorAll("#history-days option:not(.day-note)").length === 4);
+      eq(host.querySelector("#history-days").selectedOptions[0].textContent, "Tue 01/12/2026 · 1 downloaded", "the newest day follows new runs");
+
+      // Friday, picked: its broken file, never saved since
+      pick("Fri");
+      eq(host.querySelector("#history-downloaded-title").textContent, "Downloaded on Fri 27/11/2026 (3)");
+      const friday = lines("history-not-saved");
+      assert(friday.length === 1 && friday[0].includes("Tender 31265690 - IRS_Conditions.pdf") && friday[0].endsWith(" · not saved since"), friday.join());
+      eq(host.querySelector("#history-not-saved li").className, "schedule-event schedule-event-error");
+
+      // Saturday: no runs, the scheduler's notes; a picked day stays when the state changes again
+      pick("Sat");
+      eq(JSON.stringify([host.querySelector("#history-runs-empty").hidden, host.querySelector("#history-runs-empty").textContent]), JSON.stringify([false, "No scheduled download ran in this browser on Sat 28/11/2026."]));
+      eq(host.querySelector("#history-not-saved-empty").textContent, "Nothing on this day.");
+      assert(lines("history-events")[0].startsWith("10:00-17:45 (32 checks): Waiting for IREPS"), lines("history-events").join());
+      const reads = asked.length;
+      const firstOption = host.querySelector("#history-days option");
+      handleRunHistoryMessage({ type: MESSAGE_TYPES.SCHEDULE_STATE });
+      await settle(() => asked.length > reads);
+      await settle(() => false);
+      eq(host.querySelector("#history-days").selectedOptions[0].textContent, "Sat 28/11/2026 · no runs", "the day picked stays");
+      assert(host.querySelector("#history-days option") === firstOption, "the same days: the list is not rebuilt, so an open list stays open");
+
+      // Download Excel: every day kept (not only the day shown), one workbook named after its first and last day
+      const saved = [];
+      const { createObjectURL, revokeObjectURL } = URL;
+      const click = HTMLAnchorElement.prototype.click;
+      URL.createObjectURL = (blob) => (saved.push({ blob }), "blob:test");
+      URL.revokeObjectURL = () => {};
+      HTMLAnchorElement.prototype.click = function () {
+        saved.at(-1).name = this.download;
+      };
+      try {
+        host.querySelector("#btn-history-excel").click();
+      } finally {
+        Object.assign(URL, { createObjectURL, revokeObjectURL });
+        HTMLAnchorElement.prototype.click = click;
+      }
+      eq(JSON.stringify(saved.map((f) => [f.name, f.blob.type])), JSON.stringify([["DocLink_scheduled_runs_2026-11-27_to_2026-12-01.xlsx", XLSX_MIME_TYPE]]));
+      const xml = new TextDecoder().decode(await saved[0].blob.arrayBuffer());
+      for (const cell of ["MA 9 (PO 9)", "MA 4411 (PO 27253922000301)", "Tender 31265690 - IRS_Conditions.pdf", "Saved later", "Not saved"]) assert(xml.includes(`>${cell}<`), `${cell} in the workbook`);
+
+      // nothing sticks out of a 320 px panel
+      const card = host.querySelector(".card");
+      const style = getComputedStyle(card);
+      const edge = card.getBoundingClientRect().right - parseFloat(style.borderRightWidth) - parseFloat(style.paddingRight);
+      pick("Mon");
+      const sticking = [...card.querySelectorAll("*")].filter((n) => {
+        const box = n.getBoundingClientRect();
+        return box.width > 0 && box.right > edge + 0.5;
+      });
+      assert(sticking.length === 0, `inside a 320 px panel: ${sticking.map((n) => `<${n.tagName.toLowerCase()} class="${n.className}">`).join(", ")}`);
+
+      // back to the saved files: Refresh lines up with the filters, and nothing sticks out there either
+      host.querySelector("#downloads-tab-files").click();
+      eq(JSON.stringify([host.querySelector("#downloads-files").hidden, host.querySelector("#downloads-runs").hidden]), JSON.stringify([false, true]));
+      const refresh = host.querySelector("#btn-downloads-refresh").getBoundingClientRect();
+      const filterRow = host.querySelector("#downloads-destination").closest(".date-row").getBoundingClientRect();
+      eq(Math.round(refresh.left), Math.round(filterRow.left), "Refresh starts where the filters start");
+      assert(refresh.top - filterRow.bottom >= 8, `room above Refresh: ${refresh.top - filterRow.bottom}px (margin-top ${getComputedStyle(host.querySelector("#btn-downloads-refresh")).marginTop}, refresh ${JSON.stringify(refresh)}, filters ${JSON.stringify(filterRow)})`);
+      const out = [...host.querySelector("#downloads-files").querySelectorAll("*")].filter((n) => {
+        const box = n.getBoundingClientRect();
+        return box.width > 0 && box.right > edge + 0.5;
+      });
+      assert(out.length === 0, `Saved files inside a 320 px panel: ${out.map((n) => `<${n.tagName.toLowerCase()} id="${n.id}">`).join(", ")}`);
+    } finally {
+      host.remove();
+    }
+  });
+
+  await test("My Downloads > Missed documents: the day in tiles (In IREPS, Auto, Manual, Missed, Pending) and a row per type with its bar; the missed documents with what finds them in IREPS, the pending ones apart; one you downloaded with DocLink since is Manual; it fits a 320 px panel", async () => {
+    const host = document.createElement("div");
+    host.className = "app-main";
+    host.style.cssText = "position: absolute; left: -10000px; top: 0; width: 320px";
+    host.innerHTML = `<button id="btn-downloads-open" type="button"></button>${panelHtml.querySelector("#view-downloads").outerHTML}`;
+    document.body.append(host);
+    host.querySelector("#view-downloads").hidden = false;
+    const at = (hhmm, day) => new Date(Date.parse(`${day}T${hhmm}:00+05:30`)).toISOString();
+    const ledger = createDocumentLedger({ storage: memoryArea() });
+    const ma = (n) => ({ key: `ma:P${n}|M${n}`, doc: `MA M${n} (PO P${n})`, info: { date: "27/11/2026", unit: "S W RLY" } });
+    // Friday 27/11: M1 saved, M2 already saved by Priya, M3 not saved twice; Monday's complete MA search no longer lists M3
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-27", at: at("10:00", "2026-11-27"), full: true, seen: [{ ...ma(1), status: "saved" }, { ...ma(2), status: "already", by: "Priya", when: "2026-11-27 09:40" }, { ...ma(3), status: "failed", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time" }] });
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-27", at: at("17:00", "2026-11-27"), full: true, seen: [{ ...ma(3), status: "failed", code: "ECM_UNAVAILABLE", detail: "the ECM did not answer in time" }] });
+    await ledger.recordRun({ account: "833", type: "ma", day: "2026-11-30", at: at("09:00", "2026-11-30"), full: true, seen: [{ ...ma(4), status: "saved" }] });
+    // Monday 30/11: PO 2 not saved (you downloaded it with DocLink since), a tender attachment IREPS gave broken (the run did not read every list)
+    await ledger.recordRun({ account: "833", type: "poDate", day: "2026-11-30", at: at("09:30", "2026-11-30"), full: true, seen: [{ key: "po:1", doc: "PO 1", status: "saved" }, { key: "po:2", doc: "PO 2", info: { date: "30/11/2026", unit: "N RLY" }, status: "failed", code: "IREPS_PO_DOWNLOAD_FAILED", detail: "IREPS did not respond in time" }] });
+    await ledger.recordRun({ account: "833", type: "tenderNit", day: "2026-11-30", at: at("10:30", "2026-11-30"), full: false, seen: [{ key: "tender:TENDER_PDF|7|-", doc: "Tender 7 tender PDF", status: "saved" }, { key: "tender:ATTACHMENTS|7|a1", doc: "Tender 7 NIT attachment Annexure_A.pdf", status: "failed", code: "SCHEDULE_TENDER_FAILED", detail: "IREPS returned an unrecognised file type" }] });
+    const state = { ok: true, account: "833", config: { enabled: true }, ledger: await ledger.read("833") };
+    const checks = [];
+    const check = async ({ destination, keys }) => {
+      checks.push(`${destination}:${[...keys].sort().join(",")}`);
+      return { ok: true, downloaded: destination === "local" ? { "po:2": { count: 1, filename: "PO_2.pdf", date: "2026-11-30", time: "12:10:00" } } : {} };
+    };
+    const asked = [];
+    const settle = async (ready) => {
+      for (let i = 0; i < 200 && !ready(); i++) await new Promise((r) => setTimeout(r, 0));
+    };
+    const texts = (sel) => [...host.querySelectorAll(sel)].map((n) => n.textContent);
+    const tiles = () => [...host.querySelectorAll("#missed-tiles .missed-tile")].map((t) => `${t.querySelector(".missed-tile-label").textContent} ${t.querySelector(".missed-tile-value").textContent}`);
+    const rows = () => [...host.querySelectorAll("#missed-types .missed-type-row")].map((r) => [r.querySelector(".missed-type-name").textContent, r.querySelector(".missed-type-count").textContent, r.querySelector(".missed-type-line").textContent, ...[...r.querySelectorAll(".downloads-muted")].map((n) => n.textContent)].join(" | "));
+    const bars = () => [...host.querySelectorAll("#missed-types .missed-bar")].map((b) => [...b.children].map((s) => `${s.className.replace("missed-bar-", "")} ${s.style.width}`).join(", "));
+    try {
+      initMissed({ send: async (type) => (asked.push(type), type === MESSAGE_TYPES.SCHEDULE_GET_DOCUMENTS ? state : { config: { enabled: true }, log: { runs: [], events: [] } }), check });
+      await initRunHistory({ send: async () => ({ config: { enabled: true }, log: { runs: [], events: [] } }) });
+      // the repo ships scheduling off: the tabs are shown here as a build with scheduling on shows them
+      host.querySelector("#downloads-tabs").hidden = false;
+      host.querySelector("#downloads-tab-missed").click();
+      await settle(() => checks.length === 2 && host.querySelector("#missed-types .missed-type-row"));
+      await settle(() => false);
+      eq(JSON.stringify([host.querySelector("#downloads-missed").hidden, host.querySelector("#downloads-files").hidden, host.querySelector("#downloads-runs").hidden, host.querySelector("#downloads-tab-missed").getAttribute("aria-selected")]), JSON.stringify([false, true, true, "true"]));
+      assert(asked.includes(MESSAGE_TYPES.SCHEDULE_GET_DOCUMENTS), asked.join());
+      eq(JSON.stringify(checks), JSON.stringify(["ecm:ma:P3|M3,po:2,tender:ATTACHMENTS|7|a1", "local:ma:P3|M3,po:2,tender:ATTACHMENTS|7|a1"]), "the documents not saved, against your own download log");
+      eq(host.querySelector("#missed-summary").textContent, "2 days · 8 in IREPS · 6 downloaded · 1 missed · 1 pending");
+      eq(JSON.stringify(texts("#missed-days option")), JSON.stringify(["Mon 30/11/2026 · 1 pending", "Fri 27/11/2026 · 1 missed", "Only the last 3 days with documents are kept."]));
+      eq(host.querySelector("#missed-types-title").textContent, "Found in IREPS on Mon 30/11/2026");
+      eq(JSON.stringify(tiles()), JSON.stringify(["In IREPS 5", "Auto 3", "Manual 1", "Missed 0", "Pending 1"]), "the day: PO 2 you downloaded with DocLink since is Manual");
+      eq(JSON.stringify(rows()), JSON.stringify([
+        "MA copies | 1 in IREPS | 1 auto",
+        "POs by PO date | 2 in IREPS | 1 auto · 1 manual",
+        "Tender NIT documents | 2 in IREPS | 1 auto · 1 pending | List not read in full on this day: the count may be short."
+      ]));
+      eq(JSON.stringify(bars()), JSON.stringify(["auto 100%", "auto 50%, manual 50%", "auto 50%, pending 50%"]), "each bar: how the type's list ended");
+      eq(host.querySelector("#missed-tiles .missed-tile-missed").classList.contains("missed-tile-zero"), true, "a zero is muted");
+      eq(host.querySelector("#missed-list-empty").textContent, "None yet.");
+      eq(JSON.stringify(texts("#missed-pending .missed-doc-name")), JSON.stringify(["Tender NIT documents · Tender 7 NIT attachment Annexure_A.pdf"]));
+      // Friday: the MA no run will try again, with what finds it in IREPS
+      const daySelect = host.querySelector("#missed-days");
+      daySelect.value = [...daySelect.options].find((o) => o.textContent.startsWith("Fri")).value;
+      daySelect.dispatchEvent(new Event("change"));
+      const item = host.querySelector("#missed-list .missed-doc");
+      eq(JSON.stringify([...item.children].map((c) => c.textContent)), JSON.stringify([
+        "MA copies · MA M3 (PO P3)",
+        "MA date 27/11/2026 · Railway S W RLY",
+        `Not saved: ${describeError("ECM_UNAVAILABLE").title} (the ECM did not answer in time) · 2 runs could not save it · last listed 27/11/2026 17:00`,
+        "Missed: download it in IREPS (the MAs of its PO)."
+      ]));
+      eq(host.querySelector("#missed-list-title").textContent, "Missed (1): download these in IREPS");
+      eq(host.querySelector("#missed-pending-box").hidden, true, "nothing waits for a run on Friday");
+      eq(JSON.stringify(tiles()), JSON.stringify(["In IREPS 3", "Auto 1", "Manual 1", "Missed 1", "Pending 0"]));
+      eq(JSON.stringify(rows()), JSON.stringify(["MA copies | 3 in IREPS | 1 auto · 1 manual · 1 missed"]));
+      eq(host.querySelector("#missed-types .missed-part-missed").textContent, "1 missed", "the missed part stands out");
+
+      // nothing sticks out of a 320 px panel
+      const card = host.querySelector(".card");
+      const style = getComputedStyle(card);
+      const edge = card.getBoundingClientRect().right - parseFloat(style.borderRightWidth) - parseFloat(style.paddingRight);
+      const out = [...host.querySelector("#downloads-missed").querySelectorAll("*")].filter((n) => {
+        const box = n.getBoundingClientRect();
+        return box.width > 0 && box.right > edge + 0.5;
+      });
+      assert(out.length === 0, `Missed documents inside a 320 px panel: ${out.map((n) => `<${n.tagName.toLowerCase()} class="${n.className}">`).join(", ")}`);
+      const tabs = [...host.querySelectorAll(".downloads-tab")].map((t) => t.getBoundingClientRect());
+      assert(tabs.every((t) => t.right <= edge + 0.5 && Math.abs(t.height - tabs[0].height) < 1), "three tabs side by side, the same height");
+
+      // Download Excel: every day, named after the first and the last
+      const saved = [];
+      const { createObjectURL, revokeObjectURL } = URL;
+      const click = HTMLAnchorElement.prototype.click;
+      URL.createObjectURL = (blob) => (saved.push({ blob }), "blob:test");
+      URL.revokeObjectURL = () => {};
+      HTMLAnchorElement.prototype.click = function () {
+        saved.at(-1).name = this.download;
+      };
+      try {
+        host.querySelector("#btn-missed-excel").click();
+      } finally {
+        Object.assign(URL, { createObjectURL, revokeObjectURL });
+        HTMLAnchorElement.prototype.click = click;
+      }
+      eq(JSON.stringify(saved.map((f) => [f.name, f.blob.type])), JSON.stringify([["DocLink_missed_documents_2026-11-27_to_2026-11-30.xlsx", XLSX_MIME_TYPE]]));
+      const xml = new TextDecoder().decode(await saved[0].blob.arrayBuffer());
+      for (const cell of ["Missed: download it in IREPS", "MA M3 (PO P3)", "Manual: downloaded by you with DocLink on 30/11/2026 12:10", "Pending: DocLink tries again at its next run", "Auto (scheduler)"]) assert(xml.includes(`>${cell}<`), `${cell} in the workbook`);
+
+      // the download log cannot answer: said under the lists, and nothing counts as downloaded by you
+      checks.length = 0;
+      initMissed({ send: async () => state, check: async () => ({ ok: false, code: "RECON_AUTH_REQUIRED", downloaded: {} }) });
+      await loadMissed({ check: true });
+      eq(host.querySelector("#missed-check").textContent, `Not checked against your own downloads with DocLink: ${describeError("RECON_AUTH_REQUIRED").title}.`);
+    } finally {
+      host.remove();
+    }
+  });
+  downloadsCss.remove();
+
+  await test("Catch-up: the run log and its saved text list each type's last successful run", () => {
+    const lines = lastSuccessLines({ tenderNit: { day: "27/11/2026", held: 2 }, ma: "27/11/2026", newType: { day: "26/11/2026", held: 0 }, poDate: "bad", icDate: { held: 1 } });
+    eq(JSON.stringify(lines), JSON.stringify(["MA copies: 27/11/2026", "Tender NIT documents: 27/11/2026 (searched again: documents of its catch-up not saved, 2 of 3)", "newType: 26/11/2026"]), "in the Schedule view's order; no day, no line");
+    const text = runLogText({ runs: [], events: [] }, { account: "833", version: "1.7.2", savedAt: "2026-11-27T10:00:00Z", lastSuccess: { ma: { day: "27/11/2026", held: 0 } } });
+    assert(text.includes("LAST SUCCESSFUL RUN OF EACH TYPE (this browser; the first run after a gap searches from it)\n  MA copies: 27/11/2026\n"), text);
+    assert(runLogText({ runs: [], events: [] }, { lastSuccess: {} }).includes("  none stored yet"));
+    assert(!runLogText({ runs: [], events: [] }, {}).includes("LAST SUCCESSFUL RUN"), "a caller without them says nothing");
+    assert(!/[\u2013\u2014]/.test(text), "no en or em dash");
   });
 }

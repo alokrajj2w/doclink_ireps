@@ -1550,15 +1550,34 @@ IREPS / RECON pills; click again to go back) shows what the log holds for the
 signed-in user as a table, newest first: **Date** (dd/mm/yyyy and time, IST),
 **Type**, **File** (with the IREPS account) and **Location** (**Local**,
 **ECM · Hosur** / **ECM · Rohtak** with its folder - hover for the full path -
-and "already there" when the ECM already had it, or **S3**). Filters: date range
-(last 7 days by default), **Location** (All, Local, ECM - all sites, ECM -
+and "already there" when the ECM already had it, or **S3**). It opens on the **last 3 days that had
+downloads**, in a **Day** dropdown with each day's count ("Mon 30/11/2026 · 21 downloads"; on a Monday after a
+weekend: Monday, Friday, Thursday; the foot of its list says only those days are listed there), found by asking the log for each day back from today (14 days at most, one row each); the newest day is
+shown, and **Other dates** gives a From - To range instead. Filters (the days are counted with them):
+**Location** (All, Local, ECM - all sites, ECM -
 Hosur, ECM - Rohtak, S3) and **Document type**; 50 rows at a time with **Load
 more**. An admin also gets **All users**, which adds each row's user under the
 file name. It reads `GET /api/doclink/downloads` (`destination`, `site`,
 `doc_type`, `from`, `to`; `popup/popup-downloads.js`). When the Recon Engine
 cannot be reached it says "Download log unavailable"
 (`DOWNLOAD_LOG_LIST_UNAVAILABLE`), never that a sign-in is needed. A filter
-changed while a page is being read is applied (the older page is dropped).
+changed while a page is being read is applied (the older page is dropped). The view opens on the newest day each
+time; a day picked (or Other dates) stays while it is open (Refresh, filters).
+
+**Download Excel** (under the count, shown when there are rows) saves what the table shows, every page of it with the
+same day or dates and filters, as `DocLink_saved_files_<day>.xlsx` (or `<from>_to_<to>`) in Downloads, one sheet
+"Saved files": Date, Time (hh:mm:ss), Type, File, IREPS account, Location (Local, ECM, S3), ECM site, ECM folder
+(the full path), Note ("already in the ECM, not stored twice") and, with All users, User. Every cell is text, as
+the log gives it (`utils/xlsx-writer.js`), for matching by hand. It reads 50 rows at a time, 5,000 at most; when there
+are more, the button says so (pick fewer dates). A log that does not answer is said as the table says it.
+
+**Three tabs** when scheduled downloads are on (`schedular_phase1` / `schedular_phase2`): **Saved files** is the
+table above, every download of the log, manual and scheduled; **Scheduled runs** (`popup/popup-run-history.js`) is
+what this browser's scheduled downloads did on the last 3 days with runs (section 23, "Scheduled runs"): a
+Day dropdown, and for the day picked the documents downloaded (time, type, document, where saved), the ones not
+saved (with why, and "saved later" or "not saved since"), the runs and the scheduler's decisions, with Download
+Excel (My Downloads offers no text copy of the log); **Missed documents** (`popup/popup-missed.js`) is what IREPS listed to those runs and
+which documents were missed (section 23, "Missed documents"). With scheduling off there are no tabs.
 
 **Switch.** `config.json` `"downloadLog": { "enabled": true }` (default).
 `false` turns off the log, the check and the required sign-in; DocLink then
@@ -2031,18 +2050,72 @@ manual run, the Recon Engine) and its last failed check ("Last check failed: …
   for example "09:02-09:50 (6 checks): Due now: Bill Status, CRN, R-NOTE. Waiting for IREPS: log in to IREPS in
   this browser (IREPS was logged out at the last check, or has not been opened since Chrome started)".
 
-**Run log of this browser** (a box under Today, `services/scheduler/run-log.js`, `chrome.storage.local`
-`doclink.scheduler.runLog`): every scheduled run this DocLink made (the last 60), each opening to the documents it
-could not save (with why), skipped ("Already saved by Priya on …") and saved (where: "IC_45.pdf in ECM /…", the
-S3 path of an export), and the scheduler's decisions (the last 200: waiting for IREPS, for a manual run, for the
-Recon Engine; another DocLink running the account; a claim given back; a schedule changed). A decision repeated at
-every check is one line with its count. **Copy log** and **Save log** give the whole log as text (IST times) for
-support. The DocLink log (`doclinkLog.dump()`) has the same decisions and one line per document not saved.
-Both logs start afresh when a build is loaded or DocLink is reloaded in `chrome://extensions` (not when Chrome
-restarts or updates itself), so the last build's runs, maybe of another Recon server, are not shown: save the log
-first if you need it.
-Only document numbers, error codes and DocLink's own texts are kept, cut short and redacted: never a URL, an
+**Scheduled runs** (My Downloads > Scheduled runs, `popup/popup-run-history.js`; `services/scheduler/run-log.js`, `chrome.storage.local`
+`doclink.scheduler.runLog`): the scheduled runs this DocLink made on the **last 3 days with runs** (since 27 Nov
+2026; until then the last 60 runs), so on a Monday the runs of Friday and Thursday are still there, with the
+scheduler's decisions of those days and of the days between (a weekend's "waiting for IREPS"). A run's day is its slot's
+date (the Recon Engine's IST date).
+* **A Day dropdown**, newest first ("Mon 30/11/2026 · 14 downloaded", "Sat 28/11/2026 · no runs"; the foot of its list:
+  "Only the last 3 days with runs are kept."); the newest is shown until another is picked. For that day: **Downloaded on Mon 30/11/2026** (each document saved: the time of its run, its
+  type, the document and where it was saved), **Not saved** (below), the **Runs**, each opening to its range, why it
+  ended as it did and its documents (not saved, skipped as "Already saved by Priya on …", saved), and the day's
+  **Scheduler events** (waiting for IREPS, for a manual run, for the Recon Engine; another DocLink running the
+  account; a claim given back; a schedule changed). A decision repeated at every check of a day is one line with its
+  count.
+* **Not saved**: each document a run of the day could not save, once, with its last reason, how many runs did not
+  save it, and "saved later" (with when) when a later run saved it or found it already saved, else "not saved
+  since": download those by hand. A document is recognised by its download-log key (its numbers), which this browser
+  keeps with each run's lists and never sends to the Recon Engine; a later run marks the failures it saved, so this
+  stays right when older lists are cut.
+* **Download Excel** saves every day kept (not only the day shown) as `DocLink_scheduled_runs_<first day>_to_<last
+  day>.xlsx`, for matching by hand (`runLogSheets` in `run-log.js`), newest day first, every cell text: **Documents**
+  (Day, Run time, Type, Document, Status "Downloaded" / "Not saved" / "Saved later", Saved to / why not, Error
+  code), **Runs** (Day, Started, Ended, Type, Run, Outcome, Searched, Found, Saved, Already saved, Failed, Not
+  reported to the Recon Engine, Records (Bill Status / CRN / R-NOTE rows), Why; a count the run did not give stays
+  empty, never 0) and **Scheduler events** (Day, From, To, Checks, what the scheduler noted).
+* Loading a build or reloading DocLink in `chrome://extensions` keeps it, apart from what was recorded against another
+  Recon Engine server (and what an earlier build recorded without its server): those runs are not this one's. A run
+  still running when DocLink started again says "Scheduled download cut off". The DocLink log still starts afresh.
+  Each type's last successful run (the clock view's "Last successful run" box; see "After a gap" below) stays too.
+* It holds this browser's runs only: another DocLink's runs of the account are not in it (Today shows
+  everyone's runs of today). Older days keep what they downloaded and could not save, not the documents they found
+  already saved (counted instead); the whole stays under about 1 MB, the oldest runs' skipped, then saved lists going
+  first. With fewer than 3 days of runs, the scheduler's decisions are kept for 7 days at most.
+Only document numbers and keys, error codes and DocLink's own texts are kept, cut short and redacted: never a URL, an
 IREPS page, a token or a cookie.
+
+**Missed documents** (My Downloads > Missed documents, `popup/popup-missed.js`; `services/scheduler/document-ledger.js`,
+`chrome.storage.local` `doclink.scheduler.documents`; asked for by the client on 27 Nov 2026): how many documents IREPS
+listed to this browser's scheduled downloads, how many DocLink downloaded, and which it missed, with what a user needs
+to download a missed one in IREPS by hand.
+* **What IREPS listed.** Every scheduled run of a document type (MA, POs by date, ICs, every tender type) hands over
+  each document its IREPS lists named, once (`seen` in `shared-run-hooks.js` `details()`: a PDF run's rows as
+  offered to the reservation, a row without a PDF link too; a tender run's reserved documents), with what helps find
+  it in IREPS (its numbers, the MA / PO / IC date IREPS shows, the railway unit, an IC's own number) and what became
+  of it. It never goes to the Recon Engine. A document is kept once per IREPS account, under the day DocLink first
+  found it (the run's day).
+* **What became of it.** **Auto** (a scheduled run here downloaded it), **Manual** (saved with DocLink by a user:
+  already saved when the run found it, by hand or by another DocLink, as the Recon Engine's reservation said with who
+  and when; or downloaded by the signed-in user with DocLink since, as their own download log says:
+  `POST /api/doclink/downloads/check` for the ECM and for Local when the tab is opened or refreshed), **Missed** or
+  **Pending**. A document once saved stays saved. One not saved is *missed* once a later run of its type read every
+  list of its range (`searchedAll`) without listing it: DocLink no longer finds it (its date left the look-back, or
+  IREPS no longer lists it), so no run will try it again. Until then it is *pending*: the next run tries again.
+* **The tab.** A Day found dropdown ("Mon 30/11/2026 · 2 missed", "· 1 pending", "· all saved"), newest first,
+  its list ending in "Only the last 3 days with documents are kept." For the day picked: five tiles (In IREPS, Auto,
+  Manual, Missed, Pending), a row per type with the same split as a coloured bar and in words ("2 auto · 1 manual ·
+  1 missed"; "List not read in full" when no run of that day read the type's lists to their end, so the count may be
+  short), a legend, then **Missed** (download these in IREPS) and **Pending**, each document with its
+  type and name, its IREPS date and railway, why it was not saved, how many runs could not save it, when it was last
+  listed, and where to look in IREPS. **Download Excel** saves `DocLink_missed_documents_<first day>_to_<last day>.xlsx`
+  with three sheets: **Missed documents**, **By day** (a line per day and type: In IREPS, Downloaded, Auto
+  (scheduler), Manual, Missed, Pending, lists read in full) and **All documents** (every document IREPS listed and
+  what became of it), every cell text, to match by hand.
+* **Kept** for the last 3 days with documents and the days between (on a Monday: Monday, Friday, Thursday), with each
+  type's newest complete search; under about 1.5 MB, the oldest day going first. Loading a build keeps it, unless it
+  was recorded against another Recon Engine server. Like the run log it holds this browser's runs only: a document
+  another DocLink's run listed is in that browser's tab. The Bill Status, CRN and R-NOTE exports are not in it: they
+  are no documents IREPS lists, and the next export holds a failed day's rows (Scheduled runs shows those runs).
 
 **Each slot once, by one DocLink.** A once-a-day schedule makes one slot per day; an hourly one makes one slot
 per hour (09:00-10:00, 10:00-11:00, …): for a repeating schedule the window's end is the start of the last
@@ -2057,6 +2130,34 @@ no DocLink triggers it again: a once-a-day type waits for tomorrow, an hourly ty
 done by its end is `missed`. Each hourly run searches the look-back range and the reservations skip every
 document already saved, so a run downloads only what is new, and a missed hour is
 caught up by the next run.
+
+**After a gap: from the last successful run** (since 27 Nov 2026). A run searches at least its look-back. When
+this browser's last successful run of the type is older than the look-back's start (a weekend, a holiday, IREPS
+logged out overnight), the run searches from that day instead. Logged out on Friday 27/11 at 18:00 and back on
+Monday 30/11 at 09:00, Monday's first MA run searches 27/11/2026 - 30/11/2026, not the look-back's 29/11/2026 -
+30/11/2026, and its range says so: "Searched: 27/11/2026 - 30/11/2026 (from the last successful run; the look-back
+gave 29/11/2026)". The reservations skip what is already saved, so nothing is saved twice; once that run succeeds,
+the next one searches the look-back again (`caughtUpParams` in `services/scheduler/run-details.js`).
+* A run moves the day on when it read every IREPS list of its range to its end (`lastSuccessAfter`). A run that
+  IREPS cut off, or that read a list short, leaves the day where it was, so the next run searches those days again.
+* When the first run after a gap leaves documents not saved, whatever the reason (an IREPS PDF timing out, the ECM
+  refusing, a file broken in IREPS), the day stays for up to 3 more runs (`CATCH_UP_RETRIES`): they search the gap
+  again and retry those documents. Then it moves on, so a file that never downloads cannot keep every run searching
+  the whole gap; the document stays listed as not saved, as before. A run within its look-back moves the day on even
+  with documents not saved: the next run's look-back searches them again anyway. A stored day never moves back.
+* The catch-up goes back 7 days at most (`CATCH_UP_DAYS`; Tabulations stay within their 5 days). Days further
+  back are named in the run's range and noted in the run log ("ICs by IC date: 18/11/2026 - 22/11/2026 not
+  searched. ..."), to download by hand.
+* It applies to MA, POs by PO date, ICs by IC date and the tender types with a date range. Bill Status, CRN and
+  R-NOTE always search 90 days; ICs from notifications and Correspondence take no range (what IREPS lists when the
+  next run reads it).
+* The day is kept per IREPS account and type in this browser (`chrome.storage.local`
+  `doclink.scheduler.lastSuccess`, `services/scheduler/last-success.js`) and stays when a build is loaded. Each
+  browser keeps its own: one that has not run a type for a while searches from its own older day,
+  which only searches more; one that has never run it (another computer, a fresh install) has no day and searches
+  the look-back alone. The clock view lists the days in its "Last successful run" box ("Tender NIT documents:
+  27/11/2026 (searched again: documents of its catch-up not saved, 1 of 3)" while a catch-up is retried), and its
+  saved text too.
 
 **Order of checks** (`services/scheduler/scheduler.js`): config on → Recon signed in with
 `doclink.schedule.run` → last verified IREPS account known → `GET /schedule/due` → no manual job running here →

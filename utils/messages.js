@@ -52,6 +52,8 @@ export const MESSAGE_TYPES = Object.freeze({
   BILL_UPLOAD_CONFIRM_CHECKED: "BILL_UPLOAD_CONFIRM_CHECKED",
   // Phase 1 scheduled downloads (services/scheduler/, background/scheduler-job.js)
   SCHEDULE_GET_STATE: "SCHEDULE_GET_STATE",
+  // My Downloads > Missed documents: what IREPS listed to this browser's scheduled runs (document-ledger.js)
+  SCHEDULE_GET_DOCUMENTS: "SCHEDULE_GET_DOCUMENTS",
   SCHEDULE_NUDGE: "SCHEDULE_NUDGE",
   SCHEDULE_LIST: "SCHEDULE_LIST",
   SCHEDULE_SAVE: "SCHEDULE_SAVE",
@@ -914,6 +916,10 @@ export const ERROR_CATALOG = Object.freeze({
     title: "Scheduled tender download not started",
     message: "DocLink could not open the tab that runs scheduled tender downloads ({detail}). It tries again at the next check."
   },
+  SCHEDULE_RUN_INTERRUPTED: {
+    title: "Scheduled download cut off",
+    message: "DocLink was reloaded or Chrome stopped it while this scheduled download ran here ({detail}), so it did not finish. What it saved is kept; the slot can be run again by the next DocLink that checks."
+  },
   SCHEDULE_TENDER_FAILED: {
     title: "Scheduled tender download failed",
     message: "The scheduled tender download stopped with an error ({detail}). The next check tries again."
@@ -980,7 +986,13 @@ export const STORAGE_KEYS = Object.freeze({
   // scheduled downloads: the last verified IREPS account id ({ id, at }), never page content
   SCHEDULER_ACCOUNT: "doclink.scheduler.account",
   // scheduled downloads: this browser's run log ({ runs, events }: document numbers, codes, reasons)
-  SCHEDULER_RUN_LOG: "doclink.scheduler.runLog"
+  SCHEDULER_RUN_LOG: "doclink.scheduler.runLog",
+  // scheduled downloads: each type's last successful run in this browser ({ account: { docType: "DD/MM/YYYY" } }),
+  // kept when a build is loaded (services/scheduler/last-success.js)
+  SCHEDULER_LAST_SUCCESS: "doclink.scheduler.lastSuccess",
+  // scheduled downloads: what IREPS listed to this browser's runs, document by document, and what became of each
+  // ({ recon, docs, runs }: document numbers, dates, codes; services/scheduler/document-ledger.js)
+  SCHEDULER_DOCUMENTS: "doclink.scheduler.documents"
 });
 
 /** chrome.storage.session keys (memory only, cleared when Chrome closes). */

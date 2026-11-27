@@ -11,6 +11,8 @@
  *   - shows "!" on the toolbar icon while a slot of this account waits for an IREPS login;
  *   - keeps this browser's run log (services/scheduler/run-log.js): every run with the documents it
  *     saved, skipped and could not save (and why), and why a due slot did not run;
+ *   - keeps each type's last successful run here (services/scheduler/last-success.js), which the first run
+ *     after a gap (a weekend, a holiday, a night with IREPS logged out) searches from;
  *   - answers the Schedule view (state, today's slots, schedules, the run log).
  *
  * Off unless config.json "schedular_phase1" / "schedular_phase2" say otherwise (services/scheduler/schedule-types.js).
@@ -21,6 +23,8 @@ import { createScheduleApi, ScheduleApiError } from "../services/scheduler/sched
 import { createLocalSignals } from "../services/scheduler/local-signals.js";
 import { createRunnerFactory } from "../services/scheduler/runners.js";
 import { createRunLog } from "../services/scheduler/run-log.js";
+import { createLastSuccess } from "../services/scheduler/last-success.js";
+import { createDocumentLedger } from "../services/scheduler/document-ledger.js";
 import { scheduledSearch, FIXED_LOOKBACK, MAX_LOOKBACK } from "../services/scheduler/run-details.js";
 import { parseSchedulerConfig, TENDER_SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL } from "../services/scheduler/schedule-types.js";
 import { createTenderRunner } from "../services/scheduler/tender-runner.js";
@@ -28,7 +32,7 @@ import { holdWorker } from "./keep-alive.js";
 import { isPortalOtherHost } from "../utils/url-scope.js";
 import { readConfigFiles } from "../utils/config.js";
 import { reconWhoAmI } from "../services/recon-auth.js";
-import { SAVE_DESTINATION } from "../services/recon-service.js";
+import { SAVE_DESTINATION, RECON_CONFIG, loadReconConfig } from "../services/recon-service.js";
 import { EXPORT_FORMAT } from "../services/search-po/search-po-export.js";
 import { SEARCH_PO_CRITERIA } from "../services/search-po/search-po-api.js";
 import { MA_DATE_MODE, MA_ERROR } from "../services/ma/ma-service.js";
@@ -36,6 +40,15 @@ import { MESSAGE_TYPES, SCHEDULED_RUN, describeError } from "../utils/messages.j
 import { logger } from "../utils/logger.js";
 
 export const SCHEDULER_ALARM = "doclink.scheduler";
+
+/** The Recon Engine server in use (its origin), "" when it is not set: what the run log records each entry against. */
+function reconOrigin() {
+  try {
+    return new URL(RECON_CONFIG.baseUrl).origin;
+  } catch {
+    return "";
+  }
+}
 const BADGE_COLOR = "#d97706";
 
 /** Schedule fields the panel may set (the backend validates them again). */
@@ -131,7 +144,13 @@ export function batchRunEnd(state) {
 export function createSchedulerJob(deps) {
   const api = createScheduleApi();
   const signals = createLocalSignals();
-  const runLog = createRunLog();
+  const runLog = createRunLog({ recon: reconOrigin });
+  // a run still "running" from before this worker started was cut off: said so before the scheduler can wake
+  runLog.markInterrupted();
+  // each type's last successful run here: kept when a build is loaded, as the run log's days (onBuildLoaded)
+  const lastSuccess = createLastSuccess();
+  // what IREPS listed to each run here, document by document (My Downloads > Missed documents): kept as the run log
+  const documents = createDocumentLedger({ recon: reconOrigin });
   const { exportRunner, documentRunner } = createRunnerFactory({ api });
   const toS3OrEcm = SAVE_DESTINATION.RECON;
 
@@ -220,6 +239,8 @@ export function createSchedulerJob(deps) {
     runners,
     alarms,
     runLog,
+    lastSuccess,
+    documents,
     onState: (state) => {
       showBadge(state);
       deps.broadcast(MESSAGE_TYPES.SCHEDULE_STATE, { state });
@@ -274,13 +295,22 @@ export function createSchedulerJob(deps) {
       slots: today ? today.slots || [] : st.slots,
       schedules: today ? today.schedules || [] : [],
       log: await runLog.read(),
+      lastSuccess: account ? await lastSuccess.read(account) : {},
       version: chrome.runtime.getManifest().version,
       error
     };
   }
 
+  /** What the Missed documents tab shows: the documents IREPS listed to this browser's runs for the last verified account. */
+  async function documentsState() {
+    const config = await loadConfig();
+    const account = await signals.account();
+    return { ok: true, config, account, ledger: account ? await documents.read(account) : { docs: [], runs: [] } };
+  }
+
   const handlers = {
     [MESSAGE_TYPES.SCHEDULE_GET_STATE]: () => viewState(),
+    [MESSAGE_TYPES.SCHEDULE_GET_DOCUMENTS]: () => documentsState(),
     [MESSAGE_TYPES.SCHEDULE_NUDGE]: (message) => {
       scheduler.wake(`panel: ${message.reason || "nudge"}`, { force: true });
       return { ok: true };
@@ -339,8 +369,20 @@ export function createSchedulerJob(deps) {
       await scheduler.wake("ireps session check", { quietable: true });
     },
     onBrowserStart: () => scheduler.wake("browser start", { force: true }),
-    /** A build was loaded: this browser's run log starts afresh (the last build's runs may be of another Recon server). */
-    clearRunLog: () => runLog.clear(),
+    /**
+     * A build was loaded: the run log keeps its days, apart from what was recorded against another Recon Engine
+     * server (or by a build that did not record its server); the document ledger is kept unless it was recorded
+     * against another server. Never throws.
+     */
+    async onBuildLoaded() {
+      try {
+        await loadReconConfig();
+        await runLog.keepServer(reconOrigin());
+        await documents.keepServer(reconOrigin());
+      } catch (error) {
+        logger.debug("Scheduler: run log not checked after the build was loaded", error);
+      }
+    },
     /** A tab closed: a tender runner tab closed before its run ended gives the slot back; an own tab is forgotten. */
     onTabRemoved: (tabId) => {
       tenderRunner.tabRemoved(tabId);

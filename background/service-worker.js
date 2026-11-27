@@ -1914,12 +1914,13 @@ chrome.tabs.onReplaced.addListener((addedTabId) => enableTabPanel(addedTabId));
 enableTabPanelsForAllTabs();
 
 chrome.runtime.onInstalled.addListener((details) => {
-  // a build loaded (or reloaded) starts both logs afresh: the last build's runs and lines, maybe of another Recon
-  // server, are not this one's. Queued download-log records are data, not a log: they stay. Chrome updating
-  // itself ("chrome_update") loads no new build.
+  // a build loaded (or reloaded) starts the DocLink log afresh. The scheduled downloads' run log keeps its last days
+  // (the client asked for 3 days of history), apart from what was recorded against another Recon server, which is
+  // not this one's. Queued download-log records are data, not a log: they stay. Chrome updating itself
+  // ("chrome_update") loads no new build.
   if (details.reason === "install" || details.reason === "update") {
     clearLogEntries();
-    schedulerJob.clearRunLog();
+    schedulerJob.onBuildLoaded();
   }
   logger.info(`DocLink installed (${details.reason})`);
   loadIrepsConfig().then(() => schedulerJob.onBrowserStart());

@@ -17,10 +17,15 @@
  * Engine; another DocLink running the account; a claim given back) is written to this browser's run
  * log and the DocLink log, in plain words, with the types it concerns. Each run's start and end go to
  * the run log too, with every document it could not save and why.
+ *
+ * After a gap (a weekend, a holiday, a night with IREPS logged out), a claimed range starts at its type's last
+ * successful run in this browser when that day is earlier than the look-back (withCatchUp, last-success.js), and a
+ * run that succeeds becomes that last successful run (rememberSuccess).
  */
 
 import { SCHEDULE_TYPES, SCHEDULE_TYPE_LABEL } from "./schedule-types.js";
-import { scheduledSearch, fitResult, limitedParams, MAX_LOOKBACK } from "./run-details.js";
+import { scheduledSearch, fitResult, limitedParams, caughtUpParams, lastSuccessAfter, catchesUp, MAX_LOOKBACK, CATCH_UP_RETRIES } from "./run-details.js";
+import { runDay } from "./run-log.js";
 import { describeError } from "../../utils/messages.js";
 import { logger } from "../../utils/logger.js";
 
@@ -67,6 +72,10 @@ const labelOf = (type) => SCHEDULE_TYPE_LABEL[type] || type;
 const LOGGED_FAILURES_MAX = 50;
 /** No run log: the scheduler still runs (tests, or a storage that cannot be written). */
 const NO_RUN_LOG = Object.freeze({ event: () => {}, runStarted: () => {}, runFinished: () => {} });
+/** No store of last successful runs: every run searches its look-back alone (tests, as before the catch-up). */
+const NO_LAST_SUCCESS = Object.freeze({ get: async () => null, set: async () => {} });
+/** No document ledger: nothing records what IREPS listed (tests, or a storage that cannot be written). */
+const NO_DOCUMENTS = Object.freeze({ recordRun: async () => {} });
 
 /** "RECON_UNAVAILABLE: could not reach ..." -> "Recon Engine unavailable (could not reach ...)". */
 const problemText = (code, detail) => `${describeError(code).title}${detail ? ` (${detail})` : ""}`;
@@ -99,6 +108,10 @@ const irepsCheckProblem = (code, detail) =>
  * @param {() => string} [deps.uuid]
  * @param {{ setInterval: Function, clearInterval: Function, setTimeout: Function, clearTimeout: Function }} [deps.timers]
  * @param {{ event: Function, runStarted: Function, runFinished: Function }} [deps.runLog]   services/scheduler/run-log.js
+ * @param {{ get: (account: string, docType: string) => Promise<{ day: string, held: number }|null>, set: (account: string, docType: string, entry: { day: string, held: number }) => Promise<void> }} [deps.lastSuccess]
+ *        each type's last successful run here (services/scheduler/last-success.js): the first run after a gap searches from it
+ * @param {{ recordRun: (run: { account: string, type: string, day: string, at: string, full: boolean, seen: object[] }) => Promise<void> }} [deps.documents]
+ *        what IREPS listed to each run (services/scheduler/document-ledger.js): My Downloads > Missed documents
  */
 export function createScheduler(deps) {
   const now = deps.now || (() => Date.now());
@@ -113,6 +126,8 @@ export function createScheduler(deps) {
   };
   const onState = deps.onState || (() => {});
   const runLog = deps.runLog || NO_RUN_LOG;
+  const lastSuccess = deps.lastSuccess || NO_LAST_SUCCESS;
+  const documents = deps.documents || NO_DOCUMENTS;
   let lastNote = "";
 
   /**
@@ -382,9 +397,9 @@ export function createScheduler(deps) {
         logger.info(`Scheduler: claimed ${slot.doc_type} for ${slot.slot_date}${period} (account ${account})`);
         // Tabulations search 5 days at most, whatever the schedule's look-back (run-details.js MAX_LOOKBACK)
         const asked = answer.params || {};
-        const params = limitedParams(slot.doc_type, asked);
-        if (params.dateFrom !== asked.dateFrom) logger.info(`Scheduler: ${slot.doc_type} searches ${MAX_LOOKBACK[slot.doc_type]} days at most: ${params.dateFrom} - ${params.dateTo} (the schedule's look-back gave ${asked.dateFrom})`);
-        return { slot, claimId, params };
+        const limited = limitedParams(slot.doc_type, asked);
+        if (limited.dateFrom !== asked.dateFrom) logger.info(`Scheduler: ${slot.doc_type} searches ${MAX_LOOKBACK[slot.doc_type]} days at most: ${limited.dateFrom} - ${limited.dateTo} (the schedule's look-back gave ${asked.dateFrom})`);
+        return { slot, claimId, ...(await withCatchUp(slot, limited, account)) };
       } catch (error) {
         const code = error && error.code;
         if (NEXT_SLOT.has(code)) continue;
@@ -396,6 +411,67 @@ export function createScheduler(deps) {
       }
     }
     return null;
+  }
+
+  /**
+   * A claimed range searched from its type's last successful run here when that day is earlier (run-details.js
+   * caughtUpParams), so the first run after a weekend, a holiday or a night with IREPS logged out searches those
+   * days too -> { params, lastSuccess: the stored { day, held } or null }. Never throws: a store that cannot be read
+   * leaves the claim's range as it is.
+   */
+  async function withCatchUp(slot, params, account) {
+    if (!catchesUp(slot.doc_type)) return { params, lastSuccess: null };
+    let last = null;
+    try {
+      last = await lastSuccess.get(account, slot.doc_type);
+    } catch (error) {
+      logger.debug("Scheduler: last successful run not read", error);
+    }
+    const caught = caughtUpParams(slot.doc_type, params, last && last.day);
+    const c = caught.catchUp;
+    if (c && c.widened) logger.info(`Scheduler: ${slot.doc_type} searches from its last successful run here (${c.last}): ${caught.dateFrom} - ${caught.dateTo} (the schedule's look-back gave ${c.lookback})`);
+    return { params: caught, lastSuccess: last };
+  }
+
+  /** The days a catch-up could not reach, in the run log once the run starts (not for a claim given back). */
+  function noteNotSearched(claimed) {
+    const c = claimed.params && claimed.params.catchUp;
+    if (!c || !c.notSearched) return;
+    note("error", `${labelOf(claimed.slot.doc_type)}: ${c.notSearched} not searched. Its last successful run in this browser was on ${c.last}, longer ago than a run searches back: if no other DocLink ran it in between, download those days from the DocLink panel.`, [claimed.slot.doc_type]);
+  }
+
+  /** What the run means for its type's last successful run here (run-details.js lastSuccessAfter). Never throws. */
+  async function rememberSuccess(claimed, account, outcome) {
+    const next = lastSuccessAfter(claimed.slot.doc_type, claimed.params, outcome, claimed.lastSuccess);
+    if (!next) return;
+    if (next.held > 0) logger.info(`Scheduler: ${claimed.slot.doc_type}: its catch-up left documents not saved; the next run searches from ${next.day} again (${next.held} of ${CATCH_UP_RETRIES})`);
+    try {
+      await lastSuccess.set(String(account.irepsAccountId), claimed.slot.doc_type, next);
+    } catch (error) {
+      logger.debug("Scheduler: last successful run not stored", error);
+    }
+  }
+
+  /**
+   * What the run's IREPS lists named and what became of each document (the outcome's `log.seen`), for the Missed
+   * documents tab. A run whose claim was lost may have stopped anywhere: its documents count, its search is never a
+   * complete one. A run without lists (not started, a runner tab that reported none) records nothing. Never throws.
+   */
+  async function recordDocuments(claimed, account, outcome, startedAt, lost) {
+    const seen = outcome && outcome.log && Array.isArray(outcome.log.seen) ? outcome.log.seen : null;
+    if (!seen) return;
+    try {
+      await documents.recordRun({
+        account: String(account.irepsAccountId),
+        type: claimed.slot.doc_type,
+        day: runDay({ slotDate: claimed.slot.slot_date, startedAt }),
+        at: startedAt,
+        full: !lost && outcome.searchedAll === true,
+        seen
+      });
+    } catch (error) {
+      logger.debug("Scheduler: documents of the run not recorded", error);
+    }
   }
 
   async function finish(claimed, outcome) {
@@ -431,8 +507,10 @@ export function createScheduler(deps) {
     const isClaimLive = () => !lost && now() - lastBeat < LEASE_MS - HEARTBEAT_MS;
     publish({ running: { slotId: slot.id, docType: slot.doc_type, holder: null, mine: true, since: new Date(now()).toISOString() } });
     const range = scheduledSearch(slot.doc_type, claimed.params).text;
+    const startedAt = new Date(now()).toISOString();
     logger.info(`Scheduler: running ${slot.doc_type}${slot.period && slot.period !== "day" ? ` (${slot.period} run)` : ""} for account ${account.irepsAccountId}: ${range || "no date range"}`);
     await logRun(() => runLog.runStarted({ id: claimId, docType: slot.doc_type, slotId: slot.id, slotDate: slot.slot_date || null, period: slot.period || null, account: String(account.irepsAccountId), range, user: (state.user && state.user.name) || null }));
+    noteNotSearched(claimed);
 
     let outcome;
     try {
@@ -448,6 +526,9 @@ export function createScheduler(deps) {
     }
     if (lost) outcome = { ...outcome, code: outcome.code || "SCHEDULE_CLAIM_LOST" };
     await finish(claimed, outcome);
+    // a run whose claim was lost may have stopped anywhere: never a success
+    if (!lost) await rememberSuccess(claimed, account, outcome);
+    await recordDocuments(claimed, account, outcome, startedAt, lost);
     logOutcome(slot, outcome);
     await logRun(() => runLog.runFinished(claimId, outcome));
     // a manual run took the job first (BUSY): given back, and run when that job ends (scheduler-job.js jobEnded)

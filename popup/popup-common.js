@@ -4,6 +4,41 @@
 
 import { SCHEDULED_RUN } from "../utils/messages.js";
 
+/**
+ * Save `content` as a file in Downloads, the way Chrome saves a link the user clicked (Download Excel).
+ * @param {string|Uint8Array} content
+ * @param {string} filename
+ * @param {string} type   its MIME type
+ */
+export function saveFile(content, filename, type) {
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const a = Object.assign(document.createElement("a"), { href: url, download: filename });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+/**
+ * The Day filter of My Downloads' tabs (a dropdown in place of a button per day, the user's choice on 27 Nov 2026):
+ * an option per day kept, newest first, the day shown selected, and at the foot of the list a line that cannot be
+ * picked saying how many days are kept (.day-note: small in Chrome's customizable select). The options are rebuilt
+ * only when they change, so a state message never closes the list while it is open.
+ * @param {HTMLSelectElement} select
+ * @param {{ value: string, text: string }[]} choices
+ * @param {string|null} value   the day shown
+ * @param {string} note
+ */
+export function fillDaySelect(select, choices, value, note) {
+  const signature = JSON.stringify([choices, note]);
+  if (select.dataset.signature !== signature) {
+    select.replaceChildren(
+      ...choices.map((c) => Object.assign(document.createElement("option"), { value: c.value, textContent: c.text })),
+      Object.assign(document.createElement("option"), { value: "", textContent: note, disabled: true, className: "day-note" })
+    );
+    select.dataset.signature = signature;
+  }
+  if (value !== null && value !== undefined && select.value !== value) select.value = value;
+}
+
 /** The runs this panel did not start that hold a job now: key -> the line that says so. */
 const backgroundRuns = new Map();
 
